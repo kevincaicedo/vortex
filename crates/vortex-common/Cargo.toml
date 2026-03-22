@@ -1,0 +1,13 @@
+[package]
+name = "vortex-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB shared types, errors, constants, and traits"
+
+[dependencies]
+thiserror = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

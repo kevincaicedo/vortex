@@ -1,0 +1,9 @@
+[package]
+name = "vortex-acl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB ACL engine and authentication"
+
+[dependencies]
+vortex-common = { workspace = true }

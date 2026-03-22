@@ -1,0 +1,14 @@
+[package]
+name = "vortex-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB core data engine — Swiss Table, shard, commands, data structures"
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-memory = { workspace = true }
+ahash = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

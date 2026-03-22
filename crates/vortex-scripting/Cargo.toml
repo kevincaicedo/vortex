@@ -1,0 +1,9 @@
+[package]
+name = "vortex-scripting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB Lua/Function API scripting engine"
+
+[dependencies]
+vortex-common = { workspace = true }

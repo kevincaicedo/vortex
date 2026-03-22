@@ -1,0 +1,29 @@
+[package]
+name = "vortex-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB I/O reactor, io_uring backend, and cross-platform polling fallback"
+
+[features]
+default = ["polling-fallback"]
+io-uring = ["dep:io-uring"]
+sqpoll = ["io-uring"]
+polling-fallback = []
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-memory = { workspace = true }
+vortex-sync = { workspace = true }
+polling = { workspace = true }
+socket2 = { workspace = true }
+slab = { workspace = true }
+core_affinity = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

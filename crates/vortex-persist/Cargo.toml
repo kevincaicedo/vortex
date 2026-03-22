@@ -1,0 +1,16 @@
+[package]
+name = "vortex-persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB persistence engine — AOF, VXF snapshots, shadow paging"
+
+[features]
+default = []
+dax = []
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-memory = { workspace = true }
+lz4_flex = { workspace = true }
+crc32fast = { workspace = true }

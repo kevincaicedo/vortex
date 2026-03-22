@@ -1,0 +1,9 @@
+[package]
+name = "vortex-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB cluster protocol, gossip, and slot routing"
+
+[dependencies]
+vortex-common = { workspace = true }

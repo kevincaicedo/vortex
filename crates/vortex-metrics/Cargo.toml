@@ -1,0 +1,11 @@
+[package]
+name = "vortex-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB observability — Prometheus metrics, slow log, latency histograms"
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-sync = { workspace = true }
+hdrhistogram = { workspace = true }

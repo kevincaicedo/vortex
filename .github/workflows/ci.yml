@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 0.2.3 — Format check ──────────────────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ── 0.2.2 — Lint job ──────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # ── 0.2.4 — Test job (Linux x86_64) ───────────────────────────────
+  test-linux:
+    name: Test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # ── 0.2.4 — Test job (Linux aarch64 via cross) ────────────────────
+  test-linux-aarch64:
+    name: Test (Linux aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross --locked
+      - run: cross test --workspace --target aarch64-unknown-linux-gnu
+
+  # ── 0.2.5 — Test job (macOS) ──────────────────────────────────────
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # ── 0.2.6 — Miri job ──────────────────────────────────────────────
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Miri on unsafe crates
+        run: cargo miri test -p vortex-sync -p vortex-memory
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+
+  # ── 0.2.7 — Address Sanitizer job ─────────────────────────────────
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with AddressSanitizer
+        run: cargo test --workspace --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: "-Zsanitizer=address -D warnings"
+
+  # ── 0.2.8 — Thread Sanitizer job ──────────────────────────────────
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+      - uses: Swatinem/rust-cache@v2
+      - name: Run vortex-sync tests with ThreadSanitizer
+        run: cargo test -p vortex-sync --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread -D warnings"
+
+  # ── 0.2.9 — Code coverage ─────────────────────────────────────────
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --workspace \
+            --lcov --output-path lcov.info \
+            --ignore-filename-regex 'tests|benches'
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # ── 0.2.10 — Dependency audit ─────────────────────────────────────
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

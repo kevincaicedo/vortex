@@ -1,0 +1,24 @@
+[package]
+name = "vortex-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB RESP2/RESP3 protocol parser and serializer"
+build = "build.rs"
+
+[features]
+default = ["simd", "resp3"]
+simd = []
+resp3 = []
+
+[dependencies]
+vortex-common = { workspace = true }
+bytes = { workspace = true }
+phf = { workspace = true }
+itoa = { workspace = true }
+
+[build-dependencies]
+phf_codegen = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

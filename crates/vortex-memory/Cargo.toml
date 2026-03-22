@@ -1,0 +1,19 @@
+[package]
+name = "vortex-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB memory allocator, NUMA-aware arenas, and buffer pool"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+vortex-common = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

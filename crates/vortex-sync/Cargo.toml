@@ -1,0 +1,16 @@
+[package]
+name = "vortex-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VortexDB lock-free concurrent primitives (SPSC/MPSC ring buffers)"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+vortex-common = { workspace = true }
+crossbeam-utils = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

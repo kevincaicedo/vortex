@@ -1,0 +1,111 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vortex-common",
+    "crates/vortex-memory",
+    "crates/vortex-sync",
+    "crates/vortex-proto",
+    "crates/vortex-io",
+    "crates/vortex-config",
+    "crates/vortex-engine",
+    "crates/vortex-persist",
+    "crates/vortex-cluster",
+    "crates/vortex-replication",
+    "crates/vortex-pubsub",
+    "crates/vortex-scripting",
+    "crates/vortex-acl",
+    "crates/vortex-metrics",
+    "crates/vortex-server",
+    "tools/vortex-cli",
+    "tools/vortex-bench",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/vortexdb/vortex"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+# ── Error handling & logging ──
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── Serialization ──
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+bytes = "1"
+
+# ── Hashing ──
+ahash = "0.8"
+crc32fast = "1"
+
+# ── Memory & allocation ──
+tikv-jemallocator = "0.6"
+tikv-jemalloc-sys = "0.6"
+tikv-jemalloc-ctl = "0.6"
+
+# ── Concurrency ──
+crossbeam-utils = "0.8"
+
+# ── I/O ──
+polling = "3"
+socket2 = "0.5"
+slab = "0.4"
+core_affinity = "0.8"
+libc = "0.2"
+
+# ── Protocol ──
+phf = "0.11"
+phf_codegen = "0.11"
+itoa = "1"
+
+# ── Configuration ──
+clap = { version = "4", features = ["derive", "env"] }
+
+# ── Persistence ──
+lz4_flex = "0.11"
+
+# ── Observability ──
+hdrhistogram = "7"
+
+# ── Testing ──
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
+# ── CLI ──
+rustyline = "14"
+
+# ── Signal handling ──
+ctrlc = "3"
+
+# ── Internal crates ──
+vortex-common = { path = "crates/vortex-common" }
+vortex-memory = { path = "crates/vortex-memory" }
+vortex-sync = { path = "crates/vortex-sync" }
+vortex-proto = { path = "crates/vortex-proto" }
+vortex-io = { path = "crates/vortex-io" }
+vortex-config = { path = "crates/vortex-config" }
+vortex-engine = { path = "crates/vortex-engine" }
+vortex-persist = { path = "crates/vortex-persist" }
+vortex-cluster = { path = "crates/vortex-cluster" }
+vortex-replication = { path = "crates/vortex-replication" }
+vortex-pubsub = { path = "crates/vortex-pubsub" }
+vortex-scripting = { path = "crates/vortex-scripting" }
+vortex-acl = { path = "crates/vortex-acl" }
+vortex-metrics = { path = "crates/vortex-metrics" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

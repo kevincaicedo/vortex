@@ -1,0 +1,23 @@
+[package]
+name = "vortex-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vortex-proto = { path = "../crates/vortex-proto" }
+bytes = "1"
+
+[[bin]]
+name = "fuzz_resp_parser"
+path = "fuzz_targets/fuzz_resp_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_rdb_import"
+path = "fuzz_targets/fuzz_rdb_import.rs"
+doc = false

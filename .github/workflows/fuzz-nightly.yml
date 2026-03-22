@@ -1,0 +1,57 @@
+name: Nightly Fuzz
+
+on:
+  schedule:
+    # Run every day at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  fuzz-resp-parser:
+    name: Fuzz RESP parser (1 hour)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzzer
+        working-directory: fuzz
+        run: |
+          cargo fuzz run fuzz_resp_parser -- \
+            -max_total_time=3600 \
+            -jobs=$(nproc)
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-resp-${{ github.run_id }}
+          path: fuzz/artifacts/
+
+      - name: Open issue on crash
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'fuzz/artifacts/fuzz_resp_parser/';
+            let body = '## Fuzzer crash found\n\n';
+            body += `**Workflow run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n`;
+            body += 'Crash artifacts have been uploaded. Download from the workflow run.\n';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🐛 Fuzzer crash: fuzz_resp_parser',
+              body: body,
+              labels: ['bug', 'fuzzing'],
+            });
