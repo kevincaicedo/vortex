@@ -1,0 +1,45 @@
+# VortexDB development & comparison environment
+#
+# Usage:
+#   docker compose up -d          # Start all services
+#   docker compose exec dev bash  # Enter dev container
+#   docker compose down           # Stop everything
+
+services:
+  # Development environment with all tools
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    network_mode: host
+
+  # Redis — comparison baseline
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no
+
+  # Dragonfly — comparison target
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    ports:
+      - "6380:6379"
+    ulimits:
+      memlock: -1
+
+  # Valkey — comparison target
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6381:6379"
+    command: valkey-server --save "" --appendonly no
+
+volumes:
+  cargo-cache:

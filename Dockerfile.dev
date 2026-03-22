@@ -1,0 +1,41 @@
+# VortexDB development environment
+#
+# Build:  docker build -f Dockerfile.dev -t vortex-dev .
+# Run:    docker run -it --rm -v $(pwd):/workspace -w /workspace vortex-dev
+#
+# This image includes all tools needed for building, testing, fuzzing,
+# and profiling VortexDB.
+
+FROM rust:1.85-bookworm
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    linux-headers-generic \
+    liburing-dev \
+    linux-perf \
+    valgrind \
+    git \
+    curl \
+    jq \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install nightly toolchain matching rust-toolchain.toml
+RUN rustup toolchain install nightly-2026-03-15 \
+    --component rustfmt clippy llvm-tools-preview miri rust-src \
+    --target x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+    && rustup default nightly-2026-03-15
+
+# Install development tools
+RUN cargo install cargo-fuzz --locked \
+    && cargo install cargo-deny --locked \
+    && cargo install cargo-llvm-cov --locked \
+    && cargo install flamegraph --locked \
+    && cargo install just --locked
+
+# Pre-create cargo registry cache directory
+RUN mkdir -p /usr/local/cargo/registry
+
+WORKDIR /workspace
