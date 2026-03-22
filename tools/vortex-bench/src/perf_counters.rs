@@ -14,6 +14,88 @@
 
 use std::io;
 
+// ── Linux perf_event constants (not exported by libc crate) ─────────
+
+const PERF_TYPE_HARDWARE: u32 = 0;
+const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+const PERF_COUNT_HW_CACHE_REFERENCES: u64 = 3;
+const PERF_COUNT_HW_CACHE_MISSES: u64 = 4;
+const PERF_COUNT_HW_BRANCH_INSTRUCTIONS: u64 = 5;
+const PERF_COUNT_HW_BRANCH_MISSES: u64 = 6;
+
+const PERF_FLAG_FD_CLOEXEC: u64 = 1 << 3;
+
+// ioctl request codes for perf events (from linux/perf_event.h)
+// These are _IO / _IOW macros expanded for '$' (0x24) type.
+const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
+const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
+const PERF_EVENT_IOC_RESET: u64 = 0x2403;
+const PERF_IOC_FLAG_GROUP: u64 = 1;
+
+/// Minimal `perf_event_attr` matching the kernel ABI (first 112 bytes).
+/// We only need `type_`, `size`, `config`, and the bitfield flags.
+#[repr(C)]
+struct PerfEventAttr {
+    type_: u32,
+    size: u32,
+    config: u64,
+    sample_period_or_freq: u64,
+    sample_type: u64,
+    read_format: u64,
+    /// Bitfield flags packed as a u64.
+    /// Bit 0: disabled, bit 1: inherit, bit 2: pinned, bit 3: exclusive,
+    /// bit 4: exclude_user, bit 5: exclude_kernel, bit 6: exclude_hv, ...
+    flags: u64,
+    wakeup_events_or_watermark: u32,
+    bp_type: u32,
+    config1: u64,
+    config2: u64,
+    branch_sample_type: u64,
+    sample_regs_user: u64,
+    sample_stack_user: u32,
+    clockid: i32,
+    sample_regs_intr: u64,
+    aux_watermark: u32,
+    sample_max_stack: u16,
+    __reserved_2: u16,
+}
+
+impl PerfEventAttr {
+    fn new(type_: u32, config: u64, disabled: bool) -> Self {
+        let mut attr = Self {
+            type_,
+            size: std::mem::size_of::<Self>() as u32,
+            config,
+            sample_period_or_freq: 0,
+            sample_type: 0,
+            read_format: 0,
+            flags: 0,
+            wakeup_events_or_watermark: 0,
+            bp_type: 0,
+            config1: 0,
+            config2: 0,
+            branch_sample_type: 0,
+            sample_regs_user: 0,
+            sample_stack_user: 0,
+            clockid: 0,
+            sample_regs_intr: 0,
+            aux_watermark: 0,
+            sample_max_stack: 0,
+            __reserved_2: 0,
+        };
+        // flags bitfield: bit 0 = disabled, bit 5 = exclude_kernel, bit 6 = exclude_hv
+        let mut bits: u64 = 0;
+        if disabled {
+            bits |= 1 << 0;
+        }
+        bits |= 1 << 5; // exclude_kernel
+        bits |= 1 << 6; // exclude_hv
+        attr.flags = bits;
+        attr
+    }
+}
+
 /// Raw file descriptor for a perf event.
 struct PerfFd(i32);
 
@@ -62,21 +144,19 @@ impl PerfSnapshot {
 
 /// A group of hardware performance counters.
 pub struct PerfCounterGroup {
-    /// Group leader fd (cycles counter).
     leader: PerfFd,
-    /// Member fds: instructions, cache_misses, cache_refs, branch_misses, branch_insns
     members: [PerfFd; 5],
 }
 
-fn perf_event_open(attr: &libc::perf_event_attr, group_fd: i32) -> io::Result<PerfFd> {
+fn perf_event_open(attr: &PerfEventAttr, group_fd: i32) -> io::Result<PerfFd> {
     let fd = unsafe {
         libc::syscall(
             libc::SYS_perf_event_open,
-            attr as *const libc::perf_event_attr,
+            attr as *const PerfEventAttr,
             0i32,  // pid: current process
             -1i32, // cpu: any CPU
             group_fd,
-            libc::PERF_FLAG_FD_CLOEXEC as u64,
+            PERF_FLAG_FD_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -85,42 +165,26 @@ fn perf_event_open(attr: &libc::perf_event_attr, group_fd: i32) -> io::Result<Pe
     Ok(PerfFd(fd as i32))
 }
 
-fn make_attr(type_: u32, config: u64, disabled: bool) -> libc::perf_event_attr {
-    let mut attr: libc::perf_event_attr = unsafe { std::mem::zeroed() };
-    attr.type_ = type_;
-    attr.size = std::mem::size_of::<libc::perf_event_attr>() as u32;
-    attr.config = config;
-    // Bitfield flags — set via the __bindgen fields
-    attr.set_disabled(disabled as u64);
-    attr.set_exclude_kernel(1);
-    attr.set_exclude_hv(1);
-    attr
-}
-
 impl PerfCounterGroup {
     /// Creates a new counter group. Returns `Err` if perf is unavailable.
     pub fn new() -> io::Result<Self> {
-        let hw = libc::PERF_TYPE_HARDWARE;
-
-        // Leader: cycles
-        let leader_attr = make_attr(hw, libc::PERF_COUNT_HW_CPU_CYCLES as u64, true);
+        let leader_attr = PerfEventAttr::new(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, true);
         let leader = perf_event_open(&leader_attr, -1)?;
 
         let configs = [
-            libc::PERF_COUNT_HW_INSTRUCTIONS as u64,
-            libc::PERF_COUNT_HW_CACHE_MISSES as u64,
-            libc::PERF_COUNT_HW_CACHE_REFERENCES as u64,
-            libc::PERF_COUNT_HW_BRANCH_MISSES as u64,
-            libc::PERF_COUNT_HW_BRANCH_INSTRUCTIONS as u64,
+            PERF_COUNT_HW_INSTRUCTIONS,
+            PERF_COUNT_HW_CACHE_MISSES,
+            PERF_COUNT_HW_CACHE_REFERENCES,
+            PERF_COUNT_HW_BRANCH_MISSES,
+            PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
         ];
 
         let mut members_vec = Vec::with_capacity(5);
         for &cfg in &configs {
-            let attr = make_attr(hw, cfg, false);
+            let attr = PerfEventAttr::new(PERF_TYPE_HARDWARE, cfg, false);
             members_vec.push(perf_event_open(&attr, leader.0)?);
         }
 
-        // Convert Vec to fixed-size array
         let members: [PerfFd; 5] = match members_vec.try_into() {
             Ok(arr) => arr,
             Err(_) => unreachable!(),
@@ -134,8 +198,8 @@ impl PerfCounterGroup {
         let ret = unsafe {
             libc::ioctl(
                 self.leader.0,
-                libc::PERF_EVENT_IOC_RESET as _,
-                libc::PERF_IOC_FLAG_GROUP,
+                PERF_EVENT_IOC_RESET as _,
+                PERF_IOC_FLAG_GROUP,
             )
         };
         if ret < 0 {
@@ -144,8 +208,8 @@ impl PerfCounterGroup {
         let ret = unsafe {
             libc::ioctl(
                 self.leader.0,
-                libc::PERF_EVENT_IOC_ENABLE as _,
-                libc::PERF_IOC_FLAG_GROUP,
+                PERF_EVENT_IOC_ENABLE as _,
+                PERF_IOC_FLAG_GROUP,
             )
         };
         if ret < 0 {
@@ -159,8 +223,8 @@ impl PerfCounterGroup {
         let ret = unsafe {
             libc::ioctl(
                 self.leader.0,
-                libc::PERF_EVENT_IOC_DISABLE as _,
-                libc::PERF_IOC_FLAG_GROUP,
+                PERF_EVENT_IOC_DISABLE as _,
+                PERF_IOC_FLAG_GROUP,
             )
         };
         if ret < 0 {

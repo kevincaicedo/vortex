@@ -7,6 +7,7 @@ description = "VortexDB core data engine — Swiss Table, shard, commands, data 
 
 [dependencies]
 vortex-common = { workspace = true }
+vortex-proto = { workspace = true }
 vortex-memory = { workspace = true }
 ahash = { workspace = true }
 

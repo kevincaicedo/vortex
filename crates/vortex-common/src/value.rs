@@ -288,3 +288,65 @@ mod tests {
         assert!(!ib.is_empty());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn arb_short_string()(s in "[a-z]{0,23}") -> String {
+            s
+        }
+    }
+
+    prop_compose! {
+        fn arb_long_string()(s in "[a-z]{24,128}") -> String {
+            s
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn short_strings_are_inline(s in "[a-z]{0,23}") {
+            let val = VortexValue::from(s.as_str());
+            prop_assert!(matches!(val, VortexValue::InlineString(_)));
+        }
+
+        #[test]
+        fn long_strings_are_heap(s in "[a-z]{24,128}") {
+            let val = VortexValue::from(s.as_str());
+            prop_assert!(matches!(val, VortexValue::String(_)));
+        }
+
+        #[test]
+        fn integer_roundtrip(n: i64) {
+            let val = VortexValue::from(n);
+            match val {
+                VortexValue::Integer(v) => prop_assert_eq!(v, n),
+                _ => prop_assert!(false, "expected Integer variant"),
+            }
+        }
+
+        #[test]
+        fn bytes_from_roundtrip(data in proptest::collection::vec(any::<u8>(), 0..128)) {
+            let b = Bytes::from(data.clone());
+            let val = VortexValue::from(b);
+            match &val {
+                VortexValue::InlineString(ib) if data.len() <= 23 => {
+                    prop_assert_eq!(ib.as_bytes(), &data[..]);
+                }
+                VortexValue::String(s) if data.len() > 23 => {
+                    prop_assert_eq!(s.as_ref(), &data[..]);
+                }
+                _ => prop_assert!(false, "unexpected variant for len={}", data.len()),
+            }
+        }
+
+        #[test]
+        fn memory_usage_positive(n: i64) {
+            let val = VortexValue::from(n);
+            prop_assert!(val.memory_usage() > 0);
+        }
+    }
+}
