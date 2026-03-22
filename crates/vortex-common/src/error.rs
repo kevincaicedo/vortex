@@ -81,8 +81,6 @@ pub enum AuthError {
     NoPermission { command: String },
 }
 
-
-
 /// Convenience result alias.
 pub type VortexResult<T> = Result<T, VortexError>;
 

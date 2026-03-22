@@ -16,7 +16,10 @@ use serde::Deserialize;
 
 /// Master configuration struct for VortexDB.
 #[derive(Debug, Clone, Parser, Deserialize)]
-#[command(name = "vortex-server", about = "VortexDB — Next-generation in-memory data engine")]
+#[command(
+    name = "vortex-server",
+    about = "VortexDB — Next-generation in-memory data engine"
+)]
 #[serde(default)]
 pub struct VortexConfig {
     /// Bind address and port.
@@ -159,8 +162,15 @@ impl VortexConfig {
                 self.aof_fsync
             ));
         }
-        if !["noeviction", "allkeys-lru", "volatile-lru", "allkeys-random", "volatile-random", "volatile-ttl"]
-            .contains(&self.eviction_policy.as_str())
+        if ![
+            "noeviction",
+            "allkeys-lru",
+            "volatile-lru",
+            "allkeys-random",
+            "volatile-random",
+            "volatile-ttl",
+        ]
+        .contains(&self.eviction_policy.as_str())
         {
             return Err(format!(
                 "invalid eviction_policy '{}': must be noeviction, allkeys-lru, volatile-lru, allkeys-random, volatile-random, or volatile-ttl",
@@ -211,9 +221,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_bad_fsync() {
-        let mut config = VortexConfig::default();
-        config.threads = 1;
-        config.aof_fsync = "invalid".to_string();
+        let config = VortexConfig {
+            threads: 1,
+            aof_fsync: "invalid".to_string(),
+            ..VortexConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 

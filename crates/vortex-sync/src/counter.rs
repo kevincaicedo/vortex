@@ -41,10 +41,7 @@ impl ShardedCounter {
 
     /// Returns the aggregate count across all slots.
     pub fn total(&self) -> u64 {
-        self.slots
-            .iter()
-            .map(|s| s.load(Ordering::Relaxed))
-            .sum()
+        self.slots.iter().map(|s| s.load(Ordering::Relaxed)).sum()
     }
 
     /// Returns the count for a specific slot.

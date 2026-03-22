@@ -10,9 +10,19 @@ vortex-common = { workspace = true }
 vortex-engine = { workspace = true }
 vortex-proto = { workspace = true }
 vortex-sync = { workspace = true }
+hdrhistogram = { workspace = true }
+clap = { workspace = true }
+bytes = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+
+[[bin]]
+name = "vortex-loadgen"
+path = "src/bin/loadgen.rs"
 
 [[bench]]
 name = "engine"
@@ -20,4 +30,8 @@ harness = false
 
 [[bench]]
 name = "parser"
+harness = false
+
+[[bench]]
+name = "ring_buffer"
 harness = false

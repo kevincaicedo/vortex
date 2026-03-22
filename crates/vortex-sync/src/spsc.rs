@@ -27,7 +27,10 @@ unsafe impl<T: Send, const N: usize> Sync for SpscRingBuffer<T, N> {}
 impl<T, const N: usize> SpscRingBuffer<T, N> {
     /// Creates a new empty ring buffer. `N` must be a power of two.
     pub fn new() -> Self {
-        assert!(N.is_power_of_two(), "SpscRingBuffer: N must be a power of two");
+        assert!(
+            N.is_power_of_two(),
+            "SpscRingBuffer: N must be a power of two"
+        );
         assert!(N > 0, "SpscRingBuffer: N must be > 0");
 
         // SAFETY: We initialize every cell to None. UnsafeCell<Option<T>>

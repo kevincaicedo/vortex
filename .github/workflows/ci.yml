@@ -108,7 +108,7 @@ jobs:
       - name: Run tests with AddressSanitizer
         run: cargo test --workspace --target x86_64-unknown-linux-gnu
         env:
-          RUSTFLAGS: "-Zsanitizer=address -D warnings"
+          RUSTFLAGS: "-Zsanitizer=address -Cunsafe-allow-abi-mismatch=sanitizer -D warnings"
 
   # ── 0.2.8 — Thread Sanitizer job ──────────────────────────────────
   tsan:
@@ -123,7 +123,7 @@ jobs:
       - name: Run vortex-sync tests with ThreadSanitizer
         run: cargo test -p vortex-sync --target x86_64-unknown-linux-gnu
         env:
-          RUSTFLAGS: "-Zsanitizer=thread -D warnings"
+          RUSTFLAGS: "-Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer -D warnings"
 
   # ── 0.2.9 — Code coverage ─────────────────────────────────────────
   coverage:

@@ -206,10 +206,7 @@ mod tests {
 
     #[test]
     fn serialize_array() {
-        let frame = RespFrame::Array(Some(vec![
-            RespFrame::Integer(1),
-            RespFrame::Integer(2),
-        ]));
+        let frame = RespFrame::Array(Some(vec![RespFrame::Integer(1), RespFrame::Integer(2)]));
         assert_eq!(serialize(&frame), b"*2\r\n:1\r\n:2\r\n");
     }
 

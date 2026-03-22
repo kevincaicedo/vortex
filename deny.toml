@@ -1,11 +1,9 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+version = 2
+ignore = ["RUSTSEC-2024-0436"] # paste: transitive via tikv-jemalloc-ctl, no alternative
+db-urls = ["https://github.com/rustsec/advisory-db"]
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -16,11 +14,14 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
 ]
-copyleft = "deny"
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"

@@ -12,7 +12,10 @@ use crate::MAX_INLINE_KEY_LEN;
 #[derive(Clone)]
 pub enum VortexKey {
     /// Keys that fit within 23 bytes — stored inline, zero allocation.
-    Inline { len: u8, data: [u8; MAX_INLINE_KEY_LEN] },
+    Inline {
+        len: u8,
+        data: [u8; MAX_INLINE_KEY_LEN],
+    },
     /// Keys exceeding 23 bytes — heap allocated.
     Heap(Vec<u8>),
 }

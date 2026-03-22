@@ -43,10 +43,7 @@ pub enum RespFrame {
 
     /// `=<len>\r\ntxt:<data>\r\n` — RESP3 verbatim string.
     #[cfg(feature = "resp3")]
-    VerbatimString {
-        encoding: [u8; 3],
-        data: Bytes,
-    },
+    VerbatimString { encoding: [u8; 3], data: Bytes },
 
     /// `%<count>\r\n...` — RESP3 map.
     #[cfg(feature = "resp3")]
@@ -58,10 +55,7 @@ pub enum RespFrame {
 
     /// `><count>\r\n...` — RESP3 push (pub/sub, invalidation).
     #[cfg(feature = "resp3")]
-    Push {
-        kind: Bytes,
-        data: Vec<RespFrame>,
-    },
+    Push { kind: Bytes, data: Vec<RespFrame> },
 }
 
 impl RespFrame {

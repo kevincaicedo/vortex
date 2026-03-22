@@ -84,7 +84,9 @@ pub struct VortexList {
 
 impl VortexList {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -102,7 +104,9 @@ pub struct VortexHash {
 
 impl VortexHash {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -120,7 +124,9 @@ pub struct VortexSet {
 
 impl VortexSet {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -138,7 +144,9 @@ pub struct VortexSortedSet {
 
 impl VortexSortedSet {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -156,7 +164,9 @@ pub struct VortexStream {
 
 impl VortexStream {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -187,8 +197,7 @@ impl VortexValue {
             Self::String(b) => std::mem::size_of::<Bytes>() + b.len(),
             Self::Integer(_) => std::mem::size_of::<i64>(),
             Self::List(l) => {
-                std::mem::size_of::<VortexList>()
-                    + l.entries.iter().map(|e| e.len()).sum::<usize>()
+                std::mem::size_of::<VortexList>() + l.entries.iter().map(|e| e.len()).sum::<usize>()
             }
             Self::Hash(h) => {
                 std::mem::size_of::<VortexHash>()
@@ -198,8 +207,7 @@ impl VortexValue {
                         .sum::<usize>()
             }
             Self::Set(s) => {
-                std::mem::size_of::<VortexSet>()
-                    + s.entries.iter().map(|e| e.len()).sum::<usize>()
+                std::mem::size_of::<VortexSet>() + s.entries.iter().map(|e| e.len()).sum::<usize>()
             }
             Self::SortedSet(ss) => {
                 std::mem::size_of::<VortexSortedSet>()

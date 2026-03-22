@@ -78,8 +78,7 @@ impl RespParser {
 
     fn parse_integer(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
         let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let n = Self::parse_length(buf, 1, crlf)
-            .ok_or(NeedMoreData)?;
+        let n = Self::parse_length(buf, 1, crlf).ok_or(NeedMoreData)?;
         Ok((RespFrame::Integer(n), crlf + 2))
     }
 
@@ -237,10 +236,7 @@ mod tests {
     fn parse_empty_bulk_string() {
         let buf = b"$0\r\n\r\n";
         let (frame, consumed) = RespParser::parse(buf).unwrap();
-        assert_eq!(
-            frame,
-            RespFrame::BulkString(Some(Bytes::from_static(b"")))
-        );
+        assert_eq!(frame, RespFrame::BulkString(Some(Bytes::from_static(b""))));
         assert_eq!(consumed, 6);
     }
 
@@ -323,7 +319,7 @@ mod tests {
     #[cfg(feature = "resp3")]
     #[test]
     fn parse_resp3_double() {
-        let (frame, _) = RespParser::parse(b",3.14\r\n").unwrap();
-        assert_eq!(frame, RespFrame::Double(3.14));
+        let (frame, _) = RespParser::parse(b",2.72\r\n").unwrap();
+        assert_eq!(frame, RespFrame::Double(2.72));
     }
 }
