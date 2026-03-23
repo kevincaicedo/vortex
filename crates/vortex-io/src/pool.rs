@@ -5,12 +5,13 @@
 //! mesh, and manages lifecycle (startup → running → drain → shutdown).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use vortex_sync::SpscRingBuffer;
 
 use crate::reactor::{Reactor, ReactorConfig};
+use crate::shutdown::ShutdownCoordinator;
 
 /// Capacity of each cross-reactor SPSC ring buffer.
 pub const CROSS_CHANNEL_CAP: usize = 4096;
@@ -72,7 +73,7 @@ struct ReactorHandle {
 /// ring buffers with no locks on the hot path.
 pub struct ReactorPool {
     handles: Vec<ReactorHandle>,
-    shutdown: Arc<AtomicBool>,
+    coordinator: Arc<ShutdownCoordinator>,
     /// Channel mesh: `cross_channels[from][to]` for sending from reactor
     /// `from` to reactor `to`. Entry is `None` when `from == to`.
     #[allow(dead_code)]
@@ -92,7 +93,7 @@ impl ReactorPool {
             config.threads
         };
 
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
 
         // Build the N×N cross-reactor SPSC channel mesh.
         let mut cross_channels: Vec<Vec<Option<CrossChannel>>> = Vec::with_capacity(num_reactors);
@@ -116,7 +117,7 @@ impl ReactorPool {
 
         for (i, _) in cross_channels.iter().enumerate().take(num_reactors) {
             let core_id = core_ids.get(i).copied();
-            let shutdown_clone = Arc::clone(&shutdown);
+            let coord_clone = Arc::clone(&coordinator);
 
             // Gather incoming channels for this reactor: channels[j][i] for all j ≠ i.
             let incoming: Vec<CrossChannel> = (0..num_reactors)
@@ -147,7 +148,7 @@ impl ReactorPool {
                         }
                     }
 
-                    let mut reactor = match Reactor::new(i, reactor_config, shutdown_clone) {
+                    let mut reactor = match Reactor::new(i, reactor_config, coord_clone) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(reactor_id = i, error = %e, "failed to create reactor");
@@ -172,14 +173,14 @@ impl ReactorPool {
 
         Ok(Self {
             handles,
-            shutdown,
+            coordinator,
             cross_channels,
         })
     }
 
     /// Signal all reactors to shut down gracefully.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.coordinator.initiate();
     }
 
     /// Wait for all reactor threads to finish.
@@ -197,21 +198,29 @@ impl ReactorPool {
         }
     }
 
+    /// Block until all reactors finish or the timeout expires.
+    ///
+    /// Returns `true` on clean shutdown, `false` if force-kill was triggered.
+    /// After this returns, call [`join`](Self::join) to reap threads.
+    pub fn wait_for_shutdown(&self, timeout: Duration) -> bool {
+        self.coordinator.wait_for_shutdown(timeout)
+    }
+
     /// Returns the number of reactor threads.
     pub fn reactor_count(&self) -> usize {
         self.handles.len()
     }
 
-    /// Returns a reference to the shared shutdown flag.
-    pub fn shutdown_flag(&self) -> &Arc<AtomicBool> {
-        &self.shutdown
+    /// Returns a reference to the shared shutdown coordinator.
+    pub fn coordinator(&self) -> &Arc<ShutdownCoordinator> {
+        &self.coordinator
     }
 }
 
 impl Drop for ReactorPool {
     fn drop(&mut self) {
         // Ensure all reactor threads are stopped and joined on drop.
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.coordinator.initiate();
         self.join();
     }
 }

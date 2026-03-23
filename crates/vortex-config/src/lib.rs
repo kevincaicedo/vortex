@@ -8,11 +8,35 @@
 //!
 //! **Loading priority:** CLI args > environment vars > `vortex.toml` > defaults.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
 use serde::Deserialize;
+
+/// I/O backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum IoBackendKind {
+    /// Auto-detect: use io_uring on Linux if available, otherwise polling.
+    #[default]
+    Auto,
+    /// Force io_uring backend (Linux only — fails fast if unavailable).
+    Uring,
+    /// Force cross-platform polling backend.
+    Polling,
+}
+
+impl fmt::Display for IoBackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Uring => write!(f, "uring"),
+            Self::Polling => write!(f, "polling"),
+        }
+    }
+}
 
 /// Master configuration struct for VortexDB.
 #[derive(Debug, Clone, Parser, Deserialize)]
@@ -42,9 +66,29 @@ pub struct VortexConfig {
     #[arg(long, default_value = "noeviction", env = "VORTEX_EVICTION_POLICY")]
     pub eviction_policy: String,
 
-    /// I/O backend: "uring" or "polling".
-    #[arg(long, default_value = "auto", env = "VORTEX_IO_BACKEND")]
-    pub io_backend: String,
+    /// I/O backend: auto, uring, or polling.
+    #[arg(long, default_value = "auto", env = "VORTEX_IO_BACKEND", value_enum)]
+    pub io_backend: IoBackendKind,
+
+    /// io_uring submission queue size (must be a power of two).
+    #[arg(long, default_value = "4096", env = "VORTEX_RING_SIZE")]
+    pub ring_size: u32,
+
+    /// Number of fixed I/O buffers pre-registered with io_uring.
+    #[arg(long, default_value = "1024", env = "VORTEX_FIXED_BUFFERS")]
+    pub fixed_buffers: usize,
+
+    /// Size of each I/O buffer in bytes (minimum 4096).
+    #[arg(long, default_value = "16384", env = "VORTEX_BUFFER_SIZE")]
+    pub buffer_size: usize,
+
+    /// Idle connection timeout in seconds (0 = disabled).
+    #[arg(long, default_value = "300", env = "VORTEX_CONNECTION_TIMEOUT")]
+    pub connection_timeout_secs: u64,
+
+    /// SQPOLL kernel thread idle timeout in milliseconds.
+    #[arg(long, default_value = "1000", env = "VORTEX_SQPOLL_IDLE_MS")]
+    pub sqpoll_idle_ms: u32,
 
     /// Enable AOF persistence.
     #[arg(long, env = "VORTEX_AOF_ENABLED")]
@@ -95,7 +139,12 @@ impl Default for VortexConfig {
             max_clients: 10_000,
             max_memory: 0,
             eviction_policy: "noeviction".to_string(),
-            io_backend: "auto".to_string(),
+            io_backend: IoBackendKind::Auto,
+            ring_size: 4096,
+            fixed_buffers: 1024,
+            buffer_size: 16_384,
+            connection_timeout_secs: 300,
+            sqpoll_idle_ms: 1000,
             aof_enabled: false,
             aof_fsync: "everysec".to_string(),
             aof_path: PathBuf::from("vortex.aof"),
@@ -156,6 +205,18 @@ impl VortexConfig {
         if self.threads == 0 {
             return Err("threads must be > 0".to_string());
         }
+        if !self.ring_size.is_power_of_two() {
+            return Err(format!(
+                "ring_size must be a power of two, got {}",
+                self.ring_size
+            ));
+        }
+        if self.buffer_size < 4096 {
+            return Err(format!(
+                "buffer_size must be >= 4096, got {}",
+                self.buffer_size
+            ));
+        }
         if !["always", "everysec", "no"].contains(&self.aof_fsync.as_str()) {
             return Err(format!(
                 "invalid aof_fsync value '{}': must be always, everysec, or no",
@@ -180,10 +241,84 @@ impl VortexConfig {
         Ok(())
     }
 
-    /// Merge unset fields from a TOML-loaded config.
-    fn merge_defaults(&mut self, _defaults: VortexConfig) {
-        // TODO: In Phase 0, CLI args always win. A more sophisticated merge
-        // (checking which fields were explicitly set) comes in Phase 1.
+    /// Merge fields from a TOML-loaded config into `self`.
+    ///
+    /// For each field: if the CLI-parsed value equals the `Default` sentinel,
+    /// take the TOML value instead. This implements CLI > TOML > defaults priority.
+    fn merge_defaults(&mut self, defaults: VortexConfig) {
+        let sentinel = VortexConfig::default();
+
+        // Numeric/enum fields: CLI default sentinel → take TOML value.
+        if self.threads == sentinel.threads {
+            self.threads = defaults.threads;
+        }
+        if self.max_clients == sentinel.max_clients {
+            self.max_clients = defaults.max_clients;
+        }
+        if self.max_memory == sentinel.max_memory {
+            self.max_memory = defaults.max_memory;
+        }
+        if self.io_backend == sentinel.io_backend {
+            self.io_backend = defaults.io_backend;
+        }
+        if self.ring_size == sentinel.ring_size {
+            self.ring_size = defaults.ring_size;
+        }
+        if self.fixed_buffers == sentinel.fixed_buffers {
+            self.fixed_buffers = defaults.fixed_buffers;
+        }
+        if self.buffer_size == sentinel.buffer_size {
+            self.buffer_size = defaults.buffer_size;
+        }
+        if self.connection_timeout_secs == sentinel.connection_timeout_secs {
+            self.connection_timeout_secs = defaults.connection_timeout_secs;
+        }
+        if self.sqpoll_idle_ms == sentinel.sqpoll_idle_ms {
+            self.sqpoll_idle_ms = defaults.sqpoll_idle_ms;
+        }
+
+        // String fields: check against default sentinel strings.
+        if self.eviction_policy == sentinel.eviction_policy {
+            self.eviction_policy = defaults.eviction_policy;
+        }
+        if self.aof_fsync == sentinel.aof_fsync {
+            self.aof_fsync = defaults.aof_fsync;
+        }
+        if self.log_level == sentinel.log_level {
+            self.log_level = defaults.log_level;
+        }
+        if self.requirepass == sentinel.requirepass {
+            self.requirepass = defaults.requirepass;
+        }
+
+        // Bool fields: only take TOML value if CLI didn't set them (bools default to false).
+        if !self.aof_enabled && defaults.aof_enabled {
+            self.aof_enabled = true;
+        }
+        if !self.snapshot_enabled && defaults.snapshot_enabled {
+            self.snapshot_enabled = true;
+        }
+
+        // Path fields.
+        if self.aof_path == sentinel.aof_path {
+            self.aof_path = defaults.aof_path;
+        }
+        if self.snapshot_path == sentinel.snapshot_path {
+            self.snapshot_path = defaults.snapshot_path;
+        }
+        if self.snapshot_interval == sentinel.snapshot_interval {
+            self.snapshot_interval = defaults.snapshot_interval;
+        }
+
+        // SocketAddr: compare to default bind address.
+        if self.bind == sentinel.bind {
+            self.bind = defaults.bind;
+        }
+
+        // Optional fields: take TOML value if CLI didn't set.
+        if self.metrics_port.is_none() {
+            self.metrics_port = defaults.metrics_port;
+        }
     }
 
     /// Returns the effective number of reactor threads.
@@ -202,6 +337,10 @@ mod tests {
         assert_eq!(config.bind.port(), 6379);
         assert_eq!(config.max_clients, 10_000);
         assert!(!config.aof_enabled);
+        assert_eq!(config.io_backend, IoBackendKind::Auto);
+        assert_eq!(config.ring_size, 4096);
+        assert_eq!(config.buffer_size, 16_384);
+        assert_eq!(config.connection_timeout_secs, 300);
     }
 
     #[test]
@@ -220,6 +359,59 @@ mod tests {
     }
 
     #[test]
+    fn from_args_io_backend_uring() {
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--io-backend".to_string(),
+            "uring".to_string(),
+            "--ring-size".to_string(),
+            "2048".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(config.io_backend, IoBackendKind::Uring);
+        assert_eq!(config.ring_size, 2048);
+    }
+
+    #[test]
+    fn from_args_io_backend_polling() {
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--io-backend".to_string(),
+            "polling".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(config.io_backend, IoBackendKind::Polling);
+    }
+
+    #[test]
+    fn validation_rejects_bad_ring_size() {
+        let config = VortexConfig {
+            threads: 1,
+            ring_size: 3000, // Not a power of two.
+            ..VortexConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("ring_size must be a power of two"));
+    }
+
+    #[test]
+    fn validation_rejects_small_buffer_size() {
+        let config = VortexConfig {
+            threads: 1,
+            buffer_size: 1024, // Below minimum 4096.
+            ..VortexConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("buffer_size must be >= 4096"));
+    }
+
+    #[test]
     fn validation_rejects_bad_fsync() {
         let config = VortexConfig {
             threads: 1,
@@ -235,5 +427,60 @@ mod tests {
         assert_eq!(config.threads, 0);
         config.resolve_threads();
         assert!(config.threads > 0);
+    }
+
+    #[test]
+    fn merge_defaults_toml_fills_unset() {
+        // Simulate: CLI has defaults, TOML overrides some fields.
+        let mut cli = VortexConfig::default();
+        let toml_conf = VortexConfig {
+            threads: 8,
+            ring_size: 2048,
+            io_backend: IoBackendKind::Uring,
+            max_memory: 1_073_741_824,
+            ..VortexConfig::default()
+        };
+
+        cli.merge_defaults(toml_conf);
+
+        // TOML values should win over defaults.
+        assert_eq!(cli.threads, 8);
+        assert_eq!(cli.ring_size, 2048);
+        assert_eq!(cli.io_backend, IoBackendKind::Uring);
+        assert_eq!(cli.max_memory, 1_073_741_824);
+    }
+
+    #[test]
+    fn merge_defaults_cli_wins_over_toml() {
+        // Simulate: CLI explicitly set threads=4, TOML says threads=8.
+        let mut cli = VortexConfig {
+            threads: 4, // Differs from default 0 → CLI override.
+            ..VortexConfig::default()
+        };
+        let toml_conf = VortexConfig {
+            threads: 8,
+            ring_size: 2048,
+            ..VortexConfig::default()
+        };
+
+        cli.merge_defaults(toml_conf);
+
+        // CLI threads=4 should win because it differs from sentinel (0).
+        assert_eq!(cli.threads, 4);
+        // But ring_size should take TOML value because CLI was default.
+        assert_eq!(cli.ring_size, 2048);
+    }
+
+    #[test]
+    fn merge_defaults_untouched_stay_default() {
+        let mut cli = VortexConfig::default();
+        let toml_conf = VortexConfig::default();
+
+        cli.merge_defaults(toml_conf);
+
+        // All fields remain at defaults.
+        assert_eq!(cli.ring_size, 4096);
+        assert_eq!(cli.buffer_size, 16_384);
+        assert_eq!(cli.io_backend, IoBackendKind::Auto);
     }
 }

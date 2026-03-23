@@ -28,9 +28,11 @@ pub mod backend;
 pub mod connection;
 pub mod pool;
 pub mod reactor;
+pub mod shutdown;
 pub mod timer;
 
 pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
 pub use pool::{CrossMessage, ReactorPool, ReactorPoolConfig};
 pub use reactor::{Reactor, ReactorConfig};
+pub use shutdown::ShutdownCoordinator;
 pub use timer::TimerWheel;

@@ -3,10 +3,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use vortex_io::{Reactor, ReactorConfig};
+use vortex_io::{Reactor, ReactorConfig, ShutdownCoordinator};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
 fn free_port() -> u16 {
@@ -20,8 +19,8 @@ fn free_port() -> u16 {
 fn ping_pong_resp() {
     let port = free_port();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = Arc::clone(&shutdown);
+    let coordinator = Arc::new(ShutdownCoordinator::new(1));
+    let coord_clone = Arc::clone(&coordinator);
 
     let handle = std::thread::spawn(move || {
         let config = ReactorConfig {
@@ -31,7 +30,7 @@ fn ping_pong_resp() {
             buffer_count: 64,
             connection_timeout: 0,
         };
-        let mut reactor = Reactor::new(0, config, shutdown_clone).expect("reactor creation");
+        let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
     });
 
@@ -63,7 +62,7 @@ fn ping_pong_resp() {
 
     // Shut down the reactor.
     drop(stream);
-    shutdown.store(true, Ordering::SeqCst);
+    coordinator.initiate();
     handle.join().expect("reactor thread join");
 }
 
@@ -71,8 +70,8 @@ fn ping_pong_resp() {
 fn ping_pong_inline() {
     let port = free_port();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = Arc::clone(&shutdown);
+    let coordinator = Arc::new(ShutdownCoordinator::new(1));
+    let coord_clone = Arc::clone(&coordinator);
 
     let handle = std::thread::spawn(move || {
         let config = ReactorConfig {
@@ -82,7 +81,7 @@ fn ping_pong_inline() {
             buffer_count: 64,
             connection_timeout: 0,
         };
-        let mut reactor = Reactor::new(0, config, shutdown_clone).expect("reactor creation");
+        let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
     });
 
@@ -102,7 +101,7 @@ fn ping_pong_inline() {
     assert_eq!(response, "+PONG\r\n", "expected PONG for inline PING");
 
     drop(stream);
-    shutdown.store(true, Ordering::SeqCst);
+    coordinator.initiate();
     handle.join().expect("reactor thread join");
 }
 
@@ -110,8 +109,8 @@ fn ping_pong_inline() {
 fn unknown_command_returns_error() {
     let port = free_port();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = Arc::clone(&shutdown);
+    let coordinator = Arc::new(ShutdownCoordinator::new(1));
+    let coord_clone = Arc::clone(&coordinator);
 
     let handle = std::thread::spawn(move || {
         let config = ReactorConfig {
@@ -121,7 +120,7 @@ fn unknown_command_returns_error() {
             buffer_count: 64,
             connection_timeout: 0,
         };
-        let mut reactor = Reactor::new(0, config, shutdown_clone).expect("reactor creation");
+        let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
     });
 
@@ -144,6 +143,6 @@ fn unknown_command_returns_error() {
     );
 
     drop(stream);
-    shutdown.store(true, Ordering::SeqCst);
+    coordinator.initiate();
     handle.join().expect("reactor thread join");
 }

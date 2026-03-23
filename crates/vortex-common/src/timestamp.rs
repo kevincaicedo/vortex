@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// Monotonic nanosecond timestamp.
 ///
 /// Wraps a `u64` representing nanoseconds since the Unix epoch.
@@ -9,15 +7,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Timestamp(u64);
 
 impl Timestamp {
-    /// Returns the current timestamp.
+    /// Returns the current timestamp using the fastest available monotonic clock.
+    ///
+    /// - **Linux**: `CLOCK_MONOTONIC_COARSE` (~4ns per call)
+    /// - **macOS/other**: `CLOCK_MONOTONIC` (~30ns per call)
     #[inline]
     pub fn now() -> Self {
-        // Use SystemTime for portability in Phase 0.
-        // TODO: Phase 1 switches to clock_gettime(CLOCK_MONOTONIC_COARSE) on Linux.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+
+        // SAFETY: `clock_gettime` writes into a valid `timespec` we own.
+        // The clock IDs used are always available on their respective platforms.
+        #[cfg(target_os = "linux")]
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
+
+        #[cfg(not(target_os = "linux"))]
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+
+        debug_assert_eq!(ret, 0, "clock_gettime failed");
+
+        let nanos = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
         Self(nanos)
     }
 
@@ -95,5 +106,17 @@ mod tests {
         let t1 = Timestamp::from_nanos(100);
         let t2 = Timestamp::from_nanos(200);
         assert!(t1 < t2);
+    }
+
+    #[test]
+    fn timestamp_monotonic() {
+        let t1 = Timestamp::now();
+        // Spin briefly to ensure the clock advances.
+        std::hint::spin_loop();
+        let t2 = Timestamp::now();
+        assert!(
+            t2 >= t1,
+            "Timestamp::now() must be monotonically non-decreasing"
+        );
     }
 }

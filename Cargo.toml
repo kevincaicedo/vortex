@@ -50,6 +50,7 @@ tikv-jemalloc-ctl = "0.6"
 
 # ── Concurrency ──
 crossbeam-utils = "0.8"
+crossbeam-queue = "0.3"
 
 # ── I/O ──
 polling = "3"

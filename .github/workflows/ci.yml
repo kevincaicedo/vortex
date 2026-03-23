@@ -119,9 +119,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-03-15
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Run vortex-sync tests with ThreadSanitizer
-        run: cargo test -p vortex-sync --target x86_64-unknown-linux-gnu -- --test-threads=1
+        run: cargo test -Zbuild-std -p vortex-sync --target x86_64-unknown-linux-gnu --lib --tests -- --test-threads=1
         env:
           RUSTFLAGS: "-Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer -D warnings"
 

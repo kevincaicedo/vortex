@@ -37,8 +37,8 @@ const L2_SHIFT: u32 = L0_BITS + L1_BITS;
 /// Internal entry stored in the pre-allocated pool.
 #[derive(Clone, Copy)]
 struct TimerEntry {
-    /// Packed `(conn_id << 8) | generation`. Zero when cancelled/free.
-    conn_and_gen: u32,
+    /// Packed `((conn_id+1) << 24) | generation`. Zero when cancelled/free.
+    conn_and_gen: u64,
     /// Absolute deadline tick (seconds since reactor start).
     deadline: u32,
     /// Next entry index in the same wheel slot, or [`TIMER_NIL`].
@@ -53,20 +53,20 @@ impl TimerEntry {
     };
 
     #[inline]
-    fn pack(conn_id: usize, generation: u8) -> u32 {
+    fn pack(conn_id: usize, generation: u32) -> u64 {
         // Shift conn_id up by 1 so that (conn_id=0, gen=0) never produces 0.
         // This reserves conn_and_gen == 0 as the "cancelled/free" sentinel.
-        (((conn_id as u32) + 1) << 8) | (generation as u32)
+        (((conn_id as u64) + 1) << 24) | ((generation & 0xFF_FFFF) as u64)
     }
 
     #[inline]
     fn conn_id(self) -> usize {
-        ((self.conn_and_gen >> 8) - 1) as usize
+        ((self.conn_and_gen >> 24) - 1) as usize
     }
 
     #[inline]
-    fn generation(self) -> u8 {
-        (self.conn_and_gen & 0xFF) as u8
+    fn generation(self) -> u32 {
+        (self.conn_and_gen & 0xFF_FFFF) as u32
     }
 
     #[inline]
@@ -81,7 +81,7 @@ impl TimerEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiredTimer {
     pub conn_id: usize,
-    pub generation: u8,
+    pub generation: u32,
 }
 
 // -- Timer wheel ------------------------------------------------------------
@@ -151,7 +151,7 @@ impl TimerWheel {
     /// # Panics
     ///
     /// Debug-panics if the entry pool is exhausted.
-    pub fn schedule(&mut self, conn_id: usize, generation: u8, deadline: u32) -> u32 {
+    pub fn schedule(&mut self, conn_id: usize, generation: u32, deadline: u32) -> u32 {
         let entry_idx = self.alloc_entry();
         debug_assert!(entry_idx != TIMER_NIL, "timer entry pool exhausted");
 
@@ -538,7 +538,7 @@ mod tests {
         let count = 256;
         let mut tw = TimerWheel::new(count);
         for i in 0..count {
-            tw.schedule(i, (i & 0xFF) as u8, i as u32 + 1);
+            tw.schedule(i, (i & 0xFF_FFFF) as u32, i as u32 + 1);
         }
         assert_eq!(tw.pending() as usize, count);
 

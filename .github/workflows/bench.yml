@@ -26,13 +26,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run benchmarks
-        run: cargo bench -p vortex-bench -- --output-format bencher | tee bench-output.txt
+        run: cargo bench -p vortex-bench --benches 2>&1 | tee bench-output.txt
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: VortexDB Benchmarks
-          tool: cargo
+          tool: 'cargo'
           output-file-path: bench-output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
           comment-on-alert: true
