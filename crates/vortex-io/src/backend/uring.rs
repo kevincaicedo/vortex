@@ -8,7 +8,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use io_uring::{opcode, types::Fd, IoUring};
+use io_uring::{IoUring, opcode, types::Fd};
 
 use super::{Completion, IoBackend};
 
@@ -42,23 +42,24 @@ impl IoUringBackend {
             self.ring
                 .submitter()
                 .register_buffers(iovecs)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
         }
     }
 }
 
 impl IoBackend for IoUringBackend {
     fn submit_accept(&mut self, listener_fd: RawFd, token: u64) -> io::Result<()> {
-        let accept = opcode::Accept::new(Fd(listener_fd), std::ptr::null_mut(), std::ptr::null_mut())
-            .build()
-            .user_data(token);
+        let accept =
+            opcode::Accept::new(Fd(listener_fd), std::ptr::null_mut(), std::ptr::null_mut())
+                .build()
+                .user_data(token);
 
         // SAFETY: The SQE is valid and the listener_fd is a bound, listening socket.
         unsafe {
             self.ring
                 .submission()
                 .push(&accept)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+                .map_err(|_| io::Error::other("SQ full"))?;
         }
         Ok(())
     }
@@ -80,7 +81,7 @@ impl IoBackend for IoUringBackend {
             self.ring
                 .submission()
                 .push(&read)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+                .map_err(|_| io::Error::other("SQ full"))?;
         }
         Ok(())
     }
@@ -101,7 +102,7 @@ impl IoBackend for IoUringBackend {
             self.ring
                 .submission()
                 .push(&write)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+                .map_err(|_| io::Error::other("SQ full"))?;
         }
         Ok(())
     }
@@ -114,7 +115,7 @@ impl IoBackend for IoUringBackend {
             self.ring
                 .submission()
                 .push(&close)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+                .map_err(|_| io::Error::other("SQ full"))?;
         }
         Ok(())
     }
@@ -178,7 +179,10 @@ impl IoBackend for IoUringBackend {
                 // Standard mode: submit pending SQEs and wait briefly (1ms).
                 // Keeps the reactor responsive for shutdown checks and timer
                 // ticks while avoiding CPU-burning spin loops.
-                match self.ring.submit_and_wait_with_timeout(1, std::time::Duration::from_millis(1)) {
+                match self
+                    .ring
+                    .submit_and_wait_with_timeout(1, std::time::Duration::from_millis(1))
+                {
                     Ok(_) | Err(_) => {}
                 }
                 let cq = self.ring.completion();

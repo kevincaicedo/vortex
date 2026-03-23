@@ -4,14 +4,14 @@
 //! connection slab, buffer pool, timer wheel, and buffer state.
 
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
 
 use crate::backend::{
-    decode_token, encode_token, Completion, IoBackend, OpType, PollingBackend, ACCEPT_CONN_ID,
+    ACCEPT_CONN_ID, Completion, IoBackend, OpType, PollingBackend, decode_token, encode_token,
 };
 use crate::connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
 use crate::pool::{CrossChannel, CrossMessage};
@@ -106,7 +106,11 @@ pub struct Reactor {
 
 impl Reactor {
     /// Creates a new reactor with the polling backend.
-    pub fn new(id: usize, config: ReactorConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<Self> {
+    pub fn new(
+        id: usize,
+        config: ReactorConfig,
+        shutdown: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
         let backend = Box::new(PollingBackend::new()?);
         Self::with_backend(id, config, shutdown, backend)
     }
@@ -194,12 +198,9 @@ impl Reactor {
                     _ => {
                         // Validate generation for non-accept operations.
                         // Stale CQEs from closed/reused slots are silently discarded.
-                        let valid = self
-                            .connections
-                            .get(conn_id)
-                            .is_some_and(|_| {
-                                self.generations.get(conn_id).copied().unwrap_or(0) == cgen
-                            });
+                        let valid = self.connections.get(conn_id).is_some_and(|_| {
+                            self.generations.get(conn_id).copied().unwrap_or(0) == cgen
+                        });
                         if !valid {
                             continue;
                         }
@@ -326,7 +327,9 @@ impl Reactor {
         if self.connections.len() >= self.config.max_connections {
             tracing::warn!("max connections reached, rejecting");
             // SAFETY: new_fd is a valid fd.
-            unsafe { libc::close(new_fd); }
+            unsafe {
+                libc::close(new_fd);
+            }
         } else {
             // Allocate slab slot.
             let mut meta = ConnectionMeta::new(new_fd, 0);
@@ -345,7 +348,13 @@ impl Reactor {
                 c.write_buf_offset = conn_id as u32;
             }
 
-            tracing::debug!(reactor_id = self.id, conn_id, fd = new_fd, cgen, "connection accepted");
+            tracing::debug!(
+                reactor_id = self.id,
+                conn_id,
+                fd = new_fd,
+                cgen,
+                "connection accepted"
+            );
 
             // Reset read cursor.
             if conn_id < self.read_cursors.len() {
@@ -423,10 +432,7 @@ impl Reactor {
             None => return,
         };
 
-        if cursor == 0
-            || conn_id >= self.read_bufs.len()
-            || conn_id >= self.write_bufs.len()
-        {
+        if cursor == 0 || conn_id >= self.read_bufs.len() || conn_id >= self.write_bufs.len() {
             self.submit_read_for(conn_id, fd);
             return;
         }
@@ -439,8 +445,7 @@ impl Reactor {
         while offset < cursor {
             // Temporary borrow of read_bufs is released after parse returns
             // (RespFrame contains owned Bytes, not references into the buffer).
-            let parse_result =
-                RespParser::parse(&self.read_bufs[conn_id][offset..cursor]);
+            let parse_result = RespParser::parse(&self.read_bufs[conn_id][offset..cursor]);
             match parse_result {
                 Ok((frame, consumed)) => {
                     offset += consumed;
@@ -483,9 +488,7 @@ impl Reactor {
                 let cmd = Self::extract_command_name(&frames[0]);
                 match cmd {
                     Some(name) if name.eq_ignore_ascii_case(b"PING") => RESP_PONG,
-                    Some(name) if name.eq_ignore_ascii_case(b"QUIT") => {
-                        b"+OK\r\n"
-                    }
+                    Some(name) if name.eq_ignore_ascii_case(b"QUIT") => b"+OK\r\n",
                     _ => RESP_ERR_UNKNOWN,
                 }
             }
@@ -578,7 +581,10 @@ impl Reactor {
             } else {
                 // Already at max — apply backpressure: respond with an error
                 // and close the connection to protect server memory.
-                tracing::warn!(conn_id, "read buffer at maximum capacity, closing connection");
+                tracing::warn!(
+                    conn_id,
+                    "read buffer at maximum capacity, closing connection"
+                );
                 if conn_id < self.write_bufs.len() {
                     self.write_bufs[conn_id].clear();
                     self.write_bufs[conn_id].extend_from_slice(b"-ERR read buffer overflow\r\n");
@@ -706,9 +712,9 @@ mod tests {
         };
         let reactor = Reactor::new(0, config, shutdown).expect("reactor creation");
 
-        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(
-            Bytes::from_static(b"PING"),
-        ))]));
+        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
+            b"PING",
+        )))]));
 
         let resp = reactor.dispatch_command(&frame);
         assert_eq!(resp, RESP_PONG);
@@ -723,9 +729,9 @@ mod tests {
         };
         let reactor = Reactor::new(0, config, shutdown).expect("reactor creation");
 
-        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(
-            Bytes::from_static(b"SET"),
-        ))]));
+        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
+            b"SET",
+        )))]));
 
         let resp = reactor.dispatch_command(&frame);
         assert_eq!(resp, RESP_ERR_UNKNOWN);
@@ -740,9 +746,9 @@ mod tests {
         };
         let reactor = Reactor::new(0, config, shutdown).expect("reactor creation");
 
-        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(
-            Bytes::from_static(b"ping"),
-        ))]));
+        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
+            b"ping",
+        )))]));
 
         let resp = reactor.dispatch_command(&frame);
         assert_eq!(resp, RESP_PONG);

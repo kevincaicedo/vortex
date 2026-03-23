@@ -147,10 +147,7 @@ impl ConnectionMeta {
     /// In debug builds, invalid transitions panic. In release builds they
     /// return an error.
     #[inline]
-    pub fn transition(
-        &mut self,
-        to: ConnectionState,
-    ) -> Result<(), InvalidTransition> {
+    pub fn transition(&mut self, to: ConnectionState) -> Result<(), InvalidTransition> {
         let from = self.state();
         let valid = matches!(
             (from, to),
@@ -158,10 +155,7 @@ impl ConnectionMeta {
                 | (ConnectionState::New, ConnectionState::Closing)
                 | (ConnectionState::Active, ConnectionState::Closing)
         );
-        debug_assert!(
-            valid,
-            "invalid state transition: {from:?} → {to:?}"
-        );
+        debug_assert!(valid, "invalid state transition: {from:?} → {to:?}");
         if valid {
             self.state = to as u8;
             Ok(())
@@ -251,7 +245,10 @@ impl ConnectionSlab {
 
     /// Count connections in the given state.
     pub fn count_by_state(&self, state: ConnectionState) -> usize {
-        self.inner.iter().filter(|(_, m)| m.state() == state).count()
+        self.inner
+            .iter()
+            .filter(|(_, m)| m.state() == state)
+            .count()
     }
 }
 
@@ -345,7 +342,10 @@ mod tests {
         let mut slab = ConnectionSlab::with_capacity(16);
         let t1 = slab.insert(ConnectionMeta::new(1, 0));
         let _t2 = slab.insert(ConnectionMeta::new(2, 1));
-        slab.get_mut(t1).unwrap().transition(ConnectionState::Active).unwrap();
+        slab.get_mut(t1)
+            .unwrap()
+            .transition(ConnectionState::Active)
+            .unwrap();
 
         assert_eq!(slab.count_by_state(ConnectionState::Active), 1);
         assert_eq!(slab.count_by_state(ConnectionState::New), 1);

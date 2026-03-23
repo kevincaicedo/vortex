@@ -35,8 +35,7 @@ fn reactor_scaling(c: &mut Criterion) {
             &num_reactors,
             |b, &n| {
                 let port = free_port();
-                let addr: std::net::SocketAddr =
-                    format!("127.0.0.1:{port}").parse().unwrap();
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
                 let config = ReactorPoolConfig {
                     bind_addr: addr,

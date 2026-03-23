@@ -2,8 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vortex_io::{Reactor, ReactorConfig};
@@ -31,8 +31,7 @@ fn ping_pong_resp() {
             buffer_count: 64,
             connection_timeout: 0,
         };
-        let mut reactor =
-            Reactor::new(0, config, shutdown_clone).expect("reactor creation");
+        let mut reactor = Reactor::new(0, config, shutdown_clone).expect("reactor creation");
         reactor.run();
     });
 
@@ -45,7 +44,9 @@ fn ping_pong_resp() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set read timeout");
 
-    stream.write_all(b"*1\r\n$4\r\nPING\r\n").expect("write PING");
+    stream
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .expect("write PING");
 
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).expect("read PONG");
@@ -53,7 +54,9 @@ fn ping_pong_resp() {
     assert_eq!(response, "+PONG\r\n", "expected PONG response");
 
     // Send a second PING to verify persistent connections work.
-    stream.write_all(b"*1\r\n$4\r\nPING\r\n").expect("write PING 2");
+    stream
+        .write_all(b"*1\r\n$4\r\nPING\r\n")
+        .expect("write PING 2");
     let n = stream.read(&mut buf).expect("read PONG 2");
     let response = std::str::from_utf8(&buf[..n]).expect("valid utf8");
     assert_eq!(response, "+PONG\r\n", "expected second PONG");
@@ -79,8 +82,7 @@ fn ping_pong_inline() {
             buffer_count: 64,
             connection_timeout: 0,
         };
-        let mut reactor =
-            Reactor::new(0, config, shutdown_clone).expect("reactor creation");
+        let mut reactor = Reactor::new(0, config, shutdown_clone).expect("reactor creation");
         reactor.run();
     });
 
@@ -119,8 +121,7 @@ fn unknown_command_returns_error() {
             buffer_count: 64,
             connection_timeout: 0,
         };
-        let mut reactor =
-            Reactor::new(0, config, shutdown_clone).expect("reactor creation");
+        let mut reactor = Reactor::new(0, config, shutdown_clone).expect("reactor creation");
         reactor.run();
     });
 
@@ -132,9 +133,7 @@ fn unknown_command_returns_error() {
         .expect("set read timeout");
 
     // Send unknown command.
-    stream
-        .write_all(b"*1\r\n$3\r\nGET\r\n")
-        .expect("write GET");
+    stream.write_all(b"*1\r\n$3\r\nGET\r\n").expect("write GET");
 
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).expect("read error");

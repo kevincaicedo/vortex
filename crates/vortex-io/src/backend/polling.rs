@@ -14,10 +14,26 @@ use super::{Completion, IoBackend};
 
 /// Pending operation queued for execution on the next `flush()`/`completions()`.
 enum PendingOp {
-    Accept { listener_fd: RawFd, token: u64 },
-    Read { fd: RawFd, buf_ptr: *mut u8, buf_len: usize, token: u64 },
-    Write { fd: RawFd, buf_ptr: *const u8, buf_len: usize, token: u64 },
-    Close { fd: RawFd, token: u64 },
+    Accept {
+        listener_fd: RawFd,
+        token: u64,
+    },
+    Read {
+        fd: RawFd,
+        buf_ptr: *mut u8,
+        buf_len: usize,
+        token: u64,
+    },
+    Write {
+        fd: RawFd,
+        buf_ptr: *const u8,
+        buf_len: usize,
+        token: u64,
+    },
+    Close {
+        fd: RawFd,
+        token: u64,
+    },
 }
 
 // SAFETY: The raw pointers in PendingOp point to buffers owned by the reactor
@@ -47,7 +63,8 @@ impl PollingBackend {
 
 impl IoBackend for PollingBackend {
     fn submit_accept(&mut self, listener_fd: RawFd, token: u64) -> io::Result<()> {
-        self.pending.push_back(PendingOp::Accept { listener_fd, token });
+        self.pending
+            .push_back(PendingOp::Accept { listener_fd, token });
         Ok(())
     }
 
@@ -58,7 +75,12 @@ impl IoBackend for PollingBackend {
         buf_len: usize,
         token: u64,
     ) -> io::Result<()> {
-        self.pending.push_back(PendingOp::Read { fd, buf_ptr, buf_len, token });
+        self.pending.push_back(PendingOp::Read {
+            fd,
+            buf_ptr,
+            buf_len,
+            token,
+        });
         Ok(())
     }
 
@@ -69,7 +91,12 @@ impl IoBackend for PollingBackend {
         buf_len: usize,
         token: u64,
     ) -> io::Result<()> {
-        self.pending.push_back(PendingOp::Write { fd, buf_ptr, buf_len, token });
+        self.pending.push_back(PendingOp::Write {
+            fd,
+            buf_ptr,
+            buf_len,
+            token,
+        });
         Ok(())
     }
 
@@ -96,10 +123,20 @@ impl IoBackend for PollingBackend {
                     PendingOp::Accept { listener_fd, token } => {
                         self.do_accept(listener_fd, token, out);
                     }
-                    PendingOp::Read { fd, buf_ptr, buf_len, token } => {
+                    PendingOp::Read {
+                        fd,
+                        buf_ptr,
+                        buf_len,
+                        token,
+                    } => {
                         self.do_read(fd, buf_ptr, buf_len, token, out);
                     }
-                    PendingOp::Write { fd, buf_ptr, buf_len, token } => {
+                    PendingOp::Write {
+                        fd,
+                        buf_ptr,
+                        buf_len,
+                        token,
+                    } => {
                         self.do_write(fd, buf_ptr, buf_len, token, out);
                     }
                     PendingOp::Close { fd, token } => {
@@ -162,20 +199,19 @@ impl PollingBackend {
                         self.poller
                             .add(&borrowed, Event::readable(token as usize))
                             .unwrap_or_else(|_| {
-                                let _ = self.poller.modify(
-                                    borrowed,
-                                    Event::readable(token as usize),
-                                );
+                                let _ = self
+                                    .poller
+                                    .modify(borrowed, Event::readable(token as usize));
                             });
                     }
                     self.registered_read.push(listener_fd);
                 } else {
-                    let _ = self.poller.modify(
-                        borrowed,
-                        Event::readable(token as usize),
-                    );
+                    let _ = self
+                        .poller
+                        .modify(borrowed, Event::readable(token as usize));
                 }
-                self.pending.push_back(PendingOp::Accept { listener_fd, token });
+                self.pending
+                    .push_back(PendingOp::Accept { listener_fd, token });
             } else {
                 let errno = err.raw_os_error().unwrap_or(1);
                 out.push(Completion {
@@ -197,15 +233,21 @@ impl PollingBackend {
     ) {
         // SAFETY: buf_ptr is a valid buffer owned by the reactor (same thread),
         // fd is a valid socket fd.
-        let n = unsafe {
-            libc::read(fd, buf_ptr.cast::<libc::c_void>(), buf_len)
-        };
+        let n = unsafe { libc::read(fd, buf_ptr.cast::<libc::c_void>(), buf_len) };
 
         if n > 0 {
-            out.push(Completion { token, result: n as i32, flags: 0 });
+            out.push(Completion {
+                token,
+                result: n as i32,
+                flags: 0,
+            });
         } else if n == 0 {
             // EOF
-            out.push(Completion { token, result: 0, flags: 0 });
+            out.push(Completion {
+                token,
+                result: 0,
+                flags: 0,
+            });
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
@@ -218,25 +260,32 @@ impl PollingBackend {
                         self.poller
                             .add(&borrowed, Event::readable(token as usize))
                             .unwrap_or_else(|_| {
-                                let _ = self.poller.modify(
-                                    borrowed,
-                                    Event::readable(token as usize),
-                                );
+                                let _ = self
+                                    .poller
+                                    .modify(borrowed, Event::readable(token as usize));
                             });
                     }
                     self.registered_read.push(fd);
                 } else {
-                    let _ = self.poller.modify(
-                        borrowed,
-                        Event::readable(token as usize),
-                    );
+                    let _ = self
+                        .poller
+                        .modify(borrowed, Event::readable(token as usize));
                 }
                 // Re-queue the read for when the fd becomes readable.
-                self.pending.push_back(PendingOp::Read { fd, buf_ptr, buf_len, token });
+                self.pending.push_back(PendingOp::Read {
+                    fd,
+                    buf_ptr,
+                    buf_len,
+                    token,
+                });
                 return;
             }
             let errno = err.raw_os_error().unwrap_or(1);
-            out.push(Completion { token, result: -errno, flags: 0 });
+            out.push(Completion {
+                token,
+                result: -errno,
+                flags: 0,
+            });
         }
     }
 
@@ -250,21 +299,32 @@ impl PollingBackend {
     ) {
         // SAFETY: buf_ptr is a valid buffer owned by the reactor (same thread),
         // fd is a valid socket fd.
-        let n = unsafe {
-            libc::write(fd, buf_ptr.cast::<libc::c_void>(), buf_len)
-        };
+        let n = unsafe { libc::write(fd, buf_ptr.cast::<libc::c_void>(), buf_len) };
 
         if n >= 0 {
-            out.push(Completion { token, result: n as i32, flags: 0 });
+            out.push(Completion {
+                token,
+                result: n as i32,
+                flags: 0,
+            });
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
                 // Re-queue for later.
-                self.pending.push_back(PendingOp::Write { fd, buf_ptr, buf_len, token });
+                self.pending.push_back(PendingOp::Write {
+                    fd,
+                    buf_ptr,
+                    buf_len,
+                    token,
+                });
                 return;
             }
             let errno = err.raw_os_error().unwrap_or(1);
-            out.push(Completion { token, result: -errno, flags: 0 });
+            out.push(Completion {
+                token,
+                result: -errno,
+                flags: 0,
+            });
         }
     }
 

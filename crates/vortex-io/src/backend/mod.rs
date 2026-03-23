@@ -7,12 +7,12 @@
 
 pub mod polling;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;
 
 pub use polling::PollingBackend;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use uring::IoUringBackend;
 
 use std::os::fd::RawFd;

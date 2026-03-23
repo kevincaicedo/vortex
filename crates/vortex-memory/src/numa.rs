@@ -116,10 +116,7 @@ fn parse_cpulist(s: &str) -> Vec<usize> {
             continue;
         }
         if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(s), Ok(e)) = (
-                start.trim().parse::<usize>(),
-                end.trim().parse::<usize>(),
-            ) {
+            if let (Ok(s), Ok(e)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
                 cpus.extend(s..=e);
             }
         } else if let Ok(cpu) = part.parse::<usize>() {
@@ -167,6 +164,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn detect_returns_at_least_one_node() {
         let topo = NumaTopology::detect();
         assert!(topo.num_nodes() >= 1);

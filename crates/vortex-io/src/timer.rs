@@ -109,8 +109,12 @@ impl TimerWheel {
     pub fn new(capacity: usize) -> Self {
         let mut entries = vec![TimerEntry::FREE; capacity];
         // Thread the free list through `next`.
-        for i in 0..capacity.saturating_sub(1) {
-            entries[i].next = (i + 1) as u32;
+        for (i, entry) in entries
+            .iter_mut()
+            .enumerate()
+            .take(capacity.saturating_sub(1))
+        {
+            entry.next = (i + 1) as u32;
         }
         if capacity > 0 {
             entries[capacity - 1].next = TIMER_NIL;
@@ -147,12 +151,7 @@ impl TimerWheel {
     /// # Panics
     ///
     /// Debug-panics if the entry pool is exhausted.
-    pub fn schedule(
-        &mut self,
-        conn_id: usize,
-        generation: u8,
-        deadline: u32,
-    ) -> u32 {
+    pub fn schedule(&mut self, conn_id: usize, generation: u8, deadline: u32) -> u32 {
         let entry_idx = self.alloc_entry();
         debug_assert!(entry_idx != TIMER_NIL, "timer entry pool exhausted");
 

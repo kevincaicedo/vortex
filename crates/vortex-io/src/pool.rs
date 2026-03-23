@@ -4,8 +4,8 @@
 //! pins each thread to its core, creates the SPSC cross-reactor messaging
 //! mesh, and manages lifecycle (startup → running → drain → shutdown).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use vortex_sync::SpscRingBuffer;
@@ -95,8 +95,7 @@ impl ReactorPool {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Build the N×N cross-reactor SPSC channel mesh.
-        let mut cross_channels: Vec<Vec<Option<CrossChannel>>> =
-            Vec::with_capacity(num_reactors);
+        let mut cross_channels: Vec<Vec<Option<CrossChannel>>> = Vec::with_capacity(num_reactors);
         for from in 0..num_reactors {
             let mut row = Vec::with_capacity(num_reactors);
             for to in 0..num_reactors {
@@ -115,7 +114,7 @@ impl ReactorPool {
 
         let mut handles = Vec::with_capacity(num_reactors);
 
-        for i in 0..num_reactors {
+        for (i, _) in cross_channels.iter().enumerate().take(num_reactors) {
             let core_id = core_ids.get(i).copied();
             let shutdown_clone = Arc::clone(&shutdown);
 
