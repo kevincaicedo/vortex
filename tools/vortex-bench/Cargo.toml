@@ -8,6 +8,8 @@ description = "VortexDB benchmarks"
 [dependencies]
 vortex-common = { workspace = true }
 vortex-engine = { workspace = true }
+vortex-io = { workspace = true }
+core_affinity = { workspace = true }
 vortex-proto = { workspace = true }
 vortex-sync = { workspace = true }
 hdrhistogram = { workspace = true }
@@ -34,4 +36,8 @@ harness = false
 
 [[bench]]
 name = "ring_buffer"
+harness = false
+
+[[bench]]
+name = "reactor_scaling"
 harness = false

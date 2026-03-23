@@ -7,7 +7,7 @@ use std::sync::Mutex;
 /// overloaded reactor's steal queue.
 ///
 /// **Phase 0**: Uses a `Mutex<VecDeque<T>>` as a correct placeholder.
-/// TODO: **Phase 1**: Replaced with a true lock-free MPSC queue using atomic
+/// TODO(Phase 1.5): Replace with a true lock-free MPSC queue using atomic
 /// linked list with `CachePadded` nodes.
 pub struct MpscQueue<T> {
     inner: Mutex<VecDeque<T>>,

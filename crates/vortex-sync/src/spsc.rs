@@ -110,6 +110,34 @@ impl<T, const N: usize> SpscRingBuffer<T, N> {
     pub const fn capacity(&self) -> usize {
         N - 1 // One slot reserved to distinguish full from empty
     }
+
+    /// Returns a draining iterator that pops all currently available elements.
+    ///
+    /// Used during shutdown to flush in-flight cross-reactor messages.
+    /// Must only be called from the consumer thread.
+    pub fn drain(&self) -> Drain<'_, T, N> {
+        Drain { ring: self }
+    }
+}
+
+/// Draining iterator over a [`SpscRingBuffer`].
+///
+/// Each call to `next()` pops one element from the ring buffer.
+pub struct Drain<'a, T, const N: usize> {
+    ring: &'a SpscRingBuffer<T, N>,
+}
+
+impl<T, const N: usize> Iterator for Drain<'_, T, N> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.ring.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.ring.len();
+        (len, Some(len))
+    }
 }
 
 impl<T, const N: usize> Default for SpscRingBuffer<T, N> {

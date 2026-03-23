@@ -30,7 +30,7 @@ impl Buffer {
 /// Used for io_uring fixed buffer registration. Buffers are leased out
 /// for I/O operations and returned when complete.
 ///
-/// TODO: Phase 1 will upgrade this to use page-aligned, pinned memory with
+/// TODO(Phase 1.5): Upgrade to page-aligned, pinned memory with
 /// `mmap` and io_uring buffer registration.
 pub struct BufferPool {
     buffer_size: usize,
@@ -50,6 +50,14 @@ impl BufferPool {
             available,
             outstanding: 0,
         }
+    }
+
+    /// Creates a new buffer pool with optional NUMA node binding.
+    ///
+    /// When `numa_node` is `Some(n)`, buffers will be allocated on NUMA node `n`.
+    /// TODO(Phase 1.5): Implement actual NUMA-local allocation via mmap + mbind.
+    pub fn new_with_numa(count: usize, buffer_size: usize, _numa_node: Option<usize>) -> Self {
+        Self::new(count, buffer_size)
     }
 
     /// Leases a buffer from the pool. Returns `None` if all buffers are in use.

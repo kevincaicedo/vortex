@@ -53,7 +53,7 @@ crossbeam-utils = "0.8"
 
 # ── I/O ──
 polling = "3"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 slab = "0.4"
 core_affinity = "0.8"
 libc = "0.2"

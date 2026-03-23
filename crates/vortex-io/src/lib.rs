@@ -23,9 +23,14 @@
 //! - `sqpoll` — Enable `IORING_SETUP_SQPOLL` zero-syscall mode
 //! - `polling-fallback` — Cross-platform polling backend (default)
 
+pub mod accept;
 pub mod backend;
 pub mod connection;
+pub mod pool;
 pub mod reactor;
+pub mod timer;
 
-pub use connection::{Connection, ConnectionSlab, ConnectionState};
-pub use reactor::Reactor;
+pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
+pub use pool::{CrossMessage, ReactorPool, ReactorPoolConfig};
+pub use reactor::{Reactor, ReactorConfig};
+pub use timer::TimerWheel;

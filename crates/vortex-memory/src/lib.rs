@@ -24,6 +24,8 @@
 
 pub mod allocator;
 pub mod buffer_pool;
+pub mod numa;
 
 pub use allocator::GlobalAllocator;
 pub use buffer_pool::{Buffer, BufferPool};
+pub use numa::NumaTopology;
