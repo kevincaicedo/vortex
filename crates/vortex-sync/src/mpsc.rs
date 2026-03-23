@@ -75,12 +75,13 @@ mod tests {
     fn multi_producer() {
         let q = Arc::new(MpscQueue::new());
         let mut handles = Vec::new();
+        let items_per_producer = if cfg!(miri) { 10 } else { 1000 };
 
         for t in 0..4 {
             let q = Arc::clone(&q);
             handles.push(thread::spawn(move || {
-                for i in 0..1000 {
-                    q.push(t * 1000 + i);
+                for i in 0..items_per_producer {
+                    q.push(t * items_per_producer + i);
                 }
             }));
         }
@@ -94,7 +95,7 @@ mod tests {
             collected.push(v);
         }
 
-        assert_eq!(collected.len(), 4000);
+        assert_eq!(collected.len() as u64, 4 * items_per_producer);
     }
 
     #[test]
@@ -116,7 +117,7 @@ mod tests {
     fn stress_multi_producer_single_consumer() {
         let q = Arc::new(MpscQueue::new());
         let num_producers = 4;
-        let items_per_producer = 10_000;
+        let items_per_producer = if cfg!(miri) { 10 } else { 10_000 };
         let mut handles = Vec::new();
 
         for _ in 0..num_producers {

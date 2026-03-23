@@ -118,6 +118,7 @@ impl ShutdownSignal {
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                #[cfg(not(miri))]
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
         }
@@ -233,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn fd_readable_after_signal() {
         let sig = ShutdownSignal::new().unwrap();
         sig.signal();

@@ -204,7 +204,7 @@ mod tests {
         let rb_producer = Arc::clone(&rb);
         let rb_consumer = Arc::clone(&rb);
 
-        let count = 10_000u64;
+        let count = if cfg!(miri) { 10 } else { 10_000u64 };
 
         let producer = thread::spawn(move || {
             for i in 0..count {

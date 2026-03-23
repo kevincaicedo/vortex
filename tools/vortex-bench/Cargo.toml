@@ -22,9 +22,13 @@ libc = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 
+[lib]
+bench = false
+
 [[bin]]
 name = "vortex-loadgen"
 path = "src/bin/loadgen.rs"
+bench = false
 
 [[bench]]
 name = "engine"
