@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use vortex_proto::frame::RespFrame;
-use vortex_proto::{RespParser, RespSerializer, RespTape, scan_crlf, swar_parse_int};
+use vortex_proto::{IovecWriter, RespParser, RespSerializer, RespTape, scan_crlf, swar_parse_int};
 
 fn next_sample<'a, T>(samples: &'a [T], index: &mut usize) -> &'a T {
     let sample = &samples[*index];
@@ -362,7 +362,10 @@ fn bench_tape_parse(c: &mut Criterion) {
 fn bench_resp_serialize(c: &mut Criterion) {
     let mut group = c.benchmark_group("resp_serialize");
 
+    // ── Pre-computed path: +OK\r\n ──
     let ok_frame = RespFrame::ok();
+    let ok_bytes = b"+OK\r\n";
+    group.throughput(Throughput::Bytes(ok_bytes.len() as u64));
     group.bench_function("ok", |b| {
         let mut buf = BytesMut::with_capacity(64);
         b.iter(|| {
@@ -371,7 +374,44 @@ fn bench_resp_serialize(c: &mut Criterion) {
         });
     });
 
+    // ── LUT integer path: :42\r\n ──
+    let int42 = RespFrame::Integer(42);
+    let int42_bytes = b":42\r\n";
+    group.throughput(Throughput::Bytes(int42_bytes.len() as u64));
+    group.bench_function("integer_lut_42", |b| {
+        let mut buf = BytesMut::with_capacity(64);
+        b.iter(|| {
+            buf.clear();
+            RespSerializer::serialize(&int42, &mut buf);
+        });
+    });
+
+    // ── LUT large integer: :9999\r\n (LUT boundary) ──
+    let int9999 = RespFrame::Integer(9999);
+    group.throughput(Throughput::Bytes(b":9999\r\n".len() as u64));
+    group.bench_function("integer_lut_9999", |b| {
+        let mut buf = BytesMut::with_capacity(64);
+        b.iter(|| {
+            buf.clear();
+            RespSerializer::serialize(&int9999, &mut buf);
+        });
+    });
+
+    // ── itoa fallback integer: :123456\r\n ──
+    let int_large = RespFrame::Integer(123_456);
+    group.throughput(Throughput::Bytes(b":123456\r\n".len() as u64));
+    group.bench_function("integer_itoa_123456", |b| {
+        let mut buf = BytesMut::with_capacity(64);
+        b.iter(|| {
+            buf.clear();
+            RespSerializer::serialize(&int_large, &mut buf);
+        });
+    });
+
+    // ── Bulk string ──
     let bulk = RespFrame::bulk_string("hello world this is a value");
+    let bulk_wire = b"$27\r\nhello world this is a value\r\n";
+    group.throughput(Throughput::Bytes(bulk_wire.len() as u64));
     group.bench_function("bulk_string", |b| {
         let mut buf = BytesMut::with_capacity(128);
         b.iter(|| {
@@ -380,16 +420,225 @@ fn bench_resp_serialize(c: &mut Criterion) {
         });
     });
 
+    // ── 3-element array (SET command) ──
     let arr = RespFrame::Array(Some(vec![
         RespFrame::bulk_string("SET"),
         RespFrame::bulk_string("mykey"),
         RespFrame::bulk_string("myvalue"),
     ]));
+    let arr_wire = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    group.throughput(Throughput::Bytes(arr_wire.len() as u64));
     group.bench_function("array_3", |b| {
         let mut buf = BytesMut::with_capacity(128);
         b.iter(|| {
             buf.clear();
             RespSerializer::serialize(&arr, &mut buf);
+        });
+    });
+
+    // ── Pipeline: 100 OK responses ──
+    let ok_100: Vec<_> = (0..100).map(|_| RespFrame::ok()).collect();
+    let ok_100_total = ok_100.len() * ok_bytes.len();
+    group.throughput(Throughput::Bytes(ok_100_total as u64));
+    group.bench_function("pipeline_ok_100", |b| {
+        let mut buf = BytesMut::with_capacity(ok_100_total);
+        b.iter(|| {
+            buf.clear();
+            for frame in &ok_100 {
+                RespSerializer::serialize(frame, &mut buf);
+            }
+        });
+    });
+
+    // ── Pipeline: 100 integer responses ──
+    let int_100: Vec<_> = (0..100).map(RespFrame::Integer).collect();
+    // Estimate total output size.
+    let mut int_100_buf = BytesMut::with_capacity(1024);
+    for f in &int_100 {
+        RespSerializer::serialize(f, &mut int_100_buf);
+    }
+    let int_100_total = int_100_buf.len();
+    group.throughput(Throughput::Bytes(int_100_total as u64));
+    group.bench_function("pipeline_integer_100", |b| {
+        let mut buf = BytesMut::with_capacity(int_100_total);
+        b.iter(|| {
+            buf.clear();
+            for frame in &int_100 {
+                RespSerializer::serialize(frame, &mut buf);
+            }
+        });
+    });
+
+    // ── serialize_to_slice: +OK\r\n ──
+    group.throughput(Throughput::Bytes(ok_bytes.len() as u64));
+    group.bench_function("slice_ok", |b| {
+        let mut buf = [0u8; 64];
+        b.iter(|| {
+            black_box(RespSerializer::serialize_to_slice(&ok_frame, &mut buf).unwrap());
+        });
+    });
+
+    // ── serialize_to_slice: :42\r\n ──
+    group.throughput(Throughput::Bytes(int42_bytes.len() as u64));
+    group.bench_function("slice_integer_42", |b| {
+        let mut buf = [0u8; 64];
+        b.iter(|| {
+            black_box(RespSerializer::serialize_to_slice(&int42, &mut buf).unwrap());
+        });
+    });
+
+    // ── serialize_to_slice: array_3 ──
+    group.throughput(Throughput::Bytes(arr_wire.len() as u64));
+    group.bench_function("slice_array_3", |b| {
+        let mut buf = [0u8; 256];
+        b.iter(|| {
+            black_box(RespSerializer::serialize_to_slice(&arr, &mut buf).unwrap());
+        });
+    });
+
+    group.finish();
+}
+
+// ── 0.3.2 — RESP Serialize-to-Iovec Benchmarks ────────────────────
+
+fn bench_resp_serialize_iovecs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resp_serialize_iovecs");
+
+    // ── iovec: +OK\r\n ──
+    let ok_frame = RespFrame::ok();
+    let ok_bytes = b"+OK\r\n";
+    group.throughput(Throughput::Bytes(ok_bytes.len() as u64));
+    group.bench_function("iovec_ok", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&ok_frame), &mut w);
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec: :42\r\n ──
+    let int42 = RespFrame::Integer(42);
+    let int42_bytes = b":42\r\n";
+    group.throughput(Throughput::Bytes(int42_bytes.len() as u64));
+    group.bench_function("iovec_integer_42", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&int42), &mut w);
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec: bulk string ──
+    let bulk = RespFrame::bulk_string("hello world this is a value");
+    let bulk_wire = b"$27\r\nhello world this is a value\r\n";
+    group.throughput(Throughput::Bytes(bulk_wire.len() as u64));
+    group.bench_function("iovec_bulk_string", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&bulk), &mut w);
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec: 3-element array ──
+    let arr3 = RespFrame::Array(Some(vec![
+        RespFrame::bulk_string("SET"),
+        RespFrame::bulk_string("mykey"),
+        RespFrame::bulk_string("myvalue"),
+    ]));
+    let arr3_wire = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    group.throughput(Throughput::Bytes(arr3_wire.len() as u64));
+    group.bench_function("iovec_array_3", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&arr3), &mut w);
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec: 10-element array (AC target: >6 GB/s) ──
+    let arr10 = RespFrame::Array(Some(
+        (0..10)
+            .map(|_| RespFrame::bulk_string("value12345"))
+            .collect(),
+    ));
+    // Pre-compute expected wire size.
+    let mut arr10_buf = BytesMut::with_capacity(256);
+    RespSerializer::serialize(&arr10, &mut arr10_buf);
+    let arr10_len = arr10_buf.len();
+    group.throughput(Throughput::Bytes(arr10_len as u64));
+    group.bench_function("iovec_array_10", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&arr10), &mut w);
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec: pipeline 100 OK responses ──
+    let ok_100_total = 100 * ok_bytes.len();
+    group.throughput(Throughput::Bytes(ok_100_total as u64));
+    group.bench_function("iovec_pipeline_ok_100", |b| {
+        let mut w = IovecWriter::new();
+        let ok = RespFrame::ok();
+        b.iter(|| {
+            w.clear();
+            for _ in 0..100 {
+                RespSerializer::serialize_to_iovecs(black_box(&ok), &mut w);
+            }
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec flatten: 10-element array (measures full path: serialize + flatten) ──
+    group.throughput(Throughput::Bytes(arr10_len as u64));
+    group.bench_function("iovec_array_10_flatten", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&arr10), &mut w);
+            black_box(w.flatten());
+        });
+    });
+
+    // ── iovec: large 1KB bulk string (scatter-gather sweet spot) ──
+    let large_value = Bytes::from("x".repeat(1024));
+    let large_bulk = RespFrame::BulkString(Some(large_value.clone()));
+    let mut large_buf = BytesMut::with_capacity(1100);
+    RespSerializer::serialize(&large_bulk, &mut large_buf);
+    let large_len = large_buf.len();
+    group.throughput(Throughput::Bytes(large_len as u64));
+    group.bench_function("iovec_bulk_1kb", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&large_bulk), &mut w);
+            black_box(w.total_len());
+        });
+    });
+
+    // ── iovec: LRANGE-style 100-element array with 64-byte values ──
+    let lrange_value = Bytes::from("v".repeat(64));
+    let lrange = RespFrame::Array(Some(
+        (0..100)
+            .map(|_| RespFrame::BulkString(Some(lrange_value.clone())))
+            .collect(),
+    ));
+    let mut lrange_buf = BytesMut::with_capacity(8192);
+    RespSerializer::serialize(&lrange, &mut lrange_buf);
+    let lrange_len = lrange_buf.len();
+    group.throughput(Throughput::Bytes(lrange_len as u64));
+    group.bench_function("iovec_lrange_100", |b| {
+        let mut w = IovecWriter::new();
+        b.iter(|| {
+            w.clear();
+            RespSerializer::serialize_to_iovecs(black_box(&lrange), &mut w);
+            black_box(w.total_len());
         });
     });
 
@@ -402,6 +651,7 @@ criterion_group!(
     bench_swar_integer_parse,
     bench_resp_parse,
     bench_tape_parse,
-    bench_resp_serialize
+    bench_resp_serialize,
+    bench_resp_serialize_iovecs
 );
 criterion_main!(benches);

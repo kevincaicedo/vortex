@@ -290,6 +290,56 @@ impl<'a> FrameRef<'a> {
             end,
         })
     }
+
+    /// Returns the command name when this frame is a command array.
+    ///
+    /// Follows the same convention as [`RespFrame::command_name()`]: returns the
+    /// byte payload of the first child element if `self` is a non-empty array
+    /// (or attribute-wrapped array).
+    #[inline]
+    pub fn command_name(&self) -> Option<&'a [u8]> {
+        let e = &self.entries[self.start];
+        match e.tag {
+            TAG_ARRAY if e.a > 0 => {
+                // First child is at start + 1.
+                let child = &self.entries[self.start + 1];
+                match child.tag {
+                    TAG_SIMPLE_STRING | TAG_BULK_STRING => {
+                        Some(&self.backing[child.a as usize..child.b as usize])
+                    }
+                    _ => None,
+                }
+            }
+            #[cfg(feature = "resp3")]
+            TAG_ATTRIBUTE => {
+                // The inner frame is after all attribute entries.
+                let attr_end = e.b as usize;
+                // The data frame is the last child — but we need to find it.
+                // For attribute, the layout is: [ATTR header] [key1] [val1] ... [keyN] [valN] [data frame]
+                // The data frame starts at `start + 1 + 2*pair_count` tape entries... but that's
+                // not correct because entries can be multi-entry. We need to skip `e.a` pairs.
+                // Simpler: the data frame is the entry right before `attr_end` span?
+                // Actually: iterate children, the last one is the data frame.
+                let mut last_start = None;
+                let mut idx = self.start + 1;
+                while idx < attr_end {
+                    last_start = Some(idx);
+                    idx = entry_span_end(self.entries, idx);
+                }
+                if let Some(ds) = last_start {
+                    let data_ref = FrameRef {
+                        entries: self.entries,
+                        start: ds,
+                        backing: self.backing,
+                    };
+                    data_ref.command_name()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Iterator over children of an aggregate tape entry.
@@ -1132,7 +1182,7 @@ mod tests {
         }
     }
 
-    fn assert_tape_matches_frame(tape: &RespTape, fr: &FrameRef<'_>, tree: &RespFrame) {
+    fn assert_tape_matches_frame(_tape: &RespTape, fr: &FrameRef<'_>, tree: &RespFrame) {
         match tree {
             RespFrame::SimpleString(b) => {
                 assert_eq!(fr.tag(), TAG_SIMPLE_STRING);
@@ -1162,7 +1212,7 @@ mod tests {
                 let children: Vec<_> = fr.children().unwrap().collect();
                 assert_eq!(children.len(), items.len());
                 for (child_ref, child_tree) in children.iter().zip(items.iter()) {
-                    assert_tape_matches_frame(tape, child_ref, child_tree);
+                    assert_tape_matches_frame(_tape, child_ref, child_tree);
                 }
             }
             _ => {} // resp3 types tested separately
@@ -1176,7 +1226,7 @@ mod tests {
         buf.extend_from_slice(b"_\r\n");
         buf.extend_from_slice(b"#t\r\n");
         buf.extend_from_slice(b"#f\r\n");
-        buf.extend_from_slice(b",3.14\r\n");
+        buf.extend_from_slice(b",1.23\r\n");
         buf.extend_from_slice(b"(12345678901234567890\r\n");
         buf.extend_from_slice(b"!5\r\nERROR\r\n");
         buf.extend_from_slice(b"=10\r\ntxt:hello!\r\n");
@@ -1194,7 +1244,9 @@ mod tests {
         assert_eq!(entries[2].tag, TAG_BOOLEAN);
         assert!(!entries[2].as_bool());
         assert_eq!(entries[3].tag, TAG_DOUBLE);
-        assert!((entries[3].as_f64() - 3.14).abs() < 1e-10);
+        {
+            assert!((entries[3].as_f64() - 1.23).abs() < 1e-10);
+        }
         assert_eq!(entries[4].tag, TAG_BIG_NUMBER);
         assert_eq!(
             &tape.backing()[entries[4].a as usize..entries[4].b as usize],

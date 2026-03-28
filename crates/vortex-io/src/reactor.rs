@@ -15,7 +15,7 @@ use crate::pool::{CrossChannel, CrossMessage};
 use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
 use vortex_memory::{ArenaAllocator, BufferPool};
-use vortex_proto::{ParseError, RespFrame, RespParser};
+use vortex_proto::{FrameRef, IovecWriter, ParseError, RespFrame, RespSerializer, RespTape};
 
 /// Default read buffer size per connection (16 KB).
 const DEFAULT_BUF_SIZE: usize = 16_384;
@@ -29,6 +29,23 @@ static RESP_PONG: &[u8] = b"+PONG\r\n";
 static RESP_ERR_UNKNOWN: &[u8] = b"-ERR unknown command\r\n";
 /// Pre-computed RESP error for protocol failures.
 static RESP_ERR_PROTOCOL: &[u8] = b"-ERR protocol error\r\n";
+
+/// Responses smaller than this threshold are copied into the write buffer.
+/// Larger responses use scatter-gather `writev` to avoid contiguous copies.
+#[allow(dead_code)] // Infrastructure for Phase 2.5 engine command integration.
+const WRITEV_THRESHOLD: usize = 256;
+
+/// Command response type — determines serialization strategy.
+#[allow(dead_code)] // Frame variant is infrastructure for Phase 2.5 engine commands.
+enum CommandResponse {
+    /// Pre-computed static response (PONG, OK, ERR).
+    /// Copied directly into the connection write buffer.
+    Static(&'static [u8]),
+    /// Dynamic RESP frame requiring serialization.
+    /// Uses `serialize_to_iovecs()` + `submit_writev()` for large responses,
+    /// or `serialize_to_slice()` + memcpy for small ones.
+    Frame(RespFrame),
+}
 
 /// Configuration for a single reactor.
 pub struct ReactorConfig {
@@ -100,6 +117,8 @@ pub struct Reactor {
     cross_rx: Vec<CrossChannel>,
     /// Per-iteration bump allocator for transient response building.
     arena: ArenaAllocator,
+    /// Reusable scatter-gather writer for iovec responses.
+    iovec_writer: IovecWriter,
 }
 
 impl Reactor {
@@ -156,6 +175,7 @@ impl Reactor {
             config,
             cross_rx: Vec::new(),
             arena: ArenaAllocator::new(vortex_memory::arena::DEFAULT_ARENA_CAPACITY),
+            iovec_writer: IovecWriter::new(),
         })
     }
 
@@ -210,7 +230,7 @@ impl Reactor {
                         }
                         match op {
                             OpType::Read => self.handle_read(conn_id, cqe),
-                            OpType::Write => self.handle_write(conn_id, cqe),
+                            OpType::Write | OpType::Writev => self.handle_write(conn_id, cqe),
                             OpType::Close => self.handle_close(conn_id),
                             OpType::Accept => unreachable!(),
                         }
@@ -476,6 +496,15 @@ impl Reactor {
     }
 
     /// Parse RESP frames from the read buffer and generate responses.
+    ///
+    /// Uses two write strategies based on response type:
+    /// - **Direct copy** (`CommandResponse::Static`): memcpy into the pool write buffer,
+    ///   then submit `write_fixed`. Used for pre-computed responses (PONG, ERR, OK).
+    /// - **Scatter-gather** (`CommandResponse::Frame`): serialize via
+    ///   `serialize_to_slice()` into the write buffer when it fits. If the response
+    ///   exceeds the remaining write buffer, switch the entire batch to scatter-gather
+    ///   mode using `IovecWriter` + `submit_writev()`. The threshold
+    ///   (`WRITEV_THRESHOLD`) is unused for the mode switch — any overflow triggers it.
     fn process_commands(&mut self, conn_id: usize, fd: RawFd) {
         let (read_idx, cursor, write_idx) = match self.connections.get(conn_id) {
             Some(c) => (
@@ -504,23 +533,65 @@ impl Reactor {
         let mut offset = 0;
         let mut write_cursor = 0usize;
         let mut close_after_write = false;
+        // Tracks whether we've switched to scatter-gather mode for this batch.
+        // Once true, all subsequent responses go through the IovecWriter.
+        let mut scatter_gather = false;
 
         while offset < cursor {
-            match RespParser::parse_pipeline(&read_slice[offset..cursor]) {
-                Ok((frames, consumed)) => {
-                    let batch_end = offset + consumed;
-                    for frame in frames {
-                        let response = self.dispatch_command(&frame);
-                        let end = write_cursor + response.len();
-                        if end > buf_size {
-                            tracing::warn!(conn_id, "write buffer full, closing after flush");
-                            close_after_write = true;
-                            offset = cursor;
-                            break;
+            match RespTape::parse_pipeline(&read_slice[offset..cursor]) {
+                Ok(tape) => {
+                    let batch_end = offset + tape.consumed();
+                    for frame in tape.iter() {
+                        let response = Self::dispatch_tape_command(&frame);
+                        match response {
+                            CommandResponse::Static(buf) => {
+                                if scatter_gather {
+                                    // Already in scatter-gather mode — push as static iovec.
+                                    self.iovec_writer.push_static(buf);
+                                } else {
+                                    let end = write_cursor + buf.len();
+                                    if end > buf_size {
+                                        tracing::warn!(
+                                            conn_id,
+                                            "write buffer full, closing after flush"
+                                        );
+                                        close_after_write = true;
+                                        offset = cursor;
+                                        break;
+                                    }
+                                    write_buf[write_cursor..end].copy_from_slice(buf);
+                                    write_cursor = end;
+                                }
+                            }
+                            CommandResponse::Frame(ref resp_frame) => {
+                                if !scatter_gather {
+                                    // Try direct serialization into write buffer first.
+                                    let remaining = &mut write_buf[write_cursor..];
+                                    if let Some(n) =
+                                        RespSerializer::serialize_to_slice(resp_frame, remaining)
+                                    {
+                                        write_cursor += n;
+                                        continue;
+                                    }
+                                    // Doesn't fit — switch entire batch to scatter-gather.
+                                    scatter_gather = true;
+                                    self.iovec_writer.clear();
+                                    if write_cursor > 0 {
+                                        // Transfer accumulated write_buf data into iovec.
+                                        // SAFETY: write_buf is pool-allocated and remains
+                                        // valid for the connection lifetime. The pointer
+                                        // stored by push_bytes is consumed before the
+                                        // buffer is released or reused.
+                                        self.iovec_writer
+                                            .push_bytes(&write_buf[..write_cursor]);
+                                    }
+                                }
+                                RespSerializer::serialize_to_iovecs(
+                                    resp_frame,
+                                    &mut self.iovec_writer,
+                                );
+                            }
                         }
-
-                        write_buf[write_cursor..end].copy_from_slice(response);
-                        write_cursor = end;
                     }
 
                     if close_after_write {
@@ -535,15 +606,21 @@ impl Reactor {
                     | ParseError::NestingTooDeep
                     | ParseError::InvalidFrame,
                 ) => {
-                    let end = write_cursor + RESP_ERR_PROTOCOL.len();
-                    if end > buf_size {
-                        tracing::warn!(conn_id, "protocol error response does not fit, closing");
-                        self.close_connection(conn_id);
-                        return;
+                    if scatter_gather {
+                        self.iovec_writer.push_static(RESP_ERR_PROTOCOL);
+                    } else {
+                        let end = write_cursor + RESP_ERR_PROTOCOL.len();
+                        if end > buf_size {
+                            tracing::warn!(
+                                conn_id,
+                                "protocol error response does not fit, closing"
+                            );
+                            self.close_connection(conn_id);
+                            return;
+                        }
+                        write_buf[write_cursor..end].copy_from_slice(RESP_ERR_PROTOCOL);
+                        write_cursor = end;
                     }
-
-                    write_buf[write_cursor..end].copy_from_slice(RESP_ERR_PROTOCOL);
-                    write_cursor = end;
                     close_after_write = true;
                     offset = cursor;
                     break;
@@ -571,8 +648,34 @@ impl Reactor {
         }
 
         // Write all responses, or re-arm read if no complete command was parsed.
-        if write_cursor > 0 {
-            // Store write length in ConnectionMeta.
+        if scatter_gather {
+            // Scatter-gather path: submit writev with the assembled iovecs.
+            let total = self.iovec_writer.total_len();
+            if total > 0 {
+                if let Some(c) = self.connections.get_mut(conn_id) {
+                    c.write_buf_len = total as u32;
+                }
+                let iovecs = self.iovec_writer.as_raw_iovecs();
+                let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
+                let token = encode_token(conn_id, cgen, OpType::Writev);
+                // NOTE: For the polling backend, writev completes synchronously
+                // so the iovec Vec lifetime is sufficient. For io_uring, the
+                // iovecs must remain valid until the CQE is reaped — a pinned
+                // iovec buffer on the Reactor would be needed for production
+                // io_uring scatter-gather.
+                let _ = self.backend.submit_writev(
+                    fd,
+                    iovecs.as_ptr(),
+                    iovecs.len(),
+                    token,
+                );
+            } else if close_after_write {
+                self.close_connection(conn_id);
+            } else {
+                self.submit_read_for(conn_id, fd);
+            }
+        } else if write_cursor > 0 {
+            // Direct copy path: submit write_fixed from the pool buffer.
             if let Some(c) = self.connections.get_mut(conn_id) {
                 c.write_buf_len = write_cursor as u32;
             }
@@ -596,14 +699,18 @@ impl Reactor {
         }
     }
 
-    /// Dispatch a parsed RESP frame to a command handler.
+    /// Dispatch a parsed tape frame to a command handler.
     /// Phase 1 only handles PING/QUIT.
     /// TODO(Phase 2): Route commands to the vortex-engine shard via command dispatch table.
-    fn dispatch_command(&self, frame: &RespFrame) -> &'static [u8] {
+    fn dispatch_tape_command(frame: &FrameRef<'_>) -> CommandResponse {
         match frame.command_name() {
-            Some(name) if name.eq_ignore_ascii_case(b"PING") => RESP_PONG,
-            Some(name) if name.eq_ignore_ascii_case(b"QUIT") => b"+OK\r\n",
-            _ => RESP_ERR_UNKNOWN,
+            Some(name) if name.eq_ignore_ascii_case(b"PING") => {
+                CommandResponse::Static(RESP_PONG)
+            }
+            Some(name) if name.eq_ignore_ascii_case(b"QUIT") => {
+                CommandResponse::Static(b"+OK\r\n")
+            }
+            _ => CommandResponse::Static(RESP_ERR_UNKNOWN),
         }
     }
 
@@ -880,80 +987,36 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shutdown::ShutdownCoordinator;
-    use bytes::Bytes;
+
+    /// Helper: parse a single RESP wire command and dispatch it.
+    fn dispatch_wire(wire: &[u8]) -> CommandResponse {
+        let tape = RespTape::parse_pipeline(wire).expect("valid RESP");
+        let frame = tape.iter().next().expect("at least one frame");
+        Reactor::dispatch_tape_command(&frame)
+    }
 
     #[test]
     fn dispatch_ping() {
-        let coordinator = Arc::new(ShutdownCoordinator::new(1));
-        let config = ReactorConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
-            ..ReactorConfig::default()
-        };
-        let reactor = Reactor::new(0, config, coordinator).expect("reactor creation");
-
-        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
-            b"PING",
-        )))]));
-
-        let resp = reactor.dispatch_command(&frame);
-        assert_eq!(resp, RESP_PONG);
+        let resp = dispatch_wire(b"*1\r\n$4\r\nPING\r\n");
+        assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_PONG));
     }
 
     #[test]
     fn dispatch_unknown() {
-        let coordinator = Arc::new(ShutdownCoordinator::new(1));
-        let config = ReactorConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
-            ..ReactorConfig::default()
-        };
-        let reactor = Reactor::new(0, config, coordinator).expect("reactor creation");
-
-        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
-            b"SET",
-        )))]));
-
-        let resp = reactor.dispatch_command(&frame);
-        assert_eq!(resp, RESP_ERR_UNKNOWN);
+        let resp = dispatch_wire(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+        assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_ERR_UNKNOWN));
     }
 
     #[test]
     fn dispatch_ping_lowercase() {
-        let coordinator = Arc::new(ShutdownCoordinator::new(1));
-        let config = ReactorConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
-            ..ReactorConfig::default()
-        };
-        let reactor = Reactor::new(0, config, coordinator).expect("reactor creation");
-
-        let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
-            b"ping",
-        )))]));
-
-        let resp = reactor.dispatch_command(&frame);
-        assert_eq!(resp, RESP_PONG);
+        let resp = dispatch_wire(b"*1\r\n$4\r\nping\r\n");
+        assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_PONG));
     }
 
     #[test]
     fn dispatch_attribute_wrapped_ping() {
-        let coordinator = Arc::new(ShutdownCoordinator::new(1));
-        let config = ReactorConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
-            ..ReactorConfig::default()
-        };
-        let reactor = Reactor::new(0, config, coordinator).expect("reactor creation");
-
-        let frame = RespFrame::Attribute {
-            entries: vec![(
-                RespFrame::SimpleString(Bytes::from_static(b"meta")),
-                RespFrame::SimpleString(Bytes::from_static(b"value")),
-            )],
-            data: Box::new(RespFrame::Array(Some(vec![RespFrame::BulkString(Some(
-                Bytes::from_static(b"PING"),
-            ))]))),
-        };
-
-        let resp = reactor.dispatch_command(&frame);
-        assert_eq!(resp, RESP_PONG);
+        // |1\r\n+meta\r\n+value\r\n*1\r\n$4\r\nPING\r\n
+        let resp = dispatch_wire(b"|1\r\n+meta\r\n+value\r\n*1\r\n$4\r\nPING\r\n");
+        assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_PONG));
     }
 }

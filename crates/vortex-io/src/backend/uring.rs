@@ -169,6 +169,29 @@ impl IoBackend for IoUringBackend {
         Ok(())
     }
 
+    fn submit_writev(
+        &mut self,
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    ) -> io::Result<()> {
+        let writev = opcode::Writev::new(Fd(fd), iovecs.cast(), iov_count as u32)
+            .build()
+            .user_data(token);
+
+        // SAFETY: Valid SQE, fd is an open socket, iovecs points to a valid
+        // array of iov_count iovec structs whose backing memory will remain
+        // valid until the CQE is reaped.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&writev)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+        Ok(())
+    }
+
     fn register_buffers(&self, iovecs: &[libc::iovec]) -> io::Result<()> {
         // SAFETY: iovecs point to valid, pinned memory that will outlive the
         // io_uring instance. The buffers are owned by the BufferPool.

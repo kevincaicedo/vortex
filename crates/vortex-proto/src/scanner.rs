@@ -209,12 +209,12 @@ pub fn scan_crlf(buf: &[u8]) -> CrlfPositions {
 
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        return x86_scan_crlf(buf);
+        x86_scan_crlf(buf)
     }
 
     #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     {
-        return portable_simd_scan_crlf(buf);
+        portable_simd_scan_crlf(buf)
     }
 
     #[cfg(any(
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn heap_overflow_path_is_used_after_inline_capacity() {
-        let buf = vec![b'\r', b'\n'].repeat(80);
+        let buf = [b'\r', b'\n'].repeat(80);
         let positions = scan_crlf(&buf);
         let expected: Vec<usize> = (0..80).map(|index| index * 2).collect();
 

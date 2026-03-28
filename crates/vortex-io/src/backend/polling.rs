@@ -30,6 +30,12 @@ enum PendingOp {
         buf_len: usize,
         token: u64,
     },
+    Writev {
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    },
     Close {
         fd: RawFd,
         token: u64,
@@ -105,6 +111,22 @@ impl IoBackend for PollingBackend {
         Ok(())
     }
 
+    fn submit_writev(
+        &mut self,
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    ) -> io::Result<()> {
+        self.pending.push_back(PendingOp::Writev {
+            fd,
+            iovecs,
+            iov_count,
+            token,
+        });
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<usize> {
         // The polling backend doesn't batch — ops are processed in completions().
         Ok(0)
@@ -138,6 +160,14 @@ impl IoBackend for PollingBackend {
                         token,
                     } => {
                         self.do_write(fd, buf_ptr, buf_len, token, out);
+                    }
+                    PendingOp::Writev {
+                        fd,
+                        iovecs,
+                        iov_count,
+                        token,
+                    } => {
+                        self.do_writev(fd, iovecs, iov_count, token, out);
                     }
                     PendingOp::Close { fd, token } => {
                         self.do_close(fd, token, out);
@@ -315,6 +345,45 @@ impl PollingBackend {
                     fd,
                     buf_ptr,
                     buf_len,
+                    token,
+                });
+                return;
+            }
+            let errno = err.raw_os_error().unwrap_or(1);
+            out.push(Completion {
+                token,
+                result: -errno,
+                flags: 0,
+            });
+        }
+    }
+
+    fn do_writev(
+        &mut self,
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+        out: &mut Vec<Completion>,
+    ) {
+        // SAFETY: iovecs points to a valid array of iov_count iovec structs
+        // on the reactor thread. fd is a valid socket fd.
+        let n = unsafe { libc::writev(fd, iovecs, iov_count as libc::c_int) };
+
+        if n >= 0 {
+            out.push(Completion {
+                token,
+                result: n as i32,
+                flags: 0,
+            });
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                // Re-queue for later.
+                self.pending.push_back(PendingOp::Writev {
+                    fd,
+                    iovecs,
+                    iov_count,
                     token,
                 });
                 return;
