@@ -181,6 +181,7 @@ pub struct ConnectionFlags;
 impl ConnectionFlags {
     pub const READABLE: u8 = 1 << 0;
     pub const WRITABLE: u8 = 1 << 1;
+    pub const CLOSE_AFTER_WRITE: u8 = 1 << 2;
 }
 
 // ---------------------------------------------------------------------------

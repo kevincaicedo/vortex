@@ -7,17 +7,15 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
-
 use crate::backend::{
     ACCEPT_CONN_ID, Completion, IoBackend, OpType, PollingBackend, decode_token, encode_token,
 };
-use crate::connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
+use crate::connection::{ConnectionFlags, ConnectionMeta, ConnectionSlab, ConnectionState};
 use crate::pool::{CrossChannel, CrossMessage};
 use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
 use vortex_memory::{ArenaAllocator, BufferPool};
-use vortex_proto::{RespFrame, RespParser};
+use vortex_proto::{ParseError, RespFrame, RespParser};
 
 /// Default read buffer size per connection (16 KB).
 const DEFAULT_BUF_SIZE: usize = 16_384;
@@ -29,6 +27,8 @@ const MAX_COMPLETIONS: usize = 256;
 static RESP_PONG: &[u8] = b"+PONG\r\n";
 /// Pre-computed RESP error for unknown commands.
 static RESP_ERR_UNKNOWN: &[u8] = b"-ERR unknown command\r\n";
+/// Pre-computed RESP error for protocol failures.
+static RESP_ERR_PROTOCOL: &[u8] = b"-ERR protocol error\r\n";
 
 /// Configuration for a single reactor.
 pub struct ReactorConfig {
@@ -503,28 +503,49 @@ impl Reactor {
 
         let mut offset = 0;
         let mut write_cursor = 0usize;
+        let mut close_after_write = false;
 
-        // Parse and dispatch in a single pass — write responses directly to
-        // the pool write buffer, avoiding heap allocation.
         while offset < cursor {
-            let parse_result = RespParser::parse(&read_slice[offset..cursor]);
-            match parse_result {
-                Ok((frame, consumed)) => {
-                    offset += consumed;
-                    let response = self.dispatch_command(&frame);
-                    let end = write_cursor + response.len();
-                    if end <= buf_size {
+            match RespParser::parse_pipeline(&read_slice[offset..cursor]) {
+                Ok((frames, consumed)) => {
+                    let batch_end = offset + consumed;
+                    for frame in frames {
+                        let response = self.dispatch_command(&frame);
+                        let end = write_cursor + response.len();
+                        if end > buf_size {
+                            tracing::warn!(conn_id, "write buffer full, closing after flush");
+                            close_after_write = true;
+                            offset = cursor;
+                            break;
+                        }
+
                         write_buf[write_cursor..end].copy_from_slice(response);
                         write_cursor = end;
-                    } else {
-                        // Write buffer full — flush what we have and skip the
-                        // rest. In practice, Phase 1 responses are tiny.
-                        tracing::warn!(conn_id, "write buffer full, truncating response");
+                    }
+
+                    if close_after_write {
                         break;
                     }
+
+                    offset = batch_end;
                 }
-                Err(_) => {
-                    // Need more data — shift unconsumed bytes and read more.
+                Err(ParseError::NeedMoreData) => break,
+                Err(
+                    ParseError::FrameTooLarge
+                    | ParseError::NestingTooDeep
+                    | ParseError::InvalidFrame,
+                ) => {
+                    let end = write_cursor + RESP_ERR_PROTOCOL.len();
+                    if end > buf_size {
+                        tracing::warn!(conn_id, "protocol error response does not fit, closing");
+                        self.close_connection(conn_id);
+                        return;
+                    }
+
+                    write_buf[write_cursor..end].copy_from_slice(RESP_ERR_PROTOCOL);
+                    write_cursor = end;
+                    close_after_write = true;
+                    offset = cursor;
                     break;
                 }
             }
@@ -543,6 +564,12 @@ impl Reactor {
             }
         }
 
+        if close_after_write {
+            if let Some(c) = self.connections.get_mut(conn_id) {
+                c.flags |= ConnectionFlags::CLOSE_AFTER_WRITE;
+            }
+        }
+
         // Write all responses, or re-arm read if no complete command was parsed.
         if write_cursor > 0 {
             // Store write length in ConnectionMeta.
@@ -558,6 +585,8 @@ impl Reactor {
                 write_idx as u16,
                 token,
             );
+        } else if close_after_write {
+            self.close_connection(conn_id);
         } else if self.draining {
             // Drain mode: no complete command and nothing to write — close.
             self.close_connection(conn_id);
@@ -571,26 +600,10 @@ impl Reactor {
     /// Phase 1 only handles PING/QUIT.
     /// TODO(Phase 2): Route commands to the vortex-engine shard via command dispatch table.
     fn dispatch_command(&self, frame: &RespFrame) -> &'static [u8] {
-        match frame {
-            RespFrame::Array(Some(frames)) if !frames.is_empty() => {
-                let cmd = Self::extract_command_name(&frames[0]);
-                match cmd {
-                    Some(name) if name.eq_ignore_ascii_case(b"PING") => RESP_PONG,
-                    Some(name) if name.eq_ignore_ascii_case(b"QUIT") => b"+OK\r\n",
-                    _ => RESP_ERR_UNKNOWN,
-                }
-            }
-            // Inline PING (parsed as array by the inline parser).
+        match frame.command_name() {
+            Some(name) if name.eq_ignore_ascii_case(b"PING") => RESP_PONG,
+            Some(name) if name.eq_ignore_ascii_case(b"QUIT") => b"+OK\r\n",
             _ => RESP_ERR_UNKNOWN,
-        }
-    }
-
-    /// Extract the command name bytes from a RESP frame.
-    fn extract_command_name(frame: &RespFrame) -> Option<&Bytes> {
-        match frame {
-            RespFrame::BulkString(Some(data)) => Some(data),
-            RespFrame::SimpleString(data) => Some(data),
-            _ => None,
         }
     }
 
@@ -637,7 +650,12 @@ impl Reactor {
                 write_idx as u16,
                 token,
             );
-        } else if self.draining {
+        } else if self.draining
+            || self
+                .connections
+                .get(conn_id)
+                .is_some_and(|c| (c.flags & ConnectionFlags::CLOSE_AFTER_WRITE) != 0)
+        {
             // Drain mode: writes flushed — close connection, don't re-arm read.
             self.close_connection(conn_id);
         } else {
@@ -863,6 +881,7 @@ impl Reactor {
 mod tests {
     use super::*;
     use crate::shutdown::ShutdownCoordinator;
+    use bytes::Bytes;
 
     #[test]
     fn dispatch_ping() {
@@ -910,6 +929,29 @@ mod tests {
         let frame = RespFrame::Array(Some(vec![RespFrame::BulkString(Some(Bytes::from_static(
             b"ping",
         )))]));
+
+        let resp = reactor.dispatch_command(&frame);
+        assert_eq!(resp, RESP_PONG);
+    }
+
+    #[test]
+    fn dispatch_attribute_wrapped_ping() {
+        let coordinator = Arc::new(ShutdownCoordinator::new(1));
+        let config = ReactorConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            ..ReactorConfig::default()
+        };
+        let reactor = Reactor::new(0, config, coordinator).expect("reactor creation");
+
+        let frame = RespFrame::Attribute {
+            entries: vec![(
+                RespFrame::SimpleString(Bytes::from_static(b"meta")),
+                RespFrame::SimpleString(Bytes::from_static(b"value")),
+            )],
+            data: Box::new(RespFrame::Array(Some(vec![RespFrame::BulkString(Some(
+                Bytes::from_static(b"PING"),
+            ))]))),
+        };
 
         let resp = reactor.dispatch_command(&frame);
         assert_eq!(resp, RESP_PONG);

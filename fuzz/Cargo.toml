@@ -21,3 +21,13 @@ doc = false
 name = "fuzz_rdb_import"
 path = "fuzz_targets/fuzz_rdb_import.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_simd_scanner"
+path = "fuzz_targets/fuzz_simd_scanner.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_swar_integer"
+path = "fuzz_targets/fuzz_swar_integer.rs"
+doc = false

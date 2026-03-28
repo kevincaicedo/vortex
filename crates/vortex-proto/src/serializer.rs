@@ -136,6 +136,17 @@ impl RespSerializer {
                 }
             }
             #[cfg(feature = "resp3")]
+            RespFrame::Attribute { entries, data } => {
+                buf.put_u8(b'|');
+                Self::write_integer(entries.len() as i64, buf);
+                buf.extend_from_slice(b"\r\n");
+                for (k, v) in entries {
+                    Self::serialize(k, buf);
+                    Self::serialize(v, buf);
+                }
+                Self::serialize(data, buf);
+            }
+            #[cfg(feature = "resp3")]
             RespFrame::Push { kind, data } => {
                 buf.put_u8(b'>');
                 Self::write_integer((1 + data.len()) as i64, buf);
@@ -219,6 +230,26 @@ mod tests {
             RespFrame::BulkString(Some(Bytes::from_static(b"key"))),
             RespFrame::BulkString(Some(Bytes::from_static(b"value"))),
         ]));
+
+        let mut buf = BytesMut::new();
+        RespSerializer::serialize(&original, &mut buf);
+
+        let (parsed, _) = RespParser::parse(&buf).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn roundtrip_attribute() {
+        use crate::parser::RespParser;
+
+        let original = RespFrame::Attribute {
+            entries: vec![(
+                RespFrame::SimpleString(Bytes::from_static(b"meta")),
+                RespFrame::SimpleString(Bytes::from_static(b"value")),
+            )],
+            data: Box::new(RespFrame::Integer(1)),
+        };
 
         let mut buf = BytesMut::new();
         RespSerializer::serialize(&original, &mut buf);
