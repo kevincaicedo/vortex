@@ -1,10 +1,15 @@
 //! VortexDB — next-generation in-memory database server.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use vortex_io::{ReactorPool, ReactorPoolConfig};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Default shutdown timeout before force-kill (30 seconds).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const BANNER: &str = r"
  __     __       _            ____  ____
@@ -29,31 +34,74 @@ fn main() {
 
     eprintln!("{BANNER}");
     tracing::info!(
-        "VortexDB v{} starting — bind={}, threads={}, max_memory={}",
+        "VortexDB v{} starting — bind={}, threads={}, io_backend={}, max_memory={}",
         env!("CARGO_PKG_VERSION"),
         config.bind,
         config.threads,
+        config.io_backend,
         config.max_memory,
     );
 
-    let running = Arc::new(AtomicBool::new(true));
+    // ── Spawn reactor pool ─────────────────────────────────────────
+    let pool_config = ReactorPoolConfig {
+        bind_addr: config.bind,
+        threads: config.threads,
+        max_connections: config.max_clients,
+        buffer_size: config.buffer_size,
+        buffer_count: config.fixed_buffers,
+        connection_timeout: config.connection_timeout_secs as u32,
+    };
 
-    // Register signal handlers for graceful shutdown.
+    let mut pool = match ReactorPool::spawn(pool_config) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to spawn reactor pool");
+            std::process::exit(1);
+        }
+    };
+
+    tracing::info!(
+        reactors = pool.reactor_count(),
+        "server ready — awaiting connections"
+    );
+
+    // ── Signal handler (1.4.2) ─────────────────────────────────────
+    // TODO(Phase 1.5): Replace ctrlc with signalfd (Linux) / kqueue EVFILT_SIGNAL
+    // (macOS) integration into each reactor's event loop for zero-polling signal
+    // delivery. Also add SIGHUP handler for config-reload stub.
     {
-        let running = Arc::clone(&running);
+        let coordinator = Arc::clone(pool.coordinator());
         ctrlc::set_handler(move || {
-            tracing::info!("shutdown signal received");
-            running.store(false, Ordering::SeqCst);
+            if coordinator.initiate() {
+                tracing::info!("shutdown signal received — draining connections");
+            } else {
+                // Second signal — escalate to force-kill.
+                tracing::warn!("second signal received — forcing immediate shutdown");
+                coordinator.force_kill();
+            }
         })
         .expect("failed to set signal handler");
     }
 
-    tracing::info!("server ready — awaiting connections");
+    // ── Wait for shutdown ──────────────────────────────────────────
+    let clean = pool.wait_for_shutdown(SHUTDOWN_TIMEOUT);
+    pool.join();
 
-    // Phase 1 replaces this spin with the io-reactor event loop.
-    while running.load(Ordering::SeqCst) {
-        std::thread::park_timeout(std::time::Duration::from_millis(100));
+    // ── Persistence flush stub (1.4.5) ─────────────────────────────
+    persistence_flush();
+
+    if clean {
+        tracing::info!("VortexDB shutting down — goodbye");
+        std::process::exit(0);
+    } else {
+        tracing::warn!("VortexDB forced shutdown — goodbye");
+        std::process::exit(1);
     }
+}
 
-    tracing::info!("VortexDB shutting down — goodbye");
+/// Flush persistence state to disk before exit.
+///
+/// TODO(Phase 5): Replace with actual AOF flush and final snapshot write.
+fn persistence_flush() {
+    tracing::info!("persistence flush (stub) — no persistence configured yet");
 }

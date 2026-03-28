@@ -16,6 +16,11 @@ pub struct NeedMoreData;
 /// `NeedMoreData`.
 pub struct RespParser;
 
+/// Maximum number of elements in a single RESP array frame.
+/// Prevents OOM from malformed input with absurdly large counts.
+/// Matches Redis's practical limit.
+const MAX_ARRAY_ELEMENTS: usize = 1_048_576;
+
 impl RespParser {
     /// Attempts to parse a single RESP frame from the buffer.
     ///
@@ -111,6 +116,9 @@ impl RespParser {
         }
 
         let count = count as usize;
+        if count > MAX_ARRAY_ELEMENTS {
+            return Err(NeedMoreData);
+        }
         let mut offset = crlf + 2;
         let mut frames = Vec::with_capacity(count);
 
@@ -321,5 +329,21 @@ mod tests {
     fn parse_resp3_double() {
         let (frame, _) = RespParser::parse(b",2.72\r\n").unwrap();
         assert_eq!(frame, RespFrame::Double(2.72));
+    }
+
+    #[test]
+    fn reject_oversized_array_count() {
+        // Regression tests for fuzzer crash inputs that caused OOM via
+        // Vec::with_capacity with absurdly large counts.
+        let cases: &[&[u8]] = &[
+            b"*2422222211032835\r\n\n",
+            b"*7370955161\r\n\r\r\r",
+            b"*222000064541065670\r\n-2425\r\n\r\n",
+            b"*10000007370955\r\n*0\r\n",
+        ];
+        for input in cases {
+            // Must not panic or OOM — should return Err.
+            assert!(RespParser::parse(input).is_err());
+        }
     }
 }

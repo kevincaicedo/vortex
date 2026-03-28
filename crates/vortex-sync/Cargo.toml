@@ -11,6 +11,8 @@ unsafe_code = "allow"
 [dependencies]
 vortex-common = { workspace = true }
 crossbeam-utils = { workspace = true }
+crossbeam-queue = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

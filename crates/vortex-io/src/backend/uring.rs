@@ -33,18 +33,6 @@ impl IoUringBackend {
         let ring = builder.build(ring_size)?;
         Ok(Self { ring })
     }
-
-    /// Register fixed buffers with the kernel for zero-copy I/O.
-    pub fn register_buffers(&self, iovecs: &[libc::iovec]) -> io::Result<()> {
-        // SAFETY: iovecs point to valid, pinned memory that will outlive the
-        // io_uring instance. The buffers are owned by the BufferPool.
-        unsafe {
-            self.ring
-                .submitter()
-                .register_buffers(iovecs)
-                .map_err(io::Error::other)
-        }
-    }
 }
 
 impl IoBackend for IoUringBackend {
@@ -118,6 +106,78 @@ impl IoBackend for IoUringBackend {
                 .map_err(|_| io::Error::other("SQ full"))?;
         }
         Ok(())
+    }
+
+    fn submit_read_fixed(
+        &mut self,
+        fd: RawFd,
+        buf_ptr: *mut u8,
+        buf_len: usize,
+        buf_index: u16,
+        token: u64,
+    ) -> io::Result<()> {
+        let read = opcode::ReadFixed::new(Fd(fd), buf_ptr, buf_len as u32, buf_index)
+            .build()
+            .user_data(token);
+
+        // SAFETY: The SQE is valid, fd is an open socket, and buf_ptr points
+        // to a registered fixed buffer that will remain valid until the CQE is
+        // reaped. buf_index identifies the registered buffer region.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&read)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+        Ok(())
+    }
+
+    fn submit_write_fixed(
+        &mut self,
+        fd: RawFd,
+        buf_ptr: *const u8,
+        buf_len: usize,
+        buf_index: u16,
+        token: u64,
+    ) -> io::Result<()> {
+        let write = opcode::WriteFixed::new(Fd(fd), buf_ptr, buf_len as u32, buf_index)
+            .build()
+            .user_data(token);
+
+        // SAFETY: Valid SQE, fd is open, buf_ptr is within a registered fixed
+        // buffer identified by buf_index.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&write)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+        Ok(())
+    }
+
+    fn submit_cancel(&mut self, token: u64) -> io::Result<()> {
+        let cancel = opcode::AsyncCancel::new(token).build();
+
+        // SAFETY: Valid SQE. AsyncCancel targets the in-flight SQE with
+        // the matching user_data token.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&cancel)
+                .map_err(|_| io::Error::other("SQ full"))?;
+        }
+        Ok(())
+    }
+
+    fn register_buffers(&self, iovecs: &[libc::iovec]) -> io::Result<()> {
+        // SAFETY: iovecs point to valid, pinned memory that will outlive the
+        // io_uring instance. The buffers are owned by the BufferPool.
+        unsafe {
+            self.ring
+                .submitter()
+                .register_buffers(iovecs)
+                .map_err(io::Error::other)
+        }
     }
 
     fn flush(&mut self) -> io::Result<usize> {

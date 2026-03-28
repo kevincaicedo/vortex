@@ -25,9 +25,11 @@
 pub mod backoff;
 pub mod counter;
 pub mod mpsc;
+pub mod signal;
 pub mod spsc;
 
 pub use backoff::Backoff;
 pub use counter::ShardedCounter;
 pub use mpsc::MpscQueue;
+pub use signal::ShutdownSignal;
 pub use spsc::SpscRingBuffer;

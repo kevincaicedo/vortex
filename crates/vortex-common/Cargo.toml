@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "VortexDB shared types, errors, constants, and traits"
 
+[lints.rust]
+unsafe_code = "allow"
+
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

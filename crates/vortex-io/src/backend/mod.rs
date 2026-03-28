@@ -42,22 +42,29 @@ impl OpType {
 
 /// Encode a connection token, generation counter, and operation type into a single u64.
 ///
-/// Layout: `(conn_id << 16) | (generation << 8) | op_type`
+/// Layout (64-bit):
+/// ```text
+///  63        32 31        8 7       0
+/// ┌───────────┬───────────┬─────────┐
+/// │  conn_id  │ generation│ op_type │
+/// │  (32 bit) │  (24 bit) │ (8 bit) │
+/// └───────────┴───────────┴─────────┘
+/// ```
 ///
-/// The generation counter prevents stale CQE processing after a slab slot is
-/// reused by a new connection while io_uring operations for the old connection
-/// are still in flight.
+/// The 24-bit generation counter prevents stale CQE processing after a slab
+/// slot is reused. At 100K ops/sec per slot, wrap-around takes ~168 seconds
+/// instead of ~2.6ms with the old 8-bit counter.
 #[inline]
-pub fn encode_token(conn_id: usize, generation: u8, op: OpType) -> u64 {
-    ((conn_id as u64) << 16) | ((generation as u64) << 8) | (op as u64)
+pub fn encode_token(conn_id: usize, generation: u32, op: OpType) -> u64 {
+    ((conn_id as u64) << 32) | (((generation & 0xFF_FFFF) as u64) << 8) | (op as u64)
 }
 
 /// Decode a token into (connection_id, generation, operation_type).
 #[inline]
-pub fn decode_token(token: u64) -> (usize, u8, OpType) {
+pub fn decode_token(token: u64) -> (usize, u32, OpType) {
     let op = OpType::from_u8((token & 0xFF) as u8).unwrap_or(OpType::Accept);
-    let generation = ((token >> 8) & 0xFF) as u8;
-    let conn_id = (token >> 16) as usize;
+    let generation = ((token >> 8) & 0xFF_FFFF) as u32;
+    let conn_id = (token >> 32) as usize;
     (conn_id, generation, op)
 }
 
@@ -99,6 +106,56 @@ pub trait IoBackend {
         buf_len: usize,
         token: u64,
     ) -> std::io::Result<()>;
+
+    /// Submit a read into a pre-registered fixed buffer (io_uring: `ReadFixed`).
+    ///
+    /// `buf_index` is the index in the buffer array registered with
+    /// `register_buffers()`. The `buf_ptr` and `buf_len` specify the region
+    /// within that registered buffer. For polling backends this falls back
+    /// to a regular read.
+    fn submit_read_fixed(
+        &mut self,
+        fd: RawFd,
+        buf_ptr: *mut u8,
+        buf_len: usize,
+        buf_index: u16,
+        token: u64,
+    ) -> std::io::Result<()> {
+        // Default: fall back to regular read (polling backends).
+        let _ = buf_index;
+        self.submit_read(fd, buf_ptr, buf_len, token)
+    }
+
+    /// Submit a write from a pre-registered fixed buffer (io_uring: `WriteFixed`).
+    ///
+    /// For polling backends this falls back to a regular write.
+    fn submit_write_fixed(
+        &mut self,
+        fd: RawFd,
+        buf_ptr: *const u8,
+        buf_len: usize,
+        buf_index: u16,
+        token: u64,
+    ) -> std::io::Result<()> {
+        // Default: fall back to regular write (polling backends).
+        let _ = buf_index;
+        self.submit_write(fd, buf_ptr, buf_len, token)
+    }
+
+    /// Submit async cancellation of an in-flight operation identified by its
+    /// user-data token (io_uring: `AsyncCancel`).
+    ///
+    /// For polling backends this is a no-op since operations complete inline.
+    fn submit_cancel(&mut self, _token: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Register fixed buffers with the kernel (io_uring: `register_buffers`).
+    ///
+    /// No-op for non-uring backends.
+    fn register_buffers(&self, _iovecs: &[libc::iovec]) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Submit a close operation on a file descriptor.
     fn submit_close(&mut self, fd: RawFd, token: u64) -> std::io::Result<()>;
@@ -142,7 +199,7 @@ mod tests {
     #[test]
     fn token_large_conn_id() {
         let conn_id = 100_000;
-        let cgen = 255;
+        let cgen = 0xFF_FFFF_u32; // max 24-bit generation
         let op = OpType::Write;
         let token = encode_token(conn_id, cgen, op);
         let (decoded_id, decoded_gen, decoded_op) = decode_token(token);
@@ -154,10 +211,25 @@ mod tests {
     #[test]
     fn token_generation_wraps() {
         let conn_id = 5;
-        let cgen: u8 = 255;
-        let token = encode_token(conn_id, cgen.wrapping_add(1), OpType::Read);
+        let cgen: u32 = 0xFF_FFFF; // max 24-bit
+        // Wrapping add and mask to 24 bits
+        let next_gen = cgen.wrapping_add(1) & 0xFF_FFFF;
+        let token = encode_token(conn_id, next_gen, OpType::Read);
         let (decoded_id, decoded_gen, _) = decode_token(token);
         assert_eq!(decoded_id, conn_id);
-        assert_eq!(decoded_gen, 0); // Wrapped around
+        assert_eq!(decoded_gen, 0); // Wrapped around from 24-bit max
+    }
+
+    #[test]
+    fn token_32bit_conn_id() {
+        // Test that conn_id uses full 32-bit range.
+        let conn_id = u32::MAX as usize;
+        let cgen = 42_u32;
+        let op = OpType::Close;
+        let token = encode_token(conn_id, cgen, op);
+        let (decoded_id, decoded_gen, decoded_op) = decode_token(token);
+        assert_eq!(decoded_id, conn_id);
+        assert_eq!(decoded_gen, cgen);
+        assert_eq!(decoded_op, op);
     }
 }
