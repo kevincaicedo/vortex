@@ -1,6 +1,8 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use vortex_common::{VortexKey, VortexValue};
+use vortex_common::{ShardId, VortexKey, VortexValue};
+use vortex_engine::commands::execute_command;
 use vortex_engine::{Entry, ExpiryEntry, ExpiryWheel, Shard, SwissTable};
+use vortex_proto::RespTape;
 
 // ── 0.3.2 — Swiss Table Benchmarks ─────────────────────────────────
 
@@ -84,12 +86,16 @@ fn bench_swiss_table_insert_single(c: &mut Criterion) {
         let keys: Vec<VortexKey> = (0..size)
             .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
             .collect();
-        let values: Vec<VortexValue> = (0..size)
-            .map(|i| VortexValue::Integer(i as i64))
-            .collect();
+        let values: Vec<VortexValue> = (0..size).map(|i| VortexValue::Integer(i as i64)).collect();
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter_batched(
-                || (SwissTable::with_capacity(size), keys.clone(), values.clone()),
+                || {
+                    (
+                        SwissTable::with_capacity(size),
+                        keys.clone(),
+                        values.clone(),
+                    )
+                },
                 |(mut table, keys, values)| {
                     for (k, v) in keys.into_iter().zip(values) {
                         table.insert(k, v);
@@ -137,7 +143,12 @@ fn bench_entry_write_inline(c: &mut Criterion) {
         b.iter_batched(
             Entry::empty,
             |mut entry| {
-                entry.write_inline(black_box(0x91), black_box(&key), black_box(&value), black_box(42));
+                entry.write_inline(
+                    black_box(0x91),
+                    black_box(&key),
+                    black_box(&value),
+                    black_box(42),
+                );
                 black_box(entry);
             },
             criterion::BatchSize::SmallInput,
@@ -180,7 +191,12 @@ fn bench_entry_write_integer(c: &mut Criterion) {
         b.iter_batched(
             Entry::empty,
             |mut entry| {
-                entry.write_integer(black_box(0x91), black_box(&key), black_box(123_456_i64), black_box(42));
+                entry.write_integer(
+                    black_box(0x91),
+                    black_box(&key),
+                    black_box(123_456_i64),
+                    black_box(42),
+                );
                 black_box(entry);
             },
             criterion::BatchSize::SmallInput,
@@ -242,7 +258,7 @@ fn bench_lazy_expiry_overhead(c: &mut Criterion) {
     // Measure shard.get() with lazy expiry on a non-expired key.
     // The overhead vs plain Swiss Table GET (~5 ns) is the is_expired branch.
     c.bench_function("lazy_expiry_overhead", |b| {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("bench_key");
         shard.set_with_ttl(key.clone(), VortexValue::from("value"), 999 * NS_PER_SEC);
 
@@ -256,7 +272,7 @@ fn bench_active_sweep_100k(c: &mut Criterion) {
     c.bench_function("active_sweep_100K", |b| {
         b.iter_batched_ref(
             || {
-                let mut shard = Shard::new_with_time(0, 0);
+                let mut shard = Shard::new_with_time(ShardId::new(0), 0);
                 // Place 20 entries in each of 5000 second-slots (slots 1..=5000).
                 for slot in 1u64..=5000 {
                     let deadline = slot * NS_PER_SEC;
@@ -279,6 +295,203 @@ fn bench_active_sweep_100k(c: &mut Criterion) {
     });
 }
 
+// ── 3.4 — String Command Benchmarks ────────────────────────────────
+
+/// Build a RESP array command from parts.
+fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+    for part in parts {
+        buf.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        buf.extend_from_slice(part);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
+}
+
+fn bench_cmd_get_inline(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    // Pre-populate with inline-sized key+value.
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    shard.set(key, VortexValue::from_bytes(b"myvalue"));
+
+    let cmd = make_resp(&[b"GET", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_get_inline", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_set_inline(c: &mut Criterion) {
+    let cmd = make_resp(&[b"SET", b"mykey", b"myvalue"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_set_inline", |b| {
+        // Pre-create shard: benchmark measures overwrite (hot-path SET).
+        let mut shard = Shard::new(ShardId::new(0));
+        let key = VortexKey::from(b"mykey" as &[u8]);
+        shard.set(key, VortexValue::from_bytes(b"old"));
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"SET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_get_miss(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    let cmd = make_resp(&[b"GET", b"nosuchkey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_get_miss", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_incr(c: &mut Criterion) {
+    let cmd = make_resp(&[b"INCR", b"counter"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_incr", |b| {
+        let mut shard = Shard::new(ShardId::new(0));
+        let key = VortexKey::from(b"counter" as &[u8]);
+        shard.set(key, VortexValue::Integer(0));
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"INCR", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_mget_100(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    // Pre-populate 100 keys.
+    let mut parts: Vec<Vec<u8>> = vec![b"MGET".to_vec()];
+    for i in 0..100 {
+        let key_str = format!("key:{i:04}");
+        let key = VortexKey::from(key_str.as_bytes());
+        shard.set(key, VortexValue::Integer(i));
+        parts.push(key_str.into_bytes());
+    }
+
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_mget_100", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"MGET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_mset_100(c: &mut Criterion) {
+    let mut parts: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+    for i in 0..100 {
+        parts.push(format!("key:{i:04}").into_bytes());
+        parts.push(format!("val:{i:04}").into_bytes());
+    }
+
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_mset_100", |b| {
+        // Pre-create shard with capacity; measures overwrite path.
+        let mut shard = Shard::new(ShardId::new(0));
+        for i in 0..100 {
+            let key = VortexKey::from(format!("key:{i:04}").as_bytes());
+            shard.set(key, VortexValue::from_bytes(b"old"));
+        }
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"MSET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_append_inline(c: &mut Criterion) {
+    let cmd = make_resp(&[b"APPEND", b"mykey", b"abc"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_append_inline", |b| {
+        let mut shard = Shard::new(ShardId::new(0));
+        let key = VortexKey::from(b"mykey" as &[u8]);
+        shard.set(key.clone(), VortexValue::from_bytes(b"hello"));
+
+        b.iter(|| {
+            // Reset value to inline before each append (keeps it short).
+            shard.set(key.clone(), VortexValue::from_bytes(b"hello"));
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"APPEND", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_throughput_get_set_mix(c: &mut Criterion) {
+    // 50/50 GET/SET mix over 1M-key shard, measuring single-core throughput.
+    let n_keys = 1_000_000usize;
+    let n_tapes = 1000usize;
+    let batch = 100_000usize;
+
+    let set_cmds: Vec<Vec<u8>> = (0..n_tapes)
+        .map(|i| make_resp(&[b"SET", format!("k:{i:08}").as_bytes(), b"val"]))
+        .collect();
+    let get_cmds: Vec<Vec<u8>> = (0..n_tapes)
+        .map(|i| make_resp(&[b"GET", format!("k:{i:08}").as_bytes()]))
+        .collect();
+    let set_tapes: Vec<RespTape> = set_cmds
+        .iter()
+        .map(|c| RespTape::parse_pipeline(c).unwrap())
+        .collect();
+    let get_tapes: Vec<RespTape> = get_cmds
+        .iter()
+        .map(|c| RespTape::parse_pipeline(c).unwrap())
+        .collect();
+
+    // Pre-fill shard once (reused across iterations).
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..n_keys {
+        let key = VortexKey::from(format!("k:{i:08}").as_bytes());
+        shard.set(key, VortexValue::from_bytes(b"val"));
+    }
+
+    c.bench_function("throughput_get_set_mix", |b| {
+        b.iter(|| {
+            for i in 0..batch {
+                let idx = i % n_tapes;
+                if i & 1 == 0 {
+                    let frame = set_tapes[idx].iter().next().unwrap();
+                    let r = execute_command(&mut shard, b"SET", &frame, 0);
+                    black_box(r);
+                } else {
+                    let frame = get_tapes[idx].iter().next().unwrap();
+                    let r = execute_command(&mut shard, b"GET", &frame, 0);
+                    black_box(r);
+                }
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_swiss_table_insert,
@@ -296,5 +509,13 @@ criterion_group!(
     bench_expiry_tick_20,
     bench_lazy_expiry_overhead,
     bench_active_sweep_100k,
+    bench_cmd_get_inline,
+    bench_cmd_set_inline,
+    bench_cmd_get_miss,
+    bench_cmd_incr,
+    bench_cmd_mget_100,
+    bench_cmd_mset_100,
+    bench_cmd_append_inline,
+    bench_throughput_get_set_mix,
 );
 criterion_main!(benches);

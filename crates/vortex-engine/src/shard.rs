@@ -1,7 +1,19 @@
-use vortex_common::{VortexKey, VortexResult, VortexValue};
+use vortex_common::{ShardId, VortexKey, VortexResult, VortexValue};
 
 use crate::expiry::{ExpiryEntry, ExpiryWheel};
 use crate::table::SwissTable;
+
+/// Result of a SET command with options (NX/XX/GET).
+pub enum SetResult {
+    /// SET succeeded (no GET flag).
+    Ok,
+    /// SET was not performed (NX/XX condition failed, no GET flag).
+    NotSet,
+    /// SET succeeded — returns old value (GET flag was set).
+    OkGet(Option<VortexValue>),
+    /// SET was not performed — returns current value (GET flag + NX/XX failed).
+    NotSetGet(Option<VortexValue>),
+}
 
 /// A single database shard.
 ///
@@ -9,7 +21,7 @@ use crate::table::SwissTable;
 /// are single-threaded — no locks needed.
 pub struct Shard {
     /// Shard identifier.
-    pub id: u16,
+    pub id: ShardId,
     /// The key-value store.
     data: SwissTable,
     /// Dual timing wheel for TTL expiry.
@@ -20,7 +32,7 @@ pub struct Shard {
 
 impl Shard {
     /// Creates a new empty shard.
-    pub fn new(id: u16) -> Self {
+    pub fn new(id: ShardId) -> Self {
         Self {
             id,
             data: SwissTable::new(),
@@ -30,7 +42,7 @@ impl Shard {
     }
 
     /// Creates a new empty shard with the expiry wheel initialized to `now_nanos`.
-    pub fn new_with_time(id: u16, now_nanos: u64) -> Self {
+    pub fn new_with_time(id: ShardId, now_nanos: u64) -> Self {
         let mut s = Self::new(id);
         s.expiry.set_time(now_nanos);
         s
@@ -80,6 +92,82 @@ impl Shard {
         self.data.remove(key).is_some()
     }
 
+    /// DEL returning the removed value (for GETDEL).
+    pub fn remove(&mut self, key: &VortexKey) -> Option<VortexValue> {
+        self.data.remove(key)
+    }
+
+    /// Returns a mutable reference to the value for a key (no lazy expiry).
+    ///
+    /// Used by INCR/APPEND for in-place modification.
+    #[inline]
+    pub fn get_mut(&mut self, key: &VortexKey) -> Option<&mut VortexValue> {
+        self.data.get_mut(key)
+    }
+
+    /// SET + options: handles NX (only set if key doesn't exist),
+    /// XX (only set if key exists), GET (return old value), KEEPTTL.
+    ///
+    /// Returns `SetResult` indicating what happened.
+    pub fn set_with_options(
+        &mut self,
+        key: VortexKey,
+        value: VortexValue,
+        ttl_deadline: u64,
+        nx: bool,
+        xx: bool,
+        get: bool,
+        keepttl: bool,
+    ) -> SetResult {
+        let exists = self.data.contains_key(&key);
+
+        // NX: only set if NOT exists
+        if nx && exists {
+            return if get {
+                SetResult::NotSetGet(self.data.get(&key).cloned())
+            } else {
+                SetResult::NotSet
+            };
+        }
+        // XX: only set if EXISTS
+        if xx && !exists {
+            return if get {
+                SetResult::NotSetGet(None)
+            } else {
+                SetResult::NotSet
+            };
+        }
+
+        // Preserve old TTL if KEEPTTL and key already exists.
+        let effective_ttl = if keepttl && exists {
+            self.data.get_entry_ttl(&key).unwrap_or(0)
+        } else {
+            ttl_deadline
+        };
+
+        let old = if effective_ttl != 0 {
+            let hash = self.data.hash_key_bytes(key.as_bytes());
+            let prev = self.data.insert_with_ttl(key, value, effective_ttl);
+            self.expiry.register(hash, effective_ttl);
+            prev
+        } else {
+            self.data.insert(key, value)
+        };
+
+        if get {
+            SetResult::OkGet(old)
+        } else {
+            SetResult::Ok
+        }
+    }
+
+    /// Prefetch the control byte group for a key (for MGET/MSET batching).
+    #[inline]
+    pub fn prefetch(&self, key: &VortexKey) {
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.data.prefetch_group(hash);
+    }
+
     // ── TTL operations ──────────────────────────────────────────────
 
     /// EXPIRE / PEXPIRE: set a TTL on an existing key.
@@ -123,14 +211,18 @@ impl Shard {
     /// another sweep if `expired_count > sampled_count / 4` (>25% rate).
     pub fn run_active_expiry(&mut self, now_nanos: u64, max_effort: usize) -> (usize, usize) {
         self.expired_buf.clear();
-        self.expiry.tick(now_nanos, max_effort, &mut self.expired_buf);
+        self.expiry
+            .tick(now_nanos, max_effort, &mut self.expired_buf);
 
         let sampled = self.expired_buf.len();
         let mut expired = 0;
 
         for i in 0..sampled {
             let entry = self.expired_buf[i];
-            if self.data.remove_expired_by_hash(entry.key_hash, entry.deadline_nanos) {
+            if self
+                .data
+                .remove_expired_by_hash(entry.key_hash, entry.deadline_nanos)
+            {
                 expired += 1;
             }
             // If remove failed, the entry is a ghost (re-EXPIRE'd or PERSIST'd).
@@ -172,7 +264,7 @@ mod tests {
 
     #[test]
     fn shard_basic_ops() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
 
         let key = VortexKey::from("hello");
         shard.set(key.clone(), VortexValue::from("world"));
@@ -190,7 +282,7 @@ mod tests {
 
     #[test]
     fn shard_flush() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         for i in 0..100 {
             let key = VortexKey::from(format!("key:{i}").as_str());
             shard.set(key, VortexValue::from(i as i64));
@@ -205,7 +297,7 @@ mod tests {
 
     #[test]
     fn lazy_expiry_get_returns_none() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("ephemeral");
         let deadline = 5 * NS_PER_SEC;
 
@@ -223,7 +315,7 @@ mod tests {
 
     #[test]
     fn lazy_expiry_exists_returns_false() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("temp");
         shard.set_with_ttl(key.clone(), VortexValue::from("data"), 5 * NS_PER_SEC);
 
@@ -236,7 +328,7 @@ mod tests {
 
     #[test]
     fn expire_and_ttl() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("mykey");
         shard.set(key.clone(), VortexValue::from("val"));
 
@@ -254,21 +346,21 @@ mod tests {
 
     #[test]
     fn persist_on_nonexistent_key() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("ghost");
         assert!(!shard.persist(&key));
     }
 
     #[test]
     fn expire_on_nonexistent_key() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("ghost");
         assert!(!shard.expire(&key, 10 * NS_PER_SEC));
     }
 
     #[test]
     fn re_expire_ghosts_old_entry() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("reexpire");
         shard.set_with_ttl(key.clone(), VortexValue::from("v"), 5 * NS_PER_SEC);
 
@@ -284,7 +376,7 @@ mod tests {
 
     #[test]
     fn active_expiry_deletes_expired_keys() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
 
         for i in 0..10 {
             let key = VortexKey::from(format!("key:{i}").as_str());
@@ -300,7 +392,7 @@ mod tests {
 
     #[test]
     fn active_expiry_skips_ghosts() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("ghosted");
 
         // Set with TTL=5s
@@ -317,7 +409,7 @@ mod tests {
 
     #[test]
     fn active_expiry_bounded_effort() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
 
         for i in 0..50 {
             let key = VortexKey::from(format!("k:{i}").as_str());
@@ -336,7 +428,7 @@ mod tests {
 
     #[test]
     fn no_latency_impact_on_non_ttl_keys() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("persistent");
         shard.set(key.clone(), VortexValue::from("forever"));
 
@@ -346,7 +438,7 @@ mod tests {
 
     #[test]
     fn millis_precision_expiry() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let key = VortexKey::from("fast");
 
         // PX 100ms

@@ -443,7 +443,9 @@ mod tests {
         let value = VortexValue::from("this value is much longer than twenty-one bytes");
 
         // SAFETY: `key` and `value` live for the duration of the assertions.
-        unsafe { e.write_heap(0x93, &key, &value, 123); }
+        unsafe {
+            e.write_heap(0x93, &key, &value, 123);
+        }
 
         assert!(!e.has_flag(FLAG_INLINE_KEY));
         assert!(!e.has_flag(FLAG_INLINE_VALUE));
@@ -460,7 +462,9 @@ mod tests {
         let value = VortexValue::from("short-inline");
 
         // SAFETY: `key` and `value` live for the duration of the assertions.
-        unsafe { e.write_heap(0x91, &key, &value, 0); }
+        unsafe {
+            e.write_heap(0x91, &key, &value, 0);
+        }
 
         assert!(!e.has_flag(FLAG_INLINE_KEY));
         assert!(e.has_flag(FLAG_INLINE_VALUE));
@@ -475,7 +479,9 @@ mod tests {
         let value = VortexValue::List(Box::default());
 
         // SAFETY: `key` and `value` live for the duration of the assertions.
-        unsafe { e.write_heap(0x88, &key, &value, 0); }
+        unsafe {
+            e.write_heap(0x88, &key, &value, 0);
+        }
 
         assert!(e.has_flag(FLAG_INLINE_KEY));
         assert!(!e.has_flag(FLAG_INLINE_VALUE));
@@ -563,7 +569,9 @@ mod tests {
 
         let list = VortexValue::List(Box::new(VortexList::new()));
         // SAFETY: borrowed values stay alive for the duration of this test.
-        unsafe { entry.write_heap(0x81, &VortexKey::from("k"), &list, 0); }
+        unsafe {
+            entry.write_heap(0x81, &VortexKey::from("k"), &list, 0);
+        }
         assert_eq!(entry.value_type(), VTYPE_LIST);
     }
 

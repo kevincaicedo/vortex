@@ -67,11 +67,17 @@ struct BitMask(u16);
 
 impl BitMask {
     #[inline]
-    const fn any_set(self) -> bool { self.0 != 0 }
+    const fn any_set(self) -> bool {
+        self.0 != 0
+    }
 
     #[inline]
     fn lowest(self) -> Option<usize> {
-        if self.0 == 0 { None } else { Some(self.0.trailing_zeros() as usize) }
+        if self.0 == 0 {
+            None
+        } else {
+            Some(self.0.trailing_zeros() as usize)
+        }
     }
 }
 
@@ -79,7 +85,9 @@ impl Iterator for BitMask {
     type Item = usize;
     #[inline]
     fn next(&mut self) -> Option<usize> {
-        if self.0 == 0 { return None; }
+        if self.0 == 0 {
+            return None;
+        }
         let idx = self.0.trailing_zeros() as usize;
         self.0 &= self.0 - 1;
         Some(idx)
@@ -188,7 +196,11 @@ struct ProbeSeq {
 impl ProbeSeq {
     #[inline]
     fn new(h1: usize, mask: usize) -> Self {
-        Self { pos: h1 & mask, stride: 0, mask }
+        Self {
+            pos: h1 & mask,
+            stride: 0,
+            mask,
+        }
     }
 
     #[inline]
@@ -223,8 +235,7 @@ impl RawTable {
         let alloc_size = ctrl_padded + entries_size;
 
         // SAFETY: size > 0, align = 64 (power of two). Layout is valid.
-        let layout = Layout::from_size_align(alloc_size, 64)
-            .expect("SwissTable: layout overflow");
+        let layout = Layout::from_size_align(alloc_size, 64).expect("SwissTable: layout overflow");
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             alloc::handle_alloc_error(layout);
@@ -233,14 +244,21 @@ impl RawTable {
         let ctrl = ptr;
         let entries = unsafe { ptr.add(ctrl_padded).cast::<Entry>() };
 
-        let mut raw = Self { ctrl, entries, num_groups, alloc_size };
+        let mut raw = Self {
+            ctrl,
+            entries,
+            num_groups,
+            alloc_size,
+        };
         raw.fill_ctrl(CTRL_EMPTY);
 
         // Initialize entries to empty.
         let num_slots = num_groups * GROUP_SIZE;
         for i in 0..num_slots {
             // SAFETY: i < num_slots, entries valid for that count.
-            unsafe { entries.add(i).write(Entry::empty()); }
+            unsafe {
+                entries.add(i).write(Entry::empty());
+            }
         }
 
         raw
@@ -250,7 +268,9 @@ impl RawTable {
     fn fill_ctrl(&mut self, byte: u8) {
         let total = (self.num_groups + 1) * GROUP_SIZE;
         // SAFETY: ctrl is valid for `total` bytes.
-        unsafe { core::ptr::write_bytes(self.ctrl, byte, total); }
+        unsafe {
+            core::ptr::write_bytes(self.ctrl, byte, total);
+        }
     }
 
     #[inline]
@@ -344,7 +364,8 @@ impl SwissTable {
             .checked_mul(LOAD_FACTOR_D)
             .expect("capacity overflow")
             / LOAD_FACTOR_N;
-        let num_groups = required.div_ceil(GROUP_SIZE)
+        let num_groups = required
+            .div_ceil(GROUP_SIZE)
             .next_power_of_two()
             .max(MIN_GROUPS);
         let num_slots = num_groups * GROUP_SIZE;
@@ -360,19 +381,29 @@ impl SwissTable {
     }
 
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     #[inline]
-    fn capacity(&self) -> usize { self.raw.num_slots() }
+    fn capacity(&self) -> usize {
+        self.raw.num_slots()
+    }
 
     #[inline]
-    fn growth_limit(&self) -> usize { self.capacity() * LOAD_FACTOR_N / LOAD_FACTOR_D }
+    fn growth_limit(&self) -> usize {
+        self.capacity() * LOAD_FACTOR_N / LOAD_FACTOR_D
+    }
 
     #[inline]
-    fn group_mask(&self) -> usize { self.raw.num_groups - 1 }
+    fn group_mask(&self) -> usize {
+        self.raw.num_groups - 1
+    }
 
     /// Hash key bytes using ahash.
     #[inline]
@@ -398,12 +429,12 @@ impl SwissTable {
             self.keys[slot] = Some(key);
             let previous = self.values[slot].replace(value);
 
-            let key_ptr = self.keys[slot]
-                .as_ref()
-                .expect("live slot must have key") as *const VortexKey;
+            let key_ptr =
+                self.keys[slot].as_ref().expect("live slot must have key") as *const VortexKey;
             let value_ptr = self.values[slot]
                 .as_ref()
-                .expect("live slot must have value") as *const VortexValue;
+                .expect("live slot must have value")
+                as *const VortexValue;
 
             let entry = unsafe { self.raw.entry_mut(slot) };
             // SAFETY: slot ownership remains stable until the next overwrite/resize,
@@ -420,9 +451,7 @@ impl SwissTable {
         self.keys[slot] = Some(key);
         self.values[slot] = Some(value);
 
-        let key_ptr = self.keys[slot]
-            .as_ref()
-            .expect("new slot must have key") as *const VortexKey;
+        let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
         let value_ptr = self.values[slot]
             .as_ref()
             .expect("new slot must have value") as *const VortexValue;
@@ -431,7 +460,9 @@ impl SwissTable {
         // SAFETY: slot ownership remains stable until the next overwrite/resize,
         // and resize rewrites every borrowed pointer into the new table.
         Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);
-        unsafe { self.raw.set_ctrl(slot, h2); }
+        unsafe {
+            self.raw.set_ctrl(slot, h2);
+        }
 
         self.len += 1;
         if was_empty {
@@ -465,7 +496,9 @@ impl SwissTable {
         // Tombstone the slot.
         let entry = unsafe { self.raw.entry_mut(slot) };
         entry.mark_deleted();
-        unsafe { self.raw.set_ctrl(slot, CTRL_DELETED); }
+        unsafe {
+            self.raw.set_ctrl(slot, CTRL_DELETED);
+        }
 
         self.len -= 1;
         // `occupied` stays the same — tombstone still blocks probe chains.
@@ -575,7 +608,8 @@ impl SwissTable {
                 .expect("rehash slot must have key") as *const VortexKey;
             let value_ptr = new_values[new_slot]
                 .as_ref()
-                .expect("rehash slot must have value") as *const VortexValue;
+                .expect("rehash slot must have value")
+                as *const VortexValue;
 
             let entry = unsafe { new_raw.entry_mut(new_slot) };
             // SAFETY: the new slot owns these key/value objects for the lifetime of
@@ -585,7 +619,9 @@ impl SwissTable {
         }
 
         // Free the old allocation + swap.
-        unsafe { self.raw.dealloc(); }
+        unsafe {
+            self.raw.dealloc();
+        }
         self.raw = new_raw;
         self.keys = new_keys;
         self.values = new_values;
@@ -615,7 +651,9 @@ impl SwissTable {
             return;
         }
 
-        if key_bytes.len() <= 23 && let Some(bytes) = inline_string {
+        if key_bytes.len() <= 23
+            && let Some(bytes) = inline_string
+        {
             entry.write_inline(h2, key_bytes, bytes, ttl);
             return;
         }
@@ -681,15 +719,21 @@ impl SwissTable {
             self.keys[slot] = Some(key);
             let previous = self.values[slot].replace(value);
 
-            let key_ptr = self.keys[slot]
-                .as_ref()
-                .expect("live slot must have key") as *const VortexKey;
+            let key_ptr =
+                self.keys[slot].as_ref().expect("live slot must have key") as *const VortexKey;
             let value_ptr = self.values[slot]
                 .as_ref()
-                .expect("live slot must have value") as *const VortexValue;
+                .expect("live slot must have value")
+                as *const VortexValue;
 
             let entry = unsafe { self.raw.entry_mut(slot) };
-            Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, ttl_deadline);
+            Self::write_entry(
+                entry,
+                h2,
+                unsafe { &*key_ptr },
+                unsafe { &*value_ptr },
+                ttl_deadline,
+            );
             unsafe { self.raw.set_ctrl(slot, h2) };
             return previous;
         }
@@ -701,16 +745,22 @@ impl SwissTable {
         self.keys[slot] = Some(key);
         self.values[slot] = Some(value);
 
-        let key_ptr = self.keys[slot]
-            .as_ref()
-            .expect("new slot must have key") as *const VortexKey;
+        let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
         let value_ptr = self.values[slot]
             .as_ref()
             .expect("new slot must have value") as *const VortexValue;
 
         let entry = unsafe { self.raw.entry_mut(slot) };
-        Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, ttl_deadline);
-        unsafe { self.raw.set_ctrl(slot, h2); }
+        Self::write_entry(
+            entry,
+            h2,
+            unsafe { &*key_ptr },
+            unsafe { &*value_ptr },
+            ttl_deadline,
+        );
+        unsafe {
+            self.raw.set_ctrl(slot, h2);
+        }
 
         self.len += 1;
         if was_empty {
@@ -855,21 +905,30 @@ impl SwissTable {
         // SAFETY: prefetch is a hint — never traps, always safe.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::x86_64::_mm_prefetch(ctrl_ptr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(
+                ctrl_ptr.cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T0,
+            );
         }
         #[cfg(not(target_arch = "x86_64"))]
-        { let _ = ctrl_ptr; }
+        {
+            let _ = ctrl_ptr;
+        }
     }
 }
 
 impl Default for SwissTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for SwissTable {
     fn drop(&mut self) {
         // SAFETY: We own the allocation and this is the final use.
-        unsafe { self.raw.dealloc(); }
+        unsafe {
+            self.raw.dealloc();
+        }
     }
 }
 

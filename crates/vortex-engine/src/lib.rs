@@ -14,6 +14,7 @@
 //! - [`Entry`] — 64-byte cache-line-aligned hash table entry (Phase 3.2)
 
 pub mod command;
+pub mod commands;
 pub mod entry;
 pub mod expiry;
 pub mod shard;
@@ -22,5 +23,5 @@ pub mod table;
 pub use command::{Command, CommandContext};
 pub use entry::{Entry, EntryValue};
 pub use expiry::{ExpiryEntry, ExpiryWheel};
-pub use shard::Shard;
+pub use shard::{SetResult, Shard};
 pub use table::SwissTable;

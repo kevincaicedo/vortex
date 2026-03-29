@@ -2,6 +2,29 @@ use bytes::Bytes;
 
 use crate::encoding::Encoding;
 
+/// Returns the number of characters in the decimal representation of an i64.
+#[inline]
+fn itoa_len(mut n: i64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut len = 0usize;
+    if n < 0 {
+        len += 1;
+        // Handle i64::MIN specially (abs overflows).
+        if n == i64::MIN {
+            return 20; // "-9223372036854775808"
+        }
+        n = -n;
+    }
+    let mut v = n as u64;
+    while v > 0 {
+        v /= 10;
+        len += 1;
+    }
+    len
+}
+
 /// Tagged enum representing all VortexDB value types.
 ///
 /// Small values (≤23 bytes) are stored inline to avoid heap allocation.
@@ -187,6 +210,77 @@ impl VortexValue {
             Self::Set(_) => Encoding::FlatArray,
             Self::SortedSet(_) => Encoding::SortedArray,
             Self::Stream(_) => Encoding::DeltaLog,
+        }
+    }
+
+    /// Returns `true` if this value is a string type (inline, heap, or integer-encoded).
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        matches!(
+            self,
+            Self::InlineString(_) | Self::String(_) | Self::Integer(_)
+        )
+    }
+
+    /// Returns the Redis-compatible type name for this value.
+    #[inline]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::InlineString(_) | Self::String(_) | Self::Integer(_) => "string",
+            Self::List(_) => "list",
+            Self::Hash(_) => "hash",
+            Self::Set(_) => "set",
+            Self::SortedSet(_) => "zset",
+            Self::Stream(_) => "stream",
+        }
+    }
+
+    /// Returns the byte representation of a string-typed value.
+    ///
+    /// - `InlineString` → inline bytes
+    /// - `String` → heap bytes
+    /// - `Integer` → `None` (use `try_as_integer` instead)
+    /// - Other types → `None`
+    #[inline]
+    pub fn as_string_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::InlineString(ib) => Some(ib.as_bytes()),
+            Self::String(b) => Some(b.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns the integer value if this is an `Integer` variant.
+    #[inline]
+    pub fn try_as_integer(&self) -> Option<i64> {
+        match self {
+            Self::Integer(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Returns the length of the string representation.
+    ///
+    /// For `InlineString`/`String`: byte length.
+    /// For `Integer`: length of the decimal representation.
+    /// For other types: 0.
+    #[inline]
+    pub fn strlen(&self) -> usize {
+        match self {
+            Self::InlineString(ib) => ib.len(),
+            Self::String(b) => b.len(),
+            Self::Integer(n) => itoa_len(*n),
+            _ => 0,
+        }
+    }
+
+    /// Creates a VortexValue from raw bytes, using inline storage when possible.
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() <= 23 {
+            Self::InlineString(InlineBytes::from_slice(bytes))
+        } else {
+            Self::String(Bytes::copy_from_slice(bytes))
         }
     }
 

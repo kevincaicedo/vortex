@@ -142,12 +142,7 @@ impl ExpiryWheel {
 
     // ── Internal tick helpers ───────────────────────────────────────
 
-    fn tick_seconds(
-        &mut self,
-        now_nanos: u64,
-        max_entries: usize,
-        expired: &mut Vec<ExpiryEntry>,
-    ) {
+    fn tick_seconds(&mut self, now_nanos: u64, max_entries: usize, expired: &mut Vec<ExpiryEntry>) {
         let now_sec = now_nanos / SECOND_RESOLUTION_NS;
         if now_sec <= self.last_tick_sec {
             return;
@@ -196,12 +191,7 @@ impl ExpiryWheel {
         self.last_tick_sec = now_sec;
     }
 
-    fn tick_millis(
-        &mut self,
-        now_nanos: u64,
-        max_entries: usize,
-        expired: &mut Vec<ExpiryEntry>,
-    ) {
+    fn tick_millis(&mut self, now_nanos: u64, max_entries: usize, expired: &mut Vec<ExpiryEntry>) {
         let now_ms = now_nanos / MILLIS_RESOLUTION_NS;
         if now_ms <= self.last_tick_ms {
             return;

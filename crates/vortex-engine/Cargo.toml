@@ -17,6 +17,9 @@ vortex-common = { workspace = true }
 vortex-proto = { workspace = true }
 vortex-memory = { workspace = true }
 ahash = { workspace = true }
+itoa = { workspace = true }
+ryu = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

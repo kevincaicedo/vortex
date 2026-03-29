@@ -44,6 +44,8 @@ pub trait Command: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use vortex_common::ShardId;
+
     use super::*;
 
     /// Smoke-test: a trivial PING command to verify the trait compiles.
@@ -77,7 +79,7 @@ mod tests {
 
     #[test]
     fn ping_no_args() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let mut ctx = CommandContext::new(&mut shard);
         let result = PingCmd.execute(&mut ctx, &[]).unwrap();
         assert!(matches!(result, RespFrame::SimpleString(ref s) if s.as_ref() == b"PONG"));
@@ -85,7 +87,7 @@ mod tests {
 
     #[test]
     fn ping_with_message() {
-        let mut shard = Shard::new(0);
+        let mut shard = Shard::new(ShardId::new(0));
         let mut ctx = CommandContext::new(&mut shard);
         let msg = RespFrame::bulk_string("hello");
         let result = PingCmd
