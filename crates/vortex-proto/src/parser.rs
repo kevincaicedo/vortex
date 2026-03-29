@@ -334,10 +334,14 @@ fn parse_bulk_string_frame(
         return Err(ParseError::FrameTooLarge);
     }
 
-    let data_end = data_start.checked_add(len).ok_or(ParseError::FrameTooLarge)?;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(ParseError::FrameTooLarge)?;
     validate_trailing_crlf(buf, positions, state, data_end)?;
     state.offset = data_end + 2;
-    Ok(RespFrame::BulkString(Some(backing.slice(data_start..data_end))))
+    Ok(RespFrame::BulkString(Some(
+        backing.slice(data_start..data_end),
+    )))
 }
 
 #[inline(always)]
@@ -426,7 +430,8 @@ fn parse_double_frame(
 ) -> ParseResult<RespFrame> {
     let start = state.offset;
     let line_end = consume_next_crlf(positions, state, start + 1)?;
-    let text = std::str::from_utf8(&buf[start + 1..line_end]).map_err(|_| ParseError::InvalidFrame)?;
+    let text =
+        std::str::from_utf8(&buf[start + 1..line_end]).map_err(|_| ParseError::InvalidFrame)?;
     let value = text.parse().map_err(|_| ParseError::InvalidFrame)?;
     state.offset = line_end + 2;
     Ok(RespFrame::Double(value))
@@ -471,7 +476,9 @@ fn parse_bulk_error_frame(
     }
 
     let data_start = line_end + 2;
-    let data_end = data_start.checked_add(len).ok_or(ParseError::FrameTooLarge)?;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(ParseError::FrameTooLarge)?;
     validate_trailing_crlf(buf, positions, state, data_end)?;
     state.offset = data_end + 2;
     Ok(RespFrame::BulkError(backing.slice(data_start..data_end)))
@@ -498,7 +505,9 @@ fn parse_verbatim_string_frame(
     }
 
     let data_start = line_end + 2;
-    let data_end = data_start.checked_add(len).ok_or(ParseError::FrameTooLarge)?;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(ParseError::FrameTooLarge)?;
     validate_trailing_crlf(buf, positions, state, data_end)?;
 
     if buf.get(data_start + 3) != Some(&b':') {
@@ -667,7 +676,9 @@ fn parse_inline_frame(
         while cursor < line_end && buf[cursor] != b' ' {
             cursor += 1;
         }
-        frames.push(RespFrame::BulkString(Some(backing.slice(part_start..cursor))));
+        frames.push(RespFrame::BulkString(Some(
+            backing.slice(part_start..cursor),
+        )));
     }
 
     if frames.is_empty() {
@@ -759,7 +770,10 @@ mod tests {
 
     #[test]
     fn parse_rejects_invalid_integer_line() {
-        assert_eq!(RespParser::parse(b":12a\r\n"), Err(ParseError::InvalidFrame));
+        assert_eq!(
+            RespParser::parse(b":12a\r\n"),
+            Err(ParseError::InvalidFrame)
+        );
     }
 
     #[test]
@@ -791,7 +805,10 @@ mod tests {
 
     #[test]
     fn parse_rejects_invalid_bulk_length() {
-        assert_eq!(RespParser::parse(b"$2a\r\nhi\r\n"), Err(ParseError::InvalidFrame));
+        assert_eq!(
+            RespParser::parse(b"$2a\r\nhi\r\n"),
+            Err(ParseError::InvalidFrame)
+        );
     }
 
     #[test]
@@ -847,7 +864,10 @@ mod tests {
     #[test]
     fn incomplete_data() {
         assert_eq!(RespParser::parse(b"+OK\r"), Err(ParseError::NeedMoreData));
-        assert_eq!(RespParser::parse(b"$5\r\nhel"), Err(ParseError::NeedMoreData));
+        assert_eq!(
+            RespParser::parse(b"$5\r\nhel"),
+            Err(ParseError::NeedMoreData)
+        );
         assert_eq!(RespParser::parse(b""), Err(ParseError::NeedMoreData));
     }
 
@@ -880,10 +900,13 @@ mod tests {
     #[cfg(feature = "resp3")]
     #[test]
     fn parse_resp3_big_number() {
-        let (frame, consumed) = RespParser::parse(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
+        let (frame, consumed) =
+            RespParser::parse(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
         assert_eq!(
             frame,
-            RespFrame::BigNumber(Bytes::from_static(b"3492890328409238509324850943850943825024385"))
+            RespFrame::BigNumber(Bytes::from_static(
+                b"3492890328409238509324850943850943825024385"
+            ))
         );
         assert_eq!(consumed, 46);
     }
@@ -892,7 +915,10 @@ mod tests {
     #[test]
     fn parse_resp3_bulk_error() {
         let (frame, _) = RespParser::parse(b"!11\r\nERR failure\r\n").unwrap();
-        assert_eq!(frame, RespFrame::BulkError(Bytes::from_static(b"ERR failure")));
+        assert_eq!(
+            frame,
+            RespFrame::BulkError(Bytes::from_static(b"ERR failure"))
+        );
     }
 
     #[cfg(feature = "resp3")]
@@ -1024,7 +1050,10 @@ mod tests {
         let (frames, consumed) = RespParser::parse_pipeline(&buf).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(consumed, 14);
-        assert_eq!(RespParser::parse(&buf[consumed..]), Err(ParseError::InvalidFrame));
+        assert_eq!(
+            RespParser::parse(&buf[consumed..]),
+            Err(ParseError::InvalidFrame)
+        );
     }
 
     #[test]
@@ -1036,7 +1065,10 @@ mod tests {
     #[test]
     fn parse_bulk_string_too_large() {
         let buf = format!("${}\r\n", MAX_BULK_STRING_LEN + 1);
-        assert_eq!(RespParser::parse(buf.as_bytes()), Err(ParseError::FrameTooLarge));
+        assert_eq!(
+            RespParser::parse(buf.as_bytes()),
+            Err(ParseError::FrameTooLarge)
+        );
     }
 
     #[test]

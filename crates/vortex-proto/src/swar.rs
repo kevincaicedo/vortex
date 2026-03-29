@@ -27,7 +27,9 @@ pub fn swar_parse_int(buf: &[u8]) -> Option<(i64, usize)> {
         if magnitude == I64_MIN_MAGNITUDE {
             Some((i64::MIN, consumed))
         } else {
-            i64::try_from(magnitude).ok().map(|value| (-value, consumed))
+            i64::try_from(magnitude)
+                .ok()
+                .map(|value| (-value, consumed))
         }
     } else {
         i64::try_from(magnitude).ok().map(|value| (value, consumed))
@@ -139,13 +141,16 @@ mod tests {
         }
 
         let text = std::str::from_utf8(&buf[..end]).ok()?;
-        text.parse::<i64>().ok().map(|value| (value, end)).or_else(|| {
-            if negative && text == "-9223372036854775808" {
-                Some((i64::MIN, end))
-            } else {
-                None
-            }
-        })
+        text.parse::<i64>()
+            .ok()
+            .map(|value| (value, end))
+            .or_else(|| {
+                if negative && text == "-9223372036854775808" {
+                    Some((i64::MIN, end))
+                } else {
+                    None
+                }
+            })
     }
 
     #[test]

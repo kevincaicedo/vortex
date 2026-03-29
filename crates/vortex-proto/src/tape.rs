@@ -16,7 +16,9 @@
 use bytes::Bytes;
 
 use crate::{
-    parser::{parse_short_int, ParseError, MAX_ARRAY_ELEMENTS, MAX_BULK_STRING_LEN, MAX_NESTING_DEPTH},
+    parser::{
+        MAX_ARRAY_ELEMENTS, MAX_BULK_STRING_LEN, MAX_NESTING_DEPTH, ParseError, parse_short_int,
+    },
     swar::swar_parse_int,
 };
 
@@ -762,7 +764,11 @@ fn tape_parse_verbatim_string(
     let mut encoding = [0u8; 3];
     encoding.copy_from_slice(&buf[data_start..data_start + 3]);
     *offset = data_end + 2;
-    let mut entry = TapeEntry::new(TAG_VERBATIM_STRING, (data_start + 4) as u32, data_end as u32);
+    let mut entry = TapeEntry::new(
+        TAG_VERBATIM_STRING,
+        (data_start + 4) as u32,
+        data_end as u32,
+    );
     entry.extra = encoding;
     entries.push(entry);
     Ok(())
@@ -948,8 +954,8 @@ fn tape_parse_inline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::RespFrame;
     use crate::RespParser;
+    use crate::frame::RespFrame;
 
     #[test]
     fn simple_string() {
@@ -971,10 +977,7 @@ mod tests {
         assert_eq!(tape.frame_count(), 1);
         let e = &tape.entries()[0];
         assert_eq!(e.tag, TAG_ERROR);
-        assert_eq!(
-            &tape.backing()[e.a as usize..e.b as usize],
-            b"ERR bad"
-        );
+        assert_eq!(&tape.backing()[e.a as usize..e.b as usize], b"ERR bad");
     }
 
     #[test]
@@ -1006,10 +1009,7 @@ mod tests {
         assert_eq!(tape.frame_count(), 1);
         let e = &tape.entries()[0];
         assert_eq!(e.tag, TAG_BULK_STRING);
-        assert_eq!(
-            &tape.backing()[e.a as usize..e.b as usize],
-            b"hello"
-        );
+        assert_eq!(&tape.backing()[e.a as usize..e.b as usize], b"hello");
     }
 
     #[test]
@@ -1318,9 +1318,7 @@ mod tests {
         for i in 0..1000 {
             let key = format!("key:{i}");
             let val = format!("val:{i}");
-            buf.extend_from_slice(
-                format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key.as_bytes());
             buf.extend_from_slice(b"\r\n");
             buf.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());

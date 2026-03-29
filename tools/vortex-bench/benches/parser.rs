@@ -92,7 +92,21 @@ fn bench_swar_integer_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("swar_integer_parse");
 
     let cases = [
-        ("1digit", &[b"0".as_slice(), b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9"][..]),
+        (
+            "1digit",
+            &[
+                b"0".as_slice(),
+                b"1",
+                b"2",
+                b"3",
+                b"4",
+                b"5",
+                b"6",
+                b"7",
+                b"8",
+                b"9",
+            ][..],
+        ),
         (
             "3digit",
             &[
@@ -226,7 +240,8 @@ fn bench_resp_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(pipeline_10.len() as u64));
     group.bench_function("pipeline_10", |b| {
         b.iter(|| {
-            let (frames, consumed) = RespParser::parse_pipeline(black_box(pipeline_10.as_slice())).unwrap();
+            let (frames, consumed) =
+                RespParser::parse_pipeline(black_box(pipeline_10.as_slice())).unwrap();
             black_box((frames.len(), consumed));
         });
     });
@@ -235,7 +250,8 @@ fn bench_resp_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(pipeline_100.len() as u64));
     group.bench_function("pipeline_100", |b| {
         b.iter(|| {
-            let (frames, consumed) = RespParser::parse_pipeline(black_box(pipeline_100.as_slice())).unwrap();
+            let (frames, consumed) =
+                RespParser::parse_pipeline(black_box(pipeline_100.as_slice())).unwrap();
             black_box((frames.len(), consumed));
         });
     });
@@ -244,7 +260,8 @@ fn bench_resp_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(pipeline_1000.len() as u64));
     group.bench_function("pipeline_1000", |b| {
         b.iter(|| {
-            let (frames, consumed) = RespParser::parse_pipeline(black_box(pipeline_1000.as_slice())).unwrap();
+            let (frames, consumed) =
+                RespParser::parse_pipeline(black_box(pipeline_1000.as_slice())).unwrap();
             black_box((frames.len(), consumed));
         });
     });
@@ -286,7 +303,8 @@ fn bench_resp_parse(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(mixed.len() as u64));
     group.bench_function("mixed_frame_types", |b| {
         b.iter(|| {
-            let (frames, consumed) = RespParser::parse_pipeline(black_box(mixed.as_slice())).unwrap();
+            let (frames, consumed) =
+                RespParser::parse_pipeline(black_box(mixed.as_slice())).unwrap();
             black_box((frames.len(), consumed));
         });
     });
@@ -645,6 +663,99 @@ fn bench_resp_serialize_iovecs(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Command Dispatch Benchmarks ─────────────────────────────────────────────
+
+fn bench_command_dispatch(c: &mut Criterion) {
+    use vortex_proto::{CommandRouter, uppercase_inplace};
+
+    let mut group = c.benchmark_group("command_dispatch");
+
+    // ── SWAR uppercase (4 bytes — PING) ────
+    group.bench_function("swar_upper_4b", |b| {
+        let mut buf = *b"ping";
+        b.iter(|| {
+            buf.copy_from_slice(b"ping");
+            uppercase_inplace(black_box(&mut buf));
+            black_box(&buf);
+        });
+    });
+
+    // ── SWAR uppercase (11 bytes — INCRBYFLOAT crosses 8-byte boundary) ────
+    group.bench_function("swar_upper_11b", |b| {
+        let mut buf = *b"incrbyfloat";
+        b.iter(|| {
+            buf.copy_from_slice(b"incrbyfloat");
+            uppercase_inplace(black_box(&mut buf));
+            black_box(&buf);
+        });
+    });
+
+    // ── PHF lookup only (no tape overhead) ────
+    group.bench_function("phf_lookup_ping", |b| {
+        b.iter(|| {
+            black_box(vortex_proto::command::lookup_command(black_box("PING")));
+        });
+    });
+
+    // ── PHF lookup + uppercase (core dispatch, no tape) ────
+    group.bench_function("upper_and_lookup_set", |b| {
+        let mut scratch = [0u8; 8];
+        let cmd = b"set";
+        b.iter(|| {
+            scratch[..cmd.len()].copy_from_slice(cmd);
+            uppercase_inplace(&mut scratch[..cmd.len()]);
+            let name = unsafe { std::str::from_utf8_unchecked(&scratch[..cmd.len()]) };
+            black_box(vortex_proto::command::lookup_command(black_box(name)));
+        });
+    });
+
+    // ── Full dispatch: PING (1 arg, arity -1) ────
+    let ping_wire = b"*1\r\n$4\r\nPING\r\n";
+    let ping_tape = RespTape::parse_pipeline(ping_wire).unwrap();
+    let ping_frame = ping_tape.iter().next().unwrap();
+    group.bench_function("dispatch_ping", |b| {
+        let mut router = CommandRouter::new();
+        b.iter(|| {
+            black_box(router.dispatch(black_box(&ping_frame)));
+        });
+    });
+
+    // ── Full dispatch: SET foo bar (3 args, arity -3) ────
+    let set_wire = b"*3\r\n$3\r\nset\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    let set_tape = RespTape::parse_pipeline(set_wire).unwrap();
+    let set_frame = set_tape.iter().next().unwrap();
+    group.bench_function("dispatch_set", |b| {
+        let mut router = CommandRouter::new();
+        b.iter(|| {
+            black_box(router.dispatch(black_box(&set_frame)));
+        });
+    });
+
+    // ── Full dispatch: HSET (long command name, 4 args) ────
+    let hset_wire = b"*4\r\n$4\r\nhset\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+    let hset_tape = RespTape::parse_pipeline(hset_wire).unwrap();
+    let hset_frame = hset_tape.iter().next().unwrap();
+    group.bench_function("dispatch_hset", |b| {
+        let mut router = CommandRouter::new();
+        b.iter(|| {
+            black_box(router.dispatch(black_box(&hset_frame)));
+        });
+    });
+
+    // ── Full dispatch: unknown command ────
+    let unk_wire = b"*1\r\n$6\r\nFOOBAR\r\n";
+    let unk_tape = RespTape::parse_pipeline(unk_wire).unwrap();
+    let unk_frame = unk_tape.iter().next().unwrap();
+    group.bench_function("dispatch_unknown", |b| {
+        let mut router = CommandRouter::new();
+        b.iter(|| {
+            black_box(router.dispatch(black_box(&unk_frame)));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_crlf_scan,
@@ -652,6 +763,7 @@ criterion_group!(
     bench_resp_parse,
     bench_tape_parse,
     bench_resp_serialize,
-    bench_resp_serialize_iovecs
+    bench_resp_serialize_iovecs,
+    bench_command_dispatch
 );
 criterion_main!(benches);

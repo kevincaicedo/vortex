@@ -33,20 +33,14 @@ pub struct IovecWriter {
 /// Small-vector for iovec segment descriptors.
 #[allow(clippy::large_enum_variant)] // Intentional: inline avoids heap allocation on hot path
 enum IovecSegments {
-    Inline {
-        buf: [Segment; INLINE_CAP],
-        len: u8,
-    },
+    Inline { buf: [Segment; INLINE_CAP], len: u8 },
     Heap(Vec<Segment>),
 }
 
 /// Inline + overflow scratch buffer.
 #[allow(clippy::large_enum_variant)] // Intentional: inline avoids heap allocation on hot path
 enum ScratchBuf {
-    Inline {
-        buf: [u8; SCRATCH_CAP],
-        len: u16,
-    },
+    Inline { buf: [u8; SCRATCH_CAP], len: u16 },
     Heap(Vec<u8>),
 }
 

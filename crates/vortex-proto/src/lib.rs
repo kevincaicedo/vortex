@@ -36,15 +36,17 @@ pub mod serializer;
 pub mod swar;
 pub mod tape;
 
-pub use command::{CommandFlags, CommandMeta};
+pub use command::{
+    CommandFlags, CommandMeta, CommandRouter, DispatchResult, KeyRange, uppercase_inplace,
+};
 pub use frame::RespFrame;
 pub use iovec::IovecWriter;
 pub use parser::{NeedMoreData, ParseError, RespParser};
 pub use scanner::{CrlfPositions, scan_crlf};
 pub use serializer::RespSerializer;
 pub use serializer::{
-    RESP_ERR_BUSY, RESP_ERR_LOADING, RESP_ERR_NOPERM, RESP_ERR_SYNTAX, RESP_ERR_WRONGTYPE,
-    RESP_ERR_WRONG_ARGC,
+    RESP_ERR_BUSY, RESP_ERR_LOADING, RESP_ERR_NOPERM, RESP_ERR_SYNTAX, RESP_ERR_WRONG_ARGC,
+    RESP_ERR_WRONGTYPE,
 };
 pub use swar::swar_parse_int;
 pub use tape::{FrameRef, RespTape, TapeEntry};

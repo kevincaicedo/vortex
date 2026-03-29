@@ -1,12 +1,11 @@
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 use core::arch::x86_64::{
-    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
-    _mm_set1_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    _mm256_set1_epi8,
+    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
 };
 
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", test)))]
-use std::simd::{cmp::SimdPartialEq, Simd};
+use std::simd::{Simd, cmp::SimdPartialEq};
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 use std::sync::{
     Once,
@@ -219,7 +218,10 @@ pub fn scan_crlf(buf: &[u8]) -> CrlfPositions {
 
     #[cfg(any(
         not(feature = "simd"),
-        all(feature = "simd", not(any(target_arch = "x86_64", target_arch = "aarch64")))
+        all(
+            feature = "simd",
+            not(any(target_arch = "x86_64", target_arch = "aarch64"))
+        )
     ))]
     {
         scalar_scan_crlf(buf)
@@ -375,12 +377,7 @@ fn process_cr_mask(
 
 #[cfg(feature = "simd")]
 #[inline(always)]
-fn scan_tail(
-    buf: &[u8],
-    start: usize,
-    positions: &mut CrlfPositions,
-    pending_cr: &mut usize,
-) {
+fn scan_tail(buf: &[u8], start: usize, positions: &mut CrlfPositions, pending_cr: &mut usize) {
     resolve_pending_cr(buf, start, positions, pending_cr);
 
     let last = buf.len().saturating_sub(1);

@@ -15,7 +15,10 @@ use crate::pool::{CrossChannel, CrossMessage};
 use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
 use vortex_memory::{ArenaAllocator, BufferPool};
-use vortex_proto::{FrameRef, IovecWriter, ParseError, RespFrame, RespSerializer, RespTape};
+use vortex_proto::{
+    CommandRouter, DispatchResult, FrameRef, IovecWriter, ParseError, RespFrame, RespSerializer,
+    RespTape,
+};
 
 /// Default read buffer size per connection (16 KB).
 const DEFAULT_BUF_SIZE: usize = 16_384;
@@ -119,6 +122,8 @@ pub struct Reactor {
     arena: ArenaAllocator,
     /// Reusable scatter-gather writer for iovec responses.
     iovec_writer: IovecWriter,
+    /// Command dispatch router with PHF lookup.
+    command_router: CommandRouter,
 }
 
 impl Reactor {
@@ -176,6 +181,7 @@ impl Reactor {
             cross_rx: Vec::new(),
             arena: ArenaAllocator::new(vortex_memory::arena::DEFAULT_ARENA_CAPACITY),
             iovec_writer: IovecWriter::new(),
+            command_router: CommandRouter::new(),
         })
     }
 
@@ -542,7 +548,7 @@ impl Reactor {
                 Ok(tape) => {
                     let batch_end = offset + tape.consumed();
                     for frame in tape.iter() {
-                        let response = Self::dispatch_tape_command(&frame);
+                        let response = self.dispatch_command(&frame);
                         match response {
                             CommandResponse::Static(buf) => {
                                 if scatter_gather {
@@ -582,8 +588,7 @@ impl Reactor {
                                         // valid for the connection lifetime. The pointer
                                         // stored by push_bytes is consumed before the
                                         // buffer is released or reused.
-                                        self.iovec_writer
-                                            .push_bytes(&write_buf[..write_cursor]);
+                                        self.iovec_writer.push_bytes(&write_buf[..write_cursor]);
                                     }
                                 }
                                 RespSerializer::serialize_to_iovecs(
@@ -663,12 +668,9 @@ impl Reactor {
                 // iovecs must remain valid until the CQE is reaped — a pinned
                 // iovec buffer on the Reactor would be needed for production
                 // io_uring scatter-gather.
-                let _ = self.backend.submit_writev(
-                    fd,
-                    iovecs.as_ptr(),
-                    iovecs.len(),
-                    token,
-                );
+                let _ = self
+                    .backend
+                    .submit_writev(fd, iovecs.as_ptr(), iovecs.len(), token);
             } else if close_after_write {
                 self.close_connection(conn_id);
             } else {
@@ -699,18 +701,50 @@ impl Reactor {
         }
     }
 
-    /// Dispatch a parsed tape frame to a command handler.
-    /// Phase 1 only handles PING/QUIT.
-    /// TODO(Phase 2): Route commands to the vortex-engine shard via command dispatch table.
-    fn dispatch_tape_command(frame: &FrameRef<'_>) -> CommandResponse {
-        match frame.command_name() {
-            Some(name) if name.eq_ignore_ascii_case(b"PING") => {
-                CommandResponse::Static(RESP_PONG)
+    /// Dispatch a parsed tape frame via PHF command router.
+    ///
+    /// Uses O(1) perfect-hash lookup with SWAR uppercase normalization.
+    /// Handles connection-level commands (PING, QUIT, ECHO, COMMAND, INFO)
+    /// directly; all other resolved commands return an unimplemented stub.
+    fn dispatch_command(&mut self, frame: &FrameRef<'_>) -> CommandResponse {
+        static RESP_ERR_WRONG_ARGC_PREFIX: &[u8] =
+            b"-ERR wrong number of arguments for command\r\n";
+
+        match self.command_router.dispatch(frame) {
+            DispatchResult::Dispatch { meta, .. } => match meta.name {
+                "PING" => CommandResponse::Static(RESP_PONG),
+                "QUIT" => CommandResponse::Static(b"+OK\r\n"),
+                "ECHO" => {
+                    // ECHO message — return the message as a bulk string.
+                    if let Some(mut children) = frame.children() {
+                        children.next(); // skip command name
+                        if let Some(arg) = children.next() {
+                            if let Some(bytes) = arg.as_bytes() {
+                                return CommandResponse::Frame(RespFrame::bulk_string(
+                                    bytes::Bytes::copy_from_slice(bytes),
+                                ));
+                            }
+                        }
+                    }
+                    CommandResponse::Static(b"$-1\r\n")
+                }
+                "COMMAND" => {
+                    // Minimal COMMAND stub — return empty array.
+                    CommandResponse::Static(b"*0\r\n")
+                }
+                "INFO" => {
+                    // Minimal INFO stub.
+                    CommandResponse::Static(b"$11\r\n# VortexDB\r\n")
+                }
+                _ => {
+                    // Command recognized but not yet implemented.
+                    CommandResponse::Static(b"-ERR command not yet implemented\r\n")
+                }
+            },
+            DispatchResult::WrongArity { .. } => {
+                CommandResponse::Static(RESP_ERR_WRONG_ARGC_PREFIX)
             }
-            Some(name) if name.eq_ignore_ascii_case(b"QUIT") => {
-                CommandResponse::Static(b"+OK\r\n")
-            }
-            _ => CommandResponse::Static(RESP_ERR_UNKNOWN),
+            DispatchResult::UnknownCommand => CommandResponse::Static(RESP_ERR_UNKNOWN),
         }
     }
 
@@ -988,11 +1022,22 @@ impl Reactor {
 mod tests {
     use super::*;
 
-    /// Helper: parse a single RESP wire command and dispatch it.
+    /// Helper: parse a single RESP wire command and dispatch via CommandRouter.
     fn dispatch_wire(wire: &[u8]) -> CommandResponse {
         let tape = RespTape::parse_pipeline(wire).expect("valid RESP");
         let frame = tape.iter().next().expect("at least one frame");
-        Reactor::dispatch_tape_command(&frame)
+        let mut router = CommandRouter::new();
+        match router.dispatch(&frame) {
+            DispatchResult::Dispatch { meta, .. } => match meta.name {
+                "PING" => CommandResponse::Static(RESP_PONG),
+                "QUIT" => CommandResponse::Static(b"+OK\r\n"),
+                _ => CommandResponse::Static(b"-ERR command not yet implemented\r\n"),
+            },
+            DispatchResult::WrongArity { .. } => {
+                CommandResponse::Static(b"-ERR wrong number of arguments for command\r\n")
+            }
+            DispatchResult::UnknownCommand => CommandResponse::Static(RESP_ERR_UNKNOWN),
+        }
     }
 
     #[test]
@@ -1003,8 +1048,18 @@ mod tests {
 
     #[test]
     fn dispatch_unknown() {
-        let resp = dispatch_wire(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+        // FOOBAR is truly unknown
+        let resp = dispatch_wire(b"*1\r\n$6\r\nFOOBAR\r\n");
         assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_ERR_UNKNOWN));
+    }
+
+    #[test]
+    fn dispatch_set_recognized() {
+        // SET key value → recognized but not yet implemented
+        let resp = dispatch_wire(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+        assert!(
+            matches!(resp, CommandResponse::Static(b) if b == b"-ERR command not yet implemented\r\n")
+        );
     }
 
     #[test]
@@ -1018,5 +1073,12 @@ mod tests {
         // |1\r\n+meta\r\n+value\r\n*1\r\n$4\r\nPING\r\n
         let resp = dispatch_wire(b"|1\r\n+meta\r\n+value\r\n*1\r\n$4\r\nPING\r\n");
         assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_PONG));
+    }
+
+    #[test]
+    fn dispatch_wrong_arity() {
+        // GET with no key (only 1 element, arity=2)
+        let resp = dispatch_wire(b"*1\r\n$3\r\nGET\r\n");
+        assert!(matches!(resp, CommandResponse::Static(b) if b.starts_with(b"-ERR wrong number")));
     }
 }

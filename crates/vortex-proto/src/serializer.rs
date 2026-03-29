@@ -99,6 +99,7 @@ pub struct RespSerializer;
 
 impl RespSerializer {
     /// Serializes a `RespFrame` into the provided `BytesMut` buffer.
+    /// @DEPRECATED: this is the old API used by the command router; prefer `serialize_to_slice` for new code.
     pub fn serialize(frame: &RespFrame, buf: &mut BytesMut) {
         match frame {
             RespFrame::SimpleString(s) => {
@@ -353,8 +354,7 @@ impl RespSerializer {
             #[cfg(feature = "resp3")]
             RespFrame::BulkError(e) => {
                 push_byte!(b'!');
-                let written =
-                    write_integer_digits_to_slice(e.len() as i64, &mut buf[cursor..])?;
+                let written = write_integer_digits_to_slice(e.len() as i64, &mut buf[cursor..])?;
                 cursor += written;
                 push!(b"\r\n");
                 push!(e.as_ref());
@@ -364,8 +364,7 @@ impl RespSerializer {
             RespFrame::VerbatimString { encoding, data } => {
                 let total = 3 + 1 + data.len();
                 push_byte!(b'=');
-                let written =
-                    write_integer_digits_to_slice(total as i64, &mut buf[cursor..])?;
+                let written = write_integer_digits_to_slice(total as i64, &mut buf[cursor..])?;
                 cursor += written;
                 push!(b"\r\n");
                 push!(encoding.as_ref());
@@ -423,8 +422,7 @@ impl RespSerializer {
                 cursor += written;
                 push!(b"\r\n");
                 push_byte!(b'$');
-                let written =
-                    write_integer_digits_to_slice(kind.len() as i64, &mut buf[cursor..])?;
+                let written = write_integer_digits_to_slice(kind.len() as i64, &mut buf[cursor..])?;
                 cursor += written;
                 push!(b"\r\n");
                 push!(kind.as_ref());
@@ -808,9 +806,15 @@ mod tests {
     #[test]
     fn serialize_integer_lut_boundary() {
         // Test LUT boundaries: 9, 10, 99, 100, 999, 1000, 9999, 10000
-        for n in [9i64, 10, 99, 100, 999, 1000, 9999, 10_000, -9, -99, -9999, -10_000] {
+        for n in [
+            9i64, 10, 99, 100, 999, 1000, 9999, 10_000, -9, -99, -9999, -10_000,
+        ] {
             let expected = format!(":{n}\r\n");
-            assert_eq!(serialize(&RespFrame::Integer(n)), expected.as_bytes(), "n={n}");
+            assert_eq!(
+                serialize(&RespFrame::Integer(n)),
+                expected.as_bytes(),
+                "n={n}"
+            );
             assert_eq!(
                 serialize_slice(&RespFrame::Integer(n)),
                 expected.as_bytes(),
