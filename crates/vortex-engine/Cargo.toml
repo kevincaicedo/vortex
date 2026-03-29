@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "VortexDB core data engine — Swiss Table, shard, commands, data structures"
 
+[features]
+default = ["simd"]
+simd = []
+
+[lints.rust]
+unsafe_code = "allow"
+
 [dependencies]
 vortex-common = { workspace = true }
 vortex-proto = { workspace = true }
