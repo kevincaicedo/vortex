@@ -161,11 +161,18 @@ impl Shard {
         }
     }
 
-    /// Prefetch the control byte group for a key (for MGET/MSET batching).
+    /// Prefetch the control byte group for a key (for MGET batching — read path).
     #[inline]
     pub fn prefetch(&self, key: &VortexKey) {
         let hash = self.data.hash_key_bytes(key.as_bytes());
         self.data.prefetch_group(hash);
+    }
+
+    /// Prefetch with write intent (for DEL/MSET batching — write path).
+    #[inline]
+    pub fn prefetch_write(&self, key: &VortexKey) {
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.data.prefetch_group_write(hash);
     }
 
     // ── TTL operations ──────────────────────────────────────────────
@@ -248,10 +255,136 @@ impl Shard {
         Ok(self.data.len())
     }
 
+    /// Returns the number of keys that have a TTL set.
+    pub fn expires_count(&self) -> usize {
+        self.expiry.len()
+    }
+
     /// FLUSHDB: removes all keys from this shard.
     pub fn flush(&mut self) {
         self.data = SwissTable::new();
         self.expiry = ExpiryWheel::new();
+    }
+
+    // ── Key management ──────────────────────────────────────────────
+
+    /// TYPE: returns the Redis-compatible type name, or `None` if key missing.
+    pub fn type_of(&mut self, key: &VortexKey, now_nanos: u64) -> Option<&'static str> {
+        let val = self.data.get_or_expire(key, now_nanos)?;
+        Some(val.type_name())
+    }
+
+    /// RENAME: rename `old` to `new`, preserving value + TTL.
+    /// Returns `Err(msg)` if `old` doesn't exist.
+    pub fn rename(
+        &mut self,
+        old_key: &VortexKey,
+        new_key: VortexKey,
+        now_nanos: u64,
+    ) -> Result<(), &'static [u8]> {
+        // Lazy-expire old key first.
+        if !self.data.contains_key_or_expire(old_key, now_nanos) {
+            return Err(b"-ERR no such key\r\n");
+        }
+        // Same key — no-op.
+        if old_key == &new_key {
+            return Ok(());
+        }
+        let (value, ttl) = self
+            .data
+            .remove_with_ttl(old_key)
+            .expect("key existed after check");
+        // Remove destination if it exists (RENAME overwrites).
+        self.data.remove(&new_key);
+        if ttl != 0 && ttl > now_nanos {
+            let hash = self.data.hash_key_bytes(new_key.as_bytes());
+            self.data.insert_with_ttl(new_key, value, ttl);
+            self.expiry.register(hash, ttl);
+        } else {
+            self.data.insert(new_key, value);
+        }
+        Ok(())
+    }
+
+    /// COPY: copy value (+ TTL) from `src` to `dst`.
+    /// Returns `true` on success, `false` if source doesn't exist
+    /// or destination exists and `replace` is false.
+    pub fn copy_key(
+        &mut self,
+        src: &VortexKey,
+        dst: VortexKey,
+        replace: bool,
+        now_nanos: u64,
+    ) -> bool {
+        // Lazy-expire source.
+        if !self.data.contains_key_or_expire(src, now_nanos) {
+            return false;
+        }
+        // Check destination.
+        if !replace && self.data.contains_key_or_expire(&dst, now_nanos) {
+            return false;
+        }
+        let (val, ttl) = self
+            .data
+            .get_with_ttl(src)
+            .expect("key existed after check");
+        let val_clone = val.clone();
+        if ttl != 0 && ttl > now_nanos {
+            let hash = self.data.hash_key_bytes(dst.as_bytes());
+            self.data.insert_with_ttl(dst, val_clone, ttl);
+            self.expiry.register(hash, ttl);
+        } else {
+            self.data.insert(dst, val_clone);
+        }
+        true
+    }
+
+    /// Total number of slots in the Swiss Table (for cursor math).
+    #[inline]
+    pub fn total_slots(&self) -> usize {
+        self.data.total_slots()
+    }
+
+    /// Returns key+value at a raw slot index, or `None` if empty/deleted.
+    #[inline]
+    pub fn slot_key_value(&self, slot: usize) -> Option<(&VortexKey, &VortexValue)> {
+        self.data.slot_key_value(slot)
+    }
+
+    /// Returns the TTL deadline (nanos) for the entry at a raw slot.
+    #[inline]
+    pub fn slot_entry_ttl(&self, slot: usize) -> u64 {
+        self.data.slot_entry_ttl(slot)
+    }
+
+    /// RANDOMKEY: pick a random occupied slot.
+    ///
+    /// Uses xorshift64 starting from a seed. Succeeds quickly at 87.5%
+    /// load factor. Returns `None` only if the table is empty.
+    pub fn random_key(&self, seed: u64) -> Option<VortexKey> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let total = self.data.total_slots();
+        let mask = total - 1; // power of two
+        let mut rng = if seed == 0 {
+            0xDEAD_BEEF_CAFE_BABEu64
+        } else {
+            seed
+        };
+        // xorshift64
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let mut slot = (rng as usize) & mask;
+        // Linear scan forward until we find an occupied slot.
+        for _ in 0..total {
+            if let Some((key, _)) = self.data.slot_key_value(slot) {
+                return Some(key.clone());
+            }
+            slot = (slot + 1) & mask;
+        }
+        None
     }
 }
 

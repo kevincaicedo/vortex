@@ -13,6 +13,7 @@ polling-fallback = []
 
 [dependencies]
 vortex-common = { workspace = true }
+vortex-engine = { workspace = true }
 vortex-memory = { workspace = true }
 vortex-sync = { workspace = true }
 vortex-proto = { workspace = true }

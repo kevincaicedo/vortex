@@ -492,6 +492,450 @@ fn bench_throughput_get_set_mix(c: &mut Criterion) {
     });
 }
 
+// ── Task 3.5 — Key Management Benchmarks ────────────────────────────
+
+fn bench_cmd_del_inline(c: &mut Criterion) {
+    let cmd = make_resp(&[b"DEL", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_del_inline", |b| {
+        let mut shard = Shard::new(ShardId::new(0));
+        let key = VortexKey::from(b"mykey" as &[u8]);
+
+        b.iter(|| {
+            // Re-insert so DEL always finds the key.
+            shard.set(key.clone(), VortexValue::from_bytes(b"val"));
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"DEL", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_exists(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    shard.set(key, VortexValue::from_bytes(b"val"));
+
+    let cmd = make_resp(&[b"EXISTS", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_exists", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_expire(c: &mut Criterion) {
+    let mut shard = Shard::new_with_time(ShardId::new(0), 1_000_000_000_000);
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    shard.set(key, VortexValue::from_bytes(b"val"));
+
+    let cmd = make_resp(&[b"EXPIRE", b"mykey", b"3600"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_expire", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"EXPIRE", &frame, 1_000_000_000_000);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_ttl(c: &mut Criterion) {
+    let now: u64 = 1_000_000_000_000;
+    let mut shard = Shard::new_with_time(ShardId::new(0), now);
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    shard.set(key.clone(), VortexValue::from_bytes(b"val"));
+    shard.expire(&key, now + 3600 * 1_000_000_000);
+
+    let cmd = make_resp(&[b"TTL", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_ttl", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"TTL", &frame, now);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_type(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    shard.set(key, VortexValue::from_bytes(b"val"));
+
+    let cmd = make_resp(&[b"TYPE", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_type", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"TYPE", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_scan_10k(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..10_000 {
+        let key = VortexKey::from(format!("key:{i:06}").as_str());
+        shard.set(key, VortexValue::Integer(i));
+    }
+
+    c.bench_function("cmd_scan_10k", |b| {
+        b.iter(|| {
+            let mut cursor: u64 = 0;
+            let mut total = 0usize;
+            loop {
+                let cur_str = cursor.to_string();
+                let cmd = make_resp(&[b"SCAN", cur_str.as_bytes(), b"COUNT", b"100"]);
+                let tape = RespTape::parse_pipeline(&cmd).unwrap();
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mut shard), b"SCAN", &frame, 0);
+                // Extract next cursor from response.
+                if let Some(vortex_engine::commands::CmdResult::Resp(
+                    vortex_proto::RespFrame::Array(Some(ref arr)),
+                )) = r
+                {
+                    if let vortex_proto::RespFrame::BulkString(Some(c)) = &arr[0] {
+                        cursor = std::str::from_utf8(c).unwrap().parse().unwrap();
+                    }
+                    if let vortex_proto::RespFrame::Array(Some(keys)) = &arr[1] {
+                        total += keys.len();
+                    }
+                }
+                if cursor == 0 {
+                    break;
+                }
+            }
+            black_box(total);
+        });
+    });
+}
+
+fn bench_cmd_keys_star_10k(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..10_000 {
+        let key = VortexKey::from(format!("key:{i:06}").as_str());
+        shard.set(key, VortexValue::Integer(i));
+    }
+
+    let cmd = make_resp(&[b"KEYS", b"*"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_keys_star_10k", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"KEYS", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+// ── 3.6 — Server & Connection Command Benchmarks ────────────────────────
+
+// ── Task 3.9 — Prefetch Pipeline Benchmarks ─────────────────────────
+
+/// Helper: build a shard with N keys of format "key:{i:08}".
+fn prefill_shard(n: usize) -> Shard {
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..n {
+        let key = VortexKey::from(format!("key:{i:08}").as_bytes());
+        shard.set(key, VortexValue::Integer(i as i64));
+    }
+    shard
+}
+
+/// MGET 100 keys from a 1M-entry shard (uses software prefetch pipeline).
+fn bench_mget_100_1m_prefetch(c: &mut Criterion) {
+    let mut shard = prefill_shard(1_000_000);
+
+    // Build MGET command with 100 keys scattered across the keyspace.
+    let mut parts: Vec<Vec<u8>> = vec![b"MGET".to_vec()];
+    for i in 0..100 {
+        parts.push(format!("key:{:08}", i * 10_000).into_bytes());
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("mget_100_1m_prefetch", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"MGET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+/// Batch lookup of 100 keys from 1M-entry table without prefetch pipeline.
+/// Same work as MGET-with-prefetch but deliberately skips prefetch calls.
+fn bench_mget_100_1m_no_prefetch(c: &mut Criterion) {
+    let table = prefill_table(1_000_000);
+
+    // Pre-build the 100 scattered keys.
+    let keys: Vec<VortexKey> = (0..100)
+        .map(|i| VortexKey::from(format!("key:{:08}", i * 10_000).as_bytes()))
+        .collect();
+
+    c.bench_function("mget_100_1m_no_prefetch", |b| {
+        b.iter(|| {
+            let mut count = 0u64;
+            for key in &keys {
+                if table.get(key).is_some() {
+                    count += 1;
+                }
+            }
+            black_box(count);
+        });
+    });
+}
+
+/// Batch lookup with prefetch: hash all 100 keys first, prefetch groups,
+/// then execute lookups. Uses rotating key sets to defeat cache warming.
+fn bench_table_batch_100_1m_prefetch(c: &mut Criterion) {
+    let table = prefill_table(1_000_000);
+
+    // Build 100 sets of 100 keys each (rotated per iteration).
+    let key_sets: Vec<Vec<VortexKey>> = (0..100)
+        .map(|set| {
+            (0..100)
+                .map(|i| {
+                    let idx = (set * 100 + i * 9_973) % 1_000_000; // prime stride
+                    VortexKey::from(format!("key:{idx:08}").as_bytes())
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut set_idx = 0usize;
+    c.bench_function("table_batch_100_1m_prefetch", |b| {
+        b.iter(|| {
+            let keys = &key_sets[set_idx % key_sets.len()];
+            set_idx += 1;
+
+            // Phase 1: Hash all keys and prefetch.
+            let hashes: Vec<u64> = keys
+                .iter()
+                .map(|k| {
+                    let h = table.hash_key_bytes(k.as_bytes());
+                    table.prefetch_group(h);
+                    h
+                })
+                .collect();
+            // Phase 2: Lookup with warm L1.
+            let mut count = 0u64;
+            for key in keys {
+                if table.get(key).is_some() {
+                    count += 1;
+                }
+            }
+            black_box((count, hashes.len()));
+        });
+    });
+}
+
+/// Batch lookup without prefetch: sequential get for each key.
+/// Same rotating key sets to defeat cache warming.
+fn bench_table_batch_100_1m_no_prefetch(c: &mut Criterion) {
+    let table = prefill_table(1_000_000);
+
+    let key_sets: Vec<Vec<VortexKey>> = (0..100)
+        .map(|set| {
+            (0..100)
+                .map(|i| {
+                    let idx = (set * 100 + i * 9_973) % 1_000_000; // same prime stride
+                    VortexKey::from(format!("key:{idx:08}").as_bytes())
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut set_idx = 0usize;
+    c.bench_function("table_batch_100_1m_no_prefetch", |b| {
+        b.iter(|| {
+            let keys = &key_sets[set_idx % key_sets.len()];
+            set_idx += 1;
+
+            let mut count = 0u64;
+            for key in keys {
+                if table.get(key).is_some() {
+                    count += 1;
+                }
+            }
+            black_box(count);
+        });
+    });
+}
+
+/// DEL 100 keys from a 1M-entry shard (uses write-prefetch pipeline).
+fn bench_del_100_1m_prefetch(c: &mut Criterion) {
+    let mut shard = prefill_shard(1_000_000);
+
+    let del_keys: Vec<Vec<u8>> = (0..100)
+        .map(|i| format!("key:{:08}", i * 10_000).into_bytes())
+        .collect();
+
+    let mut parts: Vec<Vec<u8>> = vec![b"DEL".to_vec()];
+    for k in &del_keys {
+        parts.push(k.clone());
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("del_100_1m_prefetch", |b| {
+        b.iter(|| {
+            // Re-insert deleted keys so each iteration deletes 100.
+            for k in &del_keys {
+                let key = VortexKey::from(k.as_slice());
+                shard.set(key, VortexValue::Integer(0));
+            }
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"DEL", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+/// Sequential DEL of 100 keys from 1M-entry shard (no prefetch pipeline).
+fn bench_del_100_1m_no_prefetch(c: &mut Criterion) {
+    let mut shard = prefill_shard(1_000_000);
+
+    let del_keys: Vec<Vec<u8>> = (0..100)
+        .map(|i| format!("key:{:08}", i * 10_000).into_bytes())
+        .collect();
+    let cmds: Vec<Vec<u8>> = del_keys
+        .iter()
+        .map(|k| make_resp(&[b"DEL", k.as_slice()]))
+        .collect();
+    let tapes: Vec<RespTape> = cmds
+        .iter()
+        .map(|c| RespTape::parse_pipeline(c).unwrap())
+        .collect();
+
+    c.bench_function("del_100_1m_no_prefetch", |b| {
+        b.iter(|| {
+            // Re-insert deleted keys so each iteration deletes 100.
+            for k in &del_keys {
+                let key = VortexKey::from(k.as_slice());
+                shard.set(key, VortexValue::Integer(0));
+            }
+            for tape in &tapes {
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mut shard), b"DEL", &frame, 0);
+                black_box(r);
+            }
+        });
+    });
+}
+
+/// EXISTS 100 keys from 1M-entry shard (uses read-prefetch pipeline).
+fn bench_exists_100_1m_prefetch(c: &mut Criterion) {
+    let mut shard = prefill_shard(1_000_000);
+
+    let mut parts: Vec<Vec<u8>> = vec![b"EXISTS".to_vec()];
+    for i in 0..100 {
+        parts.push(format!("key:{:08}", i * 10_000).into_bytes());
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("exists_100_1m_prefetch", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+/// Sequential EXISTS of 100 keys from 1M-entry shard (no prefetch pipeline).
+fn bench_exists_100_1m_no_prefetch(c: &mut Criterion) {
+    let mut shard = prefill_shard(1_000_000);
+
+    let keys: Vec<Vec<u8>> = (0..100)
+        .map(|i| format!("key:{:08}", i * 10_000).into_bytes())
+        .collect();
+    let cmds: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|k| make_resp(&[b"EXISTS", k.as_slice()]))
+        .collect();
+    let tapes: Vec<RespTape> = cmds
+        .iter()
+        .map(|c| RespTape::parse_pipeline(c).unwrap())
+        .collect();
+
+    c.bench_function("exists_100_1m_no_prefetch", |b| {
+        b.iter(|| {
+            for tape in &tapes {
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
+                black_box(r);
+            }
+        });
+    });
+}
+
+fn bench_cmd_ping(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    let cmd = make_resp(&[b"PING"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_ping", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"PING", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_dbsize(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    // Fill with 10K keys to make DBSIZE non-trivial.
+    for i in 0..10_000 {
+        let key = VortexKey::from(format!("key:{i:06}").as_str());
+        shard.set(key, VortexValue::Integer(i));
+    }
+    let cmd = make_resp(&[b"DBSIZE"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_dbsize", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"DBSIZE", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_info(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..1_000 {
+        let key = VortexKey::from(format!("key:{i:06}").as_str());
+        shard.set(key, VortexValue::Integer(i));
+    }
+    let cmd = make_resp(&[b"INFO"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_info", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&mut shard), b"INFO", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_swiss_table_insert,
@@ -517,5 +961,23 @@ criterion_group!(
     bench_cmd_mset_100,
     bench_cmd_append_inline,
     bench_throughput_get_set_mix,
+    bench_cmd_del_inline,
+    bench_cmd_exists,
+    bench_cmd_expire,
+    bench_cmd_ttl,
+    bench_cmd_type,
+    bench_cmd_scan_10k,
+    bench_cmd_keys_star_10k,
+    bench_cmd_ping,
+    bench_cmd_dbsize,
+    bench_cmd_info,
+    bench_mget_100_1m_prefetch,
+    bench_mget_100_1m_no_prefetch,
+    bench_table_batch_100_1m_prefetch,
+    bench_table_batch_100_1m_no_prefetch,
+    bench_del_100_1m_prefetch,
+    bench_del_100_1m_no_prefetch,
+    bench_exists_100_1m_prefetch,
+    bench_exists_100_1m_no_prefetch,
 );
 criterion_main!(benches);

@@ -663,6 +663,68 @@ impl SwissTable {
         unsafe { entry.write_heap(h2, key, value, ttl) };
     }
 
+    // ── Cursor / scan helpers ───────────────────────────────────────
+
+    /// Total number of slots in the table (always a power of two).
+    #[inline]
+    pub fn total_slots(&self) -> usize {
+        self.raw.num_slots()
+    }
+
+    /// Returns `(key, value)` at `slot` if occupied, else `None`.
+    #[inline]
+    pub fn slot_key_value(&self, slot: usize) -> Option<(&VortexKey, &VortexValue)> {
+        debug_assert!(slot < self.raw.num_slots());
+        let ctrl = unsafe { *self.raw.ctrl_at(slot) };
+        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
+            return None;
+        }
+        let key = self.keys[slot].as_ref()?;
+        let value = self.values[slot].as_ref()?;
+        Some((key, value))
+    }
+
+    /// Returns the TTL deadline (nanos) for the entry at `slot`, or 0 if
+    /// the slot is empty/deleted or has no TTL.
+    #[inline]
+    pub fn slot_entry_ttl(&self, slot: usize) -> u64 {
+        debug_assert!(slot < self.raw.num_slots());
+        let ctrl = unsafe { *self.raw.ctrl_at(slot) };
+        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
+            return 0;
+        }
+        unsafe { self.raw.entry(slot) }.ttl_deadline()
+    }
+
+    /// Remove a key and return `(value, ttl_deadline)`.
+    pub fn remove_with_ttl(&mut self, key: &VortexKey) -> Option<(VortexValue, u64)> {
+        let key_bytes = key.as_bytes();
+        let hash = self.hash_key(key_bytes);
+        let slot = self.find_slot(key_bytes, hash)?;
+
+        let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+
+        let entry = unsafe { self.raw.entry_mut(slot) };
+        entry.mark_deleted();
+        unsafe {
+            self.raw.set_ctrl(slot, CTRL_DELETED);
+        }
+        self.len -= 1;
+        self.keys[slot] = None;
+        let value = self.values[slot].take()?;
+        Some((value, ttl))
+    }
+
+    /// Get `(&value, ttl_deadline)` for a key (no expiry check).
+    pub fn get_with_ttl(&self, key: &VortexKey) -> Option<(&VortexValue, u64)> {
+        let key_bytes = key.as_bytes();
+        let hash = self.hash_key(key_bytes);
+        let slot = self.find_slot(key_bytes, hash)?;
+        let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+        let value = self.values[slot].as_ref()?;
+        Some((value, ttl))
+    }
+
     // ── Iteration ───────────────────────────────────────────────────
 
     /// Iterate over all live `(&VortexKey, &VortexValue)` pairs,
@@ -895,25 +957,29 @@ impl SwissTable {
         self.hasher.hash_one(key)
     }
 
-    /// Prefetch the control byte group for a given hash.
-    /// Used by MGET/MSET batch pipelines to hide memory latency.
+    /// Prefetch the control byte group **and** first entry slot for a given hash.
+    /// Used by MGET/MSET/DEL/EXISTS batch pipelines to hide memory latency.
     #[inline]
     pub fn prefetch_group(&self, hash: u64) {
         let h1 = h1_from_hash(hash);
         let group_idx = h1 & self.group_mask();
+        // Prefetch the 16-byte control array for this group.
         let ctrl_ptr = unsafe { self.raw.ctrl_group(group_idx) };
-        // SAFETY: prefetch is a hint — never traps, always safe.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(
-                ctrl_ptr.cast::<i8>(),
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = ctrl_ptr;
-        }
+        crate::prefetch::prefetch_read(ctrl_ptr);
+        // Prefetch the first entry slot in the group (64-byte cache line).
+        let entry_ptr = unsafe { self.raw.entry(group_idx * GROUP_SIZE) as *const Entry };
+        crate::prefetch::prefetch_read(entry_ptr);
+    }
+
+    /// Prefetch with **write** intent (for insert/delete paths).
+    #[inline]
+    pub fn prefetch_group_write(&self, hash: u64) {
+        let h1 = h1_from_hash(hash);
+        let group_idx = h1 & self.group_mask();
+        let ctrl_ptr = unsafe { self.raw.ctrl_group(group_idx) };
+        crate::prefetch::prefetch_write(ctrl_ptr);
+        let entry_ptr = unsafe { self.raw.entry(group_idx * GROUP_SIZE) as *const Entry };
+        crate::prefetch::prefetch_write(entry_ptr);
     }
 }
 

@@ -4,6 +4,8 @@
 //! dispatched via a static match on the command name. No trait objects, no
 //! dynamic dispatch — the compiler inlines the entire chain.
 
+pub mod key;
+pub mod server;
 pub mod string;
 
 use vortex_common::{VortexKey, VortexValue};
@@ -20,6 +22,7 @@ pub const NS_PER_MS: u64 = 1_000_000;
 ///
 /// `Static` avoids allocation entirely for pre-computed wire bytes.
 /// `Resp` wraps a `RespFrame` for dynamic responses.
+#[derive(Debug)]
 pub enum CmdResult {
     /// Pre-computed static RESP bytes — written directly to the wire.
     Static(&'static [u8]),
@@ -81,6 +84,43 @@ pub fn execute_command(
         b"STRLEN" => Some(string::cmd_strlen(shard, frame, now_nanos)),
         b"GETRANGE" => Some(string::cmd_getrange(shard, frame, now_nanos)),
         b"SETRANGE" => Some(string::cmd_setrange(shard, frame, now_nanos)),
+        // Key management commands.
+        b"DEL" => Some(key::cmd_del(shard, frame, now_nanos)),
+        b"UNLINK" => Some(key::cmd_unlink(shard, frame, now_nanos)),
+        b"EXISTS" => Some(key::cmd_exists(shard, frame, now_nanos)),
+        b"EXPIRE" => Some(key::cmd_expire(shard, frame, now_nanos)),
+        b"PEXPIRE" => Some(key::cmd_pexpire(shard, frame, now_nanos)),
+        b"EXPIREAT" => Some(key::cmd_expireat(shard, frame, now_nanos)),
+        b"PEXPIREAT" => Some(key::cmd_pexpireat(shard, frame, now_nanos)),
+        b"PERSIST" => Some(key::cmd_persist(shard, frame, now_nanos)),
+        b"TTL" => Some(key::cmd_ttl(shard, frame, now_nanos)),
+        b"PTTL" => Some(key::cmd_pttl(shard, frame, now_nanos)),
+        b"EXPIRETIME" => Some(key::cmd_expiretime(shard, frame, now_nanos)),
+        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(shard, frame, now_nanos)),
+        b"TYPE" => Some(key::cmd_type(shard, frame, now_nanos)),
+        b"RENAME" => Some(key::cmd_rename(shard, frame, now_nanos)),
+        b"RENAMENX" => Some(key::cmd_renamenx(shard, frame, now_nanos)),
+        b"KEYS" => Some(key::cmd_keys(shard, frame, now_nanos)),
+        b"SCAN" => Some(key::cmd_scan(shard, frame, now_nanos)),
+        b"RANDOMKEY" => Some(key::cmd_randomkey(shard, frame, now_nanos)),
+        b"TOUCH" => Some(key::cmd_touch(shard, frame, now_nanos)),
+        b"COPY" => Some(key::cmd_copy(shard, frame, now_nanos)),
+        // Server & connection commands.
+        b"PING" => Some(server::cmd_ping(shard, frame, now_nanos)),
+        b"ECHO" => Some(server::cmd_echo(shard, frame, now_nanos)),
+        b"QUIT" => Some(server::cmd_quit(shard, frame, now_nanos)),
+        b"DBSIZE" => Some(server::cmd_dbsize(shard, frame, now_nanos)),
+        b"FLUSHDB" => Some(server::cmd_flushdb(shard, frame, now_nanos)),
+        b"FLUSHALL" => Some(server::cmd_flushall(shard, frame, now_nanos)),
+        b"INFO" => Some(server::cmd_info(shard, frame, now_nanos)),
+        b"COMMAND" => Some(server::cmd_command(shard, frame, now_nanos)),
+        b"SELECT" => Some(server::cmd_select(shard, frame, now_nanos)),
+        b"TIME" => Some(server::cmd_time(shard, frame, now_nanos)),
+        b"MULTI" => Some(server::cmd_multi(shard, frame, now_nanos)),
+        b"EXEC" => Some(server::cmd_exec(shard, frame, now_nanos)),
+        b"DISCARD" => Some(server::cmd_discard(shard, frame, now_nanos)),
+        b"WATCH" => Some(server::cmd_watch(shard, frame, now_nanos)),
+        b"UNWATCH" => Some(server::cmd_unwatch(shard, frame, now_nanos)),
         _ => None,
     }
 }

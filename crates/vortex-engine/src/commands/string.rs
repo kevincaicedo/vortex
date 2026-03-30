@@ -285,7 +285,7 @@ pub fn cmd_mset(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> Cmd
             if let Some(val_frame) = children.next() {
                 if let (Some(kb), Some(vb)) = (key_frame.as_bytes(), val_frame.as_bytes()) {
                     let key = VortexKey::from(kb);
-                    shard.prefetch(&key);
+                    shard.prefetch_write(&key);
                     pairs.push((kb, vb));
                 }
             }

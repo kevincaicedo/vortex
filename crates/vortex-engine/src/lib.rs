@@ -1,4 +1,5 @@
 #![cfg_attr(feature = "simd", feature(portable_simd))]
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_aarch64_prefetch))]
 //!
 //! # vortex-engine
 //!
@@ -17,11 +18,14 @@ pub mod command;
 pub mod commands;
 pub mod entry;
 pub mod expiry;
+pub mod morph;
+pub mod prefetch;
 pub mod shard;
 pub mod table;
 
 pub use command::{Command, CommandContext};
 pub use entry::{Entry, EntryValue};
 pub use expiry::{ExpiryEntry, ExpiryWheel};
+pub use morph::{AccessProfile, DefaultMorphMonitor, DisabledMorphMonitor, MorphMonitor};
 pub use shard::{SetResult, Shard};
 pub use table::SwissTable;

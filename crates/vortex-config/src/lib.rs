@@ -129,6 +129,11 @@ pub struct VortexConfig {
     /// Prometheus metrics port (None = disabled).
     #[arg(long, env = "VORTEX_METRICS_PORT")]
     pub metrics_port: Option<u16>,
+
+    /// Enable adaptive morphing structures (runtime encoding transitions).
+    /// When `false`, data structures use Redis-compatible static thresholds.
+    #[arg(long, default_value = "true", env = "VORTEX_ADAPTIVE_STRUCTURES")]
+    pub adaptive_structures: bool,
 }
 
 impl Default for VortexConfig {
@@ -155,6 +160,7 @@ impl Default for VortexConfig {
             log_level: "info".to_string(),
             config: None,
             metrics_port: None,
+            adaptive_structures: true,
         }
     }
 }
@@ -318,6 +324,11 @@ impl VortexConfig {
         // Optional fields: take TOML value if CLI didn't set.
         if self.metrics_port.is_none() {
             self.metrics_port = defaults.metrics_port;
+        }
+
+        // Adaptive structures: CLI default is true; take TOML value if CLI matches default.
+        if self.adaptive_structures == sentinel.adaptive_structures {
+            self.adaptive_structures = defaults.adaptive_structures;
         }
     }
 

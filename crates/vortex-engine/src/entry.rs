@@ -26,6 +26,8 @@ use core::{
 
 use vortex_common::{VortexKey, VortexValue};
 
+use crate::morph::AccessProfile;
+
 // ── Control byte sentinels ──────────────────────────────────────────
 
 /// An empty slot — never been written.
@@ -280,6 +282,20 @@ impl Entry {
     #[inline]
     pub fn clear_ttl(&mut self) {
         self.set_ttl(0);
+    }
+
+    // ── Access profile (stored in _pad0 — zero additional overhead) ─
+
+    /// Read the access profile packed into the `_pad0` padding field.
+    #[inline]
+    pub const fn access_profile(&self) -> AccessProfile {
+        AccessProfile::from_u32(self._pad0)
+    }
+
+    /// Write an access profile into the `_pad0` padding field.
+    #[inline]
+    pub fn set_access_profile(&mut self, profile: AccessProfile) {
+        self._pad0 = profile.as_u32();
     }
 
     /// Mark this entry as DELETED (tombstone) and zero payload data.
