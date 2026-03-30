@@ -15,6 +15,16 @@ pub enum SetResult {
     NotSetGet(Option<VortexValue>),
 }
 
+/// Options for SET-style writes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SetOptions {
+    pub(crate) ttl_deadline: u64,
+    pub(crate) nx: bool,
+    pub(crate) xx: bool,
+    pub(crate) get: bool,
+    pub(crate) keepttl: bool,
+}
+
 /// A single database shard.
 ///
 /// Each reactor thread owns one shard. All operations on a shard
@@ -109,29 +119,25 @@ impl Shard {
     /// XX (only set if key exists), GET (return old value), KEEPTTL.
     ///
     /// Returns `SetResult` indicating what happened.
-    pub fn set_with_options(
+    pub(crate) fn set_with_options(
         &mut self,
         key: VortexKey,
         value: VortexValue,
-        ttl_deadline: u64,
-        nx: bool,
-        xx: bool,
-        get: bool,
-        keepttl: bool,
+        options: SetOptions,
     ) -> SetResult {
         let exists = self.data.contains_key(&key);
 
         // NX: only set if NOT exists
-        if nx && exists {
-            return if get {
+        if options.nx && exists {
+            return if options.get {
                 SetResult::NotSetGet(self.data.get(&key).cloned())
             } else {
                 SetResult::NotSet
             };
         }
         // XX: only set if EXISTS
-        if xx && !exists {
-            return if get {
+        if options.xx && !exists {
+            return if options.get {
                 SetResult::NotSetGet(None)
             } else {
                 SetResult::NotSet
@@ -139,10 +145,10 @@ impl Shard {
         }
 
         // Preserve old TTL if KEEPTTL and key already exists.
-        let effective_ttl = if keepttl && exists {
+        let effective_ttl = if options.keepttl && exists {
             self.data.get_entry_ttl(&key).unwrap_or(0)
         } else {
-            ttl_deadline
+            options.ttl_deadline
         };
 
         let old = if effective_ttl != 0 {
@@ -154,7 +160,7 @@ impl Shard {
             self.data.insert(key, value)
         };
 
-        if get {
+        if options.get {
             SetResult::OkGet(old)
         } else {
             SetResult::Ok

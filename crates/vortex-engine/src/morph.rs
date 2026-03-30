@@ -59,6 +59,13 @@ const INIT_COUNTER: u32 = 1 << COUNTER_SHIFT;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AccessProfile(u32);
 
+impl Default for AccessProfile {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AccessProfile {
     /// New profile with all counters at zero and the access counter
     /// initialized so that `should_check()` first fires after 1023 accesses.

@@ -26,41 +26,19 @@ static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
 
 /// DEL key [key ...]
 /// Removes the specified keys. Returns the number of keys removed.
-///
-/// Uses software-prefetch pipeline when multiple keys are provided:
-/// Phase 1 hashes + prefetches all keys, Phase 2 deletes sequentially.
 #[inline]
 pub fn cmd_del(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
     }
-    let n = argc - 1;
-    if n == 1 {
-        // Fast path: single key, no prefetch overhead.
-        if let Some(kb) = arg_bytes(frame, 1) {
-            let key = key_from_bytes(kb);
-            return int_resp(if shard.del(&key) { 1 } else { 0 });
-        }
-        return CmdResult::Static(RESP_ZERO);
-    }
-
-    // Phase 1: Collect keys and prefetch with write intent.
-    let mut key_refs: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut deleted = 0i64;
     for i in 1..argc {
         if let Some(kb) = arg_bytes(frame, i) {
-            let key = VortexKey::from(kb);
-            shard.prefetch_write(&key);
-            key_refs.push(kb);
-        }
-    }
-
-    // Phase 2: Execute deletes (cache is now warm).
-    let mut deleted = 0i64;
-    for &kb in &key_refs {
-        let key = key_from_bytes(kb);
-        if shard.del(&key) {
-            deleted += 1;
+            let key = key_from_bytes(kb);
+            if shard.del(&key) {
+                deleted += 1;
+            }
         }
     }
     int_resp(deleted)
@@ -76,41 +54,19 @@ pub fn cmd_unlink(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> Cm
 
 /// EXISTS key [key ...]
 /// Returns the count of specified keys that exist.
-///
-/// Uses software-prefetch pipeline when multiple keys are provided:
-/// Phase 1 hashes + prefetches all keys, Phase 2 checks sequentially.
 #[inline]
 pub fn cmd_exists(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
     }
-    let n = argc - 1;
-    if n == 1 {
-        // Fast path: single key, no prefetch overhead.
-        if let Some(kb) = arg_bytes(frame, 1) {
-            let key = key_from_bytes(kb);
-            return int_resp(if shard.exists(&key, now_nanos) { 1 } else { 0 });
-        }
-        return CmdResult::Static(RESP_ZERO);
-    }
-
-    // Phase 1: Collect keys and prefetch with read intent.
-    let mut key_refs: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut count = 0i64;
     for i in 1..argc {
         if let Some(kb) = arg_bytes(frame, i) {
-            let key = VortexKey::from(kb);
-            shard.prefetch(&key);
-            key_refs.push(kb);
-        }
-    }
-
-    // Phase 2: Execute existence checks (cache is now warm).
-    let mut count = 0i64;
-    for &kb in &key_refs {
-        let key = key_from_bytes(kb);
-        if shard.exists(&key, now_nanos) {
-            count += 1;
+            let key = key_from_bytes(kb);
+            if shard.exists(&key, now_nanos) {
+                count += 1;
+            }
         }
     }
     int_resp(count)

@@ -13,7 +13,7 @@ use vortex_common::{VortexKey, VortexValue};
 use vortex_proto::{FrameRef, RespFrame};
 
 use crate::Shard;
-use crate::shard::SetResult;
+use crate::shard::{SetOptions, SetResult};
 
 use super::{
     CmdResult, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_OVERFLOW, ERR_SYNTAX, ERR_WRONG_TYPE, NS_PER_MS,
@@ -123,7 +123,15 @@ pub fn cmd_set(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdRe
         return CmdResult::Static(ERR_SYNTAX);
     }
 
-    match shard.set_with_options(key, value, ttl_deadline, nx, xx, get, keepttl) {
+    let options = SetOptions {
+        ttl_deadline,
+        nx,
+        xx,
+        get,
+        keepttl,
+    };
+
+    match shard.set_with_options(key, value, options) {
         SetResult::Ok => CmdResult::Static(RESP_OK),
         SetResult::NotSet => CmdResult::Static(RESP_NIL),
         SetResult::OkGet(Some(old)) => owned_value_to_resp(old),
@@ -802,6 +810,7 @@ pub fn cmd_setrange(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) ->
 // ── Option parsing helpers ──────────────────────────────────────────────────
 
 /// SET option tokens.
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq, Eq)]
 enum OptToken {
     EX,
@@ -861,10 +870,7 @@ fn opt_upper(b: &[u8]) -> OptToken {
 /// Case-insensitive comparison (ASCII only).
 #[inline]
 fn eq_ci(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(&x, &y)| x | 0x20 == y | 0x20)
+    a.eq_ignore_ascii_case(b)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

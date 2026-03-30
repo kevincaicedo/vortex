@@ -91,9 +91,9 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       - name: Run Miri on unsafe crates
-        run: cargo miri test -p vortex-sync -p vortex-memory
+        run: cargo miri test -p vortex-sync -p vortex-memory -p vortex-engine -- --skip proptest
         env:
-          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
 
   # ── 0.2.7 — Address Sanitizer job ─────────────────────────────────
   asan:

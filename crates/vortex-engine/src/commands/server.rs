@@ -618,10 +618,7 @@ pub fn cmd_unwatch(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -
 /// ASCII case-insensitive comparison.
 #[inline]
 fn eq_ci(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(&x, &y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+    a.eq_ignore_ascii_case(b)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

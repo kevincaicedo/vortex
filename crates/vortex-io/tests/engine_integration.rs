@@ -240,8 +240,8 @@ fn scan_full_iteration() {
         let new_cursor = parts[2].to_string();
         // Count the keys in the sub-array.
         let key_array_header = parts[3]; // "*N"
-        if key_array_header.starts_with('*') {
-            let count: usize = key_array_header[1..].parse().unwrap_or(0);
+        if let Some(count_text) = key_array_header.strip_prefix('*') {
+            let count: usize = count_text.parse().unwrap_or(0);
             for i in 0..count {
                 // Each key is: $<len>\r\n<key>
                 let key_idx = 4 + i * 2 + 1; // skip $<len>, get value

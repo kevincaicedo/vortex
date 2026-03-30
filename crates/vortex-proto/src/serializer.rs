@@ -67,6 +67,7 @@ static RESP_OK: &[u8] = b"+OK\r\n";
 static RESP_QUEUED: &[u8] = b"+QUEUED\r\n";
 static RESP_PONG: &[u8] = b"+PONG\r\n";
 static RESP_NIL: &[u8] = b"$-1\r\n";
+static RESP_NULL_ARRAY: &[u8] = b"*-1\r\n";
 static RESP_EMPTY_ARRAY: &[u8] = b"*0\r\n";
 
 // Single-digit integers :0\r\n through :9\r\n.
@@ -134,7 +135,7 @@ impl RespSerializer {
                 buf.extend_from_slice(b"\r\n");
             }
             RespFrame::Array(None) => {
-                buf.extend_from_slice(RESP_NIL);
+                buf.extend_from_slice(RESP_NULL_ARRAY);
             }
             RespFrame::Array(Some(frames)) => {
                 if frames.is_empty() {
@@ -308,7 +309,7 @@ impl RespSerializer {
                 push!(b"\r\n");
             }
             RespFrame::Array(None) => {
-                push!(RESP_NIL);
+                push!(RESP_NULL_ARRAY);
             }
             RespFrame::Array(Some(frames)) => {
                 if frames.is_empty() {
@@ -480,7 +481,7 @@ impl RespSerializer {
                 w.push_static(b"\r\n");
             }
             RespFrame::Array(None) => {
-                w.push_static(RESP_NIL);
+                w.push_static(RESP_NULL_ARRAY);
             }
             RespFrame::Array(Some(frames)) => {
                 if frames.is_empty() {
@@ -855,6 +856,12 @@ mod tests {
     }
 
     #[test]
+    fn serialize_null_array() {
+        assert_eq!(serialize(&RespFrame::Array(None)), b"*-1\r\n");
+        assert_eq!(serialize_slice(&RespFrame::Array(None)), b"*-1\r\n");
+    }
+
+    #[test]
     fn serialize_array() {
         let frame = RespFrame::Array(Some(vec![RespFrame::Integer(1), RespFrame::Integer(2)]));
         assert_eq!(serialize(&frame), b"*2\r\n:1\r\n:2\r\n");
@@ -899,6 +906,19 @@ mod tests {
         let n = RespSerializer::serialize_to_slice(&original, &mut buf).unwrap();
 
         let (parsed, _) = RespParser::parse(&buf[..n]).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_null_array() {
+        use crate::parser::RespParser;
+
+        let original = RespFrame::Array(None);
+
+        let mut buf = BytesMut::new();
+        RespSerializer::serialize(&original, &mut buf);
+
+        let (parsed, _) = RespParser::parse(&buf).unwrap();
         assert_eq!(parsed, original);
     }
 
@@ -983,6 +1003,11 @@ mod tests {
     #[test]
     fn iovec_null() {
         assert_eq!(serialize_iovec(&RespFrame::BulkString(None)), b"$-1\r\n");
+    }
+
+    #[test]
+    fn iovec_null_array() {
+        assert_eq!(serialize_iovec(&RespFrame::Array(None)), b"*-1\r\n");
     }
 
     #[test]

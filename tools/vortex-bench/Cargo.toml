@@ -21,6 +21,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+hdrhistogram = { workspace = true }
 
 [lib]
 bench = false

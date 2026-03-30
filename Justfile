@@ -36,6 +36,14 @@ deny:
 bench:
     cargo bench -p vortex-bench
 
+# Validate benchmarks against Phase 3 performance targets
+bench-validate:
+    bash scripts/validate-benchmarks.sh
+
+# Validate benchmarks (CI mode — fail on missed targets)
+bench-validate-ci:
+    bash scripts/validate-benchmarks.sh --ci --json
+
 # Run the RESP parser fuzzer for 60 seconds
 fuzz duration="60":
     cd fuzz && cargo fuzz run fuzz_resp_parser -- -max_total_time={{duration}}

@@ -1,0 +1,140 @@
+name: Competitive Benchmark
+
+on:
+  schedule:
+    # Run weekly on Sunday at 06:00 UTC
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: competitive-bench
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: VortexDB vs Redis vs Valkey vs Dragonfly
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["16379:6379"]
+        options: --memory=2g --cpus=2
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["16380:6379"]
+        options: --memory=2g --cpus=2
+      dragonfly:
+        image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+        ports: ["16381:6379"]
+        options: --memory=2g --cpus=2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+
+      - name: Wait for services
+        run: |
+          for port in 16379 16380 16381; do
+            for i in {1..30}; do
+              redis-cli -p $port PING >/dev/null 2>&1 && break
+              sleep 1
+            done
+          done
+
+      - name: Build VortexDB
+        run: cargo build --release --bin vortex-server
+
+      - name: Start VortexDB
+        run: |
+          ./target/release/vortex-server --port 16382 &
+          VORTEX_PID=$!
+          echo "VORTEX_PID=$VORTEX_PID" >> $GITHUB_ENV
+          sleep 2
+          redis-cli -p 16382 PING
+
+      - name: Run benchmark suite
+        run: |
+          REQUESTS=500000
+          CLIENTS=50
+          PIPELINE=16
+          TESTS="SET,GET,INCR,MSET,PING"
+
+          declare -A PORTS=([redis]=16379 [valkey]=16380 [dragonfly]=16381 [vortex]=16382)
+
+          echo "## Competitive Benchmark Results" > results.md
+          echo "" >> results.md
+          echo "| Test | Redis 8 | Valkey 8 | Dragonfly | **VortexDB** | vs Redis |" >> results.md
+          echo "|------|---------|----------|-----------|--------------|----------|" >> results.md
+
+          for name in redis valkey dragonfly vortex; do
+            port=${PORTS[$name]}
+            redis-benchmark -h 127.0.0.1 -p $port \
+              -n $REQUESTS -c $CLIENTS -P $PIPELINE \
+              -t $TESTS --csv 2>/dev/null > "/tmp/$name.csv"
+          done
+
+          IFS=',' read -ra TEST_LIST <<< "$TESTS"
+          for test in "${TEST_LIST[@]}"; do
+            redis_rps=$(grep -i "\"$test\"" /tmp/redis.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
+            valkey_rps=$(grep -i "\"$test\"" /tmp/valkey.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
+            dragon_rps=$(grep -i "\"$test\"" /tmp/dragonfly.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
+            vortex_rps=$(grep -i "\"$test\"" /tmp/vortex.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
+
+            if [[ "$redis_rps" != "N/A" && "$vortex_rps" != "N/A" ]]; then
+              ratio=$(echo "scale=1; $vortex_rps / $redis_rps" | bc 2>/dev/null || echo "N/A")
+              echo "| $test | $redis_rps | $valkey_rps | $dragon_rps | **$vortex_rps** | ${ratio}× |" >> results.md
+            else
+              echo "| $test | $redis_rps | $valkey_rps | $dragon_rps | **$vortex_rps** | N/A |" >> results.md
+            fi
+          done
+
+          cat results.md
+
+      - name: Run internal benchmarks
+        run: |
+          echo "" >> results.md
+          echo "## Internal Criterion Benchmarks" >> results.md
+          echo "" >> results.md
+          cargo bench -p vortex-bench --bench engine -- --output-format bencher 2>/dev/null | tee /tmp/criterion.txt
+          echo '```' >> results.md
+          cat /tmp/criterion.txt >> results.md
+          echo '```' >> results.md
+
+      - name: Stop VortexDB
+        if: always()
+        run: kill $VORTEX_PID 2>/dev/null || true
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitive-benchmark-${{ github.run_id }}
+          path: results.md
+
+      - name: Post results to issue
+        if: github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('results.md', 'utf8');
+            const date = new Date().toISOString().split('T')[0];
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `📊 Weekly Benchmark Report — ${date}`,
+              body: body,
+              labels: ['benchmarks'],
+            });

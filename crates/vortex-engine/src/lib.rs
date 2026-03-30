@@ -1,4 +1,4 @@
-#![cfg_attr(feature = "simd", feature(portable_simd))]
+#![cfg_attr(all(feature = "simd", target_arch = "aarch64"), feature(portable_simd))]
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_aarch64_prefetch))]
 //!
 //! # vortex-engine

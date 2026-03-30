@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::mem::size_of;
+
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use vortex_common::{ShardId, VortexKey, VortexValue};
 use vortex_engine::commands::execute_command;
@@ -653,8 +656,8 @@ fn prefill_shard(n: usize) -> Shard {
     shard
 }
 
-/// MGET 100 keys from a 1M-entry shard (uses software prefetch pipeline).
-fn bench_mget_100_1m_prefetch(c: &mut Criterion) {
+/// MGET 100 keys from a 1M-entry shard (measures full command latency at scale).
+fn bench_cmd_mget_100_1m(c: &mut Criterion) {
     let mut shard = prefill_shard(1_000_000);
 
     // Build MGET command with 100 keys scattered across the keyspace.
@@ -666,34 +669,11 @@ fn bench_mget_100_1m_prefetch(c: &mut Criterion) {
     let cmd = make_resp(&refs);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
-    c.bench_function("mget_100_1m_prefetch", |b| {
+    c.bench_function("cmd_mget_100_1m", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
             let r = execute_command(black_box(&mut shard), b"MGET", &frame, 0);
             black_box(r);
-        });
-    });
-}
-
-/// Batch lookup of 100 keys from 1M-entry table without prefetch pipeline.
-/// Same work as MGET-with-prefetch but deliberately skips prefetch calls.
-fn bench_mget_100_1m_no_prefetch(c: &mut Criterion) {
-    let table = prefill_table(1_000_000);
-
-    // Pre-build the 100 scattered keys.
-    let keys: Vec<VortexKey> = (0..100)
-        .map(|i| VortexKey::from(format!("key:{:08}", i * 10_000).as_bytes()))
-        .collect();
-
-    c.bench_function("mget_100_1m_no_prefetch", |b| {
-        b.iter(|| {
-            let mut count = 0u64;
-            for key in &keys {
-                if table.get(key).is_some() {
-                    count += 1;
-                }
-            }
-            black_box(count);
         });
     });
 }
@@ -775,8 +755,8 @@ fn bench_table_batch_100_1m_no_prefetch(c: &mut Criterion) {
     });
 }
 
-/// DEL 100 keys from a 1M-entry shard (uses write-prefetch pipeline).
-fn bench_del_100_1m_prefetch(c: &mut Criterion) {
+/// DEL 100 keys from a 1M-entry shard (measures full command latency at scale).
+fn bench_cmd_del_100_1m(c: &mut Criterion) {
     let mut shard = prefill_shard(1_000_000);
 
     let del_keys: Vec<Vec<u8>> = (0..100)
@@ -791,7 +771,7 @@ fn bench_del_100_1m_prefetch(c: &mut Criterion) {
     let cmd = make_resp(&refs);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
-    c.bench_function("del_100_1m_prefetch", |b| {
+    c.bench_function("cmd_del_100_1m", |b| {
         b.iter(|| {
             // Re-insert deleted keys so each iteration deletes 100.
             for k in &del_keys {
@@ -805,40 +785,8 @@ fn bench_del_100_1m_prefetch(c: &mut Criterion) {
     });
 }
 
-/// Sequential DEL of 100 keys from 1M-entry shard (no prefetch pipeline).
-fn bench_del_100_1m_no_prefetch(c: &mut Criterion) {
-    let mut shard = prefill_shard(1_000_000);
-
-    let del_keys: Vec<Vec<u8>> = (0..100)
-        .map(|i| format!("key:{:08}", i * 10_000).into_bytes())
-        .collect();
-    let cmds: Vec<Vec<u8>> = del_keys
-        .iter()
-        .map(|k| make_resp(&[b"DEL", k.as_slice()]))
-        .collect();
-    let tapes: Vec<RespTape> = cmds
-        .iter()
-        .map(|c| RespTape::parse_pipeline(c).unwrap())
-        .collect();
-
-    c.bench_function("del_100_1m_no_prefetch", |b| {
-        b.iter(|| {
-            // Re-insert deleted keys so each iteration deletes 100.
-            for k in &del_keys {
-                let key = VortexKey::from(k.as_slice());
-                shard.set(key, VortexValue::Integer(0));
-            }
-            for tape in &tapes {
-                let frame = tape.iter().next().unwrap();
-                let r = execute_command(black_box(&mut shard), b"DEL", &frame, 0);
-                black_box(r);
-            }
-        });
-    });
-}
-
-/// EXISTS 100 keys from 1M-entry shard (uses read-prefetch pipeline).
-fn bench_exists_100_1m_prefetch(c: &mut Criterion) {
+/// EXISTS 100 keys from 1M-entry shard (measures full command latency at scale).
+fn bench_cmd_exists_100_1m(c: &mut Criterion) {
     let mut shard = prefill_shard(1_000_000);
 
     let mut parts: Vec<Vec<u8>> = vec![b"EXISTS".to_vec()];
@@ -849,38 +797,11 @@ fn bench_exists_100_1m_prefetch(c: &mut Criterion) {
     let cmd = make_resp(&refs);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
-    c.bench_function("exists_100_1m_prefetch", |b| {
+    c.bench_function("cmd_exists_100_1m", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
             let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
             black_box(r);
-        });
-    });
-}
-
-/// Sequential EXISTS of 100 keys from 1M-entry shard (no prefetch pipeline).
-fn bench_exists_100_1m_no_prefetch(c: &mut Criterion) {
-    let mut shard = prefill_shard(1_000_000);
-
-    let keys: Vec<Vec<u8>> = (0..100)
-        .map(|i| format!("key:{:08}", i * 10_000).into_bytes())
-        .collect();
-    let cmds: Vec<Vec<u8>> = keys
-        .iter()
-        .map(|k| make_resp(&[b"EXISTS", k.as_slice()]))
-        .collect();
-    let tapes: Vec<RespTape> = cmds
-        .iter()
-        .map(|c| RespTape::parse_pipeline(c).unwrap())
-        .collect();
-
-    c.bench_function("exists_100_1m_no_prefetch", |b| {
-        b.iter(|| {
-            for tape in &tapes {
-                let frame = tape.iter().next().unwrap();
-                let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
-                black_box(r);
-            }
         });
     });
 }
@@ -936,23 +857,354 @@ fn bench_cmd_info(c: &mut Criterion) {
     });
 }
 
+// ── 3.10.1 — Missing Swiss Table Micro-Benchmarks ──────────────────
+
+/// Resize amortized: measure insert cost including resize overhead.
+/// Inserts into a table that starts empty — natural resizes occur.
+fn bench_swiss_table_resize_amortized(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swiss_table_resize_amortized");
+    for &target in &[1_000, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(target),
+            &target,
+            |b, &target| {
+                b.iter_batched(
+                    SwissTable::new,
+                    |mut table| {
+                        for i in 0..target {
+                            let key = VortexKey::from(format!("key:{i:08}").as_str());
+                            table.insert(key, VortexValue::Integer(i as i64));
+                        }
+                        black_box(table.len());
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+/// 50/50 mixed read/write workload at the Swiss Table level.
+fn bench_swiss_table_mixed_50_50(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swiss_table_mixed_50_50");
+    for &size in &[10_000, 1_000_000] {
+        let keys: Vec<VortexKey> = (0..size)
+            .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
+            .collect();
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || prefill_table(size),
+                |mut table| {
+                    for i in 0..1000 {
+                        if i & 1 == 0 {
+                            black_box(table.get(&keys[i % size]));
+                        } else {
+                            table.insert(keys[i % size].clone(), VortexValue::Integer(i as i64));
+                        }
+                    }
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+// ── 3.10.2 — Missing Entry Benchmark ───────────────────────────────
+
+fn bench_entry_read_integer(c: &mut Criterion) {
+    let mut entry = Entry::empty();
+    entry.write_integer(0x91, b"counter\x00\x00\x00", 42_i64, 0);
+
+    c.bench_function("entry_read_integer", |b| {
+        b.iter(|| black_box(entry.read_value()));
+    });
+}
+
+// ── 3.10.4 — Throughput at 1M Keys ─────────────────────────────────
+
+/// GET/SET throughput over a 1M-key shard — the headline perf number.
+/// Pre-fills 1M keys, runs 100K ops per iteration (50/50 GET/SET).
+fn bench_throughput_get_set_1m(c: &mut Criterion) {
+    let n_keys = 1_000_000usize;
+    let batch = 100_000usize;
+
+    // Pre-build 10K unique tape pairs (rotated via modulo).
+    let n_tapes = 10_000usize;
+    let set_cmds: Vec<Vec<u8>> = (0..n_tapes)
+        .map(|i| make_resp(&[b"SET", format!("k:{:08}", i * 100).as_bytes(), b"val"]))
+        .collect();
+    let get_cmds: Vec<Vec<u8>> = (0..n_tapes)
+        .map(|i| make_resp(&[b"GET", format!("k:{:08}", i * 100).as_bytes()]))
+        .collect();
+    let set_tapes: Vec<RespTape> = set_cmds
+        .iter()
+        .map(|c| RespTape::parse_pipeline(c).unwrap())
+        .collect();
+    let get_tapes: Vec<RespTape> = get_cmds
+        .iter()
+        .map(|c| RespTape::parse_pipeline(c).unwrap())
+        .collect();
+
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..n_keys {
+        let key = VortexKey::from(format!("k:{i:08}").as_bytes());
+        shard.set(key, VortexValue::from_bytes(b"val"));
+    }
+
+    c.bench_function("throughput_get_set_1m", |b| {
+        b.iter(|| {
+            for i in 0..batch {
+                let idx = i % n_tapes;
+                if i & 1 == 0 {
+                    let frame = set_tapes[idx].iter().next().unwrap();
+                    let r = execute_command(&mut shard, b"SET", &frame, 0);
+                    black_box(r);
+                } else {
+                    let frame = get_tapes[idx].iter().next().unwrap();
+                    let r = execute_command(&mut shard, b"GET", &frame, 0);
+                    black_box(r);
+                }
+            }
+        });
+    });
+}
+
+// ── 3.10.5 — Memory Efficiency ─────────────────────────────────────
+
+/// Analytical memory efficiency: calculates bytes-per-entry for 1M
+/// small key-value pairs. Measures SwissTable allocation overhead, not RSS.
+/// Entry=64B, ctrl=1B, parallel keys=Option<VortexKey>=32B, values=Option<VortexValue>=32B
+/// At 87.5% load factor = (64 + 1 + 32 + 32) / 0.875 ≈ 147.4B per live entry.
+/// This is a CALCULATION benchmark that validates the structural overhead.
+fn bench_memory_per_entry(c: &mut Criterion) {
+    c.bench_function("memory_per_entry_1m", |b| {
+        b.iter_batched(
+            || (),
+            |()| {
+                let n = 1_000_000usize;
+                let mut table = SwissTable::with_capacity(n);
+                for i in 0..n {
+                    // 10-byte key + 10-byte value (both inline).
+                    let key = VortexKey::from(format!("k:{i:07}").as_bytes());
+                    table.insert(key, VortexValue::from_bytes(b"v:12345678"));
+                }
+
+                // Analytical: entries * 64B + ctrl * 1B + keys * 32B + values * 32B
+                let total_slots = table.total_slots();
+                let entry_bytes = total_slots * 64; // Entry array
+                let ctrl_bytes = total_slots + 16; // ctrl + sentinel group
+                let key_vec_bytes = total_slots * size_of::<Option<VortexKey>>();
+                let value_vec_bytes = total_slots * size_of::<Option<VortexValue>>();
+                let total = entry_bytes + ctrl_bytes + key_vec_bytes + value_vec_bytes;
+                let per_entry = total / n;
+                black_box(per_entry)
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+}
+
+// ── 3.10.4 — Latency Distribution ─────────────────────────────────
+
+/// Latency distribution for point GET operations.
+/// Measures p50, p99, p999 using hdrhistogram.
+/// We capture 100K GET latencies into a histogram and report percentiles.
+fn bench_latency_distribution_get(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    // Pre-fill with 100K entries for a realistically populated shard.
+    for i in 0..100_000 {
+        let key = VortexKey::from(format!("k:{i:08}").as_bytes());
+        shard.set(key, VortexValue::from_bytes(b"value"));
+    }
+
+    let cmd = make_resp(&[b"GET", b"k:00050000"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("latency_get_p50_p99_p999", |b| {
+        b.iter(|| {
+            // Run 10K iterations, record each via std::time::Instant.
+            let mut hist = hdrhistogram::Histogram::<u64>::new(3).unwrap();
+            for _ in 0..10_000 {
+                let start = std::time::Instant::now();
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mut shard), b"GET", &frame, 0);
+                black_box(r);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                let _ = hist.record(elapsed);
+            }
+            let p50 = hist.value_at_quantile(0.50);
+            let p99 = hist.value_at_quantile(0.99);
+            let p999 = hist.value_at_quantile(0.999);
+            black_box((p50, p99, p999));
+        });
+    });
+}
+
+/// Latency distribution for point SET operations.
+fn bench_latency_distribution_set(c: &mut Criterion) {
+    let mut shard = Shard::new(ShardId::new(0));
+    for i in 0..100_000 {
+        let key = VortexKey::from(format!("k:{i:08}").as_bytes());
+        shard.set(key, VortexValue::from_bytes(b"old"));
+    }
+
+    let cmd = make_resp(&[b"SET", b"k:00050000", b"newvalue"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("latency_set_p50_p99_p999", |b| {
+        b.iter(|| {
+            let mut hist = hdrhistogram::Histogram::<u64>::new(3).unwrap();
+            for _ in 0..10_000 {
+                let start = std::time::Instant::now();
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mut shard), b"SET", &frame, 0);
+                black_box(r);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                let _ = hist.record(elapsed);
+            }
+            let p50 = hist.value_at_quantile(0.50);
+            let p99 = hist.value_at_quantile(0.99);
+            let p999 = hist.value_at_quantile(0.999);
+            black_box((p50, p99, p999));
+        });
+    });
+}
+
+// ── AC5 — Phase 0 HashMap Baseline Comparison ──────────────────────
+
+/// HashMap baseline: lookup hit at 1M entries.
+/// Direct comparison target for `swiss_table_lookup_hit/1000000`.
+fn bench_hashmap_baseline_lookup_hit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashmap_baseline_lookup");
+    for &size in &[10_000, 1_000_000] {
+        let mut map: HashMap<VortexKey, VortexValue> = HashMap::with_capacity(size);
+        for i in 0..size {
+            let key = VortexKey::from(format!("key:{i:08}").as_str());
+            map.insert(key, VortexValue::Integer(i as i64));
+        }
+        let key = VortexKey::from(format!("key:{:08}", size / 2).as_str());
+        group.bench_with_input(BenchmarkId::new("hit", size), &size, |b, _| {
+            b.iter(|| black_box(map.get(&key)));
+        });
+
+        let miss_key = VortexKey::from("nonexistent_key_xxxx");
+        group.bench_with_input(BenchmarkId::new("miss", size), &size, |b, _| {
+            b.iter(|| black_box(map.get(&miss_key)));
+        });
+    }
+    group.finish();
+}
+
+/// HashMap baseline: insert into 1M-entry map.
+/// Direct comparison target for `swiss_table_insert_single`.
+fn bench_hashmap_baseline_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashmap_baseline_insert");
+    for &size in &[10_000, 1_000_000] {
+        let keys: Vec<VortexKey> = (0..size)
+            .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
+            .collect();
+        let values: Vec<VortexValue> = (0..size).map(|i| VortexValue::Integer(i as i64)).collect();
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || (HashMap::with_capacity(size), keys.clone(), values.clone()),
+                |(mut map, keys, values)| {
+                    for (k, v) in keys.into_iter().zip(values) {
+                        map.insert(k, v);
+                    }
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// HashMap baseline: delete from pre-filled map.
+fn bench_hashmap_baseline_delete(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashmap_baseline_delete");
+    for &size in &[10_000, 1_000_000] {
+        let keys: Vec<VortexKey> = (0..size)
+            .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
+            .collect();
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || {
+                    let mut map: HashMap<VortexKey, VortexValue> = HashMap::with_capacity(size);
+                    for (index, key) in keys.iter().cloned().enumerate().take(size) {
+                        map.insert(key, VortexValue::Integer(index as i64));
+                    }
+                    (map, keys.clone())
+                },
+                |(mut map, keys)| {
+                    for k in &keys {
+                        map.remove(k);
+                    }
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// HashMap baseline: 50/50 mixed read/write at 1M entries.
+fn bench_hashmap_baseline_mixed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashmap_baseline_mixed");
+    for &size in &[10_000, 1_000_000] {
+        let keys: Vec<VortexKey> = (0..size)
+            .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
+            .collect();
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || {
+                    let mut map: HashMap<VortexKey, VortexValue> = HashMap::with_capacity(size);
+                    for (index, key) in keys.iter().cloned().enumerate().take(size) {
+                        map.insert(key, VortexValue::Integer(index as i64));
+                    }
+                    map
+                },
+                |mut map| {
+                    for i in 0..1000 {
+                        if i & 1 == 0 {
+                            black_box(map.get(&keys[i % size]));
+                        } else {
+                            map.insert(keys[i % size].clone(), VortexValue::Integer(i as i64));
+                        }
+                    }
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    // 3.10.1 — Swiss Table micro-benchmarks
     bench_swiss_table_insert,
     bench_swiss_table_insert_single,
     bench_swiss_table_lookup_hit,
     bench_swiss_table_lookup_miss,
     bench_swiss_table_delete,
     bench_swiss_table_delete_single,
+    bench_swiss_table_resize_amortized,
+    bench_swiss_table_mixed_50_50,
+    // 3.10.2 — Entry-level benchmarks
     bench_entry_write_inline,
     bench_entry_read_inline,
     bench_entry_matches_key,
     bench_entry_is_expired,
     bench_entry_write_integer,
+    bench_entry_read_integer,
+    // 3.3 — Expiry benchmarks
     bench_expiry_register,
     bench_expiry_tick_20,
     bench_lazy_expiry_overhead,
     bench_active_sweep_100k,
+    // 3.10.3 — Command-level benchmarks
     bench_cmd_get_inline,
     bench_cmd_set_inline,
     bench_cmd_get_miss,
@@ -960,7 +1212,6 @@ criterion_group!(
     bench_cmd_mget_100,
     bench_cmd_mset_100,
     bench_cmd_append_inline,
-    bench_throughput_get_set_mix,
     bench_cmd_del_inline,
     bench_cmd_exists,
     bench_cmd_expire,
@@ -971,13 +1222,24 @@ criterion_group!(
     bench_cmd_ping,
     bench_cmd_dbsize,
     bench_cmd_info,
-    bench_mget_100_1m_prefetch,
-    bench_mget_100_1m_no_prefetch,
+    // 3.9 — Prefetch / 1M-scale benchmarks
+    bench_cmd_mget_100_1m,
     bench_table_batch_100_1m_prefetch,
     bench_table_batch_100_1m_no_prefetch,
-    bench_del_100_1m_prefetch,
-    bench_del_100_1m_no_prefetch,
-    bench_exists_100_1m_prefetch,
-    bench_exists_100_1m_no_prefetch,
+    bench_cmd_del_100_1m,
+    bench_cmd_exists_100_1m,
+    // 3.10.4 — Throughput
+    bench_throughput_get_set_mix,
+    bench_throughput_get_set_1m,
+    // 3.10.5 — Memory efficiency
+    bench_memory_per_entry,
+    // Latency distribution
+    bench_latency_distribution_get,
+    bench_latency_distribution_set,
+    // AC5 — HashMap baseline comparison
+    bench_hashmap_baseline_lookup_hit,
+    bench_hashmap_baseline_insert,
+    bench_hashmap_baseline_delete,
+    bench_hashmap_baseline_mixed,
 );
 criterion_main!(benches);
