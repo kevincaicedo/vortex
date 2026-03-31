@@ -487,6 +487,95 @@ impl SwissTable {
         self.values[slot].as_mut()
     }
 
+    /// Single-probe upsert: returns `(value_ref, existed)`.
+    ///
+    /// If the key exists, returns a mutable reference to the existing value
+    /// and `true`. If the key does not exist, inserts the value produced by
+    /// `default_fn`, returns a mutable reference to it, and `false`.
+    ///
+    /// This fuses `find_slot` + `find_insert_slot` into one probe traverse,
+    /// eliminating the redundant hash+probe that `get_mut` → miss → `insert`
+    /// would perform.
+    pub fn get_or_insert_with<F>(
+        &mut self,
+        key: VortexKey,
+        default_fn: F,
+    ) -> (&mut VortexValue, bool)
+    where
+        F: FnOnce() -> VortexValue,
+    {
+        if self.occupied >= self.growth_limit() {
+            self.resize();
+        }
+
+        let key_bytes = key.as_bytes();
+        let hash = self.hash_key(key_bytes);
+        let h2 = h2_from_hash(hash);
+        let h1 = h1_from_hash(hash);
+        let mask = self.group_mask();
+        let mut probe = ProbeSeq::new(h1, mask);
+        let mut insert_candidate: Option<usize> = None;
+
+        loop {
+            let ctrl_ptr = unsafe { self.raw.ctrl_group(probe.pos) };
+
+            // Check for matching H₂ — key might already exist.
+            let matches = unsafe { Group::match_h2(ctrl_ptr, h2) };
+            for bit in matches {
+                let slot = probe.pos * GROUP_SIZE + bit;
+                let entry = unsafe { self.raw.entry(slot) };
+                if entry.matches_key(key_bytes) {
+                    // Key found — return existing value.
+                    return (self.values[slot].as_mut().expect("live slot has value"), true);
+                }
+            }
+
+            // Record first usable insertion point (EMPTY or DELETED).
+            if insert_candidate.is_none() {
+                let candidates = unsafe { Group::match_empty_or_deleted(ctrl_ptr) };
+                if let Some(bit) = candidates.lowest() {
+                    insert_candidate = Some(probe.pos * GROUP_SIZE + bit);
+                }
+            }
+
+            // If there's an EMPTY slot in this group, the key definitely doesn't exist.
+            let empties = unsafe { Group::match_empty(ctrl_ptr) };
+            if empties.any_set() {
+                break;
+            }
+
+            probe.advance();
+        }
+
+        // Key not found — insert at the recorded candidate slot.
+        let slot = insert_candidate.expect("must find an insert slot before EMPTY terminator");
+        let was_empty = unsafe { *self.raw.ctrl_at(slot) == CTRL_EMPTY };
+
+        let value = default_fn();
+        self.keys[slot] = Some(key);
+        self.values[slot] = Some(value);
+
+        let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
+        let value_ptr = self.values[slot]
+            .as_ref()
+            .expect("new slot must have value") as *const VortexValue;
+
+        let entry = unsafe { self.raw.entry_mut(slot) };
+        // SAFETY: slot ownership remains stable until the next overwrite/resize,
+        // and resize rewrites every borrowed pointer into the new table.
+        Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);
+        unsafe {
+            self.raw.set_ctrl(slot, h2);
+        }
+
+        self.len += 1;
+        if was_empty {
+            self.occupied += 1;
+        }
+
+        (self.values[slot].as_mut().expect("just inserted"), false)
+    }
+
     /// Remove a key and return its value.
     pub fn remove(&mut self, key: &VortexKey) -> Option<VortexValue> {
         let key_bytes = key.as_bytes();
@@ -504,6 +593,47 @@ impl SwissTable {
         // `occupied` stays the same — tombstone still blocks probe chains.
         self.keys[slot] = None;
         self.values[slot].take()
+    }
+
+    /// Check existence with a pre-computed hash (no rehashing).
+    #[inline]
+    pub fn contains_key_prehashed(&self, key_bytes: &[u8], hash: u64) -> bool {
+        self.find_slot(key_bytes, hash).is_some()
+    }
+
+    /// Insert a key known to be absent from the table, using a pre-computed hash.
+    ///
+    /// **Caller must guarantee the key does not already exist** — this method
+    /// skips the `find_slot` existence check and goes directly to
+    /// `find_insert_slot`, saving one full SIMD probe traversal.
+    pub fn insert_new_prehashed(&mut self, key: VortexKey, value: VortexValue, hash: u64) {
+        if self.occupied >= self.growth_limit() {
+            self.resize();
+        }
+
+        let h2 = h2_from_hash(hash);
+        let slot = self.find_insert_slot(hash);
+        let was_empty = unsafe { *self.raw.ctrl_at(slot) == CTRL_EMPTY };
+
+        self.keys[slot] = Some(key);
+        self.values[slot] = Some(value);
+
+        let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
+        let value_ptr = self.values[slot]
+            .as_ref()
+            .expect("new slot must have value")
+            as *const VortexValue;
+
+        let entry = unsafe { self.raw.entry_mut(slot) };
+        Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);
+        unsafe {
+            self.raw.set_ctrl(slot, h2);
+        }
+
+        self.len += 1;
+        if was_empty {
+            self.occupied += 1;
+        }
     }
 
     /// Returns `true` if the key exists.
@@ -836,6 +966,16 @@ impl SwissTable {
     pub fn get_or_expire(&mut self, key: &VortexKey, now_nanos: u64) -> Option<&VortexValue> {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
+        self.get_or_expire_prehashed(key_bytes, hash, now_nanos)
+    }
+
+    /// Like `get_or_expire` but uses a pre-computed hash (for MGET batching).
+    pub fn get_or_expire_prehashed(
+        &mut self,
+        key_bytes: &[u8],
+        hash: u64,
+        now_nanos: u64,
+    ) -> Option<&VortexValue> {
         let slot = self.find_slot(key_bytes, hash)?;
 
         let entry = unsafe { self.raw.entry(slot) };
@@ -857,6 +997,31 @@ impl SwissTable {
     pub fn contains_key_or_expire(&mut self, key: &VortexKey, now_nanos: u64) -> bool {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
+        let Some(slot) = self.find_slot(key_bytes, hash) else {
+            return false;
+        };
+
+        let entry = unsafe { self.raw.entry(slot) };
+        if entry.is_expired(now_nanos) {
+            let entry_mut = unsafe { self.raw.entry_mut(slot) };
+            entry_mut.mark_deleted();
+            unsafe { self.raw.set_ctrl(slot, CTRL_DELETED) };
+            self.len -= 1;
+            self.keys[slot] = None;
+            self.values[slot] = None;
+            return false;
+        }
+
+        true
+    }
+
+    /// Check existence with lazy expiry, using a pre-computed hash.
+    pub fn contains_key_or_expire_prehashed(
+        &mut self,
+        key_bytes: &[u8],
+        hash: u64,
+        now_nanos: u64,
+    ) -> bool {
         let Some(slot) = self.find_slot(key_bytes, hash) else {
             return false;
         };
@@ -1119,7 +1284,11 @@ mod tests {
 
     #[test]
     fn large_table_100k() {
-        let n = 100_000;
+        // Under Miri, reduce from 100K to 100 entries — still exercises
+        // resize, SIMD probing, and tombstone handling without the ~hours
+        // of interpretation overhead.
+        let n = if cfg!(miri) { 100 } else { 100_000 };
+        let step = if cfg!(miri) { 10 } else { 1000 };
         let mut table = SwissTable::with_capacity(n);
         for i in 0..n {
             let key = VortexKey::from(format!("key:{i:08}").as_str());
@@ -1128,7 +1297,7 @@ mod tests {
         assert_eq!(table.len(), n);
 
         // Spot-check some keys.
-        for i in (0..n).step_by(1000) {
+        for i in (0..n).step_by(step) {
             let key = VortexKey::from(format!("key:{i:08}").as_str());
             assert_eq!(table.get(&key), Some(&VortexValue::Integer(i as i64)));
         }
@@ -1200,8 +1369,11 @@ mod tests {
 }
 
 // ── Property tests (validate against HashMap as oracle) ─────────────
+// Excluded from Miri: each proptest case runs 1..500 random operations on the
+// Swiss Table. Even 16 cases × 500 ops interpreted by Miri would take hours.
+// The deterministic tests above already cover all unsafe code paths.
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod proptests {
     use std::collections::HashMap;
 

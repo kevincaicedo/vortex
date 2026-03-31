@@ -8,9 +8,10 @@
 //! | 1     | 64    | 256 s      | 16 384 s (~4.5 h) |
 //! | 2     | 64    | 16 384 s   | 1 048 576 s (~12 d) |
 //!
-//! Timers are stored in a pre-allocated entry pool — no heap allocation
-//! per insert. Cancellation is lazy: cancelled entries are skipped during
-//! tick processing.
+//! Timers are stored in a pre-allocated entry pool. Cancellation is lazy:
+//! cancelled entries are skipped during tick processing. Under heavy
+//! connection churn the pool can temporarily need more than one slot per
+//! live connection, so it grows on demand when exhausted.
 
 /// Sentinel value: empty slot / end-of-list / no entry.
 pub const TIMER_NIL: u32 = u32::MAX;
@@ -104,8 +105,8 @@ pub struct TimerWheel {
 impl TimerWheel {
     /// Creates a new timer wheel with a pool of `capacity` entries.
     ///
-    /// `capacity` should equal `max_connections` — each connection has at
-    /// most one active timer.
+    /// `capacity` should usually equal `max_connections`. The wheel grows if
+    /// lazy-cancelled entries temporarily outnumber the live connections.
     pub fn new(capacity: usize) -> Self {
         let mut entries = vec![TimerEntry::FREE; capacity];
         // Thread the free list through `next`.
@@ -148,12 +149,12 @@ impl TimerWheel {
     /// Returns the entry-pool index (store in `ConnectionMeta.timer_slot`
     /// for O(1) cancellation).
     ///
-    /// # Panics
-    ///
-    /// Debug-panics if the entry pool is exhausted.
     pub fn schedule(&mut self, conn_id: usize, generation: u32, deadline: u32) -> u32 {
         let entry_idx = self.alloc_entry();
-        debug_assert!(entry_idx != TIMER_NIL, "timer entry pool exhausted");
+        assert_ne!(
+            entry_idx, TIMER_NIL,
+            "timer entry pool exhausted after attempted growth"
+        );
 
         let entry = &mut self.entries[entry_idx as usize];
         entry.conn_and_gen = TimerEntry::pack(conn_id, generation);
@@ -283,11 +284,39 @@ impl TimerWheel {
 
     #[inline]
     fn alloc_entry(&mut self) -> u32 {
+        if self.free_head == TIMER_NIL {
+            self.grow_entries();
+        }
+
         let idx = self.free_head;
         if idx != TIMER_NIL {
             self.free_head = self.entries[idx as usize].next;
         }
         idx
+    }
+
+    fn grow_entries(&mut self) {
+        let old_len = self.entries.len();
+        let additional = old_len.max(64);
+        let new_len = old_len
+            .checked_add(additional)
+            .expect("timer entry pool length overflow");
+
+        assert!(
+            new_len < TIMER_NIL as usize,
+            "timer entry pool exceeded u32 address space"
+        );
+
+        self.entries.resize(new_len, TimerEntry::FREE);
+        for idx in old_len..new_len {
+            self.entries[idx].next = if idx + 1 < new_len {
+                (idx + 1) as u32
+            } else {
+                TIMER_NIL
+            };
+        }
+
+        self.free_head = old_len as u32;
     }
 
     #[inline]
@@ -326,6 +355,32 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].conn_id, 1);
         assert_eq!(tw.pending(), 0);
+    }
+
+    #[test]
+    fn schedule_grows_when_pool_is_exhausted() {
+        let mut tw = TimerWheel::new(1);
+
+        let first = tw.schedule(1, 0, 5);
+        let second = tw.schedule(2, 0, 6);
+
+        assert_eq!(first, 0);
+        assert_ne!(second, TIMER_NIL);
+        assert!(tw.entries.len() >= 2);
+        assert_eq!(tw.pending(), 2);
+    }
+
+    #[test]
+    fn cancelled_entries_do_not_block_future_schedules() {
+        let mut tw = TimerWheel::new(1);
+
+        let first = tw.schedule(1, 0, 60);
+        tw.cancel(first);
+        let second = tw.schedule(2, 0, 61);
+
+        assert_ne!(second, TIMER_NIL);
+        assert!(tw.entries.len() >= 2);
+        assert_eq!(tw.pending(), 1);
     }
 
     #[test]

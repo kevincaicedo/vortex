@@ -52,9 +52,26 @@ fuzz duration="60":
 fuzz-list:
     cd fuzz && cargo fuzz list
 
-# Run Miri on unsafe-containing crates
+# Run Miri on all unsafe-containing crates (optimized — safe-API tests excluded)
 miri:
-    cargo +nightly miri test -p vortex-sync -p vortex-memory
+    @echo "Running Miri on vortex-sync + vortex-memory (strict provenance)..."
+    MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation" \
+        cargo miri test -p vortex-sync -p vortex-memory
+    @echo "Running Miri on vortex-engine (symbolic alignment)..."
+    MIRIFLAGS="-Zmiri-symbolic-alignment-check -Zmiri-disable-isolation" \
+        cargo miri test -p vortex-engine
+
+# Run only the fast Miri subset (sync + memory, ~25s)
+miri-fast:
+    MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation" \
+        cargo miri test -p vortex-sync -p vortex-memory
+
+# Run full Miri including proptest (slow — may take >30 min)
+miri-full:
+    MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation" \
+        cargo miri test -p vortex-sync -p vortex-memory
+    MIRIFLAGS="-Zmiri-symbolic-alignment-check -Zmiri-disable-isolation" \
+        PROPTEST_CASES=16 cargo miri test -p vortex-engine
 
 # Code coverage report
 coverage:
@@ -65,9 +82,21 @@ coverage:
 flamegraph:
     bash scripts/flamegraph.sh
 
-# Run comparison benchmarks against Redis/Dragonfly
-compare:
-    bash scripts/compare.sh
+# Run comparison benchmarks against Redis/Dragonfly/Valkey
+compare *ARGS:
+    bash scripts/compare.sh {{ARGS}}
+
+# Fair Docker-based comparison (all databases containerized, identical resources)
+compare-docker *ARGS:
+    bash scripts/compare.sh --docker-all --json --markdown --latency --custom {{ARGS}}
+
+# Run comparison with JSON + Markdown output
+compare-full:
+    bash scripts/compare.sh --json --markdown --latency --runs 3 --custom
+
+# Run custom command benchmarks against a running server
+bench-commands port="16379":
+    bash scripts/bench-commands.sh -p {{port}}
 
 # Start the server
 run *ARGS:
@@ -80,6 +109,10 @@ cli *ARGS:
 # Build Docker development image
 docker:
     docker build -f Dockerfile.dev -t vortex-dev .
+
+# Build Docker production image
+docker-prod:
+    docker build -t vortexdb:latest .
 
 # Clean build artifacts
 clean:

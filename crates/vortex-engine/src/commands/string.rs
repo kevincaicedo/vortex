@@ -229,24 +229,42 @@ pub fn cmd_mget(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdR
     }
     let n = argc - 1;
 
-    // Phase 1: Collect key bytes and prefetch.
+    // Phase 1: Collect key bytes and pre-compute hashes + prefetch.
+    // Stack-inline buffer for up to 32 keys (covers most real workloads).
     let mut key_refs: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut inline_hashes = [0u64; 32];
+    let mut heap_hashes: Vec<u64> = if n > 32 {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
+
     if let Some(mut children) = frame.children() {
         children.next(); // skip command name
         for child in children {
             if let Some(bytes) = child.as_bytes() {
-                let key = VortexKey::from(bytes);
-                shard.prefetch(&key);
+                let hash = shard.hash_key(bytes);
+                shard.prefetch_hash(hash);
+                let idx = key_refs.len();
+                if idx < 32 {
+                    inline_hashes[idx] = hash;
+                } else {
+                    heap_hashes.push(hash);
+                }
                 key_refs.push(bytes);
             }
         }
     }
 
-    // Phase 2: Execute lookups (L1 is now warm from prefetch).
+    // Phase 2: Execute lookups using pre-computed hashes (L1 warm from prefetch).
     let mut frames = Vec::with_capacity(n);
-    for &kb in &key_refs {
-        let key = VortexKey::from(kb);
-        match shard.get(&key, now_nanos) {
+    for (i, &kb) in key_refs.iter().enumerate() {
+        let hash = if i < 32 {
+            inline_hashes[i]
+        } else {
+            heap_hashes[i - 32]
+        };
+        match shard.get_prehashed(kb, hash, now_nanos) {
             Some(val) => match val {
                 VortexValue::InlineString(ib) => {
                     frames.push(RespFrame::bulk_string(Bytes::copy_from_slice(
@@ -321,31 +339,49 @@ pub fn cmd_msetnx(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> Cm
         return CmdResult::Static(ERR_SYNTAX);
     }
 
-    // Pass 1: Check all keys don't exist.
-    let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity((argc - 1) / 2);
-    if let Some(mut children) = frame.children() {
-        children.next(); // skip command name
-        while let Some(key_frame) = children.next() {
-            if let Some(val_frame) = children.next() {
-                if let (Some(kb), Some(vb)) = (key_frame.as_bytes(), val_frame.as_bytes()) {
-                    pairs.push((kb, vb));
-                }
-            }
-        }
-    }
+    let pair_count = (argc - 1) / 2;
 
-    for &(kb, _) in &pairs {
-        let key = VortexKey::from(kb);
-        if shard.exists(&key, now_nanos) {
+    // Pre-compute hashes on the stack (up to 32 pairs inline, heap fallback beyond).
+    const INLINE_CAP: usize = 32;
+    let mut hash_inline = [0u64; INLINE_CAP];
+    let mut hash_heap = if pair_count > INLINE_CAP {
+        vec![0u64; pair_count]
+    } else {
+        Vec::new()
+    };
+    let hashes: &mut [u64] = if pair_count <= INLINE_CAP {
+        &mut hash_inline[..pair_count]
+    } else {
+        &mut hash_heap
+    };
+
+    // Pass 1: Hash all keys + check none exist (one hash per key, one probe per key).
+    for (slot, i) in (0..pair_count).enumerate() {
+        let kb = match arg_bytes(frame, 1 + i * 2) {
+            Some(b) => b,
+            None => return CmdResult::Static(ERR_SYNTAX),
+        };
+        let hash = shard.hash_key(kb);
+        hashes[slot] = hash;
+        if shard.exists_prehashed(kb, hash, now_nanos) {
             return CmdResult::Static(RESP_ZERO);
         }
     }
 
-    // Pass 2: All keys are new — insert.
-    for (kb, vb) in pairs {
+    // Pass 2: All keys are new — insert with pre-computed hashes (no re-hashing,
+    // no existence probe — goes directly to find_insert_slot).
+    for (slot, i) in (0..pair_count).enumerate() {
+        let kb = match arg_bytes(frame, 1 + i * 2) {
+            Some(b) => b,
+            None => continue,
+        };
+        let vb = match arg_bytes(frame, 2 + i * 2) {
+            Some(b) => b,
+            None => continue,
+        };
         let key = key_from_bytes(kb);
         let value = value_from_bytes(vb);
-        shard.set(key, value);
+        shard.insert_new_prehashed(key, value, hashes[slot]);
     }
 
     CmdResult::Static(super::RESP_ONE)
@@ -612,6 +648,7 @@ pub fn cmd_incrbyfloat(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64)
 
 /// APPEND key value — Appends to existing string or creates new one.
 ///
+/// Uses single-probe upsert to avoid double hash+probe on the miss path.
 /// Returns the length of the string after the append operation.
 pub fn cmd_append(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
     let key_bytes = match arg_bytes(frame, 1) {
@@ -625,63 +662,60 @@ pub fn cmd_append(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> C
 
     let key = key_from_bytes(key_bytes);
 
-    match shard.get_mut(&key) {
-        Some(existing) => {
-            let new_val = match existing {
-                VortexValue::InlineString(ib) => {
-                    let old = ib.as_bytes();
-                    let new_len = old.len() + append_bytes.len();
-                    if new_len <= 23 {
-                        // Stays inline — extend in-place.
-                        let mut data = [0u8; 23];
-                        data[..old.len()].copy_from_slice(old);
-                        data[old.len()..new_len].copy_from_slice(append_bytes);
-                        VortexValue::InlineString(InlineBytes::from_slice(&data[..new_len]))
-                    } else {
-                        // Promote to heap.
-                        let mut combined = Vec::with_capacity(new_len);
-                        combined.extend_from_slice(old);
-                        combined.extend_from_slice(append_bytes);
-                        VortexValue::String(Bytes::from(combined))
-                    }
-                }
-                VortexValue::String(b) => {
-                    let mut combined = Vec::with_capacity(b.len() + append_bytes.len());
-                    combined.extend_from_slice(b.as_ref());
-                    combined.extend_from_slice(append_bytes);
-                    let new_len = combined.len();
-                    if new_len <= 23 {
-                        VortexValue::InlineString(InlineBytes::from_slice(&combined))
-                    } else {
-                        VortexValue::String(Bytes::from(combined))
-                    }
-                }
-                VortexValue::Integer(n) => {
-                    let mut buf = itoa::Buffer::new();
-                    let s = buf.format(*n);
-                    let mut combined = Vec::with_capacity(s.len() + append_bytes.len());
-                    combined.extend_from_slice(s.as_bytes());
-                    combined.extend_from_slice(append_bytes);
-                    VortexValue::from_bytes(&combined)
-                }
-                _ => return CmdResult::Static(ERR_WRONG_TYPE),
-            };
-            let len = match &new_val {
-                VortexValue::InlineString(ib) => ib.len(),
-                VortexValue::String(b) => b.len(),
-                _ => 0,
-            };
-            *existing = new_val;
-            int_resp(len as i64)
-        }
-        None => {
-            // Key doesn't exist — create new.
-            let len = append_bytes.len();
-            let value = VortexValue::from_bytes(append_bytes);
-            shard.set(key, value);
-            int_resp(len as i64)
-        }
+    // Single-probe: find existing value or create new entry with append_bytes.
+    let (existing, was_present) =
+        shard.get_or_insert_with(key, || VortexValue::from_bytes(append_bytes));
+
+    if !was_present {
+        // Key was just created with append_bytes as the value — return its length.
+        let len = append_bytes.len();
+        return int_resp(len as i64);
     }
+
+    // Key existed — extend in place or build new value.
+    let new_val = match existing {
+        VortexValue::InlineString(ib) => {
+            // Fast path: try in-place extension (no allocation, no copy).
+            if ib.try_extend(append_bytes) {
+                let len = ib.len();
+                return int_resp(len as i64);
+            }
+            // Promote to heap — combined exceeds 23 bytes.
+            let old = ib.as_bytes();
+            let new_len = old.len() + append_bytes.len();
+            let mut combined = Vec::with_capacity(new_len);
+            combined.extend_from_slice(old);
+            combined.extend_from_slice(append_bytes);
+            VortexValue::String(Bytes::from(combined))
+        }
+        VortexValue::String(b) => {
+            let new_len = b.len() + append_bytes.len();
+            let mut combined = Vec::with_capacity(new_len);
+            combined.extend_from_slice(b.as_ref());
+            combined.extend_from_slice(append_bytes);
+            if new_len <= 23 {
+                VortexValue::InlineString(InlineBytes::from_slice(&combined))
+            } else {
+                VortexValue::String(Bytes::from(combined))
+            }
+        }
+        VortexValue::Integer(n) => {
+            let mut buf = itoa::Buffer::new();
+            let s = buf.format(*n);
+            let mut combined = Vec::with_capacity(s.len() + append_bytes.len());
+            combined.extend_from_slice(s.as_bytes());
+            combined.extend_from_slice(append_bytes);
+            VortexValue::from_bytes(&combined)
+        }
+        _ => return CmdResult::Static(ERR_WRONG_TYPE),
+    };
+    let len = match &new_val {
+        VortexValue::InlineString(ib) => ib.len(),
+        VortexValue::String(b) => b.len(),
+        _ => 0,
+    };
+    *existing = new_val;
+    int_resp(len as i64)
 }
 
 // ── STRLEN ──────────────────────────────────────────────────────────────────
@@ -875,7 +909,7 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::Shard;

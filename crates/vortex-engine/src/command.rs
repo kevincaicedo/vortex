@@ -42,7 +42,7 @@ pub trait Command: Send + Sync {
     fn flags(&self) -> CommandFlags;
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use vortex_common::ShardId;
 

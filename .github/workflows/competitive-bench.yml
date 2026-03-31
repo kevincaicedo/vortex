@@ -5,10 +5,24 @@ on:
     # Run weekly on Sunday at 06:00 UTC
     - cron: "0 6 * * 0"
   workflow_dispatch:
+    inputs:
+      requests:
+        description: "Number of requests per test"
+        default: "500000"
+        type: string
+      runs:
+        description: "Number of benchmark runs for averaging"
+        default: "3"
+        type: string
+      custom:
+        description: "Run custom command benchmarks"
+        default: true
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
   issues: write
+  pages: write
 
 concurrency:
   group: competitive-bench
@@ -18,14 +32,14 @@ jobs:
   compare:
     name: VortexDB vs Redis vs Valkey vs Dragonfly
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     services:
       redis:
         image: redis:8-alpine
         ports: ["16379:6379"]
         options: --memory=2g --cpus=2
       valkey:
-        image: valkey/valkey:8-alpine
+        image: valkey/valkey:9-alpine
         ports: ["16380:6379"]
         options: --memory=2g --cpus=2
       dragonfly:
@@ -43,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install redis-tools
-        run: sudo apt-get update && sudo apt-get install -y redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools bc
 
       - name: Wait for services
         run: |
@@ -59,51 +73,39 @@ jobs:
 
       - name: Start VortexDB
         run: |
-          ./target/release/vortex-server --port 16382 &
+          ./target/release/vortex-server --bind "127.0.0.1:16382" &
           VORTEX_PID=$!
           echo "VORTEX_PID=$VORTEX_PID" >> $GITHUB_ENV
           sleep 2
           redis-cli -p 16382 PING
 
-      - name: Run benchmark suite
+      - name: Run compare.sh v2 (standard + custom)
         run: |
-          REQUESTS=500000
-          CLIENTS=50
-          PIPELINE=16
-          TESTS="SET,GET,INCR,MSET,PING"
+          REQUESTS="${{ inputs.requests || '500000' }}"
+          RUNS="${{ inputs.runs || '3' }}"
+          CUSTOM_FLAG=""
+          if [[ "${{ inputs.custom || 'true' }}" == "true" ]]; then
+            CUSTOM_FLAG="--custom"
+          fi
 
-          declare -A PORTS=([redis]=16379 [valkey]=16380 [dragonfly]=16381 [vortex]=16382)
+          bash scripts/compare.sh \
+            -n "$REQUESTS" \
+            -c 50 \
+            -P 16 \
+            --no-build \
+            --no-docker \
+            --json \
+            --markdown \
+            --latency \
+            --runs "$RUNS" \
+            $CUSTOM_FLAG \
+            2>&1 | tee compare-output.txt || true
 
-          echo "## Competitive Benchmark Results" > results.md
-          echo "" >> results.md
-          echo "| Test | Redis 8 | Valkey 8 | Dragonfly | **VortexDB** | vs Redis |" >> results.md
-          echo "|------|---------|----------|-----------|--------------|----------|" >> results.md
+          # compare.sh writes to benchmarks/ — copy for artifact upload
+          cp benchmarks/results-*.json results.json 2>/dev/null || true
+          cp benchmarks/results-*.md results.md 2>/dev/null || true
 
-          for name in redis valkey dragonfly vortex; do
-            port=${PORTS[$name]}
-            redis-benchmark -h 127.0.0.1 -p $port \
-              -n $REQUESTS -c $CLIENTS -P $PIPELINE \
-              -t $TESTS --csv 2>/dev/null > "/tmp/$name.csv"
-          done
-
-          IFS=',' read -ra TEST_LIST <<< "$TESTS"
-          for test in "${TEST_LIST[@]}"; do
-            redis_rps=$(grep -i "\"$test\"" /tmp/redis.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
-            valkey_rps=$(grep -i "\"$test\"" /tmp/valkey.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
-            dragon_rps=$(grep -i "\"$test\"" /tmp/dragonfly.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
-            vortex_rps=$(grep -i "\"$test\"" /tmp/vortex.csv 2>/dev/null | cut -d',' -f2 | tr -d '"' || echo "N/A")
-
-            if [[ "$redis_rps" != "N/A" && "$vortex_rps" != "N/A" ]]; then
-              ratio=$(echo "scale=1; $vortex_rps / $redis_rps" | bc 2>/dev/null || echo "N/A")
-              echo "| $test | $redis_rps | $valkey_rps | $dragon_rps | **$vortex_rps** | ${ratio}× |" >> results.md
-            else
-              echo "| $test | $redis_rps | $valkey_rps | $dragon_rps | **$vortex_rps** | N/A |" >> results.md
-            fi
-          done
-
-          cat results.md
-
-      - name: Run internal benchmarks
+      - name: Run internal Criterion benchmarks
         run: |
           echo "" >> results.md
           echo "## Internal Criterion Benchmarks" >> results.md
@@ -117,11 +119,43 @@ jobs:
         if: always()
         run: kill $VORTEX_PID 2>/dev/null || true
 
-      - name: Upload results
+      - name: Upload results (Markdown)
         uses: actions/upload-artifact@v4
         with:
-          name: competitive-benchmark-${{ github.run_id }}
+          name: benchmark-results-md-${{ github.run_id }}
           path: results.md
+
+      - name: Upload results (JSON)
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-json-${{ github.run_id }}
+          path: results.json
+
+      - name: Upload full output log
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-output-${{ github.run_id }}
+          path: compare-output.txt
+
+      - name: Publish to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Copy latest results into docs/ for Pages publishing
+          mkdir -p docs/benchmarks
+          cp results.json docs/benchmarks/latest.json 2>/dev/null || true
+          cp results.md docs/benchmarks/latest.md 2>/dev/null || true
+          # Archive with timestamp
+          TIMESTAMP=$(date +%Y%m%d)
+          cp results.json "docs/benchmarks/results-${TIMESTAMP}.json" 2>/dev/null || true
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
+          destination_dir: benchmarks
+          keep_files: true
 
       - name: Post results to issue
         if: github.event_name == 'schedule'

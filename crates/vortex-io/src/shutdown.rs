@@ -89,13 +89,29 @@ impl ShutdownCoordinator {
             .all(|flag| flag.load(Ordering::Acquire))
     }
 
-    /// Block until all reactors finish or the timeout expires.
+    /// Block until shutdown is signalled and all reactors finish, or the
+    /// timeout expires after a signal.
     ///
-    /// If the timeout expires before all reactors finish, escalates to
-    /// `ForceKill` and waits a brief grace period.
+    /// Phase 1: Wait indefinitely for `initiate()` to be called (signal).
+    /// Phase 2: Once draining, wait up to `timeout` for clean shutdown.
+    /// If the timeout expires, escalates to `ForceKill`.
     ///
     /// Returns `true` on clean shutdown, `false` if force-kill was triggered.
     pub fn wait_for_shutdown(&self, timeout: Duration) -> bool {
+        let poll_interval = Duration::from_millis(10);
+
+        // Phase 1: Block until shutdown signal received or reactors already done.
+        loop {
+            if self.all_done() {
+                return true;
+            }
+            if self.is_draining() {
+                break;
+            }
+            std::thread::park_timeout(poll_interval);
+        }
+
+        // Phase 2: Shutdown signal received — apply timeout.
         let deadline = Instant::now() + timeout;
         let poll_interval = Duration::from_millis(10);
 

@@ -68,9 +68,44 @@ impl Shard {
         self.data.get_or_expire(key, now_nanos)
     }
 
+    /// GET with pre-computed hash (for MGET batching — avoids re-hashing).
+    #[inline]
+    pub fn get_prehashed(
+        &mut self,
+        key_bytes: &[u8],
+        hash: u64,
+        now_nanos: u64,
+    ) -> Option<&VortexValue> {
+        self.data.get_or_expire_prehashed(key_bytes, hash, now_nanos)
+    }
+
+    /// Prefetch the control group for a pre-computed hash.
+    #[inline]
+    pub fn prefetch_hash(&self, hash: u64) {
+        self.data.prefetch_group(hash);
+    }
+
     /// EXISTS: checks if a key exists (with lazy expiry).
     pub fn exists(&mut self, key: &VortexKey, now_nanos: u64) -> bool {
         self.data.contains_key_or_expire(key, now_nanos)
+    }
+
+    /// Hash key bytes — exposes the table's hasher for pre-computation.
+    #[inline]
+    pub fn hash_key(&self, key_bytes: &[u8]) -> u64 {
+        self.data.hash_key_bytes(key_bytes)
+    }
+
+    /// Check existence with a pre-computed hash (with lazy expiry).
+    pub fn exists_prehashed(&mut self, key_bytes: &[u8], hash: u64, now_nanos: u64) -> bool {
+        self.data
+            .contains_key_or_expire_prehashed(key_bytes, hash, now_nanos)
+    }
+
+    /// Insert a key known to be absent, using a pre-computed hash.
+    /// Caller guarantees the key does not exist in the table.
+    pub fn insert_new_prehashed(&mut self, key: VortexKey, value: VortexValue, hash: u64) {
+        self.data.insert_new_prehashed(key, value, hash);
     }
 
     // ── Write operations ────────────────────────────────────────────
@@ -113,6 +148,18 @@ impl Shard {
     #[inline]
     pub fn get_mut(&mut self, key: &VortexKey) -> Option<&mut VortexValue> {
         self.data.get_mut(key)
+    }
+
+    /// Single-probe upsert: if key exists, returns `(&mut value, true)`.
+    /// If key does not exist, inserts `default_fn()` and returns
+    /// `(&mut new_value, false)`. Avoids the double hash+probe of
+    /// `get_mut → miss → set`.
+    #[inline]
+    pub fn get_or_insert_with<F>(&mut self, key: VortexKey, default_fn: F) -> (&mut VortexValue, bool)
+    where
+        F: FnOnce() -> VortexValue,
+    {
+        self.data.get_or_insert_with(key, default_fn)
     }
 
     /// SET + options: handles NX (only set if key doesn't exist),
@@ -394,7 +441,7 @@ impl Shard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 

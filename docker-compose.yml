@@ -1,12 +1,25 @@
-# VortexDB development & comparison environment
+# VortexDB development & fair benchmark environment
 #
-# Usage:
-#   docker compose up -d          # Start all services
-#   docker compose exec dev bash  # Enter dev container
-#   docker compose down           # Stop everything
+# Development:
+#   docker compose up -d dev          # Start dev container
+#   docker compose exec dev bash      # Enter dev shell
+#
+# Fair benchmark (all databases with identical resources):
+#   docker compose --profile bench up -d
+#   ./scripts/compare.sh --docker-all --latency --markdown --json
+#   docker compose --profile bench down
+#
+# Resource limits: each benchmark service gets 4 CPUs / 2 GB RAM.
+
+x-bench-resources: &bench-resources
+  deploy:
+    resources:
+      limits:
+        cpus: "4"
+        memory: 2G
 
 services:
-  # Development environment with all tools
+  # ── Development ───────────────────────────────────────────────
   dev:
     build:
       context: .
@@ -19,27 +32,77 @@ services:
     tty: true
     network_mode: host
 
-  # Redis — comparison baseline
-  redis:
-    image: redis:8-alpine
+  # ── VortexDB (production image) ───────────────────────────────
+  vortex:
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "6379:6379"
-    command: redis-server --save "" --appendonly no
+      - "16379:6379"
+    command: ["--bind", "0.0.0.0:6379", "--threads", "4"]
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock: -1
+    <<: *bench-resources
+    profiles: [bench]
 
-  # Dragonfly — comparison target
+  # ── Redis 8.6.2 — optimal benchmark configuration ────────────
+  redis:
+    image: redis:8.6.2-alpine3.23
+    ports:
+      - "16380:6379"
+    command: >-
+      redis-server
+      --save ""
+      --appendonly no
+      --io-threads 4
+      --io-threads-do-reads yes
+      --hz 100
+      --loglevel warning
+      --protected-mode no
+      --maxmemory 1800mb
+      --maxmemory-policy noeviction
+    <<: *bench-resources
+    profiles: [bench]
+
+  # ── Dragonfly — optimal benchmark configuration ──────────────
   dragonfly:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
     ports:
-      - "6380:6379"
+      - "16381:6379"
+    command: >-
+      dragonfly
+      --logtostdout
+      --proactor_threads 4
+      --hz 100
+      --dbfilename ""
+      --pipeline_squash 10
+      --version_check false
+      --maxmemory 1800mb
     ulimits:
       memlock: -1
+    <<: *bench-resources
+    profiles: [bench]
 
-  # Valkey — comparison target
+  # ── Valkey 9.1 — optimal benchmark configuration ─────────────
   valkey:
-    image: valkey/valkey:9-alpine
+    image: valkey/valkey:9.1-alpine3.23
     ports:
-      - "6381:6379"
-    command: valkey-server --save "" --appendonly no
+      - "16382:6379"
+    command: >-
+      valkey-server
+      --save ""
+      --appendonly no
+      --io-threads 4
+      --io-threads-do-reads yes
+      --hz 100
+      --loglevel warning
+      --protected-mode no
+      --maxmemory 1800mb
+      --maxmemory-policy noeviction
+    <<: *bench-resources
+    profiles: [bench]
 
 volumes:
   cargo-cache:

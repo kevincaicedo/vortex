@@ -745,7 +745,7 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use vortex_common::{ShardId, VortexValue};

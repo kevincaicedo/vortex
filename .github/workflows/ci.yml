@@ -79,10 +79,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  # ── 0.2.6 — Miri job ──────────────────────────────────────────────
+  # ── 0.2.6 — Miri job (parallelized via matrix) ─────────────────────
   miri:
-    name: Miri
+    name: Miri (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Sync & memory crates: small, fast, strict provenance safe
+          - group: sync-memory
+            packages: -p vortex-sync -p vortex-memory
+            flags: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
+            extra_args: ""
+          # Engine crate: heavy unsafe (Swiss Table, entry layout)
+          # No strict-provenance: entry.rs stores pointers as byte arrays
+          # for 64-byte cache-line alignment — a deliberate int↔ptr round-trip
+          - group: engine
+            packages: -p vortex-engine
+            flags: "-Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
+            extra_args: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -90,10 +106,12 @@ jobs:
           toolchain: nightly-2026-03-15
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - name: Run Miri on unsafe crates
-        run: cargo miri test -p vortex-sync -p vortex-memory -p vortex-engine -- --skip proptest
+        with:
+          key: miri-${{ matrix.group }}
+      - name: Run Miri (${{ matrix.group }})
+        run: cargo miri test ${{ matrix.packages }} ${{ matrix.extra_args }}
         env:
-          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
+          MIRIFLAGS: ${{ matrix.flags }}
 
   # ── 0.2.7 — Address Sanitizer job ─────────────────────────────────
   asan:

@@ -85,6 +85,21 @@ impl InlineBytes {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Tries to append `extra` bytes in-place. Returns `true` if the combined
+    /// length fits within the 23-byte inline capacity, `false` otherwise
+    /// (contents unchanged on failure).
+    #[inline]
+    pub fn try_extend(&mut self, extra: &[u8]) -> bool {
+        let old = self.len as usize;
+        let new_len = old + extra.len();
+        if new_len > 23 {
+            return false;
+        }
+        self.data[old..new_len].copy_from_slice(extra);
+        self.len = new_len as u8;
+        true
+    }
 }
 
 impl std::fmt::Debug for InlineBytes {

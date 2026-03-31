@@ -278,7 +278,7 @@ impl MorphMonitor for DisabledMorphMonitor {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 

@@ -8,3 +8,7 @@
 .vscode/
 *.iml
 Cargo.lock
+
+# Benchmark results (generated, keep only .gitkeep)
+benchmarks/*.json
+benchmarks/*.md

@@ -253,7 +253,7 @@ pub fn int_resp(n: i64) -> CmdResult {
     CmdResult::Resp(RespFrame::integer(n))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 
