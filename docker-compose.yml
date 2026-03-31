@@ -21,7 +21,7 @@ services:
 
   # Redis — comparison baseline
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     ports:
       - "6379:6379"
     command: redis-server --save "" --appendonly no
@@ -36,7 +36,7 @@ services:
 
   # Valkey — comparison target
   valkey:
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:9-alpine
     ports:
       - "6381:6379"
     command: valkey-server --save "" --appendonly no
