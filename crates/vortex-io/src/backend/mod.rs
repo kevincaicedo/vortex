@@ -25,6 +25,8 @@ pub enum OpType {
     Read = 1,
     Write = 2,
     Close = 3,
+    /// Scatter-gather write (writev / io_uring WRITEV).
+    Writev = 4,
 }
 
 impl OpType {
@@ -35,6 +37,7 @@ impl OpType {
             1 => Some(Self::Read),
             2 => Some(Self::Write),
             3 => Some(Self::Close),
+            4 => Some(Self::Writev),
             _ => None,
         }
     }
@@ -141,6 +144,21 @@ pub trait IoBackend {
         let _ = buf_index;
         self.submit_write(fd, buf_ptr, buf_len, token)
     }
+
+    /// Submit a scatter-gather write from an array of `iovec` segments.
+    ///
+    /// For `IoUringBackend`: builds `opcode::Writev` SQE.
+    /// For `PollingBackend`: calls `libc::writev` inline.
+    ///
+    /// The completion result is bytes written (positive) or negative errno.
+    /// The caller must ensure the iovec memory outlives the operation.
+    fn submit_writev(
+        &mut self,
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    ) -> std::io::Result<()>;
 
     /// Submit async cancellation of an in-flight operation identified by its
     /// user-data token (io_uring: `AsyncCancel`).

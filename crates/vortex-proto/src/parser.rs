@@ -1,190 +1,737 @@
 use bytes::Bytes;
 
-use crate::frame::RespFrame;
+use crate::{
+    frame::RespFrame,
+    scanner::{CrlfPositions, scan_crlf},
+    swar::swar_parse_int,
+};
 
-/// Indicates that more data is needed to complete a parse.
+/// Parse result error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NeedMoreData;
+pub enum ParseError {
+    /// The buffer ends before a full frame is available.
+    NeedMoreData,
+    /// The frame exceeds configured limits.
+    FrameTooLarge,
+    /// Recursive containers exceed the configured nesting limit.
+    NestingTooDeep,
+    /// The buffer does not contain a valid RESP frame.
+    InvalidFrame,
+}
 
-/// Scalar RESP2/RESP3 parser.
+/// Backward-compatible alias for callers that still refer to the old error type.
+pub type NeedMoreData = ParseError;
+
+/// RESP2/RESP3 parser.
 ///
-/// Phase 0: byte-by-byte scanning for `\r\n`.
-/// TODO: Phase 2: SIMD-accelerated CRLF scanning via `_mm256_cmpeq_epi8`.
-///
-/// The parser is stateless — call `parse()` with a complete or partial
-/// buffer and it returns either a completed frame + bytes consumed, or
-/// `NeedMoreData`.
+/// Phase 2 uses a pre-scanned CRLF position table, SWAR integer parsing, and a
+/// jump-table dispatch to keep the parser on predictable, cache-friendly code
+/// paths. Byte-backed payloads are carved from one parser-owned `Bytes`
+/// snapshot of the input buffer, so nested frames reuse shared backing without
+/// a second materialization pass.
 pub struct RespParser;
 
-/// Maximum number of elements in a single RESP array frame.
-/// Prevents OOM from malformed input with absurdly large counts.
-/// Matches Redis's practical limit.
-const MAX_ARRAY_ELEMENTS: usize = 1_048_576;
+/// Maximum number of elements in a single RESP aggregate frame.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1_048_576;
+/// Maximum nesting depth for recursive frame types.
+pub(crate) const MAX_NESTING_DEPTH: u8 = 32;
+/// Maximum accepted bulk string length (512 MiB).
+pub(crate) const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
+
+pub(crate) type ParseResult<T> = Result<T, ParseError>;
+type ParseFn = fn(&[u8], &Bytes, &CrlfPositions, &mut ParserState, u8) -> ParseResult<RespFrame>;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ParserState {
+    pub(crate) offset: usize,
+    pub(crate) crlf_index: usize,
+}
+
+const DISPATCH: [ParseFn; 256] = build_dispatch_table();
+
+const fn build_dispatch_table() -> [ParseFn; 256] {
+    let mut table = [parse_inline_frame as ParseFn; 256];
+    table[b'+' as usize] = parse_simple_string_frame;
+    table[b'-' as usize] = parse_error_frame;
+    table[b':' as usize] = parse_integer_frame;
+    table[b'$' as usize] = parse_bulk_string_frame;
+    table[b'*' as usize] = parse_array_frame;
+    #[cfg(feature = "resp3")]
+    {
+        table[b'_' as usize] = parse_null_frame;
+        table[b'#' as usize] = parse_boolean_frame;
+        table[b',' as usize] = parse_double_frame;
+        table[b'(' as usize] = parse_big_number_frame;
+        table[b'!' as usize] = parse_bulk_error_frame;
+        table[b'=' as usize] = parse_verbatim_string_frame;
+        table[b'%' as usize] = parse_map_frame;
+        table[b'~' as usize] = parse_set_frame;
+        table[b'>' as usize] = parse_push_frame;
+        table[b'|' as usize] = parse_attribute_frame;
+    }
+    table
+}
 
 impl RespParser {
     /// Attempts to parse a single RESP frame from the buffer.
-    ///
-    /// Returns `Ok((frame, bytes_consumed))` on success, or
-    /// `Err(NeedMoreData)` if the buffer doesn't contain a complete frame.
-    pub fn parse(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
+    pub fn parse(buf: &[u8]) -> ParseResult<(RespFrame, usize)> {
         if buf.is_empty() {
-            return Err(NeedMoreData);
+            return Err(ParseError::NeedMoreData);
         }
 
-        match buf[0] {
-            b'+' => Self::parse_simple_string(buf),
-            b'-' => Self::parse_error(buf),
-            b':' => Self::parse_integer(buf),
-            b'$' => Self::parse_bulk_string(buf),
-            b'*' => Self::parse_array(buf),
-            #[cfg(feature = "resp3")]
-            b'_' => Self::parse_null(buf),
-            #[cfg(feature = "resp3")]
-            b'#' => Self::parse_boolean(buf),
-            #[cfg(feature = "resp3")]
-            b',' => Self::parse_double(buf),
-            _ => {
-                // Inline command support (Redis compatibility)
-                Self::parse_inline(buf)
+        Self::parse_bytes(Bytes::copy_from_slice(buf))
+    }
+
+    /// Attempts to parse as many complete RESP frames as possible from the buffer.
+    ///
+    /// If the buffer ends with a partial frame, all complete frames parsed before
+    /// the incomplete suffix are returned along with the consumed byte count.
+    pub fn parse_pipeline(buf: &[u8]) -> ParseResult<(Vec<RespFrame>, usize)> {
+        if buf.is_empty() {
+            return Err(ParseError::NeedMoreData);
+        }
+
+        let backing = Bytes::copy_from_slice(buf);
+        Self::parse_pipeline_inner(backing)
+    }
+
+    /// Parses a single RESP frame from a caller-owned `Bytes` without copying.
+    ///
+    /// Parsed frames share the underlying allocation of `backing`, avoiding
+    /// the `Bytes::copy_from_slice` in [`parse`].
+    pub fn parse_bytes(backing: Bytes) -> ParseResult<(RespFrame, usize)> {
+        if backing.is_empty() {
+            return Err(ParseError::NeedMoreData);
+        }
+
+        let bytes = backing.as_ref();
+        let positions = scan_crlf(bytes);
+        let mut state = ParserState::default();
+        let frame = parse_frame(bytes, &backing, &positions, &mut state, 0)?;
+        Ok((frame, state.offset))
+    }
+
+    /// Parses a pipeline of RESP frames from a caller-owned `Bytes` without copying.
+    ///
+    /// Parsed frames share the underlying allocation of `backing`, avoiding
+    /// the `Bytes::copy_from_slice` in [`parse_pipeline`].
+    pub fn parse_pipeline_bytes(backing: Bytes) -> ParseResult<(Vec<RespFrame>, usize)> {
+        if backing.is_empty() {
+            return Err(ParseError::NeedMoreData);
+        }
+
+        Self::parse_pipeline_inner(backing)
+    }
+
+    fn parse_pipeline_inner(backing: Bytes) -> ParseResult<(Vec<RespFrame>, usize)> {
+        let bytes = backing.as_ref();
+        let positions = scan_crlf(bytes);
+        let mut state = ParserState::default();
+        let mut frames = Vec::with_capacity((positions.len() / 3).max(1));
+
+        while state.offset < bytes.len() {
+            match parse_frame(bytes, &backing, &positions, &mut state, 0) {
+                Ok(frame) => frames.push(frame),
+                Err(error) if frames.is_empty() => return Err(error),
+                Err(_) => break,
             }
         }
-    }
 
-    /// Finds the next `\r\n` in the buffer, starting from `offset`.
-    fn find_crlf(buf: &[u8], offset: usize) -> Option<usize> {
-        // Phase 0: scalar scan. Phase 2 replaces with SIMD.
-        let search = &buf[offset..];
-        for i in 0..search.len().saturating_sub(1) {
-            if search[i] == b'\r' && search[i + 1] == b'\n' {
-                return Some(offset + i);
-            }
+        if frames.is_empty() {
+            Err(ParseError::NeedMoreData)
+        } else {
+            Ok((frames, state.offset))
         }
-        None
+    }
+}
+
+fn parse_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    depth: u8,
+) -> ParseResult<RespFrame> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(ParseError::NestingTooDeep);
     }
 
-    /// Parses a length/integer from the buffer line (after type byte, before CRLF).
-    fn parse_length(buf: &[u8], start: usize, end: usize) -> Option<i64> {
-        let slice = &buf[start..end];
-        let s = std::str::from_utf8(slice).ok()?;
-        s.parse::<i64>().ok()
-    }
+    let byte = *buf.get(state.offset).ok_or(ParseError::NeedMoreData)?;
+    let parser = DISPATCH[byte as usize];
+    let mut trial = *state;
+    let frame = parser(buf, backing, positions, &mut trial, depth)?;
+    *state = trial;
+    Ok(frame)
+}
 
-    fn parse_simple_string(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let data = Bytes::copy_from_slice(&buf[1..crlf]);
-        Ok((RespFrame::SimpleString(data), crlf + 2))
-    }
-
-    fn parse_error(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let data = Bytes::copy_from_slice(&buf[1..crlf]);
-        Ok((RespFrame::Error(data), crlf + 2))
-    }
-
-    fn parse_integer(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let n = Self::parse_length(buf, 1, crlf).ok_or(NeedMoreData)?;
-        Ok((RespFrame::Integer(n), crlf + 2))
-    }
-
-    fn parse_bulk_string(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let len = Self::parse_length(buf, 1, crlf).ok_or(NeedMoreData)?;
-
-        if len < 0 {
-            return Ok((RespFrame::BulkString(None), crlf + 2));
+#[inline(always)]
+pub(crate) fn consume_next_crlf(
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    search_from: usize,
+) -> ParseResult<usize> {
+    let mut index = state.crlf_index;
+    while let Some(position) = positions.get(index) {
+        if position < search_from {
+            index += 1;
+            continue;
         }
 
-        let len = len as usize;
-        let data_start = crlf + 2;
-        let data_end = data_start + len;
-
-        if buf.len() < data_end + 2 {
-            return Err(NeedMoreData);
-        }
-
-        let data = Bytes::copy_from_slice(&buf[data_start..data_end]);
-        Ok((RespFrame::BulkString(Some(data)), data_end + 2))
+        state.crlf_index = index + 1;
+        return Ok(position);
     }
 
-    fn parse_array(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let count = Self::parse_length(buf, 1, crlf).ok_or(NeedMoreData)?;
+    Err(ParseError::NeedMoreData)
+}
 
-        if count < 0 {
-            return Ok((RespFrame::Array(None), crlf + 2));
-        }
-
-        let count = count as usize;
-        if count > MAX_ARRAY_ELEMENTS {
-            return Err(NeedMoreData);
-        }
-        let mut offset = crlf + 2;
-        let mut frames = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            let (frame, consumed) = Self::parse(&buf[offset..])?;
-            frames.push(frame);
-            offset += consumed;
-        }
-
-        Ok((RespFrame::Array(Some(frames)), offset))
+/// Scalar fast path for integer lines short enough that SWAR setup overhead
+/// dominates. Handles 1-7 byte lines (positive up to 7 digits, negative up
+/// to 6 digits), which covers >99% of RESP lengths and counts.
+#[inline(always)]
+pub(crate) fn parse_short_int(line: &[u8]) -> Option<i64> {
+    let len = line.len();
+    if len == 0 || len > 7 {
+        return None;
     }
 
-    #[cfg(feature = "resp3")]
-    fn parse_null(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        Ok((RespFrame::Null, crlf + 2))
+    // Single digit — most common case (array counts, small bulk lengths).
+    if len == 1 {
+        let d = line[0].wrapping_sub(b'0');
+        return if d <= 9 { Some(i64::from(d)) } else { None };
     }
 
-    #[cfg(feature = "resp3")]
-    fn parse_boolean(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        if crlf < 2 {
-            return Err(NeedMoreData);
+    let (digits, negative) = if line[0] == b'-' {
+        (&line[1..], true)
+    } else {
+        (line, false)
+    };
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut val: u64 = 0;
+    let mut i = 0;
+    while i < digits.len() {
+        let d = digits[i].wrapping_sub(b'0');
+        if d > 9 {
+            return None;
         }
-        let val = match buf[1] {
-            b't' => true,
-            b'f' => false,
-            _ => return Err(NeedMoreData),
-        };
-        Ok((RespFrame::Boolean(val), crlf + 2))
+        val = val * 10 + u64::from(d);
+        i += 1;
     }
 
-    #[cfg(feature = "resp3")]
-    fn parse_double(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 1).ok_or(NeedMoreData)?;
-        let s = std::str::from_utf8(&buf[1..crlf]).map_err(|_| NeedMoreData)?;
-        let val: f64 = s.parse().map_err(|_| NeedMoreData)?;
-        Ok((RespFrame::Double(val), crlf + 2))
+    Some(if negative { -(val as i64) } else { val as i64 })
+}
+
+#[inline(always)]
+pub(crate) fn parse_number_line(
+    buf: &[u8],
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    start: usize,
+) -> ParseResult<(i64, usize)> {
+    let line_end = consume_next_crlf(positions, state, start)?;
+    let line = &buf[start..line_end];
+    // Scalar fast path for short integer lines (covers >99% of RESP traffic).
+    if let Some(value) = parse_short_int(line) {
+        return Ok((value, line_end));
+    }
+    // SWAR path for longer integers (8+ digits, where it outperforms scalar).
+    let (value, consumed) = swar_parse_int(line).ok_or(ParseError::InvalidFrame)?;
+    if consumed != line.len() {
+        return Err(ParseError::InvalidFrame);
+    }
+    Ok((value, line_end))
+}
+
+#[inline(always)]
+pub(crate) fn validate_trailing_crlf(
+    buf: &[u8],
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    expected_offset: usize,
+) -> ParseResult<()> {
+    if expected_offset + 1 >= buf.len() {
+        return Err(ParseError::NeedMoreData);
+    }
+    if buf[expected_offset] != b'\r' || buf[expected_offset + 1] != b'\n' {
+        return Err(ParseError::InvalidFrame);
     }
 
-    /// Parse inline commands (e.g., `PING\r\n` without RESP framing).
-    fn parse_inline(buf: &[u8]) -> Result<(RespFrame, usize), NeedMoreData> {
-        let crlf = Self::find_crlf(buf, 0).ok_or(NeedMoreData)?;
-        let line = &buf[..crlf];
+    let position = consume_next_crlf(positions, state, expected_offset)?;
+    if position != expected_offset {
+        return Err(ParseError::InvalidFrame);
+    }
 
-        let parts: Vec<&[u8]> = line
-            .split(|&b| b == b' ')
-            .filter(|s| !s.is_empty())
-            .collect();
+    Ok(())
+}
 
-        if parts.is_empty() {
-            return Err(NeedMoreData);
+#[inline(always)]
+fn parse_simple_string_frame(
+    _buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start + 1)?;
+    state.offset = line_end + 2;
+    Ok(RespFrame::SimpleString(backing.slice(start + 1..line_end)))
+}
+
+#[inline(always)]
+fn parse_error_frame(
+    _buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start + 1)?;
+    state.offset = line_end + 2;
+    Ok(RespFrame::Error(backing.slice(start + 1..line_end)))
+}
+
+#[inline(always)]
+fn parse_integer_frame(
+    buf: &[u8],
+    _backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (value, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    state.offset = line_end + 2;
+    Ok(RespFrame::Integer(value))
+}
+
+#[inline(always)]
+fn parse_bulk_string_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (len, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    let data_start = line_end + 2;
+
+    if len == -1 {
+        state.offset = data_start;
+        return Ok(RespFrame::BulkString(None));
+    }
+    if len < -1 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let len = usize::try_from(len).map_err(|_| ParseError::FrameTooLarge)?;
+    if len > MAX_BULK_STRING_LEN {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(ParseError::FrameTooLarge)?;
+    validate_trailing_crlf(buf, positions, state, data_end)?;
+    state.offset = data_end + 2;
+    Ok(RespFrame::BulkString(Some(
+        backing.slice(data_start..data_end),
+    )))
+}
+
+#[inline(always)]
+fn parse_array_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (count, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    state.offset = line_end + 2;
+
+    if count == -1 {
+        return Ok(RespFrame::Array(None));
+    }
+    if count < -1 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let count = usize::try_from(count).map_err(|_| ParseError::FrameTooLarge)?;
+    if count > MAX_ARRAY_ELEMENTS {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        frames.push(parse_frame(buf, backing, positions, state, depth + 1)?);
+    }
+
+    Ok(RespFrame::Array(Some(frames)))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_null_frame(
+    _buf: &[u8],
+    _backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start + 1)?;
+    if line_end != start + 1 {
+        return Err(ParseError::InvalidFrame);
+    }
+    state.offset = line_end + 2;
+    Ok(RespFrame::Null)
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_boolean_frame(
+    buf: &[u8],
+    _backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start + 1)?;
+    if line_end != start + 2 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let value = match buf[start + 1] {
+        b't' => true,
+        b'f' => false,
+        _ => return Err(ParseError::InvalidFrame),
+    };
+
+    state.offset = line_end + 2;
+    Ok(RespFrame::Boolean(value))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_double_frame(
+    buf: &[u8],
+    _backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start + 1)?;
+    let text =
+        std::str::from_utf8(&buf[start + 1..line_end]).map_err(|_| ParseError::InvalidFrame)?;
+    let value = text.parse().map_err(|_| ParseError::InvalidFrame)?;
+    state.offset = line_end + 2;
+    Ok(RespFrame::Double(value))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_big_number_frame(
+    _buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start + 1)?;
+    if line_end == start + 1 {
+        return Err(ParseError::InvalidFrame);
+    }
+    state.offset = line_end + 2;
+    Ok(RespFrame::BigNumber(backing.slice(start + 1..line_end)))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_bulk_error_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (len, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    if len < 0 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let len = usize::try_from(len).map_err(|_| ParseError::FrameTooLarge)?;
+    if len > MAX_BULK_STRING_LEN {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    let data_start = line_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(ParseError::FrameTooLarge)?;
+    validate_trailing_crlf(buf, positions, state, data_end)?;
+    state.offset = data_end + 2;
+    Ok(RespFrame::BulkError(backing.slice(data_start..data_end)))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_verbatim_string_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (len, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    if len < 4 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let len = usize::try_from(len).map_err(|_| ParseError::FrameTooLarge)?;
+    if len > MAX_BULK_STRING_LEN {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    let data_start = line_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or(ParseError::FrameTooLarge)?;
+    validate_trailing_crlf(buf, positions, state, data_end)?;
+
+    if buf.get(data_start + 3) != Some(&b':') {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let mut encoding = [0; 3];
+    encoding.copy_from_slice(&buf[data_start..data_start + 3]);
+    state.offset = data_end + 2;
+    Ok(RespFrame::VerbatimString {
+        encoding,
+        data: backing.slice(data_start + 4..data_end),
+    })
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_map_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (count, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    if count < 0 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let count = usize::try_from(count).map_err(|_| ParseError::FrameTooLarge)?;
+    if count > MAX_ARRAY_ELEMENTS {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    state.offset = line_end + 2;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = parse_frame(buf, backing, positions, state, depth + 1)?;
+        let value = parse_frame(buf, backing, positions, state, depth + 1)?;
+        entries.push((key, value));
+    }
+
+    Ok(RespFrame::Map(entries))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_set_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (count, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    if count < 0 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let count = usize::try_from(count).map_err(|_| ParseError::FrameTooLarge)?;
+    if count > MAX_ARRAY_ELEMENTS {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    state.offset = line_end + 2;
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        frames.push(parse_frame(buf, backing, positions, state, depth + 1)?);
+    }
+
+    Ok(RespFrame::Set(frames))
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_push_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (count, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    if count <= 0 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let count = usize::try_from(count).map_err(|_| ParseError::FrameTooLarge)?;
+    if count > MAX_ARRAY_ELEMENTS {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    state.offset = line_end + 2;
+    let kind_frame = parse_frame(buf, backing, positions, state, depth + 1)?;
+    let kind = match kind_frame {
+        RespFrame::BulkString(Some(bytes)) | RespFrame::SimpleString(bytes) => bytes,
+        _ => return Err(ParseError::InvalidFrame),
+    };
+
+    let mut data = Vec::with_capacity(count - 1);
+    for _ in 1..count {
+        data.push(parse_frame(buf, backing, positions, state, depth + 1)?);
+    }
+
+    Ok(RespFrame::Push { kind, data })
+}
+
+#[cfg(feature = "resp3")]
+#[inline(always)]
+fn parse_attribute_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let (count, line_end) = parse_number_line(buf, positions, state, start + 1)?;
+    if count < 0 {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    let count = usize::try_from(count).map_err(|_| ParseError::FrameTooLarge)?;
+    if count > MAX_ARRAY_ELEMENTS {
+        return Err(ParseError::FrameTooLarge);
+    }
+
+    state.offset = line_end + 2;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = parse_frame(buf, backing, positions, state, depth + 1)?;
+        let value = parse_frame(buf, backing, positions, state, depth + 1)?;
+        entries.push((key, value));
+    }
+
+    let data = Box::new(parse_frame(buf, backing, positions, state, depth + 1)?);
+    Ok(RespFrame::Attribute { entries, data })
+}
+
+#[inline(always)]
+fn parse_inline_frame(
+    buf: &[u8],
+    backing: &Bytes,
+    positions: &CrlfPositions,
+    state: &mut ParserState,
+    _depth: u8,
+) -> ParseResult<RespFrame> {
+    let start = state.offset;
+    let line_end = consume_next_crlf(positions, state, start)?;
+    let mut cursor = start;
+    let mut frames = Vec::with_capacity(4);
+
+    while cursor < line_end {
+        while cursor < line_end && buf[cursor] == b' ' {
+            cursor += 1;
         }
 
-        let frames: Vec<RespFrame> = parts
-            .into_iter()
-            .map(|p| RespFrame::BulkString(Some(Bytes::copy_from_slice(p))))
-            .collect();
+        if cursor == line_end {
+            break;
+        }
 
-        Ok((RespFrame::Array(Some(frames)), crlf + 2))
+        let part_start = cursor;
+        while cursor < line_end && buf[cursor] != b' ' {
+            cursor += 1;
+        }
+        frames.push(RespFrame::BulkString(Some(
+            backing.slice(part_start..cursor),
+        )));
     }
+
+    if frames.is_empty() {
+        return Err(ParseError::InvalidFrame);
+    }
+
+    state.offset = line_end + 2;
+    Ok(RespFrame::Array(Some(frames)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_pipeline_loop(buf: &[u8]) -> Result<(Vec<RespFrame>, usize), ParseError> {
+        let mut frames = Vec::new();
+        let mut consumed = 0;
+
+        while consumed < buf.len() {
+            match RespParser::parse(&buf[consumed..]) {
+                Ok((frame, used)) => {
+                    frames.push(frame);
+                    consumed += used;
+                }
+                Err(ParseError::NeedMoreData) => break,
+                Err(error) if frames.is_empty() => return Err(error),
+                Err(_) => break,
+            }
+        }
+
+        if frames.is_empty() {
+            Err(ParseError::NeedMoreData)
+        } else {
+            Ok((frames, consumed))
+        }
+    }
+
+    fn ping_pipeline(count: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for _ in 0..count {
+            buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        }
+        buf
+    }
+
+    fn nested_array(depth: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for _ in 0..depth {
+            buf.extend_from_slice(b"*1\r\n");
+        }
+        buf.extend_from_slice(b":1\r\n");
+        buf
+    }
 
     #[test]
     fn parse_simple_string() {
@@ -222,6 +769,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_invalid_integer_line() {
+        assert_eq!(
+            RespParser::parse(b":12a\r\n"),
+            Err(ParseError::InvalidFrame)
+        );
+    }
+
+    #[test]
     fn parse_bulk_string() {
         let buf = b"$5\r\nhello\r\n";
         let (frame, consumed) = RespParser::parse(buf).unwrap();
@@ -246,6 +801,14 @@ mod tests {
         let (frame, consumed) = RespParser::parse(buf).unwrap();
         assert_eq!(frame, RespFrame::BulkString(Some(Bytes::from_static(b""))));
         assert_eq!(consumed, 6);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_bulk_length() {
+        assert_eq!(
+            RespParser::parse(b"$2a\r\nhi\r\n"),
+            Err(ParseError::InvalidFrame)
+        );
     }
 
     #[test]
@@ -300,9 +863,12 @@ mod tests {
 
     #[test]
     fn incomplete_data() {
-        assert!(RespParser::parse(b"+OK\r").is_err());
-        assert!(RespParser::parse(b"$5\r\nhel").is_err());
-        assert!(RespParser::parse(b"").is_err());
+        assert_eq!(RespParser::parse(b"+OK\r"), Err(ParseError::NeedMoreData));
+        assert_eq!(
+            RespParser::parse(b"$5\r\nhel"),
+            Err(ParseError::NeedMoreData)
+        );
+        assert_eq!(RespParser::parse(b""), Err(ParseError::NeedMoreData));
     }
 
     #[cfg(feature = "resp3")]
@@ -331,6 +897,200 @@ mod tests {
         assert_eq!(frame, RespFrame::Double(2.72));
     }
 
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_big_number() {
+        let (frame, consumed) =
+            RespParser::parse(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::BigNumber(Bytes::from_static(
+                b"3492890328409238509324850943850943825024385"
+            ))
+        );
+        assert_eq!(consumed, 46);
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_bulk_error() {
+        let (frame, _) = RespParser::parse(b"!11\r\nERR failure\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::BulkError(Bytes::from_static(b"ERR failure"))
+        );
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_verbatim_string() {
+        let (frame, _) = RespParser::parse(b"=15\r\ntxt:hello world\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::VerbatimString {
+                encoding: *b"txt",
+                data: Bytes::from_static(b"hello world"),
+            }
+        );
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_map() {
+        let (frame, _) = RespParser::parse(b"%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::Map(vec![
+                (
+                    RespFrame::SimpleString(Bytes::from_static(b"first")),
+                    RespFrame::Integer(1),
+                ),
+                (
+                    RespFrame::SimpleString(Bytes::from_static(b"second")),
+                    RespFrame::Integer(2),
+                ),
+            ])
+        );
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_set() {
+        let (frame, _) = RespParser::parse(b"~2\r\n+orange\r\n+blue\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::Set(vec![
+                RespFrame::SimpleString(Bytes::from_static(b"orange")),
+                RespFrame::SimpleString(Bytes::from_static(b"blue")),
+            ])
+        );
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_push() {
+        let (frame, _) = RespParser::parse(b">2\r\n+message\r\n+payload\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::Push {
+                kind: Bytes::from_static(b"message"),
+                data: vec![RespFrame::SimpleString(Bytes::from_static(b"payload"))],
+            }
+        );
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_resp3_attribute() {
+        let (frame, _) = RespParser::parse(b"|1\r\n+meta\r\n+value\r\n:1\r\n").unwrap();
+        assert_eq!(
+            frame,
+            RespFrame::Attribute {
+                entries: vec![(
+                    RespFrame::SimpleString(Bytes::from_static(b"meta")),
+                    RespFrame::SimpleString(Bytes::from_static(b"value")),
+                )],
+                data: Box::new(RespFrame::Integer(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pipeline_multiple_frames() {
+        let buf = ping_pipeline(5);
+        let (frames, consumed) = RespParser::parse_pipeline(&buf).unwrap();
+        let (loop_frames, loop_consumed) = parse_pipeline_loop(&buf).unwrap();
+
+        assert_eq!(frames.len(), 5);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(frames, loop_frames);
+        assert_eq!(consumed, loop_consumed);
+    }
+
+    #[test]
+    fn parse_pipeline_hundreds_of_frames() {
+        let buf = ping_pipeline(100);
+        let (frames, consumed) = RespParser::parse_pipeline(&buf).unwrap();
+        assert_eq!(frames.len(), 100);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn parse_pipeline_returns_complete_prefix_before_partial_tail() {
+        let mut buf = ping_pipeline(1);
+        buf.extend_from_slice(b"*1\r\n$4\r\nPIN");
+
+        let (frames, consumed) = RespParser::parse_pipeline(&buf).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(consumed, 14);
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn parse_pipeline_handles_mixed_frame_types() {
+        let buf = b"+OK\r\n:1\r\n#t\r\n$5\r\nhello\r\n";
+        let (frames, consumed) = RespParser::parse_pipeline(buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(
+            frames,
+            vec![
+                RespFrame::SimpleString(Bytes::from_static(b"OK")),
+                RespFrame::Integer(1),
+                RespFrame::Boolean(true),
+                RespFrame::BulkString(Some(Bytes::from_static(b"hello"))),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_pipeline_stops_before_invalid_suffix() {
+        let mut buf = ping_pipeline(1);
+        buf.extend_from_slice(b":12a\r\n");
+
+        let (frames, consumed) = RespParser::parse_pipeline(&buf).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(consumed, 14);
+        assert_eq!(
+            RespParser::parse(&buf[consumed..]),
+            Err(ParseError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn parse_nesting_too_deep() {
+        let buf = nested_array(33);
+        assert_eq!(RespParser::parse(&buf), Err(ParseError::NestingTooDeep));
+    }
+
+    #[test]
+    fn parse_bulk_string_too_large() {
+        let buf = format!("${}\r\n", MAX_BULK_STRING_LEN + 1);
+        assert_eq!(
+            RespParser::parse(buf.as_bytes()),
+            Err(ParseError::FrameTooLarge)
+        );
+    }
+
+    #[test]
+    fn materialized_frames_share_one_backing_snapshot() {
+        let buf = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+        let backing = Bytes::copy_from_slice(buf);
+        let positions = scan_crlf(backing.as_ref());
+        let mut state = ParserState::default();
+        let frame = parse_frame(backing.as_ref(), &backing, &positions, &mut state, 0).unwrap();
+
+        let RespFrame::Array(Some(frames)) = frame else {
+            panic!("expected array frame");
+        };
+
+        let first = frames[0].as_bytes().unwrap();
+        let second = frames[1].as_bytes().unwrap();
+        let base = backing.as_ptr() as usize;
+
+        assert_eq!(first.as_ptr() as usize - base, 8);
+        assert_eq!(second.as_ptr() as usize - base, 17);
+    }
+
     #[test]
     fn reject_oversized_array_count() {
         // Regression tests for fuzzer crash inputs that caused OOM via
@@ -342,8 +1102,10 @@ mod tests {
             b"*10000007370955\r\n*0\r\n",
         ];
         for input in cases {
-            // Must not panic or OOM — should return Err.
-            assert!(RespParser::parse(input).is_err());
+            assert!(matches!(
+                RespParser::parse(input),
+                Err(ParseError::FrameTooLarge | ParseError::InvalidFrame)
+            ));
         }
     }
 }

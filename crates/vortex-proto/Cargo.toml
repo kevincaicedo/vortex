@@ -16,6 +16,8 @@ vortex-common = { workspace = true }
 bytes = { workspace = true }
 phf = { workspace = true }
 itoa = { workspace = true }
+ryu = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 phf_codegen = { workspace = true }

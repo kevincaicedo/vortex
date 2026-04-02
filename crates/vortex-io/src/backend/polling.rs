@@ -3,8 +3,21 @@
 //! Wraps epoll (Linux), kqueue (macOS/BSD). Emulates
 //! io_uring's completion-based model by performing I/O inline on poll events
 //! and generating synthetic [`Completion`] structs.
+//!
+//! ## Optimisation
+//!
+//! * **Write-readiness registration** – on `EAGAIN` from `write`/`writev`,
+//!   the fd is registered for write-readiness with the poller instead of
+//!   blindly re-trying every iteration (busy-poll elimination).
+//! * **Immediate retry after poll** – when `poller.wait()` returns readiness
+//!   events, all pending ops are retried in the *same* `completions()` call
+//!   instead of deferring to the next reactor iteration.
+//! * **O(1) fd tracking** – registered fds are kept in a `HashSet` instead
+//!   of a `Vec`, eliminating linear scans on every `EAGAIN`.
+//! * **1 ms poll timeout** – matches io_uring's wait strategy and keeps tail
+//!   latency low during idle periods.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::os::fd::{BorrowedFd, RawFd};
 
@@ -30,6 +43,12 @@ enum PendingOp {
         buf_len: usize,
         token: u64,
     },
+    Writev {
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    },
     Close {
         fd: RawFd,
         token: u64,
@@ -45,8 +64,8 @@ pub struct PollingBackend {
     poller: Poller,
     events: Events,
     pending: VecDeque<PendingOp>,
-    /// File descriptors registered with the poller for read interest.
-    registered_read: Vec<RawFd>,
+    /// File descriptors currently registered with the poller (any interest).
+    registered: HashSet<RawFd>,
 }
 
 impl PollingBackend {
@@ -56,8 +75,65 @@ impl PollingBackend {
             poller: Poller::new()?,
             events: Events::new(),
             pending: VecDeque::with_capacity(256),
-            registered_read: Vec::new(),
+            registered: HashSet::with_capacity(64),
         })
+    }
+
+    /// Register (or re-arm) interest for `fd` with the poller.
+    fn register_interest(&mut self, fd: RawFd, event: Event) {
+        // SAFETY: fd is a valid, open file descriptor owned by the reactor.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        if self.registered.contains(&fd) {
+            let _ = self.poller.modify(borrowed, event);
+        } else {
+            unsafe {
+                self.poller.add(&borrowed, event).unwrap_or_else(|_| {
+                    let _ = self.poller.modify(borrowed, event);
+                });
+            }
+            self.registered.insert(fd);
+        }
+    }
+
+    /// Process all currently-pending ops, appending completions to `out`.
+    fn drain_pending(&mut self, out: &mut Vec<Completion>) {
+        let n_pending = self.pending.len();
+        for _ in 0..n_pending {
+            if let Some(op) = self.pending.pop_front() {
+                match op {
+                    PendingOp::Accept { listener_fd, token } => {
+                        self.do_accept(listener_fd, token, out);
+                    }
+                    PendingOp::Read {
+                        fd,
+                        buf_ptr,
+                        buf_len,
+                        token,
+                    } => {
+                        self.do_read(fd, buf_ptr, buf_len, token, out);
+                    }
+                    PendingOp::Write {
+                        fd,
+                        buf_ptr,
+                        buf_len,
+                        token,
+                    } => {
+                        self.do_write(fd, buf_ptr, buf_len, token, out);
+                    }
+                    PendingOp::Writev {
+                        fd,
+                        iovecs,
+                        iov_count,
+                        token,
+                    } => {
+                        self.do_writev(fd, iovecs, iov_count, token, out);
+                    }
+                    PendingOp::Close { fd, token } => {
+                        self.do_close(fd, token, out);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -105,6 +181,22 @@ impl IoBackend for PollingBackend {
         Ok(())
     }
 
+    fn submit_writev(
+        &mut self,
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    ) -> io::Result<()> {
+        self.pending.push_back(PendingOp::Writev {
+            fd,
+            iovecs,
+            iov_count,
+            token,
+        });
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<usize> {
         // The polling backend doesn't batch — ops are processed in completions().
         Ok(0)
@@ -113,49 +205,24 @@ impl IoBackend for PollingBackend {
     fn completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         let start = out.len();
 
-        // Process only the operations that were pending at the start of this
-        // call. Operations re-queued during processing (e.g., on EAGAIN) will
-        // be picked up on the next call after the poller signals readiness.
-        let n_pending = self.pending.len();
-        for _ in 0..n_pending {
-            if let Some(op) = self.pending.pop_front() {
-                match op {
-                    PendingOp::Accept { listener_fd, token } => {
-                        self.do_accept(listener_fd, token, out);
-                    }
-                    PendingOp::Read {
-                        fd,
-                        buf_ptr,
-                        buf_len,
-                        token,
-                    } => {
-                        self.do_read(fd, buf_ptr, buf_len, token, out);
-                    }
-                    PendingOp::Write {
-                        fd,
-                        buf_ptr,
-                        buf_len,
-                        token,
-                    } => {
-                        self.do_write(fd, buf_ptr, buf_len, token, out);
-                    }
-                    PendingOp::Close { fd, token } => {
-                        self.do_close(fd, token, out);
-                    }
-                }
-            }
+        // First pass: attempt all pending operations.
+        self.drain_pending(out);
+
+        // Hot path: if we produced completions, return immediately.
+        if out.len() > start {
+            return Ok(out.len() - start);
         }
 
-        // If no completions yet, poll for events with a short timeout so the
+        // No completions — poll for readiness with a short timeout so the
         // reactor can tick timers and check shutdown.
-        if out.len() == start {
-            self.events.clear();
-            self.poller
-                .wait(&mut self.events, Some(std::time::Duration::from_millis(10)))?;
+        self.events.clear();
+        self.poller
+            .wait(&mut self.events, Some(std::time::Duration::from_millis(1)))?;
 
-            // Events indicate readiness, not completion. The re-queued pending
-            // ops (from EAGAIN paths) will pick up the ready I/O next iteration.
-            // No synthetic completions are generated from events.
+        // Immediately retry pending ops now that readiness has been signalled.
+        // This avoids deferring to the next reactor iteration.
+        if !self.events.is_empty() {
+            self.drain_pending(out);
         }
 
         Ok(out.len() - start)
@@ -191,25 +258,8 @@ impl PollingBackend {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                // Not ready — register listener with poller and re-queue.
-                let is_new = !self.registered_read.contains(&listener_fd);
-                let borrowed = unsafe { BorrowedFd::borrow_raw(listener_fd) };
-                if is_new {
-                    unsafe {
-                        self.poller
-                            .add(&borrowed, Event::readable(token as usize))
-                            .unwrap_or_else(|_| {
-                                let _ = self
-                                    .poller
-                                    .modify(borrowed, Event::readable(token as usize));
-                            });
-                    }
-                    self.registered_read.push(listener_fd);
-                } else {
-                    let _ = self
-                        .poller
-                        .modify(borrowed, Event::readable(token as usize));
-                }
+                // Not ready — register listener for read-readiness and re-queue.
+                self.register_interest(listener_fd, Event::readable(token as usize));
                 self.pending
                     .push_back(PendingOp::Accept { listener_fd, token });
             } else {
@@ -251,27 +301,8 @@ impl PollingBackend {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                // Not ready yet — register with poller and retry later.
-                let is_new = !self.registered_read.contains(&fd);
-                // SAFETY: fd is a valid, open file descriptor owned by the reactor.
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                if is_new {
-                    unsafe {
-                        self.poller
-                            .add(&borrowed, Event::readable(token as usize))
-                            .unwrap_or_else(|_| {
-                                let _ = self
-                                    .poller
-                                    .modify(borrowed, Event::readable(token as usize));
-                            });
-                    }
-                    self.registered_read.push(fd);
-                } else {
-                    let _ = self
-                        .poller
-                        .modify(borrowed, Event::readable(token as usize));
-                }
-                // Re-queue the read for when the fd becomes readable.
+                // Not ready — register for read-readiness and retry later.
+                self.register_interest(fd, Event::readable(token as usize));
                 self.pending.push_back(PendingOp::Read {
                     fd,
                     buf_ptr,
@@ -310,7 +341,8 @@ impl PollingBackend {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                // Re-queue for later.
+                // Register for write-readiness instead of busy-polling.
+                self.register_interest(fd, Event::writable(token as usize));
                 self.pending.push_back(PendingOp::Write {
                     fd,
                     buf_ptr,
@@ -328,13 +360,52 @@ impl PollingBackend {
         }
     }
 
+    fn do_writev(
+        &mut self,
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+        out: &mut Vec<Completion>,
+    ) {
+        // SAFETY: iovecs points to a valid array of iov_count iovec structs
+        // on the reactor thread. fd is a valid socket fd.
+        let n = unsafe { libc::writev(fd, iovecs, iov_count as libc::c_int) };
+
+        if n >= 0 {
+            out.push(Completion {
+                token,
+                result: n as i32,
+                flags: 0,
+            });
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                // Register for write-readiness instead of busy-polling.
+                self.register_interest(fd, Event::writable(token as usize));
+                self.pending.push_back(PendingOp::Writev {
+                    fd,
+                    iovecs,
+                    iov_count,
+                    token,
+                });
+                return;
+            }
+            let errno = err.raw_os_error().unwrap_or(1);
+            out.push(Completion {
+                token,
+                result: -errno,
+                flags: 0,
+            });
+        }
+    }
+
     fn do_close(&mut self, fd: RawFd, token: u64, out: &mut Vec<Completion>) {
         // Remove from poller if registered.
-        if let Some(pos) = self.registered_read.iter().position(|&f| f == fd) {
+        if self.registered.remove(&fd) {
             // SAFETY: fd was previously registered with the poller.
             let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
             let _ = self.poller.delete(borrowed);
-            self.registered_read.swap_remove(pos);
         }
 
         // SAFETY: fd is a valid socket fd owned by the reactor.

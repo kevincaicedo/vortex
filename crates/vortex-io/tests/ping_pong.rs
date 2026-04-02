@@ -131,8 +131,10 @@ fn unknown_command_returns_error() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set read timeout");
 
-    // Send unknown command.
-    stream.write_all(b"*1\r\n$3\r\nGET\r\n").expect("write GET");
+    // Send truly unknown command.
+    stream
+        .write_all(b"*1\r\n$6\r\nFOOBAR\r\n")
+        .expect("write FOOBAR");
 
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).expect("read error");
