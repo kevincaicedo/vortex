@@ -256,6 +256,38 @@ impl Reactor {
             completions.clear();
             self.cqe_buf = completions;
 
+            // 3b. Fast-path: process newly submitted ops (e.g., writes after
+            //     reads) immediately, collapsing read→process→write into a
+            //     single event-loop iteration instead of two.
+            self.cqe_buf.clear();
+            if self.backend.completions(&mut self.cqe_buf).is_ok() && !self.cqe_buf.is_empty() {
+                let mut fast_completions = std::mem::take(&mut self.cqe_buf);
+                for cqe in &fast_completions {
+                    let (conn_id, cgen, op) = decode_token(cqe.token);
+                    match op {
+                        OpType::Accept => self.handle_accept(cqe),
+                        _ => {
+                            let valid = self.connections.get(conn_id).is_some_and(|_| {
+                                self.generations.get(conn_id).copied().unwrap_or(0) == cgen
+                            });
+                            if !valid {
+                                continue;
+                            }
+                            match op {
+                                OpType::Read => self.handle_read(conn_id, cqe),
+                                OpType::Write | OpType::Writev => {
+                                    self.handle_write(conn_id, cqe);
+                                }
+                                OpType::Close => self.handle_close(conn_id),
+                                OpType::Accept => unreachable!(),
+                            }
+                        }
+                    }
+                }
+                fast_completions.clear();
+                self.cqe_buf = fast_completions;
+            }
+
             // 4. Tick timer wheel — expire idle connections.
             if self.connection_timeout > 0 {
                 self.tick_timers();

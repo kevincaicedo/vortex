@@ -526,7 +526,10 @@ impl SwissTable {
                 let entry = unsafe { self.raw.entry(slot) };
                 if entry.matches_key(key_bytes) {
                     // Key found — return existing value.
-                    return (self.values[slot].as_mut().expect("live slot has value"), true);
+                    return (
+                        self.values[slot].as_mut().expect("live slot has value"),
+                        true,
+                    );
                 }
             }
 
@@ -621,8 +624,7 @@ impl SwissTable {
         let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
         let value_ptr = self.values[slot]
             .as_ref()
-            .expect("new slot must have value")
-            as *const VortexValue;
+            .expect("new slot must have value") as *const VortexValue;
 
         let entry = unsafe { self.raw.entry_mut(slot) };
         Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);

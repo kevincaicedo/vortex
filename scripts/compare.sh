@@ -26,6 +26,8 @@
 #   --no-docker  Skip Docker containers (expect servers already running on ports)
 #   --docker-all Run ALL databases (including VortexDB) in Docker with identical
 #                resource limits for a fair apples-to-apples comparison
+#   --native     Run VortexDB and Redis both natively (no Docker at all).
+#                Requires redis-server installed locally.
 #   --cpus NUM   CPU limit per Docker container (default: 4)
 #   --memory SZ  Memory limit per container (default: 2g)
 #   --help       Show this help message
@@ -60,6 +62,7 @@ RUN_CUSTOM=false
 DO_BUILD=true
 DO_DOCKER=true
 DOCKER_ALL=false
+NATIVE_MODE=false
 DOCKER_CPUS=4
 DOCKER_MEMORY="2g"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -89,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --no-build) DO_BUILD=false; shift ;;
         --no-docker) DO_DOCKER=false; shift ;;
         --docker-all) DOCKER_ALL=true; shift ;;
+        --native) NATIVE_MODE=true; shift ;;
         --cpus) DOCKER_CPUS=$2; shift 2 ;;
         --memory) DOCKER_MEMORY=$2; shift 2 ;;
         --help|-h)
@@ -101,6 +105,16 @@ done
 
 [[ -z "$TESTS" ]] && TESTS="$DEFAULT_TESTS"
 kv_init
+
+# ── Mode validation ──
+if [[ "$NATIVE_MODE" == true && "$DOCKER_ALL" == true ]]; then
+    echo "ERROR: --native and --docker-all are mutually exclusive" >&2
+    exit 1
+fi
+if [[ "$NATIVE_MODE" == true ]]; then
+    DO_DOCKER=false
+    SERVERS="vortex redis"
+fi
 
 # ── Utility functions ──
 
@@ -119,6 +133,10 @@ cleanup() {
     if [[ -n "${VORTEX_PID:-}" ]]; then
         kill "$VORTEX_PID" 2>/dev/null || true
         wait "$VORTEX_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${REDIS_PID:-}" ]]; then
+        kill "$REDIS_PID" 2>/dev/null || true
+        wait "$REDIS_PID" 2>/dev/null || true
     fi
     rm -rf "$RESULTS_DIR"
 }
@@ -216,6 +234,8 @@ printf "║  Requests: %-8s  Clients: %-6s  Pipeline: %-6s        ║\n" "$REQUE
 printf "║  Runs: %-4s  JSON: %-5s  Markdown: %-5s  Latency: %-5s   ║\n" "$NUM_RUNS" "$OUTPUT_JSON" "$OUTPUT_MARKDOWN" "$CAPTURE_LATENCY"
 if [[ "$DOCKER_ALL" == true ]]; then
 printf "║  Docker-All: yes    CPUs: %-4s  Memory: %-8s              ║\n" "$DOCKER_CPUS" "$DOCKER_MEMORY"
+elif [[ "$NATIVE_MODE" == true ]]; then
+printf "║  Native: yes (VortexDB + Redis, no Docker)                    ║\n"
 fi
 echo "╚══════════════════════════════════════════════════════════════════╝"
 echo ""
@@ -266,7 +286,28 @@ else
 fi
 
 # ── Start competitor databases ──
-if [[ "$DO_DOCKER" == true ]]; then
+if [[ "$NATIVE_MODE" == true ]]; then
+    # Native mode: start Redis locally without Docker
+    if ! command -v redis-server >/dev/null 2>&1; then
+        echo "ERROR: redis-server not found. Install Redis to use --native mode." >&2
+        exit 1
+    fi
+    # Detect available CPU cores for io-threads (cap at 4 for consistency)
+    local_cpus=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+    redis_threads=$((local_cpus > 4 ? 4 : local_cpus))
+    REDIS_LOG="$RESULTS_DIR/redis.log"
+    log_info "Starting Redis (native, io-threads $redis_threads) on port $PORT..."
+    redis-server \
+        --port "$PORT" \
+        --save "" --appendonly no \
+        --io-threads "$redis_threads" --io-threads-do-reads yes \
+        --hz 100 --loglevel warning \
+        --protected-mode no \
+        --daemonize no >"$REDIS_LOG" 2>&1 &
+    REDIS_PID=$!
+    kv_set "port_redis" "$PORT"
+    PORT=$((PORT + 1))
+elif [[ "$DO_DOCKER" == true ]]; then
     # Redis 8.6.2 — optimal benchmark configuration
     log_info "Starting Redis ($IMAGE_redis) on port $PORT..."
     docker run -d --rm \
@@ -410,6 +451,11 @@ done
 
 collect_result_rows() {
     local suffix=$1
+    local files=""
+    for name in $SERVERS; do
+        files="$files $RESULTS_DIR/${name}${suffix}"
+    done
+    # shellcheck disable=SC2086
     awk -F',' '
         FNR == 1 { next }
         {
@@ -419,10 +465,7 @@ collect_result_rows() {
                 print label
             }
         }
-    ' "$RESULTS_DIR"/vortex"$suffix" \
-      "$RESULTS_DIR"/redis"$suffix" \
-      "$RESULTS_DIR"/dragonfly"$suffix" \
-      "$RESULTS_DIR"/valkey"$suffix" 2>/dev/null
+    ' $files 2>/dev/null
 }
 
 average_rps() {
@@ -553,45 +596,72 @@ fi
 
 # ── Print terminal table ──
 echo ""
-echo "╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗"
-echo "║                                    Results (requests/sec)                                                  ║"
-if [[ $NUM_RUNS -gt 1 ]]; then
-    printf "║                              Averaged over %d runs                                                        ║\n" "$NUM_RUNS"
-fi
-echo "╠══════════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦════════╦════════╦════════╣"
-printf "║ %-16s ║ %13s ║ %13s ║ %13s ║ %13s ║ %6s ║ %6s ║ %6s ║\n" \
-    "Test" "Vortex" "Redis" "Dragonfly" "Valkey" "vs Red" "vs Drg" "vs Val"
-echo "╠══════════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬════════╬════════╬════════╣"
+if [[ "$NATIVE_MODE" == true ]]; then
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                    Results (requests/sec)                     ║"
+    if [[ $NUM_RUNS -gt 1 ]]; then
+        printf "║                    Averaged over %d runs                      ║\n" "$NUM_RUNS"
+    fi
+    echo "╠══════════════════╦═══════════════╦═══════════════╦════════════╣"
+    printf "║ %-16s ║ %13s ║ %13s ║ %8s   ║\n" "Test" "Vortex" "Redis" "vs Redis"
+    echo "╠══════════════════╬═══════════════╬═══════════════╬════════════╣"
 
-while IFS= read -r test; do
-    [[ -z "$test" ]] && continue
-    v_rps=$(kv_get "rps__${test}__vortex")
-    r_rps=$(kv_get "rps__${test}__redis")
-    d_rps=$(kv_get "rps__${test}__dragonfly")
-    k_rps=$(kv_get "rps__${test}__valkey")
-    [[ -z "$v_rps" ]] && v_rps="N/A"
-    [[ -z "$r_rps" ]] && r_rps="N/A"
-    [[ -z "$d_rps" ]] && d_rps="N/A"
-    [[ -z "$k_rps" ]] && k_rps="N/A"
+    while IFS= read -r test; do
+        [[ -z "$test" ]] && continue
+        v_rps=$(kv_get "rps__${test}__vortex"); [[ -z "$v_rps" ]] && v_rps="N/A"
+        r_rps=$(kv_get "rps__${test}__redis"); [[ -z "$r_rps" ]] && r_rps="N/A"
+        vs_redis=$(calc_ratio "$v_rps" "$r_rps")
+        [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="${vs_redis}x"
 
-    vs_redis=$(calc_ratio "$v_rps" "$r_rps")
-    vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
-    vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
+        printf "║ %-16s ║ %13s ║ %13s ║ %8s   ║\n" \
+            "$test" \
+            "$(format_number "$v_rps")" \
+            "$(format_number "$r_rps")" \
+            "$vs_redis"
+    done < "$ALL_TESTS_FILE"
 
-    [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="${vs_redis}x"
-    [[ "$vs_dragon" != "N/A" && "$vs_dragon" != "inf" ]] && vs_dragon="${vs_dragon}x"
-    [[ "$vs_valkey" != "N/A" && "$vs_valkey" != "inf" ]] && vs_valkey="${vs_valkey}x"
-
+    echo "╚══════════════════╩═══════════════╩═══════════════╩════════════╝"
+else
+    echo "╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗"
+    echo "║                                    Results (requests/sec)                                                  ║"
+    if [[ $NUM_RUNS -gt 1 ]]; then
+        printf "║                              Averaged over %d runs                                                        ║\n" "$NUM_RUNS"
+    fi
+    echo "╠══════════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦════════╦════════╦════════╣"
     printf "║ %-16s ║ %13s ║ %13s ║ %13s ║ %13s ║ %6s ║ %6s ║ %6s ║\n" \
-        "$test" \
-        "$(format_number "$v_rps")" \
-        "$(format_number "$r_rps")" \
-        "$(format_number "$d_rps")" \
-        "$(format_number "$k_rps")" \
-        "$vs_redis" "$vs_dragon" "$vs_valkey"
-done < "$ALL_TESTS_FILE"
+        "Test" "Vortex" "Redis" "Dragonfly" "Valkey" "vs Red" "vs Drg" "vs Val"
+    echo "╠══════════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬════════╬════════╬════════╣"
 
-echo "╚══════════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩════════╩════════╩════════╝"
+    while IFS= read -r test; do
+        [[ -z "$test" ]] && continue
+        v_rps=$(kv_get "rps__${test}__vortex")
+        r_rps=$(kv_get "rps__${test}__redis")
+        d_rps=$(kv_get "rps__${test}__dragonfly")
+        k_rps=$(kv_get "rps__${test}__valkey")
+        [[ -z "$v_rps" ]] && v_rps="N/A"
+        [[ -z "$r_rps" ]] && r_rps="N/A"
+        [[ -z "$d_rps" ]] && d_rps="N/A"
+        [[ -z "$k_rps" ]] && k_rps="N/A"
+
+        vs_redis=$(calc_ratio "$v_rps" "$r_rps")
+        vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
+        vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
+
+        [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="${vs_redis}x"
+        [[ "$vs_dragon" != "N/A" && "$vs_dragon" != "inf" ]] && vs_dragon="${vs_dragon}x"
+        [[ "$vs_valkey" != "N/A" && "$vs_valkey" != "inf" ]] && vs_valkey="${vs_valkey}x"
+
+        printf "║ %-16s ║ %13s ║ %13s ║ %13s ║ %13s ║ %6s ║ %6s ║ %6s ║\n" \
+            "$test" \
+            "$(format_number "$v_rps")" \
+            "$(format_number "$r_rps")" \
+            "$(format_number "$d_rps")" \
+            "$(format_number "$k_rps")" \
+            "$vs_redis" "$vs_dragon" "$vs_valkey"
+    done < "$ALL_TESTS_FILE"
+
+    echo "╚══════════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩════════╩════════╩════════╝"
+fi
 
 # ── JSON output ──
 if [[ "$OUTPUT_JSON" == true ]]; then
@@ -605,7 +675,8 @@ if [[ "$OUTPUT_JSON" == true ]]; then
         echo "    \"requests\": $REQUESTS,"
         echo "    \"clients\": $CLIENTS,"
         echo "    \"pipeline\": $PIPELINE,"
-        echo "    \"runs\": $NUM_RUNS"
+        echo "    \"runs\": $NUM_RUNS,"
+        echo "    \"mode\": \"$(if [[ "$NATIVE_MODE" == true ]]; then echo "native"; elif [[ "$DOCKER_ALL" == true ]]; then echo "docker-all"; else echo "mixed"; fi)\""
         echo "  },"
         echo "  \"results\": ["
 
@@ -615,15 +686,11 @@ if [[ "$OUTPUT_JSON" == true ]]; then
             [[ "$first_entry" == true ]] && first_entry=false || echo "    ,"
             v_rps=$(kv_get "rps__${test}__vortex"); [[ -z "$v_rps" ]] && v_rps="N/A"
             r_rps=$(kv_get "rps__${test}__redis"); [[ -z "$r_rps" ]] && r_rps="N/A"
-            d_rps=$(kv_get "rps__${test}__dragonfly"); [[ -z "$d_rps" ]] && d_rps="N/A"
-            k_rps=$(kv_get "rps__${test}__valkey"); [[ -z "$k_rps" ]] && k_rps="N/A"
             v_sd=$(kv_get "sd__${test}__vortex"); [[ -z "$v_sd" ]] && v_sd="0"
             r_sd=$(kv_get "sd__${test}__redis"); [[ -z "$r_sd" ]] && r_sd="0"
-            d_sd=$(kv_get "sd__${test}__dragonfly"); [[ -z "$d_sd" ]] && d_sd="0"
-            k_sd=$(kv_get "sd__${test}__valkey"); [[ -z "$k_sd" ]] && k_sd="0"
+            v_ci=$(kv_get "ci95__${test}__vortex"); [[ -z "$v_ci" ]] && v_ci="0"
+            r_ci=$(kv_get "ci95__${test}__redis"); [[ -z "$r_ci" ]] && r_ci="0"
             vs_redis=$(calc_ratio "$v_rps" "$r_rps")
-            vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
-            vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
 
             json_val() { [[ "$1" == "N/A" ]] && echo "null" || echo "$1"; }
 
@@ -631,30 +698,50 @@ if [[ "$OUTPUT_JSON" == true ]]; then
             echo "      \"test\": \"$test\","
             echo "      \"rps\": {"
             echo "        \"vortex\": $(json_val "$v_rps"),"
-            echo "        \"redis\": $(json_val "$r_rps"),"
-            echo "        \"dragonfly\": $(json_val "$d_rps"),"
-            echo "        \"valkey\": $(json_val "$k_rps")"
+            echo "        \"redis\": $(json_val "$r_rps")"
+
+            if [[ "$NATIVE_MODE" != true ]]; then
+                d_rps=$(kv_get "rps__${test}__dragonfly"); [[ -z "$d_rps" ]] && d_rps="N/A"
+                k_rps=$(kv_get "rps__${test}__valkey"); [[ -z "$k_rps" ]] && k_rps="N/A"
+                echo "        ,\"dragonfly\": $(json_val "$d_rps")"
+                echo "        ,\"valkey\": $(json_val "$k_rps")"
+            fi
+
             echo "      },"
             echo "      \"stddev\": {"
             echo "        \"vortex\": $(json_val "$v_sd"),"
-            echo "        \"redis\": $(json_val "$r_sd"),"
-            echo "        \"dragonfly\": $(json_val "$d_sd"),"
-            echo "        \"valkey\": $(json_val "$k_sd")"
+            echo "        \"redis\": $(json_val "$r_sd")"
+
+            if [[ "$NATIVE_MODE" != true ]]; then
+                d_sd=$(kv_get "sd__${test}__dragonfly"); [[ -z "$d_sd" ]] && d_sd="0"
+                k_sd=$(kv_get "sd__${test}__valkey"); [[ -z "$k_sd" ]] && k_sd="0"
+                echo "        ,\"dragonfly\": $(json_val "$d_sd")"
+                echo "        ,\"valkey\": $(json_val "$k_sd")"
+            fi
+
             echo "      },"
-            v_ci=$(kv_get "ci95__${test}__vortex"); [[ -z "$v_ci" ]] && v_ci="0"
-            r_ci=$(kv_get "ci95__${test}__redis"); [[ -z "$r_ci" ]] && r_ci="0"
-            d_ci=$(kv_get "ci95__${test}__dragonfly"); [[ -z "$d_ci" ]] && d_ci="0"
-            k_ci=$(kv_get "ci95__${test}__valkey"); [[ -z "$k_ci" ]] && k_ci="0"
             echo "      \"ci95\": {"
             echo "        \"vortex\": $(json_val "$v_ci"),"
-            echo "        \"redis\": $(json_val "$r_ci"),"
-            echo "        \"dragonfly\": $(json_val "$d_ci"),"
-            echo "        \"valkey\": $(json_val "$k_ci")"
+            echo "        \"redis\": $(json_val "$r_ci")"
+
+            if [[ "$NATIVE_MODE" != true ]]; then
+                d_ci=$(kv_get "ci95__${test}__dragonfly"); [[ -z "$d_ci" ]] && d_ci="0"
+                k_ci=$(kv_get "ci95__${test}__valkey"); [[ -z "$k_ci" ]] && k_ci="0"
+                echo "        ,\"dragonfly\": $(json_val "$d_ci")"
+                echo "        ,\"valkey\": $(json_val "$k_ci")"
+            fi
+
             echo "      },"
             echo "      \"ratios\": {"
-            echo "        \"vs_redis\": $(json_val "$vs_redis"),"
-            echo "        \"vs_dragonfly\": $(json_val "$vs_dragon"),"
-            echo "        \"vs_valkey\": $(json_val "$vs_valkey")"
+            echo "        \"vs_redis\": $(json_val "$vs_redis")"
+
+            if [[ "$NATIVE_MODE" != true ]]; then
+                vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
+                vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
+                echo "        ,\"vs_dragonfly\": $(json_val "$vs_dragon")"
+                echo "        ,\"vs_valkey\": $(json_val "$vs_valkey")"
+            fi
+
             echo "      }"
             echo "    }"
         done < "$ALL_TESTS_FILE"
@@ -681,30 +768,50 @@ if [[ "$OUTPUT_MARKDOWN" == true ]]; then
         if [[ "$DOCKER_ALL" == true ]]; then
             echo "**Mode:** All databases containerized with identical resource limits"
             echo "**Resources per container:** ${DOCKER_CPUS} CPUs, ${DOCKER_MEMORY} RAM"
+        elif [[ "$NATIVE_MODE" == true ]]; then
+            echo "**Mode:** Native (both VortexDB and Redis running natively, no Docker)"
         fi
-        echo "**Versions:** Redis ${IMAGE_redis}, Dragonfly ${IMAGE_dragonfly}, Valkey ${IMAGE_valkey}"
-        echo ""
-        echo "## Throughput (requests/sec)"
-        echo ""
-        echo "| Test | VortexDB | Redis 8 | Dragonfly | Valkey 9 | vs Redis | vs Dragonfly | vs Valkey |"
-        echo "|------|----------|---------|-----------|----------|----------|--------------|-----------|"
 
-        while IFS= read -r test; do
-            [[ -z "$test" ]] && continue
-            v_rps=$(kv_get "rps__${test}__vortex"); [[ -z "$v_rps" ]] && v_rps="N/A"
-            r_rps=$(kv_get "rps__${test}__redis"); [[ -z "$r_rps" ]] && r_rps="N/A"
-            d_rps=$(kv_get "rps__${test}__dragonfly"); [[ -z "$d_rps" ]] && d_rps="N/A"
-            k_rps=$(kv_get "rps__${test}__valkey"); [[ -z "$k_rps" ]] && k_rps="N/A"
-            vs_redis=$(calc_ratio "$v_rps" "$r_rps")
-            vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
-            vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
+        if [[ "$NATIVE_MODE" == true ]]; then
+            echo ""
+            echo "## Throughput (requests/sec)"
+            echo ""
+            echo "| Test | VortexDB | Redis | vs Redis |"
+            echo "|------|----------|-------|----------|"
 
-            [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="**${vs_redis}x**"
-            [[ "$vs_dragon" != "N/A" && "$vs_dragon" != "inf" ]] && vs_dragon="**${vs_dragon}x**"
-            [[ "$vs_valkey" != "N/A" && "$vs_valkey" != "inf" ]] && vs_valkey="**${vs_valkey}x**"
+            while IFS= read -r test; do
+                [[ -z "$test" ]] && continue
+                v_rps=$(kv_get "rps__${test}__vortex"); [[ -z "$v_rps" ]] && v_rps="N/A"
+                r_rps=$(kv_get "rps__${test}__redis"); [[ -z "$r_rps" ]] && r_rps="N/A"
+                vs_redis=$(calc_ratio "$v_rps" "$r_rps")
+                [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="**${vs_redis}x**"
+                echo "| $test | $(format_number "$v_rps") | $(format_number "$r_rps") | $vs_redis |"
+            done < "$ALL_TESTS_FILE"
+        else
+            echo "**Versions:** Redis ${IMAGE_redis}, Dragonfly ${IMAGE_dragonfly}, Valkey ${IMAGE_valkey}"
+            echo ""
+            echo "## Throughput (requests/sec)"
+            echo ""
+            echo "| Test | VortexDB | Redis 8 | Dragonfly | Valkey 9 | vs Redis | vs Dragonfly | vs Valkey |"
+            echo "|------|----------|---------|-----------|----------|----------|--------------|-----------|"
 
-            echo "| $test | $(format_number "$v_rps") | $(format_number "$r_rps") | $(format_number "$d_rps") | $(format_number "$k_rps") | $vs_redis | $vs_dragon | $vs_valkey |"
-        done < "$ALL_TESTS_FILE"
+            while IFS= read -r test; do
+                [[ -z "$test" ]] && continue
+                v_rps=$(kv_get "rps__${test}__vortex"); [[ -z "$v_rps" ]] && v_rps="N/A"
+                r_rps=$(kv_get "rps__${test}__redis"); [[ -z "$r_rps" ]] && r_rps="N/A"
+                d_rps=$(kv_get "rps__${test}__dragonfly"); [[ -z "$d_rps" ]] && d_rps="N/A"
+                k_rps=$(kv_get "rps__${test}__valkey"); [[ -z "$k_rps" ]] && k_rps="N/A"
+                vs_redis=$(calc_ratio "$v_rps" "$r_rps")
+                vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
+                vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
+
+                [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="**${vs_redis}x**"
+                [[ "$vs_dragon" != "N/A" && "$vs_dragon" != "inf" ]] && vs_dragon="**${vs_dragon}x**"
+                [[ "$vs_valkey" != "N/A" && "$vs_valkey" != "inf" ]] && vs_valkey="**${vs_valkey}x**"
+
+                echo "| $test | $(format_number "$v_rps") | $(format_number "$r_rps") | $(format_number "$d_rps") | $(format_number "$k_rps") | $vs_redis | $vs_dragon | $vs_valkey |"
+            done < "$ALL_TESTS_FILE"
+        fi
 
         echo ""
         echo "---"

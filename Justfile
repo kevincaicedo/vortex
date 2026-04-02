@@ -90,6 +90,10 @@ compare *ARGS:
 compare-docker *ARGS:
     bash scripts/compare.sh --docker-all --json --markdown --latency --custom {{ARGS}}
 
+# Native comparison (VortexDB + Redis both native, no Docker)
+compare-native *ARGS:
+    bash scripts/compare.sh --native --json --markdown --latency --custom {{ARGS}}
+
 # Run comparison with JSON + Markdown output
 compare-full:
     bash scripts/compare.sh --json --markdown --latency --runs 3 --custom

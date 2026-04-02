@@ -1,10 +1,10 @@
-# VortexDB development & fair benchmark environment
+# VortexDB development & benchmark environment
 #
 # Development:
 #   docker compose up -d dev          # Start dev container
 #   docker compose exec dev bash      # Enter dev shell
 #
-# Fair benchmark (all databases with identical resources):
+# benchmark (all databases with identical resources):
 #   docker compose --profile bench up -d
 #   ./scripts/compare.sh --docker-all --latency --markdown --json
 #   docker compose --profile bench down

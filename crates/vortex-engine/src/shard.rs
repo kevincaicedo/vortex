@@ -76,7 +76,8 @@ impl Shard {
         hash: u64,
         now_nanos: u64,
     ) -> Option<&VortexValue> {
-        self.data.get_or_expire_prehashed(key_bytes, hash, now_nanos)
+        self.data
+            .get_or_expire_prehashed(key_bytes, hash, now_nanos)
     }
 
     /// Prefetch the control group for a pre-computed hash.
@@ -155,7 +156,11 @@ impl Shard {
     /// `(&mut new_value, false)`. Avoids the double hash+probe of
     /// `get_mut → miss → set`.
     #[inline]
-    pub fn get_or_insert_with<F>(&mut self, key: VortexKey, default_fn: F) -> (&mut VortexValue, bool)
+    pub fn get_or_insert_with<F>(
+        &mut self,
+        key: VortexKey,
+        default_fn: F,
+    ) -> (&mut VortexValue, bool)
     where
         F: FnOnce() -> VortexValue,
     {
