@@ -342,6 +342,125 @@ impl<'a> FrameRef<'a> {
             _ => None,
         }
     }
+
+    /// Write this frame's RESP encoding to a byte buffer.
+    ///
+    /// Reconstructs the RESP wire bytes from the parsed tape entries.
+    /// Used by the AOF writer to log mutation commands without storing
+    /// raw byte offsets in the tape (which would bloat every entry).
+    ///
+    /// Returns the number of bytes written, or `None` if the buffer is too small.
+    pub fn write_resp_to(&self, buf: &mut [u8]) -> Option<usize> {
+        let mut pos = 0;
+        self.write_entry_resp(self.start, buf, &mut pos)?;
+        Some(pos)
+    }
+
+    /// Recursive helper: write the RESP encoding of entry at `idx`.
+    fn write_entry_resp(&self, idx: usize, buf: &mut [u8], pos: &mut usize) -> Option<()> {
+        let e = &self.entries[idx];
+        match e.tag {
+            TAG_BULK_STRING => {
+                let data = &self.backing[e.a as usize..e.b as usize];
+                let mut len_buf = itoa::Buffer::new();
+                let len_str = len_buf.format(data.len());
+                let needed = 1 + len_str.len() + 2 + data.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'$';
+                *pos += 1;
+                buf[*pos..*pos + len_str.len()].copy_from_slice(len_str.as_bytes());
+                *pos += len_str.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                buf[*pos..*pos + data.len()].copy_from_slice(data);
+                *pos += data.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            TAG_SIMPLE_STRING => {
+                let data = &self.backing[e.a as usize..e.b as usize];
+                let needed = 1 + data.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'+';
+                *pos += 1;
+                buf[*pos..*pos + data.len()].copy_from_slice(data);
+                *pos += data.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            TAG_INTEGER => {
+                let val = e.as_i64();
+                let mut int_buf = itoa::Buffer::new();
+                let int_str = int_buf.format(val);
+                let needed = 1 + int_str.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b':';
+                *pos += 1;
+                buf[*pos..*pos + int_str.len()].copy_from_slice(int_str.as_bytes());
+                *pos += int_str.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            TAG_ARRAY => {
+                let count = e.a;
+                let end = e.b as usize;
+                let mut count_buf = itoa::Buffer::new();
+                let count_str = count_buf.format(count);
+                let needed = 1 + count_str.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'*';
+                *pos += 1;
+                buf[*pos..*pos + count_str.len()].copy_from_slice(count_str.as_bytes());
+                *pos += count_str.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                // Write children.
+                let mut child_idx = idx + 1;
+                while child_idx < end {
+                    self.write_entry_resp(child_idx, buf, pos)?;
+                    child_idx = entry_span_end(self.entries, child_idx);
+                }
+                Some(())
+            }
+            TAG_NULL_BULK_STRING => {
+                if *pos + 5 > buf.len() {
+                    return None;
+                }
+                buf[*pos..*pos + 5].copy_from_slice(b"$-1\r\n");
+                *pos += 5;
+                Some(())
+            }
+            TAG_ERROR => {
+                let data = &self.backing[e.a as usize..e.b as usize];
+                let needed = 1 + data.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'-';
+                *pos += 1;
+                buf[*pos..*pos + data.len()].copy_from_slice(data);
+                *pos += data.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            _ => {
+                // Unsupported tag — skip (shouldn't happen for command arrays).
+                Some(())
+            }
+        }
+    }
 }
 
 /// Iterator over children of an aggregate tape entry.

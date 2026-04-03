@@ -34,6 +34,7 @@ fn shutdown_timeout_forces_exit() {
         buffer_size: 4096,
         buffer_count: 128,
         connection_timeout: 0,
+        aof_config: None,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -99,6 +100,7 @@ fn zero_timeout_triggers_force_kill() {
         buffer_size: 4096,
         buffer_count: 64,
         connection_timeout: 0,
+        aof_config: None,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

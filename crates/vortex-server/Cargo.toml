@@ -17,6 +17,7 @@ vortex-common = { workspace = true }
 vortex-memory = { workspace = true }
 vortex-config = { workspace = true }
 vortex-io = { workspace = true }
+vortex-persist = { workspace = true }
 vortex-engine = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing = { workspace = true }

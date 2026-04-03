@@ -29,6 +29,7 @@ fn ping_pong_resp() {
             buffer_size: 4096,
             buffer_count: 64,
             connection_timeout: 0,
+            aof_config: None,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -80,6 +81,7 @@ fn ping_pong_inline() {
             buffer_size: 4096,
             buffer_count: 64,
             connection_timeout: 0,
+            aof_config: None,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -119,6 +121,7 @@ fn unknown_command_returns_error() {
             buffer_size: 4096,
             buffer_count: 64,
             connection_timeout: 0,
+            aof_config: None,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

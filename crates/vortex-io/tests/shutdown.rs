@@ -39,6 +39,7 @@ fn graceful_shutdown_single_reactor() {
             buffer_size: 4096,
             buffer_count: 64,
             connection_timeout: 0,
+            aof_config: None,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -93,6 +94,7 @@ fn graceful_shutdown_pool() {
         buffer_size: 4096,
         buffer_count: 128,
         connection_timeout: 0,
+        aof_config: None,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -150,6 +152,7 @@ fn new_connections_refused_during_drain() {
             buffer_size: 4096,
             buffer_count: 64,
             connection_timeout: 0,
+            aof_config: None,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

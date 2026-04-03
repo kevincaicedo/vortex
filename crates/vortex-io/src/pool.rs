@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use vortex_sync::SpscRingBuffer;
 
-use crate::reactor::{Reactor, ReactorConfig};
+use crate::reactor::{AofConfig, Reactor, ReactorConfig};
 use crate::shutdown::ShutdownCoordinator;
 
 /// Capacity of each cross-reactor SPSC ring buffer.
@@ -43,6 +43,8 @@ pub struct ReactorPoolConfig {
     pub buffer_count: usize,
     /// Idle connection timeout in seconds (0 = disabled).
     pub connection_timeout: u32,
+    /// AOF persistence configuration (None = disabled).
+    pub aof_config: Option<AofConfig>,
 }
 
 impl Default for ReactorPoolConfig {
@@ -54,6 +56,7 @@ impl Default for ReactorPoolConfig {
             buffer_size: 16_384,
             buffer_count: 1024,
             connection_timeout: 300,
+            aof_config: None,
         }
     }
 }
@@ -131,6 +134,7 @@ impl ReactorPool {
                 buffer_size: config.buffer_size,
                 buffer_count: per_reactor_bufs,
                 connection_timeout: config.connection_timeout,
+                aof_config: config.aof_config.clone(),
             };
 
             let thread = std::thread::Builder::new()

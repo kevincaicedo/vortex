@@ -2,18 +2,20 @@
 //!
 //! Persistence engine for VortexDB.
 //!
-//! Designed in Phase 0, implemented in Phase 5.
-//!
 //! ## Components
 //!
-//! - **AOF** — Per-shard append-only file writer (binary format)
-//! - **VXF** — VortexDB native snapshot format (LZ4 compressed, columnar)
-//! - **RDB Import** — Read Redis `.rdb` files for migration
-//! - **Shadow Page Manager** — Dual-page-table snapshot without fork()
+//! - **AOF** — Per-shard append-only file with raw RESP wire-byte logging.
+//!   Zero-allocation hot path: mutation bytes are memcpy'd into a 64 KB
+//!   `BufWriter`. Three fsync modes: `always`, `everysec`, `no`.
+//! - **VXF** — VortexDB native snapshot format (LZ4 compressed, columnar) — Phase 5
+//! - **RDB Import** — Read Redis `.rdb` files for migration — Phase 5
+//! - **Shadow Page Manager** — Dual-page-table snapshot without fork() — Phase 5
 //!
 //! ## Feature Flags
 //!
 //! - `dax` — Enable DAX (Direct Access) memory-mapped persistence
+
+pub mod aof;
 
 use std::path::Path;
 

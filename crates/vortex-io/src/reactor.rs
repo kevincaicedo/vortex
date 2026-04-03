@@ -16,8 +16,11 @@ use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
 use vortex_common::{ShardId, Timestamp};
 use vortex_engine::Shard;
-use vortex_engine::commands::{CmdResult, execute_command};
+use vortex_engine::commands::{CmdResult, arg_bytes, arg_count, execute_command};
 use vortex_memory::{ArenaAllocator, BufferPool};
+use vortex_persist::aof::format::is_mutation;
+use vortex_persist::aof::rewrite::AofRewriter;
+use vortex_persist::aof::writer::AofFileWriter;
 use vortex_proto::{
     CommandRouter, DispatchResult, FrameRef, IovecWriter, ParseError, RespFrame, RespSerializer,
     RespTape,
@@ -63,6 +66,17 @@ pub struct ReactorConfig {
     pub buffer_count: usize,
     /// Idle connection timeout in seconds (0 = disabled).
     pub connection_timeout: u32,
+    /// AOF persistence configuration (None = disabled).
+    pub aof_config: Option<AofConfig>,
+}
+
+/// AOF configuration passed to each reactor.
+#[derive(Clone, Debug)]
+pub struct AofConfig {
+    /// Base path for AOF files. Each reactor appends its shard ID.
+    pub path: std::path::PathBuf,
+    /// Fsync policy.
+    pub fsync_policy: vortex_persist::aof::AofFsyncPolicy,
 }
 
 impl Default for ReactorConfig {
@@ -73,6 +87,7 @@ impl Default for ReactorConfig {
             buffer_size: DEFAULT_BUF_SIZE,
             buffer_count: 1024,
             connection_timeout: 300,
+            aof_config: None,
         }
     }
 }
@@ -130,6 +145,11 @@ pub struct Reactor {
     /// Cached monotonic timestamp (nanoseconds) for the current event-loop iteration.
     /// Avoids re-reading the clock for every command in a batch.
     cached_nanos: u64,
+    /// AOF writer (None if persistence disabled).
+    aof_writer: Option<AofFileWriter>,
+    /// Reusable scratch buffer for serializing RESP frames to AOF.
+    /// 4 KB is enough for any single command (max key 512 bytes + value + overhead).
+    aof_scratch: Vec<u8>,
 }
 
 impl Reactor {
@@ -167,6 +187,86 @@ impl Reactor {
             tracing::warn!(error = %e, "failed to register fixed buffers (non-fatal on polling)");
         }
 
+        let mut shard = Shard::new_with_time(ShardId::new(id as u16), Timestamp::now().as_nanos());
+
+        // Initialize AOF writer if persistence is enabled.
+        let aof_writer = if let Some(ref aof_cfg) = config.aof_config {
+            // Per-shard AOF path: base.aof → base-shard0.aof for multi-reactor.
+            let aof_path = if id == 0 {
+                aof_cfg.path.clone()
+            } else {
+                let stem = aof_cfg
+                    .path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let ext = aof_cfg
+                    .path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                aof_cfg
+                    .path
+                    .with_file_name(format!("{stem}-shard{id}.{ext}"))
+            };
+
+            // Replay existing AOF before accepting connections.
+            let reader = vortex_persist::aof::reader::AofReader::new(&aof_path);
+            if reader.exists() {
+                tracing::info!(
+                    reactor_id = id,
+                    path = %aof_path.display(),
+                    "replaying AOF..."
+                );
+                match reader.replay(&mut shard) {
+                    Ok(stats) => {
+                        tracing::info!(
+                            reactor_id = id,
+                            commands = stats.commands_replayed,
+                            bytes = stats.bytes_read,
+                            truncated = stats.bytes_truncated,
+                            duration_ms = stats.duration_ms,
+                            "AOF replay complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            reactor_id = id,
+                            error = %e,
+                            "AOF replay failed — starting with empty shard"
+                        );
+                        // Reset shard to empty on failed replay.
+                        shard = Shard::new_with_time(
+                            ShardId::new(id as u16),
+                            Timestamp::now().as_nanos(),
+                        );
+                    }
+                }
+            }
+
+            match AofFileWriter::open(&aof_path, id as u16, aof_cfg.fsync_policy) {
+                Ok(w) => {
+                    tracing::info!(
+                        reactor_id = id,
+                        path = %aof_path.display(),
+                        policy = ?aof_cfg.fsync_policy,
+                        "AOF writer initialized"
+                    );
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        reactor_id = id,
+                        error = %e,
+                        "failed to open AOF file — persistence disabled for this reactor"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             id,
             backend,
@@ -188,8 +288,10 @@ impl Reactor {
             arena: ArenaAllocator::new(vortex_memory::arena::DEFAULT_ARENA_CAPACITY),
             iovec_writer: IovecWriter::new(),
             command_router: CommandRouter::new(),
-            shard: Shard::new_with_time(ShardId::new(id as u16), Timestamp::now().as_nanos()),
+            shard,
             cached_nanos: Timestamp::now().as_nanos(),
+            aof_writer,
+            aof_scratch: vec![0u8; 4096],
         })
     }
 
@@ -310,6 +412,13 @@ impl Reactor {
                 }
             }
 
+            // 5.6 AOF periodic fsync — for `everysec` policy, flush to disk
+            // at most once per second. No-op for `always` (synced inline)
+            // or `no` (OS-managed). Cheap: just checks a timestamp.
+            if let Some(ref mut w) = self.aof_writer {
+                let _ = w.maybe_fsync();
+            }
+
             // 6. Check for force-kill (immediate exit, no flushing).
             if self.coordinator.is_force_kill() {
                 tracing::warn!(
@@ -331,6 +440,15 @@ impl Reactor {
 
             // 8. Reset the per-iteration arena allocator.
             self.arena.reset();
+        }
+
+        // Flush and sync AOF before tearing down I/O.
+        if let Some(ref mut w) = self.aof_writer {
+            if let Err(e) = w.flush_and_sync() {
+                tracing::error!(reactor_id = self.id, error = %e, "AOF final flush failed");
+            } else {
+                tracing::info!(reactor_id = self.id, "AOF flushed and synced on shutdown");
+            }
         }
 
         // Cancel all in-flight I/O and drain completions before dropping the
@@ -769,6 +887,27 @@ impl Reactor {
         static RESP_ERR_WRONG_ARGC_PREFIX: &[u8] =
             b"-ERR wrong number of arguments for command\r\n";
 
+        // Intercept reactor-level commands before PHF dispatch to avoid
+        // borrow conflicts (dispatch borrows self.command_router mutably).
+        if let Some(cmd_name) = frame.command_name() {
+            // Quick uppercase check — command names are short (≤16 bytes).
+            let mut upper = [0u8; 16];
+            let len = cmd_name.len().min(16);
+            upper[..len].copy_from_slice(&cmd_name[..len]);
+            upper[..len].make_ascii_uppercase();
+
+            match &upper[..len] {
+                b"BGREWRITEAOF" => return self.handle_bgrewriteaof(),
+                b"CONFIG" => {
+                    if let Some(resp) = self.handle_config(frame) {
+                        return resp;
+                    }
+                    // Fall through to engine/PHF for unhandled CONFIG subcommands.
+                }
+                _ => {}
+            }
+        }
+
         match self.command_router.dispatch(frame) {
             DispatchResult::Dispatch { meta, name, .. } => {
                 // Route through the engine for all recognized commands.
@@ -776,9 +915,19 @@ impl Reactor {
                 match execute_command(&mut self.shard, name, frame, now) {
                     Some(CmdResult::Static(buf)) => {
                         let close = meta.name == "QUIT";
+                        // AOF: log mutation commands after successful execution.
+                        if !close && self.aof_writer.is_some() && is_mutation(name) {
+                            self.append_to_aof(frame);
+                        }
                         (CommandResponse::Static(buf), close)
                     }
-                    Some(CmdResult::Resp(f)) => (CommandResponse::Frame(f), false),
+                    Some(CmdResult::Resp(f)) => {
+                        // AOF: log mutation commands after successful execution.
+                        if self.aof_writer.is_some() && is_mutation(name) {
+                            self.append_to_aof(frame);
+                        }
+                        (CommandResponse::Frame(f), false)
+                    }
                     None => {
                         // Engine doesn't handle this command — shouldn't happen
                         // since all PHF commands are wired, but handle gracefully.
@@ -793,6 +942,256 @@ impl Reactor {
                 (CommandResponse::Static(RESP_ERR_WRONG_ARGC_PREFIX), false)
             }
             DispatchResult::UnknownCommand => (CommandResponse::Static(RESP_ERR_UNKNOWN), false),
+        }
+    }
+
+    /// Append a mutation command to the AOF file.
+    ///
+    /// Serializes the frame's RESP encoding into the scratch buffer, then
+    /// writes it to the AOF. This is the only AOF hot-path code.
+    #[inline]
+    fn append_to_aof(&mut self, frame: &FrameRef<'_>) {
+        // Serialize frame RESP into scratch buffer.
+        let written = match frame.write_resp_to(&mut self.aof_scratch) {
+            Some(n) => n,
+            None => {
+                // Scratch buffer too small — grow it and retry.
+                self.aof_scratch.resize(self.aof_scratch.len() * 2, 0);
+                match frame.write_resp_to(&mut self.aof_scratch) {
+                    Some(n) => n,
+                    None => {
+                        tracing::warn!("AOF: frame too large for scratch buffer, skipping");
+                        return;
+                    }
+                }
+            }
+        };
+
+        if let Some(ref mut writer) = self.aof_writer {
+            if let Err(e) = writer.append(&self.aof_scratch[..written]) {
+                tracing::error!(error = %e, "AOF write failed");
+            }
+        }
+    }
+
+    /// Handle BGREWRITEAOF command.
+    ///
+    /// Rewrites the AOF file by dumping current shard state. This is done
+    /// inline (not in a background thread) since the reactor is single-threaded.
+    /// The old AOF file is atomically swapped via rename.
+    fn handle_bgrewriteaof(&mut self) -> (CommandResponse, bool) {
+        let Some(ref aof_cfg) = self.config.aof_config else {
+            return (
+                CommandResponse::Static(b"-ERR AOF is not enabled\r\n"),
+                false,
+            );
+        };
+
+        let aof_path = if self.id == 0 {
+            aof_cfg.path.clone()
+        } else {
+            let stem = aof_cfg
+                .path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let ext = aof_cfg
+                .path
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy();
+            aof_cfg
+                .path
+                .with_file_name(format!("{stem}-shard{}.{ext}", self.id))
+        };
+
+        match AofRewriter::rewrite(&self.shard, &aof_path, self.id as u16) {
+            Ok((_tmp_path, _keys)) => {
+                // Re-open the AOF writer on the new (compacted) file.
+                if let Some(ref mut writer) = self.aof_writer {
+                    match AofFileWriter::open(&aof_path, self.id as u16, aof_cfg.fsync_policy) {
+                        Ok(new_writer) => {
+                            *writer = new_writer;
+                            tracing::info!(
+                                reactor_id = self.id,
+                                "AOF rewrite complete, writer swapped"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                reactor_id = self.id,
+                                error = %e,
+                                "failed to reopen AOF after rewrite"
+                            );
+                        }
+                    }
+                }
+                (
+                    CommandResponse::Static(b"+Background append only file rewriting started\r\n"),
+                    false,
+                )
+            }
+            Err(e) => {
+                tracing::error!(reactor_id = self.id, error = %e, "AOF rewrite failed");
+                (
+                    CommandResponse::Frame(RespFrame::Error(
+                        format!("ERR AOF rewrite failed: {e}").into(),
+                    )),
+                    false,
+                )
+            }
+        }
+    }
+
+    /// Handle CONFIG subcommands relevant to AOF.
+    ///
+    /// Returns `Some(response)` for handled subcommands, `None` to fall through
+    /// to the engine for other CONFIG operations.
+    fn handle_config(&mut self, frame: &FrameRef<'_>) -> Option<(CommandResponse, bool)> {
+        // CONFIG GET/SET require at least 3 args: CONFIG <subcmd> <param>
+        let argc = arg_count(frame);
+        if argc < 3 {
+            return None;
+        }
+
+        let subcmd = arg_bytes(frame, 1)?;
+        let param = arg_bytes(frame, 2)?;
+
+        // Normalize subcmd to uppercase for comparison.
+        let subcmd_upper: Vec<u8> = subcmd.iter().map(|b| b.to_ascii_uppercase()).collect();
+
+        match subcmd_upper.as_slice() {
+            b"GET" => {
+                let param_lower: Vec<u8> = param.iter().map(|b| b.to_ascii_lowercase()).collect();
+                match param_lower.as_slice() {
+                    b"appendonly" => {
+                        let val = if self.aof_writer.is_some() {
+                            "yes"
+                        } else {
+                            "no"
+                        };
+                        Some((
+                            CommandResponse::Frame(RespFrame::Array(Some(vec![
+                                RespFrame::BulkString(Some(bytes::Bytes::from_static(
+                                    b"appendonly",
+                                ))),
+                                RespFrame::BulkString(Some(bytes::Bytes::from(
+                                    val.as_bytes().to_vec(),
+                                ))),
+                            ]))),
+                            false,
+                        ))
+                    }
+                    b"appendfsync" => {
+                        let val = match &self.config.aof_config {
+                            Some(cfg) => match cfg.fsync_policy {
+                                vortex_persist::aof::AofFsyncPolicy::Always => "always",
+                                vortex_persist::aof::AofFsyncPolicy::Everysec => "everysec",
+                                vortex_persist::aof::AofFsyncPolicy::No => "no",
+                            },
+                            None => "everysec",
+                        };
+                        Some((
+                            CommandResponse::Frame(RespFrame::Array(Some(vec![
+                                RespFrame::BulkString(Some(bytes::Bytes::from_static(
+                                    b"appendfsync",
+                                ))),
+                                RespFrame::BulkString(Some(bytes::Bytes::from(
+                                    val.as_bytes().to_vec(),
+                                ))),
+                            ]))),
+                            false,
+                        ))
+                    }
+                    _ => None, // Fall through to engine.
+                }
+            }
+            b"SET" => {
+                if argc < 4 {
+                    return Some((
+                        CommandResponse::Static(
+                            b"-ERR wrong number of arguments for CONFIG SET\r\n",
+                        ),
+                        false,
+                    ));
+                }
+                let param_lower: Vec<u8> = param.iter().map(|b| b.to_ascii_lowercase()).collect();
+                let value = arg_bytes(frame, 3)?;
+                match param_lower.as_slice() {
+                    b"appendonly" => {
+                        let val_lower: Vec<u8> =
+                            value.iter().map(|b| b.to_ascii_lowercase()).collect();
+                        match val_lower.as_slice() {
+                            b"yes" => {
+                                if self.aof_writer.is_some() {
+                                    return Some((CommandResponse::Static(b"+OK\r\n"), false));
+                                }
+                                let aof_cfg = match &self.config.aof_config {
+                                    Some(cfg) => cfg.clone(),
+                                    None => AofConfig {
+                                        path: std::path::PathBuf::from("vortex.aof"),
+                                        fsync_policy: vortex_persist::aof::AofFsyncPolicy::Everysec,
+                                    },
+                                };
+                                let aof_path = if self.id == 0 {
+                                    aof_cfg.path.clone()
+                                } else {
+                                    let stem = aof_cfg
+                                        .path
+                                        .file_stem()
+                                        .unwrap_or_default()
+                                        .to_string_lossy();
+                                    let ext = aof_cfg
+                                        .path
+                                        .extension()
+                                        .unwrap_or_default()
+                                        .to_string_lossy();
+                                    aof_cfg
+                                        .path
+                                        .with_file_name(format!("{stem}-shard{}.{ext}", self.id))
+                                };
+                                match AofFileWriter::open(
+                                    &aof_path,
+                                    self.id as u16,
+                                    aof_cfg.fsync_policy,
+                                ) {
+                                    Ok(w) => {
+                                        self.aof_writer = Some(w);
+                                        self.config.aof_config = Some(aof_cfg);
+                                        tracing::info!(
+                                            reactor_id = self.id,
+                                            "AOF enabled via CONFIG SET"
+                                        );
+                                        Some((CommandResponse::Static(b"+OK\r\n"), false))
+                                    }
+                                    Err(e) => Some((
+                                        CommandResponse::Frame(RespFrame::Error(
+                                            format!("ERR failed to enable AOF: {e}").into(),
+                                        )),
+                                        false,
+                                    )),
+                                }
+                            }
+                            b"no" => {
+                                if let Some(ref mut w) = self.aof_writer {
+                                    let _ = w.flush_and_sync();
+                                }
+                                self.aof_writer = None;
+                                tracing::info!(reactor_id = self.id, "AOF disabled via CONFIG SET");
+                                Some((CommandResponse::Static(b"+OK\r\n"), false))
+                            }
+                            _ => Some((
+                                CommandResponse::Static(
+                                    b"-ERR invalid argument for CONFIG SET appendonly\r\n",
+                                ),
+                                false,
+                            )),
+                        }
+                    }
+                    _ => None, // Fall through to engine.
+                }
+            }
+            _ => None, // RESETSTAT, REWRITE, etc. — fall through.
         }
     }
 

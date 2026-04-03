@@ -226,6 +226,33 @@ get_port() {
     kv_get "port_$1"
 }
 
+filter_vortex_tests() {
+    local requested=$1
+    local filtered=""
+    local old_ifs=$IFS
+    local test
+
+    IFS=','
+    for test in $requested; do
+        case ",${VORTEX_BUILTIN_TESTS}," in
+            *,"${test}",*)
+                if [[ -n "$filtered" ]]; then
+                    filtered="${filtered},${test}"
+                else
+                    filtered="$test"
+                fi
+                ;;
+        esac
+    done
+    IFS=$old_ifs
+
+    if [[ -n "$filtered" ]]; then
+        echo "$filtered"
+    else
+        echo "$VORTEX_BUILTIN_TESTS"
+    fi
+}
+
 # ── Banner ──
 echo "╔══════════════════════════════════════════════════════════════════╗"
 echo "║         VortexDB Competitive Benchmark Suite v2                ║"
@@ -388,7 +415,7 @@ run_standard_benchmark() {
     # Use the vortex-compatible subset for vortex, full list for others
     local test_list="$TESTS"
     if [[ "$name" == "vortex" ]]; then
-        test_list="$VORTEX_BUILTIN_TESTS"
+        test_list=$(filter_vortex_tests "$TESTS")
     fi
 
     if ! redis-benchmark \

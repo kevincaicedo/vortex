@@ -33,6 +33,6 @@ pub mod timer;
 
 pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
 pub use pool::{CrossMessage, ReactorPool, ReactorPoolConfig};
-pub use reactor::{Reactor, ReactorConfig};
+pub use reactor::{AofConfig, Reactor, ReactorConfig};
 pub use shutdown::ShutdownCoordinator;
 pub use timer::TimerWheel;

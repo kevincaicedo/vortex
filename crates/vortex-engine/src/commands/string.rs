@@ -661,16 +661,18 @@ pub fn cmd_append(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> C
     };
 
     let key = key_from_bytes(key_bytes);
+    let hash = shard.hash_key(key_bytes);
 
-    // Single-probe: find existing value or create new entry with append_bytes.
-    let (existing, was_present) =
-        shard.get_or_insert_with(key, || VortexValue::from_bytes(append_bytes));
-
-    if !was_present {
-        // Key was just created with append_bytes as the value — return its length.
+    if !shard.exists_prehashed(key_bytes, hash, _now_nanos) {
+        shard.insert_new_prehashed(key, VortexValue::from_bytes(append_bytes), hash);
         let len = append_bytes.len();
+        if len == 1 {
+            return CmdResult::Static(super::RESP_ONE);
+        }
         return int_resp(len as i64);
     }
+    
+    let existing = shard.get_mut(&key).unwrap();
 
     // Key existed — extend in place or build new value.
     let new_val = match existing {
@@ -678,6 +680,9 @@ pub fn cmd_append(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> C
             // Fast path: try in-place extension (no allocation, no copy).
             if ib.try_extend(append_bytes) {
                 let len = ib.len();
+                if len == 1 {
+                    return CmdResult::Static(super::RESP_ONE);
+                }
                 return int_resp(len as i64);
             }
             // Promote to heap — combined exceeds 23 bytes.

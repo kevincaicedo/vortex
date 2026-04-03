@@ -17,6 +17,7 @@ vortex-engine = { workspace = true }
 vortex-memory = { workspace = true }
 vortex-sync = { workspace = true }
 vortex-proto = { workspace = true }
+vortex-persist = { workspace = true }
 bytes = { workspace = true }
 polling = { workspace = true }
 socket2 = { workspace = true }

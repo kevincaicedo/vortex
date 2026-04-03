@@ -27,6 +27,7 @@ fn multi_reactor_ping_pong() {
         buffer_size: 4096,
         buffer_count: 128,
         connection_timeout: 0,
+        aof_config: None,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

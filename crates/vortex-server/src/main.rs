@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vortex_io::{ReactorPool, ReactorPoolConfig};
+use vortex_io::{AofConfig, ReactorPool, ReactorPoolConfig};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -43,6 +43,25 @@ fn main() {
     );
 
     // ── Spawn reactor pool ─────────────────────────────────────────
+    let aof_config = if config.aof_enabled {
+        let policy = match config.aof_fsync.as_str() {
+            "always" => vortex_persist::aof::AofFsyncPolicy::Always,
+            "no" => vortex_persist::aof::AofFsyncPolicy::No,
+            _ => vortex_persist::aof::AofFsyncPolicy::Everysec,
+        };
+        tracing::info!(
+            path = %config.aof_path.display(),
+            fsync = %config.aof_fsync,
+            "AOF persistence enabled"
+        );
+        Some(AofConfig {
+            path: config.aof_path.clone(),
+            fsync_policy: policy,
+        })
+    } else {
+        None
+    };
+
     let pool_config = ReactorPoolConfig {
         bind_addr: config.bind,
         threads: config.threads,
@@ -50,6 +69,7 @@ fn main() {
         buffer_size: config.buffer_size,
         buffer_count: config.fixed_buffers,
         connection_timeout: config.connection_timeout_secs as u32,
+        aof_config,
     };
 
     let mut pool = match ReactorPool::spawn(pool_config) {
