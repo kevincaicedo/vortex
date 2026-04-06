@@ -202,6 +202,24 @@ impl IoBackend for PollingBackend {
         Ok(0)
     }
 
+    fn try_completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
+        let start = out.len();
+
+        self.drain_pending(out);
+        if out.len() > start {
+            return Ok(out.len() - start);
+        }
+
+        self.events.clear();
+        self.poller
+            .wait(&mut self.events, Some(std::time::Duration::ZERO))?;
+        if !self.events.is_empty() {
+            self.drain_pending(out);
+        }
+
+        Ok(out.len() - start)
+    }
+
     fn completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         let start = out.len();
 

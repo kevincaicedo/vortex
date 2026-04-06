@@ -16,7 +16,7 @@ unsafe_code = "allow"
 vortex-common = { workspace = true }
 vortex-memory = { workspace = true }
 vortex-config = { workspace = true }
-vortex-io = { workspace = true }
+vortex-io = { workspace = true, features = ["io-uring"] }
 vortex-persist = { workspace = true }
 vortex-engine = { workspace = true }
 tikv-jemallocator = { workspace = true }

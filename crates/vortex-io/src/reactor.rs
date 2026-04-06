@@ -68,6 +68,10 @@ pub struct ReactorConfig {
     pub connection_timeout: u32,
     /// AOF persistence configuration (None = disabled).
     pub aof_config: Option<AofConfig>,
+    /// Total number of reactors (for cross-shard routing).
+    pub num_reactors: usize,
+    /// Per-shard memory limit in bytes (0 = unlimited).
+    pub max_memory: u64,
 }
 
 /// AOF configuration passed to each reactor.
@@ -88,6 +92,8 @@ impl Default for ReactorConfig {
             buffer_count: 1024,
             connection_timeout: 300,
             aof_config: None,
+            num_reactors: 1,
+            max_memory: 0,
         }
     }
 }
@@ -108,6 +114,11 @@ pub struct Reactor {
     /// `lease_index()`. Buffers are registered with the kernel for
     /// zero-copy `ReadFixed`/`WriteFixed` operations on io_uring.
     buffer_pool: BufferPool,
+    /// Whether the current backend can use fixed-buffer read/write ops.
+    ///
+    /// When registration fails on io_uring, the reactor falls back to regular
+    /// `Read`/`Write` SQEs while keeping the io_uring backend active.
+    use_fixed_buffers: bool,
     /// Per-slot generation counters: indexed by slab token.
     /// 24-bit effective range (masked with `0xFF_FFFF`). Incremented each
     /// time a slot is reused, preventing stale CQE processing.
@@ -176,18 +187,30 @@ impl Reactor {
         let max_conn = config.max_connections;
         let connection_timeout = config.connection_timeout;
 
-        // Allocate 2 buffers per connection (read + write) from the mmap pool.
-        let buffer_count = max_conn * 2;
+        // Allocate the configured number of reactor-local buffers.
+        // Connections lease 2 buffers each and may be rejected if the pool is
+        // temporarily exhausted.
+        let buffer_count = config.buffer_count.max(2);
         let buffer_pool = BufferPool::new(buffer_count, config.buffer_size);
 
         // Register the fixed buffers with the io_uring kernel if applicable.
-        // For polling backends this is a no-op.
+        // For polling backends this is a no-op that returns success.
         let iovecs = buffer_pool.as_iovecs();
-        if let Err(e) = backend.register_buffers(&iovecs) {
-            tracing::warn!(error = %e, "failed to register fixed buffers (non-fatal on polling)");
-        }
+        let use_fixed_buffers = match backend.register_buffers(&iovecs) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    buffer_count,
+                    buffer_size = buffer_pool.buffer_size(),
+                    "fixed buffer registration failed; falling back to non-fixed I/O"
+                );
+                false
+            }
+        };
 
         let mut shard = Shard::new_with_time(ShardId::new(id as u16), Timestamp::now().as_nanos());
+        shard.set_max_memory(config.max_memory);
 
         // Initialize AOF writer if persistence is enabled.
         let aof_writer = if let Some(ref aof_cfg) = config.aof_config {
@@ -273,6 +296,7 @@ impl Reactor {
             connections: ConnectionSlab::with_capacity(max_conn),
             listener_fd,
             buffer_pool,
+            use_fixed_buffers,
             generations: vec![0u32; max_conn],
             cqe_buf: Vec::with_capacity(MAX_COMPLETIONS),
             timer_wheel: TimerWheel::new(max_conn),
@@ -361,6 +385,10 @@ impl Reactor {
             // 3b. Fast-path: process newly submitted ops (e.g., writes after
             //     reads) immediately, collapsing read→process→write into a
             //     single event-loop iteration instead of two.
+            if let Err(e) = self.backend.flush() {
+                tracing::error!(error = %e, "backend fast-path flush failed");
+                break;
+            }
             self.cqe_buf.clear();
             if self.backend.completions(&mut self.cqe_buf).is_ok() && !self.cqe_buf.is_empty() {
                 let mut fast_completions = std::mem::take(&mut self.cqe_buf);
@@ -860,11 +888,11 @@ impl Reactor {
             }
             let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
             let token = encode_token(conn_id, cgen, OpType::Write);
-            let _ = self.backend.submit_write_fixed(
+            let _ = self.submit_buffer_write(
                 fd,
                 write_ptr as *const u8,
                 write_cursor,
-                write_idx as u16,
+                write_idx,
                 token,
             );
         } else if close_after_write {
@@ -1231,13 +1259,8 @@ impl Reactor {
             }
             let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
             let token = encode_token(conn_id, cgen, OpType::Write);
-            let _ = self.backend.submit_write_fixed(
-                fd,
-                write_ptr as *const u8,
-                remaining,
-                write_idx as u16,
-                token,
-            );
+            let _ =
+                self.submit_buffer_write(fd, write_ptr as *const u8, remaining, write_idx, token);
         } else if self.draining
             || self
                 .connections
@@ -1301,9 +1324,45 @@ impl Reactor {
         let buf_ptr = unsafe { self.buffer_pool.ptr(read_idx).add(cursor) };
         let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
         let token = encode_token(conn_id, cgen, OpType::Read);
-        let _ = self
-            .backend
-            .submit_read_fixed(fd, buf_ptr, remaining, read_idx as u16, token);
+        let _ = self.submit_buffer_read(fd, buf_ptr, remaining, read_idx, token);
+    }
+
+    fn submit_buffer_read(
+        &mut self,
+        fd: RawFd,
+        buf_ptr: *mut u8,
+        buf_len: usize,
+        buf_index: usize,
+        token: u64,
+    ) -> std::io::Result<()> {
+        if self.use_fixed_buffers {
+            if let Ok(buf_index) = u16::try_from(buf_index) {
+                return self
+                    .backend
+                    .submit_read_fixed(fd, buf_ptr, buf_len, buf_index, token);
+            }
+        }
+
+        self.backend.submit_read(fd, buf_ptr, buf_len, token)
+    }
+
+    fn submit_buffer_write(
+        &mut self,
+        fd: RawFd,
+        buf_ptr: *const u8,
+        buf_len: usize,
+        buf_index: usize,
+        token: u64,
+    ) -> std::io::Result<()> {
+        if self.use_fixed_buffers {
+            if let Ok(buf_index) = u16::try_from(buf_index) {
+                return self
+                    .backend
+                    .submit_write_fixed(fd, buf_ptr, buf_len, buf_index, token);
+            }
+        }
+
+        self.backend.submit_write(fd, buf_ptr, buf_len, token)
     }
 
     /// Initiate a connection close.
@@ -1407,13 +1466,7 @@ impl Reactor {
                 let write_ptr = self.buffer_pool.ptr(write_idx) as *const u8;
                 let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
                 let token = encode_token(conn_id, cgen, OpType::Write);
-                let _ = self.backend.submit_write_fixed(
-                    fd,
-                    write_ptr,
-                    write_len,
-                    write_idx as u16,
-                    token,
-                );
+                let _ = self.submit_buffer_write(fd, write_ptr, write_len, write_idx, token);
             } else {
                 // No pending writes — close immediately.
                 self.close_connection(conn_id);

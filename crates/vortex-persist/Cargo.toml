@@ -8,6 +8,7 @@ description = "VortexDB persistence engine — AOF, VXF snapshots, shadow paging
 [features]
 default = []
 dax = []
+io-uring = ["dep:io-uring"]
 
 [dependencies]
 vortex-common = { workspace = true }
@@ -18,3 +19,6 @@ lz4_flex = { workspace = true }
 crc32fast = { workspace = true }
 itoa = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }

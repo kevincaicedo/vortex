@@ -16,6 +16,7 @@ vortex-common = { workspace = true }
 vortex-engine = { workspace = true }
 vortex-memory = { workspace = true }
 vortex-sync = { workspace = true }
+vortex-config = { workspace = true }
 vortex-proto = { workspace = true }
 vortex-persist = { workspace = true }
 bytes = { workspace = true }

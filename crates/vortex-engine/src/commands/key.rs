@@ -35,8 +35,8 @@ pub fn cmd_del(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdR
     let mut deleted = 0i64;
     for i in 1..argc {
         if let Some(kb) = arg_bytes(frame, i) {
-            let key = key_from_bytes(kb);
-            if shard.del(&key) {
+            let hash = shard.hash_key(kb);
+            if shard.del_prehashed(kb, hash) {
                 deleted += 1;
             }
         }

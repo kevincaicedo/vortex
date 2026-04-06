@@ -98,6 +98,14 @@ compare-native *ARGS:
 compare-full:
     bash scripts/compare.sh --json --markdown --latency --runs 3 --custom
 
+# Run comparison with AOF enabled (measures persistence overhead)
+compare-aof *ARGS:
+    bash scripts/compare.sh --aof --json --markdown --latency --custom {{ARGS}}
+
+# Run comparison with AOF enabled, native mode
+compare-aof-native *ARGS:
+    bash scripts/compare.sh --native --aof --json --markdown --latency --custom {{ARGS}}
+
 # Run custom command benchmarks against a running server
 bench-commands port="16379":
     bash scripts/bench-commands.sh -p {{port}}

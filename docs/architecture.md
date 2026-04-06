@@ -54,56 +54,70 @@ graph TD
 
 ---
 
-## Threading Model: Thread-Per-Core
+## Threading Model: Thread-Per-Core Reactors with Shared Concurrent Keyspace
 
-VortexDB uses a **thread-per-core** architecture. Each CPU core runs exactly one reactor thread that owns its own:
+VortexDB uses a **thread-per-core** architecture with a **shared concurrent keyspace**. Each CPU core runs exactly one reactor thread that owns its own I/O resources:
 
 - **io_uring instance** (Linux) or **kqueue poller** (macOS)
-- **Shard** — an independent Swiss Table with its own data partition
 - **BufferPool** — pre-allocated, mmap'd, page-aligned I/O buffers
 - **ArenaAllocator** — bump allocator for per-iteration transient allocations
 - **TimerWheel** — hierarchical timing wheel for connection timeouts
 - **Connection slab** — dense array of active client connections
 
-No mutexes exist on the hot path. Each reactor is fully independent.
+All reactors share a single **ConcurrentKeyspace** — a heavily-sharded concurrent hash map with K=512 `parking_lot::RwLock`-guarded Swiss Table shards. Every command executes locally on the reactor that received it, against the shared keyspace.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     ReactorPool                              │
-│  ┌────────────┐  ┌────────────┐       ┌────────────┐       │
-│  │ Reactor 0   │  │ Reactor 1   │  ...  │ Reactor N   │    │
-│  │  CPU Core 0 │  │  CPU Core 1 │       │  CPU Core N │    │
-│  │             │  │             │       │             │     │
-│  │ ┌─────────┐│  │ ┌─────────┐│       │ ┌─────────┐│     │
-│  │ │  Shard  ││  │ │  Shard  ││       │ │  Shard  ││     │
-│  │ └─────────┘│  │ └─────────┘│       │ └─────────┘│     │
-│  │ ┌─────────┐│  │ ┌─────────┐│       │ ┌─────────┐│     │
-│  │ │BufferPool││  │ │BufferPool││       │ │BufferPool││     │
-│  │ └─────────┘│  │ └─────────┘│       │ └─────────┘│     │
-│  │ ┌─────────┐│  │ ┌─────────┐│       │ ┌─────────┐│     │
-│  │ │io_uring/ ││  │ │io_uring/ ││       │ │io_uring/ ││     │
-│  │ │ kqueue   ││  │ │ kqueue   ││       │ │ kqueue   ││     │
-│  │ └─────────┘│  │ └─────────┘│       │ └─────────┘│     │
-│  └────────────┘  └────────────┘       └────────────┘       │
-│                                                              │
-│  Cross-reactor SPSC mesh: N×(N-1) ring buffers, 4096 cap    │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                       VortexDB Process                         │
+│                                                                │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
+│  │ Reactor 0│  │ Reactor 1│  │ Reactor 2│  │Reactor N │      │
+│  │ io_uring │  │ io_uring │  │ io_uring │  │io_uring  │      │
+│  │ Conns    │  │ Conns    │  │ Conns    │  │Conns     │      │
+│  │ SIMD     │  │ SIMD     │  │ SIMD     │  │SIMD      │      │
+│  │ Buffers  │  │ Buffers  │  │ Buffers  │  │Buffers   │      │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘      │
+│       │             │             │             │              │
+│       └─────────────┴──────┬──────┴─────────────┘              │
+│                            │                                   │
+│              ┌─────────────┴─────────────┐                     │
+│              │  Shared ConcurrentKeyspace │                     │
+│              │  K = 512 RwLock-guarded    │                     │
+│              │  Swiss Table shards        │                     │
+│              │  ┌───┐┌───┐┌───┐   ┌───┐  │                     │
+│              │  │S₀ ││S₁ ││S₂ │...│Sₖ │  │                     │
+│              │  └───┘└───┘└───┘   └───┘  │                     │
+│              └───────────────────────────┘                     │
+└────────────────────────────────────────────────────────────────┘
 ```
+
+### Why Shared Concurrent Keyspace
+
+The previous shared-nothing design (each reactor owns one shard, cross-reactor SPSC messaging for non-local keys) was abandoned after benchmarking revealed catastrophic regression: with N=4 reactors, 75% of random keys hit remote shards at ~2ms round-trip vs 0.13µs local execution. The shared concurrent approach uses `parking_lot::RwLock` at ~15ns uncontended — **100,000× cheaper** than cross-reactor messaging.
+
+| Metric | Previous (Shared-Nothing) | Current (Shared Concurrent) |
+|--------|--------------------------|----------------------------|
+| Single-key, local | 0.13µs, zero overhead | 0.15µs, one RwLock (~15ns) |
+| Single-key, remote (75% of random ops) | 1–4ms cross-reactor round-trip | 0.15µs, one RwLock |
+| MSET(10), cross-shard | ~1ms fan-out + aggregate | ~1.5µs, 10 sorted locks |
+| KEYS / SCAN | Fan-out to all reactors | Sequential local scan |
+
+### Lock Acquisition Strategy
+
+- **Single-key reads** (GET, EXISTS, TTL, TYPE): `shard.read()` — concurrent with other readers
+- **Single-key writes** (SET, DEL, INCR): `shard.write()` — exclusive per shard bucket
+- **Multi-key** (MGET, MSET, DEL): sorted lock acquisition (deterministic order prevents deadlocks)
+- **Transactions** (MULTI/EXEC): collect keys during MULTI, acquire all shard locks at EXEC
 
 ### CPU Pinning
 
 Each reactor thread is pinned to a specific CPU core via `core_affinity::set_for_current(CoreId)`. This ensures:
 
-- L1/L2 cache locality for the shard's hot data
+- L1/L2 cache locality for I/O buffers and connection state
 - Deterministic scheduling — no OS thread migration
 - Predictable latency — no cross-core cache-line bouncing
 
-### Cross-Reactor Communication
-
-Reactors communicate via a mesh of lock-free SPSC ring buffers (`SpscRingBuffer<CrossMessage, 4096>`). Each pair of reactors has a dedicated unidirectional channel. Current message types:
-
-- `CrossMessage::Shutdown` — graceful shutdown signal
-- `CrossMessage::Ping` — health check (future use)
+Note: With the shared concurrent keyspace, data cache locality is shard-bucket-level rather than per-reactor. The K=512 sharding means each shard bucket's working set fits in L1/L2. The CPU pinning benefit is primarily for I/O buffer and connection state locality.
 
 ---
 
@@ -142,7 +156,7 @@ sequenceDiagram
 
 3. **Command Routing** — The `CommandRouter` normalizes the command name to uppercase using SWAR (processes 8 bytes at a time, branchless), then dispatches via a PHF (Perfect Hash Function) lookup table containing ~160 known Redis commands with arity validation and key-range extraction.
 
-4. **Engine Execution** — The command handler executes against the reactor's local `Shard`. The `Shard` wraps a `SwissTable` (SIMD-probed hash map) and an `ExpiryWheel` (dual timing wheel for TTLs). Each key lookup is a single SIMD comparison of 16 control bytes, followed by an inline entry read from a 64-byte cache line.
+4. **Engine Execution** — The command handler executes against the shared `ConcurrentKeyspace`. For single-key commands, the reactor acquires a read or write lock on the target shard bucket (`ahash(key) % K`). For multi-key commands, it collects unique shard indices, sorts them (deadlock prevention), and acquires locks in order. The `Shard` wraps a `SwissTable` (SIMD-probed hash map) and an `ExpiryWheel` (dual timing wheel for TTLs). Each key lookup is a single SIMD comparison of 16 control bytes, followed by an inline entry read from a 64-byte cache line.
 
 5. **Response** — Pre-computed responses (`+OK\r\n`, `$-1\r\n`, `:0\r\n`, etc.) are returned as `CmdResult::Static` — a pointer to read-only memory, zero allocation. Dynamic responses are serialized via `RespSerializer` with scatter-gather I/O support (`IovecWriter` → `writev` / io_uring `IORING_OP_WRITEV`).
 
@@ -260,20 +274,28 @@ Offset  Size  Field          Description
 | 4 | Sorted Set |
 | 5 | Stream |
 
-### Shard
+### ConcurrentKeyspace and Shard
 
-A `Shard` is the unit of data ownership — one per reactor. It wraps:
+The `ConcurrentKeyspace` is the shared data layer accessed by all reactors. It contains K=512 `Shard` instances, each protected by a `parking_lot::RwLock`. Keys are routed to shards via `ahash(key) % K`.
+
+A `Shard` wraps:
 
 - `SwissTable` — the hash table
 - `ExpiryWheel` — dual timing wheel for TTL management
 - An expired entries buffer for active expiry sweeps
+- `memory_used` — per-shard memory accounting
 
 ```rust
+pub struct ConcurrentKeyspace {
+    shards: Vec<RwLock<Shard>>,  // K = 512 shard buckets
+}
+
 pub struct Shard {
     pub id: ShardId,
     data: SwissTable,
     expiry: ExpiryWheel,
     expired_buf: Vec<ExpiryEntry>,
+    memory_used: usize,
 }
 ```
 
@@ -370,7 +392,7 @@ Each reactor owns an `ArenaAllocator` (default 1 MiB) for transient allocations 
 `SpscRingBuffer<T, N>` — lock-free, single-producer/single-consumer ring buffer with compile-time capacity `N` (must be power of 2):
 
 - `CachePadded` head/tail atomics prevent false sharing
-- Used for cross-reactor messaging (4096 capacity per channel)
+- Used for shutdown signaling between reactors
 
 ### MPSC Queue
 
@@ -408,10 +430,11 @@ Each reactor owns an `ArenaAllocator` (default 1 MiB) for transient allocations 
 3. Print ASCII banner
 
 4. ReactorPool::spawn(config)
+   └── Create shared ConcurrentKeyspace (K=512 RwLock<Shard> buckets)
    └── For each CPU core:
        ├── Create IoBackend (io_uring or polling)
        ├── Create BufferPool (mmap + mlock + register)
-       ├── Create Shard (SwissTable + ExpiryWheel)
+       ├── Arc-clone ConcurrentKeyspace reference
        ├── Spawn thread, pin to core
        └── Enter Reactor::run() event loop
 

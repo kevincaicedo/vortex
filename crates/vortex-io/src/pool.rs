@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use crate::backend::IoUringBackend;
+use crate::backend::{IoBackend, PollingBackend};
+use vortex_config::IoBackendKind;
 use vortex_sync::SpscRingBuffer;
 
 use crate::reactor::{AofConfig, Reactor, ReactorConfig};
@@ -45,6 +49,14 @@ pub struct ReactorPoolConfig {
     pub connection_timeout: u32,
     /// AOF persistence configuration (None = disabled).
     pub aof_config: Option<AofConfig>,
+    /// Maximum memory in bytes (0 = unlimited). Divided across shards.
+    pub max_memory: u64,
+    /// Runtime I/O backend selection.
+    pub backend: IoBackendKind,
+    /// io_uring ring size.
+    pub ring_size: u32,
+    /// SQPOLL idle timeout in milliseconds.
+    pub sqpoll_idle_ms: u32,
 }
 
 impl Default for ReactorPoolConfig {
@@ -57,6 +69,49 @@ impl Default for ReactorPoolConfig {
             buffer_count: 1024,
             connection_timeout: 300,
             aof_config: None,
+            max_memory: 0,
+            backend: IoBackendKind::Auto,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
+        }
+    }
+}
+
+fn build_backend(
+    config: &ReactorPoolConfig,
+) -> std::io::Result<Box<dyn IoBackend>> {
+    match config.backend {
+        IoBackendKind::Polling => {
+            let backend = PollingBackend::new()?;
+            Ok(Box::new(backend))
+        }
+        IoBackendKind::Auto => {
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            {
+                match IoUringBackend::new(config.ring_size, config.sqpoll_idle_ms) {
+                    Ok(backend) => return Ok(Box::new(backend)),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "io_uring unavailable, falling back to polling backend");
+                    }
+                }
+            }
+
+            let backend = PollingBackend::new()?;
+            Ok(Box::new(backend))
+        }
+        IoBackendKind::Uring => {
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            {
+                let backend = IoUringBackend::new(config.ring_size, config.sqpoll_idle_ms)?;
+                return Ok(Box::new(backend));
+            }
+
+            #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+            {
+                Err(std::io::Error::other(
+                    "io_uring backend requested but this build does not support it",
+                ))
+            }
         }
     }
 }
@@ -98,6 +153,12 @@ impl ReactorPool {
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
 
+        let mut backends: Vec<Option<Box<dyn IoBackend>>> = Vec::with_capacity(num_reactors);
+        for _ in 0..num_reactors {
+            let backend = build_backend(&config)?;
+            backends.push(Some(backend));
+        }
+
         // Build the N×N cross-reactor SPSC channel mesh.
         let mut cross_channels: Vec<Vec<Option<CrossChannel>>> = Vec::with_capacity(num_reactors);
         for from in 0..num_reactors {
@@ -121,6 +182,9 @@ impl ReactorPool {
         for (i, _) in cross_channels.iter().enumerate().take(num_reactors) {
             let core_id = core_ids.get(i).copied();
             let coord_clone = Arc::clone(&coordinator);
+            let backend = backends[i]
+                .take()
+                .expect("backend slot populated for each reactor");
 
             // Gather incoming channels for this reactor: channels[j][i] for all j ≠ i.
             let incoming: Vec<CrossChannel> = (0..num_reactors)
@@ -135,7 +199,24 @@ impl ReactorPool {
                 buffer_count: per_reactor_bufs,
                 connection_timeout: config.connection_timeout,
                 aof_config: config.aof_config.clone(),
+                num_reactors,
+                max_memory: if config.max_memory > 0 {
+                    config.max_memory / num_reactors as u64
+                } else {
+                    0
+                },
             };
+
+            // Gather outgoing channels for this reactor: channels[i][j] for all j ≠ i.
+            let outgoing: Vec<Option<CrossChannel>> = (0..num_reactors)
+                .map(|j| {
+                    if j == i {
+                        None
+                    } else {
+                        cross_channels[i][j].as_ref().map(Arc::clone)
+                    }
+                })
+                .collect();
 
             let thread = std::thread::Builder::new()
                 .name(format!("vortex-reactor-{i}"))
@@ -152,7 +233,12 @@ impl ReactorPool {
                         }
                     }
 
-                    let mut reactor = match Reactor::new(i, reactor_config, coord_clone) {
+                    let mut reactor = match Reactor::with_backend(
+                        i,
+                        reactor_config,
+                        coord_clone,
+                        backend,
+                    ) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(reactor_id = i, error = %e, "failed to create reactor");

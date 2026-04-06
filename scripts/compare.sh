@@ -28,6 +28,8 @@
 #                resource limits for a fair apples-to-apples comparison
 #   --native     Run VortexDB and Redis both natively (no Docker at all).
 #                Requires redis-server installed locally.
+#   --aof        Enable AOF persistence on VortexDB during benchmarks.
+#   --aof-fsync  AOF fsync policy: always, everysec (default), no.
 #   --cpus NUM   CPU limit per Docker container (default: 4)
 #   --memory SZ  Memory limit per container (default: 2g)
 #   --help       Show this help message
@@ -63,10 +65,14 @@ DO_BUILD=true
 DO_DOCKER=true
 DOCKER_ALL=false
 NATIVE_MODE=false
+AOF_MODE=false
+AOF_FSYNC="everysec"
 DOCKER_CPUS=4
 DOCKER_MEMORY="2g"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BENCHMARKS_DIR="$PROJECT_ROOT/benchmarks"
+NATIVE_THREADS=""
+NATIVE_FIXED_BUFFERS=""
 
 # Server names and ports stored in files for bash 3.x compatibility
 SERVERS="vortex redis dragonfly valkey"
@@ -93,6 +99,8 @@ while [[ $# -gt 0 ]]; do
         --no-docker) DO_DOCKER=false; shift ;;
         --docker-all) DOCKER_ALL=true; shift ;;
         --native) NATIVE_MODE=true; shift ;;
+        --aof) AOF_MODE=true; shift ;;
+        --aof-fsync) AOF_FSYNC=$2; shift 2 ;;
         --cpus) DOCKER_CPUS=$2; shift 2 ;;
         --memory) DOCKER_MEMORY=$2; shift 2 ;;
         --help|-h)
@@ -114,6 +122,19 @@ fi
 if [[ "$NATIVE_MODE" == true ]]; then
     DO_DOCKER=false
     SERVERS="vortex redis"
+
+    # Keep native VortexDB and Redis on the same capped thread budget for a
+    # fair comparison, and size the fixed buffer pool from the benchmark
+    # client load so per-reactor buffer sharding does not reject connections
+    # during high-concurrency runs.
+    native_cpus=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+    NATIVE_THREADS=$((native_cpus > 4 ? 4 : native_cpus))
+    [[ "$NATIVE_THREADS" -lt 1 ]] && NATIVE_THREADS=1
+
+    NATIVE_FIXED_BUFFERS=$((CLIENTS * NATIVE_THREADS * 4))
+    if [[ "$NATIVE_FIXED_BUFFERS" -lt 1024 ]]; then
+        NATIVE_FIXED_BUFFERS=1024
+    fi
 fi
 
 # ── Utility functions ──
@@ -292,6 +313,11 @@ PORT=$PORT_BASE
 # ── Start VortexDB ──
 if [[ "$DOCKER_ALL" == true ]]; then
     log_info "Starting VortexDB (Docker) on port $PORT..."
+    DOCKER_VORTEX_ARGS="--bind 0.0.0.0:6379 --threads $DOCKER_CPUS"
+    if [[ "$AOF_MODE" == true ]]; then
+        DOCKER_VORTEX_ARGS="$DOCKER_VORTEX_ARGS --aof-enabled --aof-fsync $AOF_FSYNC"
+        log_info "AOF enabled in Docker (fsync=$AOF_FSYNC)"
+    fi
     docker run -d --rm \
         --name vortex-bench-vortex \
         -p "$PORT:6379" \
@@ -300,13 +326,26 @@ if [[ "$DOCKER_ALL" == true ]]; then
         --security-opt seccomp=unconfined \
         --ulimit memlock=-1 \
         "$IMAGE_vortex" \
-        --bind "0.0.0.0:6379" --threads "$DOCKER_CPUS" >/dev/null
+        $DOCKER_VORTEX_ARGS >/dev/null
     kv_set "port_vortex" "$PORT"
     PORT=$((PORT + 1))
 else
-    log_info "Starting VortexDB (native) on port $PORT..."
+    if [[ "$NATIVE_MODE" == true ]]; then
+        log_info "Starting VortexDB (native, threads $NATIVE_THREADS, fixed-buffers $NATIVE_FIXED_BUFFERS) on port $PORT..."
+    else
+        log_info "Starting VortexDB (native) on port $PORT..."
+    fi
     VORTEX_LOG="$RESULTS_DIR/vortex.log"
-    "$PROJECT_ROOT/target/release/vortex-server" --bind "127.0.0.1:$PORT" >"$VORTEX_LOG" 2>&1 &
+    VORTEX_ARGS=(--bind "127.0.0.1:$PORT")
+    if [[ "$NATIVE_MODE" == true ]]; then
+        VORTEX_ARGS+=(--threads "$NATIVE_THREADS" --fixed-buffers "$NATIVE_FIXED_BUFFERS")
+    fi
+    if [[ "$AOF_MODE" == true ]]; then
+        AOF_DIR="$(mktemp -d)"
+        VORTEX_ARGS+=(--aof-enabled --aof-fsync "$AOF_FSYNC" --aof-path "$AOF_DIR/vortex.aof")
+        log_info "AOF enabled (fsync=$AOF_FSYNC, path=$AOF_DIR/vortex.aof)"
+    fi
+    "$PROJECT_ROOT/target/release/vortex-server" "${VORTEX_ARGS[@]}" >"$VORTEX_LOG" 2>&1 &
     VORTEX_PID=$!
     kv_set "port_vortex" "$PORT"
     PORT=$((PORT + 1))
@@ -319,10 +358,8 @@ if [[ "$NATIVE_MODE" == true ]]; then
         echo "ERROR: redis-server not found. Install Redis to use --native mode." >&2
         exit 1
     fi
-    # Detect available CPU cores for io-threads (cap at 4 for consistency)
-    local_cpus=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
-    redis_threads=$((local_cpus > 4 ? 4 : local_cpus))
     REDIS_LOG="$RESULTS_DIR/redis.log"
+    redis_threads="$NATIVE_THREADS"
     log_info "Starting Redis (native, io-threads $redis_threads) on port $PORT..."
     redis-server \
         --port "$PORT" \

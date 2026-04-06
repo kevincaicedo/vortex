@@ -88,7 +88,7 @@ pub struct Completion {
 /// retrieves completions. This matches io_uring's native model; the polling
 /// backend emulates it by performing I/O inline and generating synthetic
 /// completions.
-pub trait IoBackend {
+pub trait IoBackend: Send {
     /// Submit an accept operation on the listening socket.
     fn submit_accept(&mut self, listener_fd: RawFd, token: u64) -> std::io::Result<()>;
 
@@ -181,6 +181,9 @@ pub trait IoBackend {
     /// Flush all pending submissions to the kernel (io_uring: `submit()`).
     /// Returns the number of SQEs submitted.
     fn flush(&mut self) -> std::io::Result<usize>;
+
+    /// Drain completions without blocking for new work.
+    fn try_completions(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize>;
 
     /// Drain available completions into `out`. Returns the count of completions.
     fn completions(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize>;

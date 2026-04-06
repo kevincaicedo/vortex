@@ -49,6 +49,9 @@ bench_raw() {
     shift
     local args=("$@")
 
+    # Flush state between benchmarks to prevent SwissTable swell / cache pollution.
+    redis-cli -h "$HOST" -p "$PORT" FLUSHALL > /dev/null 2>&1 || true
+
     local csv_file="$TMPDIR/${label}.csv"
     local err_file="$TMPDIR/${label}.err"
 
@@ -84,6 +87,9 @@ bench_raw_slow() {
     local label=$1
     shift
     local args=("$@")
+
+    # Flush state between benchmarks to prevent SwissTable swell / cache pollution.
+    redis-cli -h "$HOST" -p "$PORT" FLUSHALL > /dev/null 2>&1 || true
 
     local csv_file="$TMPDIR/${label}.csv"
     local err_file="$TMPDIR/${label}.err"

@@ -38,6 +38,10 @@ pub struct Shard {
     expiry: ExpiryWheel,
     /// Reusable buffer for expired entries from the timing wheel.
     expired_buf: Vec<ExpiryEntry>,
+    /// Approximate memory used by keys + values in bytes.
+    memory_used: usize,
+    /// Maximum allowed memory per shard in bytes (0 = unlimited).
+    max_memory: u64,
 }
 
 impl Shard {
@@ -48,6 +52,8 @@ impl Shard {
             data: SwissTable::new(),
             expiry: ExpiryWheel::new(),
             expired_buf: Vec::with_capacity(64),
+            memory_used: 0,
+            max_memory: 0,
         }
     }
 
@@ -56,6 +62,37 @@ impl Shard {
         let mut s = Self::new(id);
         s.expiry.set_time(now_nanos);
         s
+    }
+
+    /// Sets the per-shard memory limit in bytes (0 = unlimited).
+    pub fn set_max_memory(&mut self, max_memory: u64) {
+        self.max_memory = max_memory;
+    }
+
+    /// Returns `true` if the shard is over its memory budget.
+    ///
+    /// Used by write commands to reject operations under `noeviction` policy.
+    #[inline]
+    pub fn is_over_memory(&self) -> bool {
+        self.max_memory > 0 && self.memory_used as u64 >= self.max_memory
+    }
+
+    /// Approximate memory used by this shard in bytes.
+    #[inline]
+    pub fn memory_used(&self) -> usize {
+        self.memory_used
+    }
+
+    /// Approximate cost of storing one key-value pair:
+    /// 64 (Entry) + key bytes + value overhead.
+    #[inline]
+    fn entry_cost(key: &VortexKey, value: &VortexValue) -> usize {
+        Self::entry_cost_for_key_len(key.as_bytes().len(), value)
+    }
+
+    #[inline]
+    fn entry_cost_for_key_len(key_len: usize, value: &VortexValue) -> usize {
+        64 + key_len + value.memory_usage()
     }
 
     // ── Read operations (lazy expiry) ───────────────────────────────
@@ -106,6 +143,7 @@ impl Shard {
     /// Insert a key known to be absent, using a pre-computed hash.
     /// Caller guarantees the key does not exist in the table.
     pub fn insert_new_prehashed(&mut self, key: VortexKey, value: VortexValue, hash: u64) {
+        self.memory_used += Self::entry_cost(&key, &value);
         self.data.insert_new_prehashed(key, value, hash);
     }
 
@@ -113,7 +151,35 @@ impl Shard {
 
     /// SET: sets a key-value pair (no TTL).
     pub fn set(&mut self, key: VortexKey, value: VortexValue) -> Option<VortexValue> {
-        self.data.insert(key, value)
+        self.memory_used += Self::entry_cost(&key, &value);
+        let prev = self.data.insert(key, value);
+        if let Some(ref old) = prev {
+            // Subtract the old value's cost (key cost stays the same).
+            self.memory_used = self.memory_used.saturating_sub(old.memory_usage());
+        }
+        prev
+    }
+
+    /// SET with pre-computed hash (for MSET batching — avoids re-hashing).
+    #[inline]
+    pub fn set_prehashed(
+        &mut self,
+        key: VortexKey,
+        value: VortexValue,
+        hash: u64,
+    ) -> Option<VortexValue> {
+        self.memory_used += Self::entry_cost(&key, &value);
+        let prev = self.data.insert_prehashed(key, value, hash);
+        if let Some(ref old) = prev {
+            self.memory_used = self.memory_used.saturating_sub(old.memory_usage());
+        }
+        prev
+    }
+
+    /// Prefetch with write intent from a pre-computed hash (no re-hashing).
+    #[inline]
+    pub fn prefetch_write_hash(&self, hash: u64) {
+        self.data.prefetch_group_write(hash);
     }
 
     /// SET with TTL: sets a key-value pair with an absolute nanosecond deadline.
@@ -125,8 +191,12 @@ impl Shard {
         value: VortexValue,
         ttl_deadline_nanos: u64,
     ) -> Option<VortexValue> {
+        self.memory_used += Self::entry_cost(&key, &value);
         let hash = self.data.hash_key_bytes(key.as_bytes());
         let prev = self.data.insert_with_ttl(key, value, ttl_deadline_nanos);
+        if let Some(ref old) = prev {
+            self.memory_used = self.memory_used.saturating_sub(old.memory_usage());
+        }
         if ttl_deadline_nanos != 0 {
             self.expiry.register(hash, ttl_deadline_nanos);
         }
@@ -135,12 +205,35 @@ impl Shard {
 
     /// DEL: deletes a key.
     pub fn del(&mut self, key: &VortexKey) -> bool {
-        self.data.remove(key).is_some()
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.del_prehashed(key.as_bytes(), hash)
+    }
+
+    /// DEL with a pre-computed hash.
+    pub fn del_prehashed(&mut self, key_bytes: &[u8], hash: u64) -> bool {
+        if let Some(old) = self.data.remove_prehashed(key_bytes, hash) {
+            self.memory_used = self
+                .memory_used
+                .saturating_sub(Self::entry_cost_for_key_len(key_bytes.len(), &old));
+            true
+        } else {
+            false
+        }
     }
 
     /// DEL returning the removed value (for GETDEL).
     pub fn remove(&mut self, key: &VortexKey) -> Option<VortexValue> {
-        self.data.remove(key)
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.remove_prehashed(key.as_bytes(), hash)
+    }
+
+    /// DEL returning the removed value with a pre-computed hash.
+    pub fn remove_prehashed(&mut self, key_bytes: &[u8], hash: u64) -> Option<VortexValue> {
+        let old = self.data.remove_prehashed(key_bytes, hash)?;
+        self.memory_used = self
+            .memory_used
+            .saturating_sub(Self::entry_cost_for_key_len(key_bytes.len(), &old));
+        Some(old)
     }
 
     /// Returns a mutable reference to the value for a key (no lazy expiry).
@@ -148,7 +241,28 @@ impl Shard {
     /// Used by INCR/APPEND for in-place modification.
     #[inline]
     pub fn get_mut(&mut self, key: &VortexKey) -> Option<&mut VortexValue> {
-        self.data.get_mut(key)
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.get_mut_prehashed(key.as_bytes(), hash)
+    }
+
+    /// Returns a mutable reference to the value for a key using a pre-computed hash.
+    #[inline]
+    pub fn get_mut_prehashed(&mut self, key_bytes: &[u8], hash: u64) -> Option<&mut VortexValue> {
+        self.data.get_mut_prehashed(key_bytes, hash)
+    }
+
+    /// Re-sync the Entry's cached value_data after in-place mutation via `get_mut()`.
+    #[inline]
+    pub fn sync_entry_value(&mut self, key: &VortexKey) {
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.sync_entry_value_prehashed(key.as_bytes(), hash);
+    }
+
+    /// Re-sync the Entry's cached value_data after in-place mutation via
+    /// `get_mut()` using a pre-computed hash.
+    #[inline]
+    pub fn sync_entry_value_prehashed(&mut self, key_bytes: &[u8], hash: u64) {
+        self.data.sync_entry_value_prehashed(key_bytes, hash);
     }
 
     /// Single-probe upsert: if key exists, returns `(&mut value, true)`.
@@ -164,7 +278,39 @@ impl Shard {
     where
         F: FnOnce() -> VortexValue,
     {
-        self.data.get_or_insert_with(key, default_fn)
+        let hash = self.data.hash_key_bytes(key.as_bytes());
+        self.get_or_insert_with_prehashed(key, hash, default_fn)
+    }
+
+    /// Single-probe upsert with a pre-computed hash.
+    #[inline]
+    pub fn get_or_insert_with_prehashed<F>(
+        &mut self,
+        key: VortexKey,
+        hash: u64,
+        default_fn: F,
+    ) -> (&mut VortexValue, bool)
+    where
+        F: FnOnce() -> VortexValue,
+    {
+        let key_len = key.as_bytes().len();
+        let (value, existed) = self
+            .data
+            .get_or_insert_with_prehashed(key, hash, default_fn);
+        if !existed {
+            self.memory_used += Self::entry_cost_for_key_len(key_len, value);
+        }
+        (value, existed)
+    }
+
+    /// Adjust memory accounting after an in-place value mutation.
+    #[inline]
+    pub fn adjust_value_memory(&mut self, old_usage: usize, new_usage: usize) {
+        if new_usage >= old_usage {
+            self.memory_used += new_usage - old_usage;
+        } else {
+            self.memory_used = self.memory_used.saturating_sub(old_usage - new_usage);
+        }
     }
 
     /// SET + options: handles NX (only set if key doesn't exist),

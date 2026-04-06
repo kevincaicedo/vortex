@@ -74,3 +74,100 @@ jobs:
           alert-comment-cc-users: "@${{ github.actor }}"
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: true
+
+  aof-benchmark:
+    name: AOF Overhead Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install redis-tools
+        run: sudo apt-get update && sudo apt-get install -y redis-tools bc
+
+      - name: Build VortexDB (release)
+        run: cargo build --release --bin vortex-server
+
+      - name: Benchmark without AOF (baseline)
+        run: |
+          ./target/release/vortex-server --bind "127.0.0.1:6399" &
+          VORTEX_PID=$!
+          sleep 2
+          redis-cli -p 6399 PING
+
+          redis-benchmark -p 6399 -n 200000 -c 50 -P 16 \
+            -t SET,GET,INCR,MSET --csv > /tmp/baseline.csv 2>/dev/null
+
+          bash scripts/bench-commands.sh -p 6399 -n 100000 --csv --output /tmp/baseline-custom.csv || true
+
+          kill $VORTEX_PID 2>/dev/null || true
+          wait $VORTEX_PID 2>/dev/null || true
+
+      - name: Benchmark with AOF (everysec)
+        run: |
+          AOF_DIR=$(mktemp -d)
+          ./target/release/vortex-server --bind "127.0.0.1:6399" \
+            --aof-enabled --aof-fsync everysec --aof-path "$AOF_DIR/vortex.aof" &
+          VORTEX_PID=$!
+          sleep 2
+          redis-cli -p 6399 PING
+
+          redis-benchmark -p 6399 -n 200000 -c 50 -P 16 \
+            -t SET,GET,INCR,MSET --csv > /tmp/aof-everysec.csv 2>/dev/null
+
+          bash scripts/bench-commands.sh -p 6399 -n 100000 --csv --output /tmp/aof-custom.csv || true
+
+          kill $VORTEX_PID 2>/dev/null || true
+          wait $VORTEX_PID 2>/dev/null || true
+          rm -rf "$AOF_DIR"
+
+      - name: Benchmark with AOF (always)
+        run: |
+          AOF_DIR=$(mktemp -d)
+          ./target/release/vortex-server --bind "127.0.0.1:6399" \
+            --aof-enabled --aof-fsync always --aof-path "$AOF_DIR/vortex.aof" &
+          VORTEX_PID=$!
+          sleep 2
+          redis-cli -p 6399 PING
+
+          redis-benchmark -p 6399 -n 200000 -c 50 -P 16 \
+            -t SET,GET,INCR,MSET --csv > /tmp/aof-always.csv 2>/dev/null
+
+          kill $VORTEX_PID 2>/dev/null || true
+          wait $VORTEX_PID 2>/dev/null || true
+          rm -rf "$AOF_DIR"
+
+      - name: Generate AOF overhead report
+        run: |
+          echo "# AOF Overhead Report" > /tmp/aof-report.md
+          echo "" >> /tmp/aof-report.md
+          echo "## Baseline (no AOF)" >> /tmp/aof-report.md
+          echo '```' >> /tmp/aof-report.md
+          cat /tmp/baseline.csv >> /tmp/aof-report.md
+          echo '```' >> /tmp/aof-report.md
+          echo "" >> /tmp/aof-report.md
+          echo "## AOF everysec" >> /tmp/aof-report.md
+          echo '```' >> /tmp/aof-report.md
+          cat /tmp/aof-everysec.csv >> /tmp/aof-report.md
+          echo '```' >> /tmp/aof-report.md
+          echo "" >> /tmp/aof-report.md
+          echo "## AOF always" >> /tmp/aof-report.md
+          echo '```' >> /tmp/aof-report.md
+          cat /tmp/aof-always.csv >> /tmp/aof-report.md
+          echo '```' >> /tmp/aof-report.md
+          cat /tmp/aof-report.md
+
+      - name: Upload AOF benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: aof-benchmark-report-${{ github.run_id }}
+          path: |
+            /tmp/aof-report.md
+            /tmp/baseline.csv
+            /tmp/aof-everysec.csv
+            /tmp/aof-always.csv

@@ -48,6 +48,7 @@ pub static ERR_NOT_INTEGER: &[u8] = b"-ERR value is not an integer or out of ran
 pub static ERR_NOT_FLOAT: &[u8] = b"-ERR value is not a valid float\r\n";
 pub static ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
 pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of range\r\n";
+pub static ERR_OOM: &[u8] = b"-OOM command not allowed when used memory > 'maxmemory'\r\n";
 
 /// Execute a command by name.
 ///
@@ -62,6 +63,11 @@ pub fn execute_command(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> Option<CmdResult> {
+    // OOM guard: reject write commands when over memory limit (noeviction).
+    if shard.is_over_memory() && is_write_command(name) {
+        return Some(CmdResult::Static(ERR_OOM));
+    }
+
     // String commands — ordered by frequency in typical workloads.
     match name {
         b"GET" => Some(string::cmd_get(shard, frame, now_nanos)),
@@ -123,6 +129,31 @@ pub fn execute_command(
         b"UNWATCH" => Some(server::cmd_unwatch(shard, frame, now_nanos)),
         _ => None,
     }
+}
+
+/// Returns `true` if the command may write data (and should be rejected under OOM).
+#[inline]
+fn is_write_command(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"SET"
+            | b"SETNX"
+            | b"SETEX"
+            | b"PSETEX"
+            | b"MSET"
+            | b"MSETNX"
+            | b"GETSET"
+            | b"APPEND"
+            | b"INCR"
+            | b"INCRBY"
+            | b"INCRBYFLOAT"
+            | b"DECR"
+            | b"DECRBY"
+            | b"SETRANGE"
+            | b"RENAME"
+            | b"RENAMENX"
+            | b"COPY"
+    )
 }
 
 // ── Argument extraction helpers ─────────────────────────────────────────

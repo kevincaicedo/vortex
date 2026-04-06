@@ -7,8 +7,12 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::time::Duration;
 
-use io_uring::{IoUring, opcode, types::Fd};
+use io_uring::{
+    IoUring, opcode,
+    types::{Fd, SubmitArgs, Timespec},
+};
 
 use super::{Completion, IoBackend};
 
@@ -23,12 +27,17 @@ impl IoUringBackend {
     /// `ring_size` is the number of SQEs (must be power of two).
     /// If `sqpoll` feature is enabled and `sqpoll_idle_ms > 0`, enables SQPOLL mode.
     pub fn new(ring_size: u32, _sqpoll_idle_ms: u32) -> io::Result<Self> {
-        let mut builder = IoUring::builder();
-
         #[cfg(feature = "sqpoll")]
-        if _sqpoll_idle_ms > 0 {
-            builder.setup_sqpoll(_sqpoll_idle_ms);
-        }
+        let builder = {
+            let mut builder = IoUring::builder();
+            if _sqpoll_idle_ms > 0 {
+                builder.setup_sqpoll(_sqpoll_idle_ms);
+            }
+            builder
+        };
+
+        #[cfg(not(feature = "sqpoll"))]
+        let builder = IoUring::builder();
 
         let ring = builder.build(ring_size)?;
         Ok(Self { ring })
@@ -208,6 +217,21 @@ impl IoBackend for IoUringBackend {
         Ok(n)
     }
 
+    fn try_completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
+        let start = out.len();
+
+        let cq = self.ring.completion();
+        for cqe in cq {
+            out.push(Completion {
+                token: cqe.user_data(),
+                result: cqe.result(),
+                flags: cqe.flags(),
+            });
+        }
+
+        Ok(out.len() - start)
+    }
+
     fn completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         let start = out.len();
 
@@ -262,10 +286,9 @@ impl IoBackend for IoUringBackend {
                 // Standard mode: submit pending SQEs and wait briefly (1ms).
                 // Keeps the reactor responsive for shutdown checks and timer
                 // ticks while avoiding CPU-burning spin loops.
-                match self
-                    .ring
-                    .submit_and_wait_with_timeout(1, std::time::Duration::from_millis(1))
-                {
+                let timeout = Timespec::from(Duration::from_millis(1));
+                let args = SubmitArgs::new().timespec(&timeout);
+                match self.ring.submitter().submit_with_args(1, &args) {
                     Ok(_) | Err(_) => {}
                 }
                 let cq = self.ring.completion();

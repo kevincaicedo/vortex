@@ -471,6 +471,65 @@ impl SwissTable {
         None
     }
 
+    /// Insert a key-value pair with a pre-computed hash. Returns the old value
+    /// if the key existed. Avoids re-hashing — used by MSET batch pipeline.
+    pub fn insert_prehashed(
+        &mut self,
+        key: VortexKey,
+        value: VortexValue,
+        hash: u64,
+    ) -> Option<VortexValue> {
+        if self.occupied >= self.growth_limit() {
+            self.resize();
+        }
+
+        let key_bytes = key.as_bytes();
+        let h2 = h2_from_hash(hash);
+
+        // Phase 1: probe for existing key.
+        if let Some(slot) = self.find_slot(key_bytes, hash) {
+            let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+            self.keys[slot] = Some(key);
+            let previous = self.values[slot].replace(value);
+
+            let key_ptr =
+                self.keys[slot].as_ref().expect("live slot must have key") as *const VortexKey;
+            let value_ptr = self.values[slot]
+                .as_ref()
+                .expect("live slot must have value")
+                as *const VortexValue;
+
+            let entry = unsafe { self.raw.entry_mut(slot) };
+            Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, ttl);
+            unsafe { self.raw.set_ctrl(slot, h2) };
+            return previous;
+        }
+
+        // Phase 2: key not found — insert into first available slot.
+        let slot = self.find_insert_slot(hash);
+        let was_empty = unsafe { *self.raw.ctrl_at(slot) == CTRL_EMPTY };
+
+        self.keys[slot] = Some(key);
+        self.values[slot] = Some(value);
+
+        let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
+        let value_ptr = self.values[slot]
+            .as_ref()
+            .expect("new slot must have value") as *const VortexValue;
+
+        let entry = unsafe { self.raw.entry_mut(slot) };
+        Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);
+        unsafe {
+            self.raw.set_ctrl(slot, h2);
+        }
+
+        self.len += 1;
+        if was_empty {
+            self.occupied += 1;
+        }
+        None
+    }
+
     /// Get a reference to the value for a key.
     pub fn get(&self, key: &VortexKey) -> Option<&VortexValue> {
         let key_bytes = key.as_bytes();
@@ -483,8 +542,45 @@ impl SwissTable {
     pub fn get_mut(&mut self, key: &VortexKey) -> Option<&mut VortexValue> {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
+        self.get_mut_prehashed(key_bytes, hash)
+    }
+
+    /// Get a mutable reference to the value for a key using a pre-computed hash.
+    pub fn get_mut_prehashed(&mut self, key_bytes: &[u8], hash: u64) -> Option<&mut VortexValue> {
         let slot = self.find_slot(key_bytes, hash)?;
         self.values[slot].as_mut()
+    }
+
+    /// Re-sync the Entry's value_data after an in-place mutation via `get_mut()`.
+    ///
+    /// Commands like INCR/APPEND modify the VortexValue through `get_mut()`,
+    /// which updates `self.values[slot]` but leaves the Entry's cached
+    /// value_data stale. Call this after any in-place mutation to keep the
+    /// Entry consistent for future readers (morph profiling, snapshots).
+    pub fn sync_entry_value(&mut self, key: &VortexKey) {
+        let key_bytes = key.as_bytes();
+        let hash = self.hash_key(key_bytes);
+        self.sync_entry_value_prehashed(key_bytes, hash);
+    }
+
+    /// Re-sync the Entry's value_data after an in-place mutation via `get_mut()`
+    /// using a pre-computed hash.
+    pub fn sync_entry_value_prehashed(&mut self, key_bytes: &[u8], hash: u64) {
+        if let Some(slot) = self.find_slot(key_bytes, hash) {
+            let h2 = unsafe { *self.raw.ctrl_at(slot) };
+            let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+
+            let key_ptr =
+                self.keys[slot].as_ref().expect("live slot must have key") as *const VortexKey;
+            let value_ptr = self.values[slot]
+                .as_ref()
+                .expect("live slot must have value")
+                as *const VortexValue;
+
+            let entry = unsafe { self.raw.entry_mut(slot) };
+            // SAFETY: slot ownership remains stable; we just rewrite the entry.
+            Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, ttl);
+        }
     }
 
     /// Single-probe upsert: returns `(value_ref, existed)`.
@@ -504,12 +600,25 @@ impl SwissTable {
     where
         F: FnOnce() -> VortexValue,
     {
+        let hash = self.hash_key(key.as_bytes());
+        self.get_or_insert_with_prehashed(key, hash, default_fn)
+    }
+
+    /// Single-probe upsert with a pre-computed hash: returns `(value_ref, existed)`.
+    pub fn get_or_insert_with_prehashed<F>(
+        &mut self,
+        key: VortexKey,
+        hash: u64,
+        default_fn: F,
+    ) -> (&mut VortexValue, bool)
+    where
+        F: FnOnce() -> VortexValue,
+    {
         if self.occupied >= self.growth_limit() {
             self.resize();
         }
 
         let key_bytes = key.as_bytes();
-        let hash = self.hash_key(key_bytes);
         let h2 = h2_from_hash(hash);
         let h1 = h1_from_hash(hash);
         let mask = self.group_mask();
@@ -583,6 +692,11 @@ impl SwissTable {
     pub fn remove(&mut self, key: &VortexKey) -> Option<VortexValue> {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
+        self.remove_prehashed(key_bytes, hash)
+    }
+
+    /// Remove a key with a pre-computed hash and return its value.
+    pub fn remove_prehashed(&mut self, key_bytes: &[u8], hash: u64) -> Option<VortexValue> {
         let slot = self.find_slot(key_bytes, hash)?;
 
         // Tombstone the slot.

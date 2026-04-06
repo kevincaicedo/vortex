@@ -70,6 +70,10 @@ fn main() {
         buffer_count: config.fixed_buffers,
         connection_timeout: config.connection_timeout_secs as u32,
         aof_config,
+        max_memory: config.max_memory,
+        backend: config.io_backend,
+        ring_size: config.ring_size,
+        sqpoll_idle_ms: config.sqpoll_idle_ms,
     };
 
     let mut pool = match ReactorPool::spawn(pool_config) {

@@ -29,6 +29,19 @@ use super::format::{AofFsyncPolicy, AofHeader};
 /// Userspace write buffer size (64 KB).
 const AOF_BUF_SIZE: usize = 64 * 1024;
 
+// ── Fsync backend trait (used only by io_uring backend) ──────────────
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+trait FsyncBackend {
+    fn request_sync(&mut self, syncing_writes: u64) -> io::Result<()>;
+    fn poll(&mut self) -> io::Result<Option<u64>>;
+    fn wait(&mut self) -> io::Result<Option<u64>>;
+    fn is_inflight(&self) -> bool;
+    fn shutdown(self);
+}
+
+// ── Helper-thread backend (portable fallback) ────────────────────────
+
 struct AsyncFsyncWorker {
     request_tx: SyncSender<()>,
     done_rx: Receiver<io::Result<()>>,
@@ -133,6 +146,162 @@ impl AsyncFsyncWorker {
     }
 }
 
+// ── io_uring FSYNC backend (Linux only) ──────────────────────────────
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+struct UringFsyncWorker {
+    ring: io_uring::IoUring,
+    fd: std::os::fd::RawFd,
+    inflight: bool,
+    syncing_writes: u64,
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl UringFsyncWorker {
+    fn new(file: &File) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let ring = io_uring::IoUring::builder()
+            .setup_clamp()
+            .build(2)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(Self {
+            ring,
+            fd: file.as_raw_fd(),
+            inflight: false,
+            syncing_writes: 0,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl FsyncBackend for UringFsyncWorker {
+    fn request_sync(&mut self, syncing_writes: u64) -> io::Result<()> {
+        if self.inflight || syncing_writes == 0 {
+            return Ok(());
+        }
+
+        let entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(self.fd))
+            .flags(io_uring::types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(0x1);
+
+        // SAFETY: the SQE is valid and the fd outlives the submission.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&entry)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+        }
+
+        self.ring.submit()?;
+        self.inflight = true;
+        self.syncing_writes = syncing_writes;
+        Ok(())
+    }
+
+    fn poll(&mut self) -> io::Result<Option<u64>> {
+        if !self.inflight {
+            return Ok(None);
+        }
+
+        if let Some(cqe) = self.ring.completion().next() {
+            let result = cqe.result();
+            let syncing_writes = self.syncing_writes;
+            self.inflight = false;
+            self.syncing_writes = 0;
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
+            Ok(Some(syncing_writes))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<Option<u64>> {
+        if !self.inflight {
+            return Ok(None);
+        }
+
+        self.ring.submit_and_wait(1)?;
+
+        match self.ring.completion().next() {
+            Some(cqe) => {
+                let result = cqe.result();
+                let syncing_writes = self.syncing_writes;
+                self.inflight = false;
+                self.syncing_writes = 0;
+                if result < 0 {
+                    return Err(io::Error::from_raw_os_error(-result));
+                }
+                Ok(Some(syncing_writes))
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "io_uring: no CQE after wait",
+            )),
+        }
+    }
+
+    fn is_inflight(&self) -> bool {
+        self.inflight
+    }
+
+    fn shutdown(self) {
+        // Drop the ring; kernel cleans up.
+    }
+}
+
+// ── Fsync worker dispatch ────────────────────────────────────────────
+
+enum FsyncWorker {
+    Thread(AsyncFsyncWorker),
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    Uring(UringFsyncWorker),
+}
+
+impl FsyncWorker {
+    fn request_sync(&mut self, syncing_writes: u64) -> io::Result<()> {
+        match self {
+            Self::Thread(w) => w.request_sync(syncing_writes),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(w) => FsyncBackend::request_sync(w, syncing_writes),
+        }
+    }
+
+    fn poll(&mut self) -> io::Result<Option<u64>> {
+        match self {
+            Self::Thread(w) => w.poll(),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(w) => FsyncBackend::poll(w),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<Option<u64>> {
+        match self {
+            Self::Thread(w) => w.wait(),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(w) => FsyncBackend::wait(w),
+        }
+    }
+
+    fn is_inflight(&self) -> bool {
+        match self {
+            Self::Thread(w) => w.is_inflight(),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(w) => w.is_inflight(),
+        }
+    }
+
+    fn shutdown(self) {
+        match self {
+            Self::Thread(w) => w.shutdown(),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(w) => FsyncBackend::shutdown(w),
+        }
+    }
+}
+
 /// AOF file writer with buffered I/O and configurable fsync.
 ///
 /// Owned by a single reactor thread — no synchronization needed.
@@ -152,7 +321,24 @@ pub struct AofFileWriter {
     /// File path (for rewrite/rename operations).
     path: PathBuf,
     /// Async fsync worker used by `everysec` to keep sync stalls off-reactor.
-    async_fsync: Option<AsyncFsyncWorker>,
+    async_fsync: Option<FsyncWorker>,
+}
+
+/// Create the appropriate fsync worker for the current platform.
+fn create_fsync_worker(file: &File) -> io::Result<FsyncWorker> {
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    {
+        match UringFsyncWorker::new(file) {
+            Ok(w) => return Ok(FsyncWorker::Uring(w)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "io_uring fsync init failed, falling back to helper thread"
+                );
+            }
+        }
+    }
+    Ok(FsyncWorker::Thread(AsyncFsyncWorker::new(file)?))
 }
 
 impl AofFileWriter {
@@ -175,7 +361,7 @@ impl AofFileWriter {
         }
 
         let async_fsync = if policy == AofFsyncPolicy::Everysec {
-            Some(AsyncFsyncWorker::new(writer.get_ref())?)
+            Some(create_fsync_worker(writer.get_ref())?)
         } else {
             None
         };
@@ -262,7 +448,7 @@ impl AofFileWriter {
         if self
             .async_fsync
             .as_ref()
-            .is_some_and(AsyncFsyncWorker::is_inflight)
+            .is_some_and(FsyncWorker::is_inflight)
         {
             return Ok(());
         }
@@ -340,7 +526,7 @@ impl AofFileWriter {
         // Replace writer.
         self.writer = BufWriter::with_capacity(AOF_BUF_SIZE, new_file);
         self.async_fsync = if self.policy == AofFsyncPolicy::Everysec {
-            Some(AsyncFsyncWorker::new(self.writer.get_ref())?)
+            Some(create_fsync_worker(self.writer.get_ref())?)
         } else {
             None
         };
