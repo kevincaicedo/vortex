@@ -86,17 +86,21 @@ flamegraph:
 compare *ARGS:
     bash scripts/compare.sh {{ARGS}}
 
+# Run the mixed-workload memtier suite alongside the standard comparison harness
+compare-memtier *ARGS:
+    bash scripts/compare.sh --memtier --json --markdown {{ARGS}}
+
 # Fair Docker-based comparison (all databases containerized, identical resources)
 compare-docker *ARGS:
-    bash scripts/compare.sh --docker-all --json --markdown --latency --custom {{ARGS}}
+    bash scripts/compare.sh --docker-all --json --markdown --latency --custom --memtier {{ARGS}}
 
 # Native comparison (VortexDB + Redis both native, no Docker)
 compare-native *ARGS:
-    bash scripts/compare.sh --native --json --markdown --latency --custom {{ARGS}}
+    bash scripts/compare.sh --native --json --markdown --latency --custom --memtier {{ARGS}}
 
 # Run comparison with JSON + Markdown output
 compare-full:
-    bash scripts/compare.sh --json --markdown --latency --runs 3 --custom
+    bash scripts/compare.sh --json --markdown --latency --runs 3 --custom --memtier
 
 # Run custom command benchmarks against a running server
 bench-commands port="16379":

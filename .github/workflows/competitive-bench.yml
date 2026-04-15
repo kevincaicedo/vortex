@@ -1,6 +1,8 @@
 name: Competitive Benchmark
 
 on:
+  push:
+    branches: [main]
   schedule:
     # Run weekly on Sunday at 06:00 UTC
     - cron: "0 6 * * 0"
@@ -56,8 +58,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install redis-tools
-        run: sudo apt-get update && sudo apt-get install -y redis-tools bc
+      - name: Install redis-tools and memtier_benchmark
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-tools bc lsb-release curl gpg
+          curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y memtier-benchmark
 
       - name: Wait for services
         run: |
@@ -79,7 +87,7 @@ jobs:
           sleep 2
           redis-cli -p 16382 PING
 
-      - name: Run compare.sh v2 (standard + custom)
+      - name: Run compare.sh v2 (standard + custom + memtier)
         run: |
           REQUESTS="${{ inputs.requests || '500000' }}"
           RUNS="${{ inputs.runs || '3' }}"
@@ -98,6 +106,7 @@ jobs:
             --markdown \
             --latency \
             --runs "$RUNS" \
+            --memtier \
             $CUSTOM_FLAG \
             2>&1 | tee compare-output.txt || true
 

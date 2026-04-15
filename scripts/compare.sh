@@ -2,12 +2,15 @@
 # scripts/compare.sh — VortexDB Competitive Benchmark Suite v2
 #
 # Benchmarks VortexDB against Redis, Dragonfly, and Valkey across ALL
-# supported commands. Produces terminal tables, JSON, and Markdown output.
+# supported commands plus an optional memtier mixed-workload suite.
+# Produces terminal tables, JSON, and Markdown output.
 #
 # Prerequisites:
 #   - docker
 #   - redis-benchmark (redis-tools package)
+#   - redis-cli (redis-tools package)
 #   - bc (for ratio calculations)
+#   - memtier_benchmark (optional, required only with --memtier)
 #
 # Usage:
 #   ./scripts/compare.sh [options]
@@ -22,6 +25,19 @@
 #   --latency    Capture p50/p95/p99 latency percentiles per command
 #   --runs N     Execute benchmarks N times with statistical analysis (default: 1)
 #   --custom     Also run custom command benchmarks (bench-commands.sh)
+#   --memtier    Also run memtier_benchmark mixed-workload suite
+#   --memtier-threads LIST
+#                Comma-separated memtier thread counts (default: 1,2,4,8)
+#   --memtier-requests NUM
+#                Memtier requests per client (default: 2000)
+#   --memtier-clients NUM
+#                Memtier clients per thread (default: 50)
+#   --memtier-pipeline NUM
+#                Memtier pipeline depth (default: 1)
+#   --memtier-data-size NUM
+#                Memtier value size in bytes (default: 384)
+#   --memtier-ratio RATIO
+#                Memtier read:write ratio (default: 1:15)
 #   --no-build   Skip building VortexDB (use existing binary / Docker image)
 #   --no-docker  Skip Docker containers (expect servers already running on ports)
 #   --docker-all Run ALL databases (including VortexDB) in Docker with identical
@@ -35,6 +51,7 @@
 # Examples:
 #   ./scripts/compare.sh -n 500000 -c 100 -P 16
 #   ./scripts/compare.sh --json --markdown --runs 3
+#   ./scripts/compare.sh --json --markdown --custom --memtier
 #   ./scripts/compare.sh --custom --latency --runs 5
 
 set -euo pipefail
@@ -59,12 +76,23 @@ OUTPUT_MARKDOWN=false
 CAPTURE_LATENCY=false
 NUM_RUNS=1
 RUN_CUSTOM=false
+RUN_MEMTIER=false
 DO_BUILD=true
 DO_DOCKER=true
 DOCKER_ALL=false
 NATIVE_MODE=false
 DOCKER_CPUS=4
 DOCKER_MEMORY="2g"
+MEMTIER_THREADS="1,2,4,8"
+MEMTIER_REQUESTS=2000
+MEMTIER_CLIENTS=50
+MEMTIER_PIPELINE=1
+MEMTIER_DATA_SIZE=384
+MEMTIER_RATIO="1:15"
+MEMTIER_KEY_MINIMUM=1
+MEMTIER_KEY_MAXIMUM=1000000
+MEMTIER_KEY_MEDIAN=500000
+MEMTIER_KEY_STDDEV=166667
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BENCHMARKS_DIR="$PROJECT_ROOT/benchmarks"
 
@@ -89,6 +117,13 @@ while [[ $# -gt 0 ]]; do
         --latency) CAPTURE_LATENCY=true; shift ;;
         --runs) NUM_RUNS=$2; shift 2 ;;
         --custom) RUN_CUSTOM=true; shift ;;
+        --memtier) RUN_MEMTIER=true; shift ;;
+        --memtier-threads) MEMTIER_THREADS=$2; shift 2 ;;
+        --memtier-requests) MEMTIER_REQUESTS=$2; shift 2 ;;
+        --memtier-clients) MEMTIER_CLIENTS=$2; shift 2 ;;
+        --memtier-pipeline) MEMTIER_PIPELINE=$2; shift 2 ;;
+        --memtier-data-size) MEMTIER_DATA_SIZE=$2; shift 2 ;;
+        --memtier-ratio) MEMTIER_RATIO=$2; shift 2 ;;
         --no-build) DO_BUILD=false; shift ;;
         --no-docker) DO_DOCKER=false; shift ;;
         --docker-all) DOCKER_ALL=true; shift ;;
@@ -121,6 +156,18 @@ fi
 log_info()  { echo "  [INFO] $*"; }
 log_warn()  { echo "  [WARN] $*" >&2; }
 
+require_command() {
+    local tool=$1
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERROR: required command '$tool' not found in PATH" >&2
+        exit 1
+    fi
+}
+
+memtier_threads_list() {
+    echo "$MEMTIER_THREADS" | tr ',' ' '
+}
+
 cleanup() {
     echo ""
     log_info "Cleaning up..."
@@ -141,6 +188,12 @@ cleanup() {
     rm -rf "$RESULTS_DIR"
 }
 trap cleanup EXIT
+
+require_command redis-benchmark
+require_command redis-cli
+if [[ "$RUN_MEMTIER" == true ]]; then
+    require_command memtier_benchmark
+fi
 
 wait_for_server() {
     local name=$1
@@ -197,6 +250,14 @@ calc_ratio() {
     echo "scale=1; $vortex_num / $other_num" | bc 2>/dev/null || echo "N/A"
 }
 
+json_value() {
+    if [[ "$1" == "N/A" || -z "$1" ]]; then
+        echo "null"
+    else
+        echo "$1"
+    fi
+}
+
 extract_rps() {
     local file=$1
     local label=$2
@@ -220,6 +281,130 @@ extract_latency() {
     else
         echo "N/A"
     fi
+}
+
+flush_server() {
+    local port=$1
+    redis-cli -h 127.0.0.1 -p "$port" FLUSHALL >/dev/null 2>&1 || true
+}
+
+run_memtier_benchmark() {
+    local name=$1
+    local port=$2
+    local thread_count=$3
+    local run_id=$4
+    local output="$RESULTS_DIR/memtier_${name}_t${thread_count}_run${run_id}.txt"
+    local error_output="$RESULTS_DIR/memtier_${name}_t${thread_count}_run${run_id}.err"
+
+    flush_server "$port"
+
+    if ! memtier_benchmark \
+        -s 127.0.0.1 \
+        -p "$port" \
+        --protocol=redis \
+        -t "$thread_count" \
+        -c "$MEMTIER_CLIENTS" \
+        --requests="$MEMTIER_REQUESTS" \
+        --pipeline="$MEMTIER_PIPELINE" \
+        --data-size="$MEMTIER_DATA_SIZE" \
+        --ratio="$MEMTIER_RATIO" \
+        --key-pattern=G:G \
+        --key-minimum="$MEMTIER_KEY_MINIMUM" \
+        --key-maximum="$MEMTIER_KEY_MAXIMUM" \
+        --key-median="$MEMTIER_KEY_MEDIAN" \
+        --key-stddev="$MEMTIER_KEY_STDDEV" \
+        --distinct-client-seed \
+        --hide-histogram \
+        > "$output" 2> "$error_output"; then
+        log_warn "Memtier benchmark failed for $name (${thread_count}T, run $run_id)"
+        return 1
+    fi
+}
+
+extract_memtier_field() {
+    local file=$1
+    local row=$2
+    local field=$3
+    local value
+
+    value=$(awk -v row="$row" -v field="$field" '$1 == row { print $field; exit }' "$file" 2>/dev/null || true)
+    if [[ -n "$value" && "$value" != "---" ]]; then
+        echo "$value"
+    else
+        echo "N/A"
+    fi
+}
+
+average_memtier_field() {
+    local name=$1
+    local thread_count=$2
+    local row=$3
+    local field=$4
+    local sum=0
+    local count=0
+
+    for run in $(seq 1 "$NUM_RUNS"); do
+        local file="$RESULTS_DIR/memtier_${name}_t${thread_count}_run${run}.txt"
+        local val
+        val=$(extract_memtier_field "$file" "$row" "$field")
+        if [[ "$val" != "N/A" && -n "$val" ]]; then
+            sum=$(echo "$sum + $val" | bc 2>/dev/null || echo "$sum")
+            count=$((count + 1))
+        fi
+    done
+
+    if [[ $count -eq 0 ]]; then
+        echo "N/A"
+        return
+    fi
+
+    echo "scale=3; $sum / $count" | bc 2>/dev/null || echo "N/A"
+}
+
+average_memtier_field_with_stats() {
+    local name=$1
+    local thread_count=$2
+    local row=$3
+    local field=$4
+    local sum=0
+    local count=0
+    local values=""
+
+    for run in $(seq 1 "$NUM_RUNS"); do
+        local file="$RESULTS_DIR/memtier_${name}_t${thread_count}_run${run}.txt"
+        local val
+        val=$(extract_memtier_field "$file" "$row" "$field")
+        if [[ "$val" != "N/A" && -n "$val" ]]; then
+            sum=$(echo "$sum + $val" | bc 2>/dev/null || echo "$sum")
+            count=$((count + 1))
+            values="$values $val"
+        fi
+    done
+
+    if [[ $count -eq 0 ]]; then
+        echo "N/A|N/A|N/A"
+        return
+    fi
+
+    local mean
+    mean=$(echo "scale=3; $sum / $count" | bc 2>/dev/null || echo "N/A")
+
+    local stddev="0"
+    if [[ $count -gt 1 ]]; then
+        local sq_sum=0
+        local v
+        for v in $values; do
+            sq_sum=$(echo "$sq_sum + ($v - $mean) * ($v - $mean)" | bc 2>/dev/null || echo "$sq_sum")
+        done
+        stddev=$(echo "scale=3; sqrt($sq_sum / ($count - 1))" | bc 2>/dev/null || echo "0")
+    fi
+
+    local ci95="0"
+    if [[ $count -gt 1 && "$stddev" != "0" ]]; then
+        ci95=$(echo "scale=3; 1.96 * $stddev / sqrt($count)" | bc 2>/dev/null || echo "0")
+    fi
+
+    echo "${mean}|${stddev}|${ci95}"
 }
 
 get_port() {
@@ -268,6 +453,9 @@ echo "╚═══════════════════════�
 echo ""
 echo "Benchmark tests: $TESTS"
 [[ "$RUN_CUSTOM" == true ]] && echo "Custom command benchmarks: enabled"
+if [[ "$RUN_MEMTIER" == true ]]; then
+    echo "Memtier mixed workload: enabled (${MEMTIER_THREADS} threads, ratio ${MEMTIER_RATIO})"
+fi
 echo ""
 
 # ── Build VortexDB ──
@@ -471,6 +659,13 @@ for run in $(seq 1 "$NUM_RUNS"); do
             log_info "Running custom command benchmarks on $name..."
             run_custom_command_benchmark "$name" "$port" "$run" || true
         fi
+
+        if [[ "$RUN_MEMTIER" == true ]]; then
+            for thread_count in $(memtier_threads_list); do
+                log_info "Running memtier mixed workload on $name (${thread_count}T)..."
+                run_memtier_benchmark "$name" "$port" "$thread_count" "$run" || true
+            done
+        fi
     done
 done
 
@@ -621,6 +816,26 @@ if [[ "$RUN_CUSTOM" == true ]]; then
     done
 fi
 
+if [[ "$RUN_MEMTIER" == true ]]; then
+    for thread_count in $(memtier_threads_list); do
+        for row in Sets Gets Totals; do
+            for name in $SERVERS; do
+                result=$(average_memtier_field_with_stats "$name" "$thread_count" "$row" 2)
+                kv_set "memtier_ops__${row}__${thread_count}__${name}" "${result%%|*}"
+                local_rest="${result#*|}"
+                kv_set "memtier_sd__${row}__${thread_count}__${name}" "${local_rest%%|*}"
+                kv_set "memtier_ci95__${row}__${thread_count}__${name}" "${local_rest##*|}"
+                kv_set "memtier_hits__${row}__${thread_count}__${name}" "$(average_memtier_field "$name" "$thread_count" "$row" 3)"
+                kv_set "memtier_misses__${row}__${thread_count}__${name}" "$(average_memtier_field "$name" "$thread_count" "$row" 4)"
+                kv_set "memtier_avg__${row}__${thread_count}__${name}" "$(average_memtier_field "$name" "$thread_count" "$row" 5)"
+                kv_set "memtier_p50__${row}__${thread_count}__${name}" "$(average_memtier_field "$name" "$thread_count" "$row" 6)"
+                kv_set "memtier_p99__${row}__${thread_count}__${name}" "$(average_memtier_field "$name" "$thread_count" "$row" 7)"
+                kv_set "memtier_p999__${row}__${thread_count}__${name}" "$(average_memtier_field "$name" "$thread_count" "$row" 8)"
+            done
+        done
+    done
+fi
+
 # ── Print terminal table ──
 echo ""
 if [[ "$NATIVE_MODE" == true ]]; then
@@ -690,6 +905,52 @@ else
     echo "╚══════════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩════════╩════════╩════════╝"
 fi
 
+if [[ "$RUN_MEMTIER" == true ]]; then
+    echo ""
+    echo "Memtier Mixed Workload — Totals (ops/sec)"
+    echo "  ratio=${MEMTIER_RATIO} requests/client=${MEMTIER_REQUESTS} clients/thread=${MEMTIER_CLIENTS} pipeline=${MEMTIER_PIPELINE} data-size=${MEMTIER_DATA_SIZE}B"
+
+    if [[ "$NATIVE_MODE" == true ]]; then
+        printf "%-8s | %-13s | %-13s | %-10s\n" "Threads" "Vortex" "Redis" "vs Redis"
+        printf "%-8s-+-%-13s-+-%-13s-+-%-10s\n" "--------" "-------------" "-------------" "----------"
+        for thread_count in $(memtier_threads_list); do
+            v_ops=$(kv_get "memtier_ops__Totals__${thread_count}__vortex"); [[ -z "$v_ops" ]] && v_ops="N/A"
+            r_ops=$(kv_get "memtier_ops__Totals__${thread_count}__redis"); [[ -z "$r_ops" ]] && r_ops="N/A"
+            vs_redis=$(calc_ratio "$v_ops" "$r_ops")
+            [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="${vs_redis}x"
+            printf "%-8s | %-13s | %-13s | %-10s\n" \
+                "${thread_count}T" \
+                "$(format_number "$v_ops")" \
+                "$(format_number "$r_ops")" \
+                "$vs_redis"
+        done
+    else
+        printf "%-8s | %-13s | %-13s | %-13s | %-13s | %-10s | %-10s | %-10s\n" \
+            "Threads" "Vortex" "Redis" "Dragonfly" "Valkey" "vs Redis" "vs Drg" "vs Val"
+        printf "%-8s-+-%-13s-+-%-13s-+-%-13s-+-%-13s-+-%-10s-+-%-10s-+-%-10s\n" \
+            "--------" "-------------" "-------------" "-------------" "-------------" "----------" "----------" "----------"
+        for thread_count in $(memtier_threads_list); do
+            v_ops=$(kv_get "memtier_ops__Totals__${thread_count}__vortex"); [[ -z "$v_ops" ]] && v_ops="N/A"
+            r_ops=$(kv_get "memtier_ops__Totals__${thread_count}__redis"); [[ -z "$r_ops" ]] && r_ops="N/A"
+            d_ops=$(kv_get "memtier_ops__Totals__${thread_count}__dragonfly"); [[ -z "$d_ops" ]] && d_ops="N/A"
+            k_ops=$(kv_get "memtier_ops__Totals__${thread_count}__valkey"); [[ -z "$k_ops" ]] && k_ops="N/A"
+            vs_redis=$(calc_ratio "$v_ops" "$r_ops")
+            vs_dragon=$(calc_ratio "$v_ops" "$d_ops")
+            vs_valkey=$(calc_ratio "$v_ops" "$k_ops")
+            [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="${vs_redis}x"
+            [[ "$vs_dragon" != "N/A" && "$vs_dragon" != "inf" ]] && vs_dragon="${vs_dragon}x"
+            [[ "$vs_valkey" != "N/A" && "$vs_valkey" != "inf" ]] && vs_valkey="${vs_valkey}x"
+            printf "%-8s | %-13s | %-13s | %-13s | %-13s | %-10s | %-10s | %-10s\n" \
+                "${thread_count}T" \
+                "$(format_number "$v_ops")" \
+                "$(format_number "$r_ops")" \
+                "$(format_number "$d_ops")" \
+                "$(format_number "$k_ops")" \
+                "$vs_redis" "$vs_dragon" "$vs_valkey"
+        done
+    fi
+fi
+
 # ── JSON output ──
 if [[ "$OUTPUT_JSON" == true ]]; then
     mkdir -p "$BENCHMARKS_DIR"
@@ -719,54 +980,52 @@ if [[ "$OUTPUT_JSON" == true ]]; then
             r_ci=$(kv_get "ci95__${test}__redis"); [[ -z "$r_ci" ]] && r_ci="0"
             vs_redis=$(calc_ratio "$v_rps" "$r_rps")
 
-            json_val() { [[ "$1" == "N/A" ]] && echo "null" || echo "$1"; }
-
             echo "    {"
             echo "      \"test\": \"$test\","
             echo "      \"rps\": {"
-            echo "        \"vortex\": $(json_val "$v_rps"),"
-            echo "        \"redis\": $(json_val "$r_rps")"
+            echo "        \"vortex\": $(json_value "$v_rps"),"
+            echo "        \"redis\": $(json_value "$r_rps")"
 
             if [[ "$NATIVE_MODE" != true ]]; then
                 d_rps=$(kv_get "rps__${test}__dragonfly"); [[ -z "$d_rps" ]] && d_rps="N/A"
                 k_rps=$(kv_get "rps__${test}__valkey"); [[ -z "$k_rps" ]] && k_rps="N/A"
-                echo "        ,\"dragonfly\": $(json_val "$d_rps")"
-                echo "        ,\"valkey\": $(json_val "$k_rps")"
+                echo "        ,\"dragonfly\": $(json_value "$d_rps")"
+                echo "        ,\"valkey\": $(json_value "$k_rps")"
             fi
 
             echo "      },"
             echo "      \"stddev\": {"
-            echo "        \"vortex\": $(json_val "$v_sd"),"
-            echo "        \"redis\": $(json_val "$r_sd")"
+            echo "        \"vortex\": $(json_value "$v_sd"),"
+            echo "        \"redis\": $(json_value "$r_sd")"
 
             if [[ "$NATIVE_MODE" != true ]]; then
                 d_sd=$(kv_get "sd__${test}__dragonfly"); [[ -z "$d_sd" ]] && d_sd="0"
                 k_sd=$(kv_get "sd__${test}__valkey"); [[ -z "$k_sd" ]] && k_sd="0"
-                echo "        ,\"dragonfly\": $(json_val "$d_sd")"
-                echo "        ,\"valkey\": $(json_val "$k_sd")"
+                echo "        ,\"dragonfly\": $(json_value "$d_sd")"
+                echo "        ,\"valkey\": $(json_value "$k_sd")"
             fi
 
             echo "      },"
             echo "      \"ci95\": {"
-            echo "        \"vortex\": $(json_val "$v_ci"),"
-            echo "        \"redis\": $(json_val "$r_ci")"
+            echo "        \"vortex\": $(json_value "$v_ci"),"
+            echo "        \"redis\": $(json_value "$r_ci")"
 
             if [[ "$NATIVE_MODE" != true ]]; then
                 d_ci=$(kv_get "ci95__${test}__dragonfly"); [[ -z "$d_ci" ]] && d_ci="0"
                 k_ci=$(kv_get "ci95__${test}__valkey"); [[ -z "$k_ci" ]] && k_ci="0"
-                echo "        ,\"dragonfly\": $(json_val "$d_ci")"
-                echo "        ,\"valkey\": $(json_val "$k_ci")"
+                echo "        ,\"dragonfly\": $(json_value "$d_ci")"
+                echo "        ,\"valkey\": $(json_value "$k_ci")"
             fi
 
             echo "      },"
             echo "      \"ratios\": {"
-            echo "        \"vs_redis\": $(json_val "$vs_redis")"
+            echo "        \"vs_redis\": $(json_value "$vs_redis")"
 
             if [[ "$NATIVE_MODE" != true ]]; then
                 vs_dragon=$(calc_ratio "$v_rps" "$d_rps")
                 vs_valkey=$(calc_ratio "$v_rps" "$k_rps")
-                echo "        ,\"vs_dragonfly\": $(json_val "$vs_dragon")"
-                echo "        ,\"vs_valkey\": $(json_val "$vs_valkey")"
+                echo "        ,\"vs_dragonfly\": $(json_value "$vs_dragon")"
+                echo "        ,\"vs_valkey\": $(json_value "$vs_valkey")"
             fi
 
             echo "      }"
@@ -774,6 +1033,76 @@ if [[ "$OUTPUT_JSON" == true ]]; then
         done < "$ALL_TESTS_FILE"
 
         echo "  ]"
+        if [[ "$RUN_MEMTIER" == true ]]; then
+            echo "  ,\"memtier\": {"
+            echo "    \"config\": {"
+            echo "      \"threads\": [$(echo "$MEMTIER_THREADS" | sed 's/,/, /g')],"
+            echo "      \"requests_per_client\": $MEMTIER_REQUESTS,"
+            echo "      \"clients_per_thread\": $MEMTIER_CLIENTS,"
+            echo "      \"pipeline\": $MEMTIER_PIPELINE,"
+            echo "      \"data_size\": $MEMTIER_DATA_SIZE,"
+            echo "      \"ratio\": \"$MEMTIER_RATIO\","
+            echo "      \"key_pattern\": \"G:G\","
+            echo "      \"key_minimum\": $MEMTIER_KEY_MINIMUM,"
+            echo "      \"key_maximum\": $MEMTIER_KEY_MAXIMUM,"
+            echo "      \"key_median\": $MEMTIER_KEY_MEDIAN,"
+            echo "      \"key_stddev\": $MEMTIER_KEY_STDDEV"
+            echo "    },"
+            echo "    \"results\": ["
+
+            first_thread=true
+            for thread_count in $(memtier_threads_list); do
+                [[ "$first_thread" == true ]] && first_thread=false || echo "      ,"
+                echo "      {"
+                echo "        \"threads\": $thread_count,"
+
+                for row in Sets Gets Totals; do
+                    row_key=$(echo "$row" | tr 'A-Z' 'a-z')
+                    echo "        \"$row_key\": {"
+                    first_server=true
+                    for name in $SERVERS; do
+                        [[ "$first_server" == true ]] && first_server=false || echo "          ,"
+                        ops=$(kv_get "memtier_ops__${row}__${thread_count}__${name}"); [[ -z "$ops" ]] && ops="N/A"
+                        hits=$(kv_get "memtier_hits__${row}__${thread_count}__${name}"); [[ -z "$hits" ]] && hits="N/A"
+                        misses=$(kv_get "memtier_misses__${row}__${thread_count}__${name}"); [[ -z "$misses" ]] && misses="N/A"
+                        avg=$(kv_get "memtier_avg__${row}__${thread_count}__${name}"); [[ -z "$avg" ]] && avg="N/A"
+                        p50=$(kv_get "memtier_p50__${row}__${thread_count}__${name}"); [[ -z "$p50" ]] && p50="N/A"
+                        p99=$(kv_get "memtier_p99__${row}__${thread_count}__${name}"); [[ -z "$p99" ]] && p99="N/A"
+                        p999=$(kv_get "memtier_p999__${row}__${thread_count}__${name}"); [[ -z "$p999" ]] && p999="N/A"
+                        sd=$(kv_get "memtier_sd__${row}__${thread_count}__${name}"); [[ -z "$sd" ]] && sd="N/A"
+                        ci=$(kv_get "memtier_ci95__${row}__${thread_count}__${name}"); [[ -z "$ci" ]] && ci="N/A"
+                        echo "          \"$name\": {"
+                        echo "            \"ops_sec\": $(json_value "$ops"),"
+                        echo "            \"hits_sec\": $(json_value "$hits"),"
+                        echo "            \"misses_sec\": $(json_value "$misses"),"
+                        echo "            \"avg_latency_ms\": $(json_value "$avg"),"
+                        echo "            \"p50_latency_ms\": $(json_value "$p50"),"
+                        echo "            \"p99_latency_ms\": $(json_value "$p99"),"
+                        echo "            \"p999_latency_ms\": $(json_value "$p999"),"
+                        echo "            \"stddev_ops_sec\": $(json_value "$sd"),"
+                        echo "            \"ci95_ops_sec\": $(json_value "$ci")"
+                        echo "          }"
+                    done
+                    echo "        },"
+                done
+
+                v_ops=$(kv_get "memtier_ops__Totals__${thread_count}__vortex"); [[ -z "$v_ops" ]] && v_ops="N/A"
+                r_ops=$(kv_get "memtier_ops__Totals__${thread_count}__redis"); [[ -z "$r_ops" ]] && r_ops="N/A"
+                echo "        \"ratios\": {"
+                echo "          \"vs_redis\": $(json_value "$(calc_ratio "$v_ops" "$r_ops")")"
+                if [[ "$NATIVE_MODE" != true ]]; then
+                    d_ops=$(kv_get "memtier_ops__Totals__${thread_count}__dragonfly"); [[ -z "$d_ops" ]] && d_ops="N/A"
+                    k_ops=$(kv_get "memtier_ops__Totals__${thread_count}__valkey"); [[ -z "$k_ops" ]] && k_ops="N/A"
+                    echo "          ,\"vs_dragonfly\": $(json_value "$(calc_ratio "$v_ops" "$d_ops")")"
+                    echo "          ,\"vs_valkey\": $(json_value "$(calc_ratio "$v_ops" "$k_ops")")"
+                fi
+                echo "        }"
+                echo "      }"
+            done
+
+            echo "    ]"
+            echo "  }"
+        fi
         echo "}"
     } > "$JSON_FILE"
 
@@ -838,6 +1167,86 @@ if [[ "$OUTPUT_MARKDOWN" == true ]]; then
 
                 echo "| $test | $(format_number "$v_rps") | $(format_number "$r_rps") | $(format_number "$d_rps") | $(format_number "$k_rps") | $vs_redis | $vs_dragon | $vs_valkey |"
             done < "$ALL_TESTS_FILE"
+        fi
+
+        if [[ "$RUN_MEMTIER" == true ]]; then
+            echo ""
+            echo "## Memtier Mixed Workload"
+            echo ""
+            echo "Mixed Gaussian workload driven by \`memtier_benchmark\` and published alongside the point-command \`redis-benchmark\` suite."
+            echo ""
+            echo "- Ratio: ${MEMTIER_RATIO}"
+            echo "- Requests per client: ${MEMTIER_REQUESTS}"
+            echo "- Clients per thread: ${MEMTIER_CLIENTS}"
+            echo "- Pipeline: ${MEMTIER_PIPELINE}"
+            echo "- Data size: ${MEMTIER_DATA_SIZE} bytes"
+            echo "- Thread sweep: ${MEMTIER_THREADS}"
+
+            if [[ "$NATIVE_MODE" == true ]]; then
+                echo ""
+                echo "### Totals (ops/sec)"
+                echo ""
+                echo "| Threads | VortexDB | Redis 8 | vs Redis |"
+                echo "|---------|----------|---------|----------|"
+                for thread_count in $(memtier_threads_list); do
+                    v_ops=$(kv_get "memtier_ops__Totals__${thread_count}__vortex"); [[ -z "$v_ops" ]] && v_ops="N/A"
+                    r_ops=$(kv_get "memtier_ops__Totals__${thread_count}__redis"); [[ -z "$r_ops" ]] && r_ops="N/A"
+                    vs_redis=$(calc_ratio "$v_ops" "$r_ops")
+                    [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="**${vs_redis}x**"
+                    echo "| ${thread_count} | $(format_number "$v_ops") | $(format_number "$r_ops") | $vs_redis |"
+                done
+
+                echo ""
+                echo "### Totals Latency (ms)"
+                echo ""
+                echo "| Threads | Vortex p50 | Vortex p99 | Vortex p99.9 | Redis p50 | Redis p99 | Redis p99.9 |"
+                echo "|---------|-----------:|-----------:|-------------:|----------:|----------:|------------:|"
+                for thread_count in $(memtier_threads_list); do
+                    v_p50=$(kv_get "memtier_p50__Totals__${thread_count}__vortex"); [[ -z "$v_p50" ]] && v_p50="N/A"
+                    v_p99=$(kv_get "memtier_p99__Totals__${thread_count}__vortex"); [[ -z "$v_p99" ]] && v_p99="N/A"
+                    v_p999=$(kv_get "memtier_p999__Totals__${thread_count}__vortex"); [[ -z "$v_p999" ]] && v_p999="N/A"
+                    r_p50=$(kv_get "memtier_p50__Totals__${thread_count}__redis"); [[ -z "$r_p50" ]] && r_p50="N/A"
+                    r_p99=$(kv_get "memtier_p99__Totals__${thread_count}__redis"); [[ -z "$r_p99" ]] && r_p99="N/A"
+                    r_p999=$(kv_get "memtier_p999__Totals__${thread_count}__redis"); [[ -z "$r_p999" ]] && r_p999="N/A"
+                    echo "| ${thread_count} | ${v_p50} | ${v_p99} | ${v_p999} | ${r_p50} | ${r_p99} | ${r_p999} |"
+                done
+            else
+                echo ""
+                echo "### Totals (ops/sec)"
+                echo ""
+                echo "| Threads | VortexDB | Redis 8 | Dragonfly | Valkey 9 | vs Redis | vs Dragonfly | vs Valkey |"
+                echo "|---------|----------|---------|-----------|----------|----------|--------------|-----------|"
+                for thread_count in $(memtier_threads_list); do
+                    v_ops=$(kv_get "memtier_ops__Totals__${thread_count}__vortex"); [[ -z "$v_ops" ]] && v_ops="N/A"
+                    r_ops=$(kv_get "memtier_ops__Totals__${thread_count}__redis"); [[ -z "$r_ops" ]] && r_ops="N/A"
+                    d_ops=$(kv_get "memtier_ops__Totals__${thread_count}__dragonfly"); [[ -z "$d_ops" ]] && d_ops="N/A"
+                    k_ops=$(kv_get "memtier_ops__Totals__${thread_count}__valkey"); [[ -z "$k_ops" ]] && k_ops="N/A"
+                    vs_redis=$(calc_ratio "$v_ops" "$r_ops")
+                    vs_dragon=$(calc_ratio "$v_ops" "$d_ops")
+                    vs_valkey=$(calc_ratio "$v_ops" "$k_ops")
+                    [[ "$vs_redis" != "N/A" && "$vs_redis" != "inf" ]] && vs_redis="**${vs_redis}x**"
+                    [[ "$vs_dragon" != "N/A" && "$vs_dragon" != "inf" ]] && vs_dragon="**${vs_dragon}x**"
+                    [[ "$vs_valkey" != "N/A" && "$vs_valkey" != "inf" ]] && vs_valkey="**${vs_valkey}x**"
+                    echo "| ${thread_count} | $(format_number "$v_ops") | $(format_number "$r_ops") | $(format_number "$d_ops") | $(format_number "$k_ops") | $vs_redis | $vs_dragon | $vs_valkey |"
+                done
+
+                echo ""
+                echo "### Totals Latency (ms)"
+                echo ""
+                echo "| Threads | Vortex p50 | Vortex p99 | Redis p50 | Redis p99 | Dragonfly p50 | Dragonfly p99 | Valkey p50 | Valkey p99 |"
+                echo "|---------|-----------:|-----------:|----------:|----------:|--------------:|--------------:|-----------:|-----------:|"
+                for thread_count in $(memtier_threads_list); do
+                    v_p50=$(kv_get "memtier_p50__Totals__${thread_count}__vortex"); [[ -z "$v_p50" ]] && v_p50="N/A"
+                    v_p99=$(kv_get "memtier_p99__Totals__${thread_count}__vortex"); [[ -z "$v_p99" ]] && v_p99="N/A"
+                    r_p50=$(kv_get "memtier_p50__Totals__${thread_count}__redis"); [[ -z "$r_p50" ]] && r_p50="N/A"
+                    r_p99=$(kv_get "memtier_p99__Totals__${thread_count}__redis"); [[ -z "$r_p99" ]] && r_p99="N/A"
+                    d_p50=$(kv_get "memtier_p50__Totals__${thread_count}__dragonfly"); [[ -z "$d_p50" ]] && d_p50="N/A"
+                    d_p99=$(kv_get "memtier_p99__Totals__${thread_count}__dragonfly"); [[ -z "$d_p99" ]] && d_p99="N/A"
+                    k_p50=$(kv_get "memtier_p50__Totals__${thread_count}__valkey"); [[ -z "$k_p50" ]] && k_p50="N/A"
+                    k_p99=$(kv_get "memtier_p99__Totals__${thread_count}__valkey"); [[ -z "$k_p99" ]] && k_p99="N/A"
+                    echo "| ${thread_count} | ${v_p50} | ${v_p99} | ${r_p50} | ${r_p99} | ${d_p50} | ${d_p99} | ${k_p50} | ${k_p99} |"
+                done
+            fi
         fi
 
         echo ""

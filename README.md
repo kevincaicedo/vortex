@@ -9,7 +9,7 @@ VortexDB is a high-performance, drop-in Redis replacement built from the ground 
 
 ## Benchmark Results
 
-All benchmarks use `redis-benchmark` (100K requests, 50 clients, pipeline 16). Redis 8.6.2 configured with `io-threads 4`.
+The headline tables below use `redis-benchmark` point workloads (100K requests, 50 clients, pipeline 16). The automated benchmark suite also runs `memtier_benchmark` mixed Gaussian workloads and publishes both harnesses in the same JSON/Markdown report. Redis 8.6.2 is configured with `io-threads 4`.
 
 ### Linux (Docker-All, i7-13700KF, identical containers, 4 CPUs / 2 GB each)
 
@@ -37,7 +37,7 @@ All benchmarks use `redis-benchmark` (100K requests, 50 clients, pipeline 16). R
 
 > **Key insight:** VortexDB's engine excels at multi-key batch operations (MSET 2–3.5×) where the SwissTable's batch-prefetch pipeline and zero-copy serializer shine. Single-key reads (GET, PING) are at parity on macOS/kqueue and 1.0–1.5× on Linux/io_uring. PING_INLINE is I/O-bound and does not reflect engine performance.
 
-Full results with 50+ commands, latency percentiles, Docker-all / native modes, and methodology: [docs/benchmarks.md](docs/benchmarks.md)
+Full results with 50+ commands, latency percentiles, Docker-all / native modes, mixed-workload memtier runs, and methodology: [docs/benchmarks.md](docs/benchmarks.md)
 
 ## Why VortexDB is Fast
 
@@ -93,7 +93,9 @@ just clippy         # Lint check
 just bench          # Run 69 Criterion benchmarks
 just miri           # Memory safety checks (~42s)
 just compare        # Competitive benchmark vs Redis/Dragonfly/Valkey
+just compare-memtier # Point workloads + memtier mixed workloads
 just compare-docker # containerized Competitive benchmark
+just compare-full   # CI-style benchmark report with JSON/Markdown output
 ```
 
 ## Supported Commands (55)
@@ -158,7 +160,7 @@ Full architecture guide: [docs/architecture.md](docs/architecture.md)
 
 - **Rust nightly** — pinned via `rust-toolchain.toml` (nightly-2026-03-15)
 - **Linux** recommended for `io_uring` support; macOS uses `kqueue` fallback
-- **redis-cli** / **redis-benchmark** — for client testing and benchmarks
+- **redis-cli** / **redis-benchmark** / **memtier_benchmark** — for client testing and benchmarks
 
 ```sh
 # Install Rust (nightly auto-selected on first build)

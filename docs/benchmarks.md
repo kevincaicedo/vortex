@@ -1,6 +1,6 @@
 # VortexDB Benchmark Methodology
 
-This document describes how VortexDB benchmarks are conducted, what hardware is used, and how to reproduce results independently.
+This document describes how VortexDB benchmarks are conducted, what hardware is used, and how to reproduce results independently. The benchmark program now has two complementary layers: `redis-benchmark` for point-command throughput and `memtier_benchmark` for mixed Gaussian workloads.
 
 ---
 
@@ -51,13 +51,27 @@ The primary throughput measurement tool. Ships with Redis — measures raw ops/s
 | Pipeline (`-P`) | 16 | Requests pipelined per batch |
 | Data size (`-d`) | 3 bytes | Default value size for SET |
 
+### memtier_benchmark
+
+The mixed-workload companion harness. It exercises concurrent GET/SET traffic with a Gaussian key distribution, which makes hot-key behavior, hit/miss ratios, and thread scaling visible in a way `redis-benchmark` does not.
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| Threads (`-t`) | `1,2,4,8` | Thread sweep published in the same report |
+| Requests (`--requests`) | 2,000 | Per client |
+| Clients (`-c`) | 50 | Per thread |
+| Pipeline (`--pipeline`) | 1 | Keeps latency signal visible |
+| Data size (`--data-size`) | 384 bytes | Matches the research script baseline |
+| Ratio (`--ratio`) | `1:15` | Read-heavy mixed workload |
+| Key pattern (`--key-pattern`) | `G:G` | Gaussian access distribution |
+
 ### Criterion (Micro-Benchmarks)
 
 The `vortex-bench` crate contains 69 Criterion benchmarks measuring individual operation latency at the Rust function level — no network overhead.
 
 ### Custom Benchmark Scripts
 
-`scripts/bench-commands.sh` benchmarks 37+ commands that `redis-benchmark -t` doesn't cover natively, using `redis-benchmark` with raw command syntax.
+`scripts/bench-commands.sh` benchmarks 37+ commands that `redis-benchmark -t` doesn't cover natively, using `redis-benchmark` with raw command syntax. `scripts/compare.sh --memtier` augments the same report with `memtier_benchmark` mixed-workload totals and latency tables.
 
 ---
 
@@ -97,7 +111,7 @@ just compare-docker
 Multiple runs with confidence intervals:
 
 ```sh
-just compare-full  # 3 runs, JSON + Markdown, latency, custom commands
+just compare-full  # 3 runs, JSON + Markdown, latency, custom commands, memtier mixed workloads
 ```
 
 ---
@@ -107,6 +121,8 @@ just compare-full  # 3 runs, JSON + Markdown, latency, custom commands
 ### Native Mode (VortexDB native + Redis native with io-threads 4)
 
 Both servers natively on macOS, kqueue I/O backend, Redis configured with `io-threads 4`.
+
+These tables are **point-workload** results from `redis-benchmark`. The automated report can also include a `memtier_benchmark` mixed-workload section when run with `--memtier`.
 
 | Command | VortexDB | Redis 8 | vs Redis | Notes |
 |---------|----------|---------|----------|-------|
@@ -184,9 +200,13 @@ Measured at the Rust function level — pure computation, no TCP overhead.
 # Install Redis CLI tools (for redis-benchmark)
 # macOS:
 brew install redis
+brew install memtier_benchmark
 
 # Ubuntu:
 sudo apt-get install redis-tools
+
+# memtier_benchmark on Ubuntu/Debian is available from Redis packages
+sudo apt-get install memtier-benchmark
 
 # Install Docker (for competitor databases)
 # https://docs.docker.com/get-docker/
@@ -206,17 +226,20 @@ just compare-native
 # Quick comparison with throughput only
 just compare
 
+# Mixed workload + point-command suite
+just compare-memtier
+
 # Full comparison with latency percentiles, custom commands, and reports
-just compare --latency --markdown --custom --json
+just compare --latency --markdown --custom --json --memtier
 
 # Fair Docker-based comparison (all databases containerized)
 just compare-docker
 
-# Full statistical run (3 iterations with CI95)
+# Full statistical run (3 iterations with CI95 + memtier mixed workloads)
 just compare-full
 
 # Custom parameters
-bash scripts/compare.sh -n 200000 -c 100 -P 32 --native --latency --markdown
+bash scripts/compare.sh -n 200000 -c 100 -P 32 --native --latency --markdown --memtier
 ```
 
 ### Run Micro-Benchmarks
@@ -255,13 +278,15 @@ just bench-validate
 
 4. **Redis io-threads** — Redis 8.6 with `io-threads 4` is ~2× faster than single-threaded Redis. Previous benchmarks comparing VortexDB against single-threaded Redis showed inflated ratios. All current benchmarks use optimally configured Redis (io-threads 4).
 
-5. **Single-core measurement** — `redis-benchmark` defaults measure aggregate throughput across pipelined connections to a single server instance. VortexDB's per-core advantage is most visible in micro-benchmarks.
+5. **Point vs mixed workloads** — `redis-benchmark` and `memtier_benchmark` answer different questions. Point-command wins do not automatically predict mixed-workload wins, which is why the automated suite now publishes both.
 
-6. **Pipeline depth** — Default pipeline depth of 16 favors throughput over latency. Use `-P 1` for realistic low-latency measurements.
+6. **Single-core measurement** — `redis-benchmark` defaults measure aggregate throughput across pipelined connections to a single server instance. VortexDB's per-core advantage is most visible in micro-benchmarks.
 
-7. **Data size** — Default value size is 3 bytes. Real-world workloads with larger values will show different characteristics (memory bandwidth becomes the bottleneck).
+7. **Pipeline depth** — Default pipeline depth of 16 favors throughput over latency. Use `-P 1` for realistic low-latency measurements. The memtier harness intentionally defaults to pipeline depth 1 so mixed-workload latency remains visible.
 
-8. **Warm-up** — The first benchmark run after build warms CPU caches and JIT. For statistical validity, use `--runs 3` or higher.
+8. **Data size** — Default point-workload value size is 3 bytes, while the mixed-workload memtier suite uses 384-byte values. Real-world workloads with larger or smaller values will shift the balance toward memory bandwidth or parser overhead.
+
+9. **Warm-up** — The first benchmark run after build warms CPU caches and JIT. For statistical validity, use `--runs 3` or higher.
 
 ---
 
