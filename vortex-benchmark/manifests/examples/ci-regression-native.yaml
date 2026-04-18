@@ -1,0 +1,42 @@
+schema_version: 1
+name: ci-regression-native
+description: Native Vortex plus Redis regression suite used by CI report generation.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+  - memtier_benchmark
+commands:
+  - GET
+  - SET
+  - INCR
+workloads:
+  - uniform-read_heavy
+  - zipfian-mixed
+duration: 20s
+environment:
+  mode: native
+  port_base: 16379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 150000
+    clients: 50
+    pipeline: 16
+    keyspace_size: 250000
+  memtier_benchmark:
+    clients: 40
+    pipeline: 8
+    keyspace_size: 250000
+    data_size: 256
+    thread_sweep:
+      - 1
+      - 4
+      - 8

@@ -10,15 +10,16 @@
 use vortex_common::VortexKey;
 use vortex_proto::{FrameRef, RespFrame};
 
-use crate::Shard;
-
+use super::context::TtlState;
 use super::{
     CmdResult, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE,
     RESP_ZERO, arg_bytes, arg_count, arg_i64, int_resp, key_from_bytes,
 };
+use crate::ConcurrentKeyspace;
 
 // ── Error constants ─────────────────────────────────────────────────
 
+#[cfg(test)]
 static ERR_NO_SUCH_KEY: &[u8] = b"-ERR no such key\r\n";
 static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
 
@@ -27,85 +28,107 @@ static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
 /// DEL key [key ...]
 /// Removes the specified keys. Returns the number of keys removed.
 #[inline]
-pub fn cmd_del(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_del(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
     }
-    let mut deleted = 0i64;
+    let mut keys = Vec::with_capacity(argc - 1);
     for i in 1..argc {
         if let Some(kb) = arg_bytes(frame, i) {
-            let key = key_from_bytes(kb);
-            if shard.del(&key) {
-                deleted += 1;
-            }
+            keys.push(key_from_bytes(kb));
         }
     }
-    int_resp(deleted)
+    int_resp(keyspace.delete_keys(&keys, now_nanos))
 }
 
 /// UNLINK key [key ...]
 /// Same as DEL for now (heap deallocation is deferred in Phase 3 via
 /// inline entry tombstoning — no heap to free for inline entries).
 #[inline]
-pub fn cmd_unlink(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    cmd_del(shard, frame, now_nanos)
+pub fn cmd_unlink(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    cmd_del(keyspace, frame, now_nanos)
 }
 
 /// EXISTS key [key ...]
 /// Returns the count of specified keys that exist.
 #[inline]
-pub fn cmd_exists(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_exists(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
     }
-    let mut count = 0i64;
+    let mut keys = Vec::with_capacity(argc - 1);
     for i in 1..argc {
         if let Some(kb) = arg_bytes(frame, i) {
-            let key = key_from_bytes(kb);
-            if shard.exists(&key, now_nanos) {
-                count += 1;
-            }
+            keys.push(key_from_bytes(kb));
         }
     }
-    int_resp(count)
+    int_resp(keyspace.count_existing(&keys, now_nanos))
 }
 
 // ── EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT / PERSIST ───────────────
 
 /// EXPIRE key seconds [NX|XX|GT|LT]
 #[inline]
-pub fn cmd_expire(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    expire_generic(shard, frame, now_nanos, ExpireMode::RelativeSeconds)
+pub fn cmd_expire(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    expire_generic(keyspace, frame, now_nanos, ExpireMode::RelativeSeconds)
 }
 
 /// PEXPIRE key milliseconds [NX|XX|GT|LT]
 #[inline]
-pub fn cmd_pexpire(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    expire_generic(shard, frame, now_nanos, ExpireMode::RelativeMillis)
+pub fn cmd_pexpire(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    expire_generic(keyspace, frame, now_nanos, ExpireMode::RelativeMillis)
 }
 
 /// EXPIREAT key timestamp [NX|XX|GT|LT]
 #[inline]
-pub fn cmd_expireat(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    expire_generic(shard, frame, now_nanos, ExpireMode::AbsoluteSeconds)
+pub fn cmd_expireat(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    expire_generic(keyspace, frame, now_nanos, ExpireMode::AbsoluteSeconds)
 }
 
 /// PEXPIREAT key ms-timestamp [NX|XX|GT|LT]
 #[inline]
-pub fn cmd_pexpireat(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    expire_generic(shard, frame, now_nanos, ExpireMode::AbsoluteMillis)
+pub fn cmd_pexpireat(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    expire_generic(keyspace, frame, now_nanos, ExpireMode::AbsoluteMillis)
 }
 
 /// PERSIST key
 #[inline]
-pub fn cmd_persist(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_persist(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     let Some(kb) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
-    if shard.persist(&key) {
+    if keyspace.persist_key(&key) {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
@@ -122,7 +145,7 @@ enum ExpireMode {
 
 /// Generic implementation for all EXPIRE variants with NX/XX/GT/LT flags.
 fn expire_generic(
-    shard: &mut Shard,
+    keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
     mode: ExpireMode,
@@ -165,9 +188,8 @@ fn expire_generic(
     let deadline_nanos = match mode {
         ExpireMode::RelativeSeconds => {
             if time_val <= 0 {
-                // Non-positive relative TTL: delete the key immediately.
                 let key = key_from_bytes(kb);
-                return if shard.del(&key) {
+                return if keyspace.remove_value(&key, now_nanos).is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
@@ -178,7 +200,7 @@ fn expire_generic(
         ExpireMode::RelativeMillis => {
             if time_val <= 0 {
                 let key = key_from_bytes(kb);
-                return if shard.del(&key) {
+                return if keyspace.remove_value(&key, now_nanos).is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
@@ -190,7 +212,7 @@ fn expire_generic(
             let deadline = (time_val as u64) * NS_PER_SEC;
             if deadline <= now_nanos {
                 let key = key_from_bytes(kb);
-                return if shard.del(&key) {
+                return if keyspace.remove_value(&key, now_nanos).is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
@@ -202,7 +224,7 @@ fn expire_generic(
             let deadline = (time_val as u64) * NS_PER_MS;
             if deadline <= now_nanos {
                 let key = key_from_bytes(kb);
-                return if shard.del(&key) {
+                return if keyspace.remove_value(&key, now_nanos).is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
@@ -214,30 +236,26 @@ fn expire_generic(
 
     let key = key_from_bytes(kb);
 
-    // Check if key exists and get current TTL.
-    let current_ttl = match shard.ttl(&key) {
-        Some(t) => t,
-        None => return CmdResult::Static(RESP_ZERO), // Key doesn't exist.
+    let current_ttl = match keyspace.ttl_state(&key, now_nanos) {
+        TtlState::Missing => return CmdResult::Static(RESP_ZERO),
+        TtlState::Persistent => 0,
+        TtlState::Deadline(deadline) => deadline,
     };
 
-    // NX: only set if no TTL currently.
     if nx && current_ttl != 0 {
         return CmdResult::Static(RESP_ZERO);
     }
-    // XX: only set if TTL already exists.
     if xx && current_ttl == 0 {
         return CmdResult::Static(RESP_ZERO);
     }
-    // GT: only set if new deadline > current deadline.
     if gt && current_ttl != 0 && deadline_nanos <= current_ttl {
         return CmdResult::Static(RESP_ZERO);
     }
-    // LT: only set if no current TTL or new deadline < current deadline.
     if lt && current_ttl != 0 && deadline_nanos >= current_ttl {
         return CmdResult::Static(RESP_ZERO);
     }
 
-    if shard.expire(&key, deadline_nanos) {
+    if keyspace.expire_key(&key, deadline_nanos, now_nanos) {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
@@ -248,84 +266,65 @@ fn expire_generic(
 
 /// TTL key
 #[inline]
-pub fn cmd_ttl(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_ttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let Some(kb) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
-    // Lazy expire.
-    if !shard.exists(&key, now_nanos) {
-        return CmdResult::Static(RESP_NEG_TWO); // Key doesn't exist.
-    }
-    match shard.ttl(&key) {
-        None => CmdResult::Static(RESP_NEG_TWO),
-        Some(0) => CmdResult::Static(RESP_NEG_ONE), // No TTL (persistent).
-        Some(deadline) => {
-            if deadline <= now_nanos {
-                CmdResult::Static(RESP_NEG_TWO)
-            } else {
-                let remaining_secs = ((deadline - now_nanos) / NS_PER_SEC) as i64;
-                int_resp(remaining_secs)
-            }
-        }
+    match keyspace.ttl_state(&key, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(((deadline - now_nanos) / NS_PER_SEC) as i64),
     }
 }
 
 /// PTTL key
 #[inline]
-pub fn cmd_pttl(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_pttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let Some(kb) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
-    if !shard.exists(&key, now_nanos) {
-        return CmdResult::Static(RESP_NEG_TWO);
-    }
-    match shard.ttl(&key) {
-        None => CmdResult::Static(RESP_NEG_TWO),
-        Some(0) => CmdResult::Static(RESP_NEG_ONE),
-        Some(deadline) => {
-            if deadline <= now_nanos {
-                CmdResult::Static(RESP_NEG_TWO)
-            } else {
-                let remaining_ms = ((deadline - now_nanos) / NS_PER_MS) as i64;
-                int_resp(remaining_ms)
-            }
-        }
+    match keyspace.ttl_state(&key, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(((deadline - now_nanos) / NS_PER_MS) as i64),
     }
 }
 
 /// EXPIRETIME key
 #[inline]
-pub fn cmd_expiretime(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_expiretime(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     let Some(kb) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
-    if !shard.exists(&key, now_nanos) {
-        return CmdResult::Static(RESP_NEG_TWO);
-    }
-    match shard.ttl(&key) {
-        None => CmdResult::Static(RESP_NEG_TWO),
-        Some(0) => CmdResult::Static(RESP_NEG_ONE),
-        Some(deadline) => int_resp((deadline / NS_PER_SEC) as i64),
+    match keyspace.ttl_state(&key, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp((deadline / NS_PER_SEC) as i64),
     }
 }
 
 /// PEXPIRETIME key
 #[inline]
-pub fn cmd_pexpiretime(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_pexpiretime(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     let Some(kb) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
-    if !shard.exists(&key, now_nanos) {
-        return CmdResult::Static(RESP_NEG_TWO);
-    }
-    match shard.ttl(&key) {
-        None => CmdResult::Static(RESP_NEG_TWO),
-        Some(0) => CmdResult::Static(RESP_NEG_ONE),
-        Some(deadline) => int_resp((deadline / NS_PER_MS) as i64),
+    match keyspace.ttl_state(&key, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp((deadline / NS_PER_MS) as i64),
     }
 }
 
@@ -333,16 +332,13 @@ pub fn cmd_pexpiretime(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) 
 
 /// TYPE key
 #[inline]
-pub fn cmd_type(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_type(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let Some(kb) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
-    match shard.type_of(&key, now_nanos) {
-        Some(type_name) => {
-            // TYPE returns a simple string response: "+string\r\n"
-            CmdResult::Resp(RespFrame::simple_string(type_name))
-        }
+    match keyspace.type_of_key(&key, now_nanos) {
+        Some(type_name) => CmdResult::Resp(RespFrame::simple_string(type_name)),
         None => CmdResult::Resp(RespFrame::simple_string("none")),
     }
 }
@@ -351,7 +347,11 @@ pub fn cmd_type(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdR
 
 /// RENAME key newkey
 #[inline]
-pub fn cmd_rename(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_rename(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 3 {
         return CmdResult::Static(ERR_WRONG_ARGS);
@@ -364,15 +364,20 @@ pub fn cmd_rename(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> Cm
     };
     let old_key = key_from_bytes(old_kb);
     let new_key = key_from_bytes(new_kb);
-    match shard.rename(&old_key, new_key, now_nanos) {
-        Ok(()) => CmdResult::Static(RESP_OK),
+    match keyspace.rename_key(&old_key, new_key, now_nanos, false) {
+        Ok(true) => CmdResult::Static(RESP_OK),
+        Ok(false) => CmdResult::Static(RESP_ZERO),
         Err(msg) => CmdResult::Static(msg),
     }
 }
 
 /// RENAMENX key newkey
 #[inline]
-pub fn cmd_renamenx(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_renamenx(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 3 {
         return CmdResult::Static(ERR_WRONG_ARGS);
@@ -386,16 +391,9 @@ pub fn cmd_renamenx(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> 
     let old_key = key_from_bytes(old_kb);
     let new_key = key_from_bytes(new_kb);
 
-    // Check if old key exists.
-    if !shard.exists(&old_key, now_nanos) {
-        return CmdResult::Static(ERR_NO_SUCH_KEY);
-    }
-    // RENAMENX: fail if newkey already exists.
-    if shard.exists(&new_key, now_nanos) {
-        return CmdResult::Static(RESP_ZERO);
-    }
-    match shard.rename(&old_key, new_key, now_nanos) {
-        Ok(()) => CmdResult::Static(RESP_ONE),
+    match keyspace.rename_key(&old_key, new_key, now_nanos, true) {
+        Ok(true) => CmdResult::Static(RESP_ONE),
+        Ok(false) => CmdResult::Static(RESP_ZERO),
         Err(msg) => CmdResult::Static(msg),
     }
 }
@@ -403,7 +401,7 @@ pub fn cmd_renamenx(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> 
 // ── SCAN ────────────────────────────────────────────────────────────
 
 /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
-pub fn cmd_scan(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_scan(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
@@ -439,61 +437,8 @@ pub fn cmd_scan(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdR
         i += 1;
     }
 
-    // Check for KEYS * equivalent (no pattern or "*").
-    let match_all = pattern.is_none() || pattern == Some(b"*");
-
-    let total_slots = shard.total_slots();
-    if total_slots == 0 {
-        return scan_response(0, &[]);
-    }
-
-    let bits = (total_slots as u64).trailing_zeros();
-    let mask = total_slots as u64 - 1;
-
-    // Reverse-bit cursor iteration.
-    let mut pos = cursor;
-    let mut results: Vec<VortexKey> = Vec::with_capacity(count);
-
-    // Walk up to `total_slots` steps maximum.
-    for _ in 0..total_slots {
-        let slot = pos as usize;
-        if slot < total_slots {
-            if let Some((key, val)) = shard.slot_key_value(slot) {
-                // Check TTL expiry lazily.
-                let ttl = shard.slot_entry_ttl(slot);
-                if ttl == 0 || ttl > now_nanos {
-                    let mut accept = true;
-                    // Pattern filter.
-                    if !match_all {
-                        if let Some(pat) = pattern {
-                            accept = glob_match(pat, key.as_bytes());
-                        }
-                    }
-                    // Type filter.
-                    if accept {
-                        if let Some(tf) = type_filter {
-                            accept = eq_ci(tf, val.type_name().as_bytes());
-                        }
-                    }
-                    if accept {
-                        results.push(key.clone());
-                    }
-                }
-            }
-        }
-
-        // Advance reverse-bit cursor.
-        pos = reverse_bit_advance(pos, bits, mask);
-        if pos == 0 {
-            // Full scan complete.
-            return scan_response(0, &results);
-        }
-        if results.len() >= count {
-            return scan_response(pos, &results);
-        }
-    }
-
-    scan_response(0, &results)
+    let (next_cursor, results) = keyspace.scan_keys(cursor, pattern, count, type_filter, now_nanos);
+    scan_response(next_cursor, &results)
 }
 
 /// Build a SCAN response: `*2\r\n $cursor_len\r\n cursor\r\n *N\r\n ...keys...`
@@ -511,43 +456,18 @@ fn scan_response(cursor: u64, keys: &[VortexKey]) -> CmdResult {
     ])))
 }
 
-/// Reverse-bit increment for SCAN cursor.
-///
-/// Redis approach: set all high bits outside the mask, reverse all 64 bits,
-/// increment, reverse again. This handles table resizes gracefully.
-#[inline]
-fn reverse_bit_advance(cursor: u64, _bits: u32, mask: u64) -> u64 {
-    let mut v = cursor;
-    v |= !mask; // Set bits outside table size.
-    v = v.reverse_bits(); // Reverse all 64 bits.
-    v = v.wrapping_add(1); // Increment.
-    v = v.reverse_bits(); // Reverse back.
-    v & mask // Mask to table size.
-}
-
 // ── KEYS ────────────────────────────────────────────────────────────
 
 /// KEYS pattern
-pub fn cmd_keys(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_keys(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let Some(pat) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
-    let match_all = pat == b"*";
-    let total_slots = shard.total_slots();
-    let mut results: Vec<RespFrame> = Vec::new();
-
-    for slot in 0..total_slots {
-        if let Some((key, _val)) = shard.slot_key_value(slot) {
-            let ttl = shard.slot_entry_ttl(slot);
-            if ttl != 0 && ttl <= now_nanos {
-                continue; // Expired.
-            }
-            if match_all || glob_match(pat, key.as_bytes()) {
-                results.push(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
-                    key.as_bytes(),
-                )));
-            }
-        }
+    let mut results = Vec::new();
+    for key in keyspace.keys_matching(pat, now_nanos) {
+        results.push(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
+            key.as_bytes(),
+        )));
     }
 
     CmdResult::Resp(RespFrame::Array(Some(results)))
@@ -557,10 +477,13 @@ pub fn cmd_keys(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdR
 
 /// RANDOMKEY
 #[inline]
-pub fn cmd_randomkey(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_randomkey(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     let _ = frame;
-    // Use now_nanos as a pseudo-random seed.
-    match shard.random_key(now_nanos) {
+    match keyspace.random_key(now_nanos, now_nanos) {
         Some(key) => CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
             key.as_bytes(),
         ))),
@@ -574,14 +497,14 @@ pub fn cmd_randomkey(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) ->
 /// Like EXISTS but conceptually "touches" the key (updates access time).
 /// In Phase 3, behaves identically to EXISTS.
 #[inline]
-pub fn cmd_touch(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    cmd_exists(shard, frame, now_nanos)
+pub fn cmd_touch(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    cmd_exists(keyspace, frame, now_nanos)
 }
 
 // ── COPY ────────────────────────────────────────────────────────────
 
 /// COPY source destination [DB destination-db] [REPLACE]
-pub fn cmd_copy(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_copy(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let argc = arg_count(frame);
     if argc < 3 {
         return CmdResult::Static(ERR_WRONG_ARGS);
@@ -611,7 +534,7 @@ pub fn cmd_copy(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdR
     let src_key = key_from_bytes(src_kb);
     let dst_key = key_from_bytes(dst_kb);
 
-    if shard.copy_key(&src_key, dst_key, replace, now_nanos) {
+    if keyspace.copy_key(&src_key, dst_key, replace, now_nanos) {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
@@ -621,110 +544,10 @@ pub fn cmd_copy(shard: &mut Shard, frame: &FrameRef<'_>, now_nanos: u64) -> CmdR
 // ── Glob pattern matcher ────────────────────────────────────────────
 
 /// Match a Redis-style glob pattern against a string.
-///
-/// Supported: `*` (any sequence), `?` (any one byte), `[abc]` (char class),
-/// `[^abc]` / `[!abc]` (negated char class), `\x` (escape).
-///
-/// Implemented iteratively with backtracking stack for `*` wildcards.
 #[inline]
+#[cfg(test)]
 pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
-    let mut pi = 0usize; // Pattern index.
-    let mut si = 0usize; // String index.
-    let mut star_pi = usize::MAX; // Pattern index after last `*`.
-    let mut star_si = usize::MAX; // String index at last `*` match.
-
-    while si < string.len() {
-        if pi < pattern.len() {
-            match pattern[pi] {
-                b'*' => {
-                    star_pi = pi + 1;
-                    star_si = si;
-                    pi += 1;
-                    continue;
-                }
-                b'?' => {
-                    pi += 1;
-                    si += 1;
-                    continue;
-                }
-                b'[' => {
-                    pi += 1;
-                    let negate = pi < pattern.len() && (pattern[pi] == b'^' || pattern[pi] == b'!');
-                    if negate {
-                        pi += 1;
-                    }
-                    let mut found = false;
-                    let mut class_end = pi;
-                    while class_end < pattern.len() && pattern[class_end] != b']' {
-                        // Range: a-z
-                        if class_end + 2 < pattern.len()
-                            && pattern[class_end + 1] == b'-'
-                            && pattern[class_end + 2] != b']'
-                        {
-                            if string[si] >= pattern[class_end]
-                                && string[si] <= pattern[class_end + 2]
-                            {
-                                found = true;
-                            }
-                            class_end += 3;
-                        } else {
-                            if string[si] == pattern[class_end] {
-                                found = true;
-                            }
-                            class_end += 1;
-                        }
-                    }
-                    // Skip closing ']'.
-                    if class_end < pattern.len() {
-                        class_end += 1;
-                    }
-                    if negate {
-                        found = !found;
-                    }
-                    if found {
-                        pi = class_end;
-                        si += 1;
-                        continue;
-                    }
-                    // Character class didn't match — fall through to backtrack.
-                }
-                b'\\' => {
-                    pi += 1;
-                    if pi < pattern.len() && pattern[pi] == string[si] {
-                        pi += 1;
-                        si += 1;
-                        continue;
-                    }
-                    // Escaped char didn't match — fall through to backtrack.
-                }
-                c => {
-                    if c == string[si] {
-                        pi += 1;
-                        si += 1;
-                        continue;
-                    }
-                    // Literal didn't match — fall through to backtrack.
-                }
-            }
-        }
-
-        // No match — try backtracking to last `*`.
-        if star_pi != usize::MAX {
-            pi = star_pi;
-            star_si += 1;
-            si = star_si;
-            continue;
-        }
-
-        return false;
-    }
-
-    // Consume trailing `*` in pattern.
-    while pi < pattern.len() && pattern[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == pattern.len()
+    super::pattern::glob_match(pattern, string)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -748,7 +571,8 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use vortex_common::{ShardId, VortexValue};
+    use crate::commands::test_harness::TestHarness;
+    use vortex_common::VortexValue;
     use vortex_proto::RespTape;
 
     const NOW: u64 = 1_000_000_000_000; // 1000 seconds in nanos.
@@ -767,15 +591,15 @@ mod tests {
 
     /// Parse RESP bytes and execute command via handler function.
     fn exec(
-        shard: &mut Shard,
-        handler: fn(&mut Shard, &FrameRef<'_>, u64) -> CmdResult,
+        keyspace: &ConcurrentKeyspace,
+        handler: fn(&ConcurrentKeyspace, &FrameRef<'_>, u64) -> CmdResult,
         parts: &[&[u8]],
         now: u64,
     ) -> CmdResult {
         let data = make_resp(parts);
         let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
         let frame = tape.iter().next().unwrap();
-        handler(shard, &frame, now)
+        handler(keyspace, &frame, now)
     }
 
     fn assert_static(result: CmdResult, expected: &[u8]) {
@@ -797,35 +621,35 @@ mod tests {
         }
     }
 
-    fn new_shard() -> Shard {
-        Shard::new_with_time(ShardId::new(0), NOW)
+    fn new_harness() -> TestHarness {
+        TestHarness::new()
     }
 
     // ── DEL tests ───────────────────────────────────────────────────
 
     #[test]
     fn del_single() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("foo"), VortexValue::from("bar"));
-        let r = exec(&mut shard, cmd_del, &[b"DEL", b"foo"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("foo"), VortexValue::from("bar"));
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"foo"], NOW);
         assert_integer(r, 1);
-        assert!(!shard.exists(&VortexKey::from("foo"), NOW));
+        assert!(!h.exists(&VortexKey::from("foo"), NOW));
     }
 
     #[test]
     fn del_multi() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("a"), VortexValue::from("1"));
-        shard.set(VortexKey::from("b"), VortexValue::from("2"));
-        shard.set(VortexKey::from("c"), VortexValue::from("3"));
-        let r = exec(&mut shard, cmd_del, &[b"DEL", b"a", b"b", b"d"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        h.set(VortexKey::from("b"), VortexValue::from("2"));
+        h.set(VortexKey::from("c"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"a", b"b", b"d"], NOW);
         assert_integer(r, 2); // "d" doesn't exist.
     }
 
     #[test]
     fn del_nonexistent() {
-        let mut shard = new_shard();
-        let r = exec(&mut shard, cmd_del, &[b"DEL", b"x"], NOW);
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"x"], NOW);
         assert_integer(r, 0);
     }
 
@@ -833,25 +657,25 @@ mod tests {
 
     #[test]
     fn exists_single() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("foo"), VortexValue::from("bar"));
-        let r = exec(&mut shard, cmd_exists, &[b"EXISTS", b"foo"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("foo"), VortexValue::from("bar"));
+        let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"foo"], NOW);
         assert_integer(r, 1);
     }
 
     #[test]
     fn exists_multi_with_duplicates() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("k"), VortexValue::from("v"));
+        let h = new_harness();
+        h.set(VortexKey::from("k"), VortexValue::from("v"));
         // EXISTS k k (same key twice) — Redis counts each occurrence.
-        let r = exec(&mut shard, cmd_exists, &[b"EXISTS", b"k", b"k"], NOW);
+        let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"k", b"k"], NOW);
         assert_integer(r, 2);
     }
 
     #[test]
     fn exists_miss() {
-        let mut shard = new_shard();
-        let r = exec(&mut shard, cmd_exists, &[b"EXISTS", b"nope"], NOW);
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"nope"], NOW);
         assert_integer(r, 0);
     }
 
@@ -859,56 +683,56 @@ mod tests {
 
     #[test]
     fn expire_and_ttl() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("mykey"), VortexValue::from("val"));
+        let h = new_harness();
+        h.set(VortexKey::from("mykey"), VortexValue::from("val"));
 
         // EXPIRE mykey 100
-        let r = exec(&mut shard, cmd_expire, &[b"EXPIRE", b"mykey", b"100"], NOW);
+        let r = exec(&h.keyspace, cmd_expire, &[b"EXPIRE", b"mykey", b"100"], NOW);
         assert_static(r, RESP_ONE);
 
         // TTL mykey => ~100 seconds.
-        let r = exec(&mut shard, cmd_ttl, &[b"TTL", b"mykey"], NOW);
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"mykey"], NOW);
         // Deadline = NOW + 100*NS_PER_SEC. Remaining = 100.
         assert_integer(r, 100);
     }
 
     #[test]
     fn pexpire_and_pttl() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("pk"), VortexValue::from("pv"));
+        let h = new_harness();
+        h.set(VortexKey::from("pk"), VortexValue::from("pv"));
 
-        let r = exec(&mut shard, cmd_pexpire, &[b"PEXPIRE", b"pk", b"5000"], NOW);
+        let r = exec(&h.keyspace, cmd_pexpire, &[b"PEXPIRE", b"pk", b"5000"], NOW);
         assert_static(r, RESP_ONE);
 
-        let r = exec(&mut shard, cmd_pttl, &[b"PTTL", b"pk"], NOW);
+        let r = exec(&h.keyspace, cmd_pttl, &[b"PTTL", b"pk"], NOW);
         assert_integer(r, 5000);
     }
 
     #[test]
     fn persist_removes_ttl() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("tk"), VortexValue::from("tv"));
-        exec(&mut shard, cmd_expire, &[b"EXPIRE", b"tk", b"10"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("tk"), VortexValue::from("tv"));
+        exec(&h.keyspace, cmd_expire, &[b"EXPIRE", b"tk", b"10"], NOW);
 
-        let r = exec(&mut shard, cmd_persist, &[b"PERSIST", b"tk"], NOW);
+        let r = exec(&h.keyspace, cmd_persist, &[b"PERSIST", b"tk"], NOW);
         assert_static(r, RESP_ONE);
 
-        let r = exec(&mut shard, cmd_ttl, &[b"TTL", b"tk"], NOW);
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], NOW);
         assert_static(r, RESP_NEG_ONE); // No TTL.
     }
 
     #[test]
     fn ttl_no_key() {
-        let mut shard = new_shard();
-        let r = exec(&mut shard, cmd_ttl, &[b"TTL", b"nokey"], NOW);
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"nokey"], NOW);
         assert_static(r, RESP_NEG_TWO);
     }
 
     #[test]
     fn ttl_no_expiry() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("p"), VortexValue::from("v"));
-        let r = exec(&mut shard, cmd_ttl, &[b"TTL", b"p"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("p"), VortexValue::from("v"));
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"p"], NOW);
         assert_static(r, RESP_NEG_ONE);
     }
 
@@ -916,12 +740,12 @@ mod tests {
 
     #[test]
     fn expireat_and_expiretime() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("ea"), VortexValue::from("v"));
+        let h = new_harness();
+        h.set(VortexKey::from("ea"), VortexValue::from("v"));
 
         // EXPIREAT ea 2000 (unix timestamp in seconds)
         let r = exec(
-            &mut shard,
+            &h.keyspace,
             cmd_expireat,
             &[b"EXPIREAT", b"ea", b"2000"],
             NOW,
@@ -929,7 +753,7 @@ mod tests {
         assert_static(r, RESP_ONE);
 
         // EXPIRETIME ea => 2000
-        let r = exec(&mut shard, cmd_expiretime, &[b"EXPIRETIME", b"ea"], NOW);
+        let r = exec(&h.keyspace, cmd_expiretime, &[b"EXPIRETIME", b"ea"], NOW);
         assert_integer(r, 2000);
     }
 
@@ -937,9 +761,9 @@ mod tests {
 
     #[test]
     fn type_string() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("s"), VortexValue::from("hello"));
-        let r = exec(&mut shard, cmd_type, &[b"TYPE", b"s"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("s"), VortexValue::from("hello"));
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"s"], NOW);
         match r {
             CmdResult::Resp(RespFrame::SimpleString(s)) => {
                 assert_eq!(s.as_ref(), b"string")
@@ -950,8 +774,8 @@ mod tests {
 
     #[test]
     fn type_none() {
-        let mut shard = new_shard();
-        let r = exec(&mut shard, cmd_type, &[b"TYPE", b"missing"], NOW);
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"missing"], NOW);
         match r {
             CmdResult::Resp(RespFrame::SimpleString(s)) => {
                 assert_eq!(s.as_ref(), b"none")
@@ -964,41 +788,41 @@ mod tests {
 
     #[test]
     fn rename_basic() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("old"), VortexValue::from("val"));
-        let r = exec(&mut shard, cmd_rename, &[b"RENAME", b"old", b"new"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("old"), VortexValue::from("val"));
+        let r = exec(&h.keyspace, cmd_rename, &[b"RENAME", b"old", b"new"], NOW);
         assert_static(r, RESP_OK);
-        assert!(!shard.exists(&VortexKey::from("old"), NOW));
-        assert!(shard.exists(&VortexKey::from("new"), NOW));
+        assert!(!h.exists(&VortexKey::from("old"), NOW));
+        assert!(h.exists(&VortexKey::from("new"), NOW));
     }
 
     #[test]
     fn rename_preserves_ttl() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("rk"), VortexValue::from("rv"));
-        exec(&mut shard, cmd_expire, &[b"EXPIRE", b"rk", b"60"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("rk"), VortexValue::from("rv"));
+        exec(&h.keyspace, cmd_expire, &[b"EXPIRE", b"rk", b"60"], NOW);
 
-        exec(&mut shard, cmd_rename, &[b"RENAME", b"rk", b"rk2"], NOW);
+        exec(&h.keyspace, cmd_rename, &[b"RENAME", b"rk", b"rk2"], NOW);
 
         // TTL should still be ~60 on the new key.
-        let r = exec(&mut shard, cmd_ttl, &[b"TTL", b"rk2"], NOW);
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"rk2"], NOW);
         assert_integer(r, 60);
     }
 
     #[test]
     fn rename_same_key() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("same"), VortexValue::from("v"));
-        let r = exec(&mut shard, cmd_rename, &[b"RENAME", b"same", b"same"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("same"), VortexValue::from("v"));
+        let r = exec(&h.keyspace, cmd_rename, &[b"RENAME", b"same", b"same"], NOW);
         assert_static(r, RESP_OK);
-        assert!(shard.exists(&VortexKey::from("same"), NOW));
+        assert!(h.exists(&VortexKey::from("same"), NOW));
     }
 
     #[test]
     fn rename_no_key() {
-        let mut shard = new_shard();
+        let h = new_harness();
         let r = exec(
-            &mut shard,
+            &h.keyspace,
             cmd_rename,
             &[b"RENAME", b"missing", b"new"],
             NOW,
@@ -1008,18 +832,18 @@ mod tests {
 
     #[test]
     fn renamenx_success() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("a"), VortexValue::from("1"));
-        let r = exec(&mut shard, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        let r = exec(&h.keyspace, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
         assert_static(r, RESP_ONE);
     }
 
     #[test]
     fn renamenx_dest_exists() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("a"), VortexValue::from("1"));
-        shard.set(VortexKey::from("b"), VortexValue::from("2"));
-        let r = exec(&mut shard, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        h.set(VortexKey::from("b"), VortexValue::from("2"));
+        let r = exec(&h.keyspace, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
         assert_static(r, RESP_ZERO);
     }
 
@@ -1027,11 +851,11 @@ mod tests {
 
     #[test]
     fn scan_full_iteration() {
-        let mut shard = new_shard();
+        let h = new_harness();
         let n = 50;
         for i in 0..n {
             let key = format!("key:{i}");
-            shard.set(VortexKey::from(key.as_str()), VortexValue::from("v"));
+            h.set(VortexKey::from(key.as_str()), VortexValue::from("v"));
         }
 
         let mut all_keys: Vec<String> = Vec::new();
@@ -1042,7 +866,7 @@ mod tests {
             let data = make_resp(&[b"SCAN", cursor.to_string().as_bytes(), b"COUNT", b"10"]);
             let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
             let frame = tape.iter().next().unwrap();
-            let result = cmd_scan(&mut shard, &frame, NOW);
+            let result = cmd_scan(&h.keyspace, &frame, NOW);
 
             match result {
                 CmdResult::Resp(RespFrame::Array(Some(arr))) => {
@@ -1086,10 +910,10 @@ mod tests {
 
     #[test]
     fn scan_with_match() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("user:1"), VortexValue::from("a"));
-        shard.set(VortexKey::from("user:2"), VortexValue::from("b"));
-        shard.set(VortexKey::from("post:1"), VortexValue::from("c"));
+        let h = new_harness();
+        h.set(VortexKey::from("user:1"), VortexValue::from("a"));
+        h.set(VortexKey::from("user:2"), VortexValue::from("b"));
+        h.set(VortexKey::from("post:1"), VortexValue::from("c"));
 
         let mut matched: Vec<String> = Vec::new();
         let mut cursor: u64 = 0;
@@ -1098,7 +922,7 @@ mod tests {
             let data = make_resp(&[b"SCAN", cur_str.as_bytes(), b"MATCH", b"user:*"]);
             let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
             let frame = tape.iter().next().unwrap();
-            let result = cmd_scan(&mut shard, &frame, NOW);
+            let result = cmd_scan(&h.keyspace, &frame, NOW);
 
             match result {
                 CmdResult::Resp(RespFrame::Array(Some(arr))) => {
@@ -1131,10 +955,10 @@ mod tests {
 
     #[test]
     fn keys_star() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("a"), VortexValue::from("1"));
-        shard.set(VortexKey::from("b"), VortexValue::from("2"));
-        let r = exec(&mut shard, cmd_keys, &[b"KEYS", b"*"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        h.set(VortexKey::from("b"), VortexValue::from("2"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"*"], NOW);
         match r {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
                 assert_eq!(arr.len(), 2);
@@ -1145,11 +969,11 @@ mod tests {
 
     #[test]
     fn keys_pattern() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("hello"), VortexValue::from("1"));
-        shard.set(VortexKey::from("hallo"), VortexValue::from("2"));
-        shard.set(VortexKey::from("world"), VortexValue::from("3"));
-        let r = exec(&mut shard, cmd_keys, &[b"KEYS", b"h?llo"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("hello"), VortexValue::from("1"));
+        h.set(VortexKey::from("hallo"), VortexValue::from("2"));
+        h.set(VortexKey::from("world"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"h?llo"], NOW);
         match r {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
                 assert_eq!(arr.len(), 2);
@@ -1160,11 +984,11 @@ mod tests {
 
     #[test]
     fn keys_char_class() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("hello"), VortexValue::from("1"));
-        shard.set(VortexKey::from("hallo"), VortexValue::from("2"));
-        shard.set(VortexKey::from("hxllo"), VortexValue::from("3"));
-        let r = exec(&mut shard, cmd_keys, &[b"KEYS", b"h[ae]llo"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("hello"), VortexValue::from("1"));
+        h.set(VortexKey::from("hallo"), VortexValue::from("2"));
+        h.set(VortexKey::from("hxllo"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"h[ae]llo"], NOW);
         match r {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
                 assert_eq!(arr.len(), 2); // hello, hallo — not hxllo.
@@ -1175,11 +999,11 @@ mod tests {
 
     #[test]
     fn keys_negated_class() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("hello"), VortexValue::from("1"));
-        shard.set(VortexKey::from("hallo"), VortexValue::from("2"));
-        shard.set(VortexKey::from("hxllo"), VortexValue::from("3"));
-        let r = exec(&mut shard, cmd_keys, &[b"KEYS", b"h[^ae]llo"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("hello"), VortexValue::from("1"));
+        h.set(VortexKey::from("hallo"), VortexValue::from("2"));
+        h.set(VortexKey::from("hxllo"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"h[^ae]llo"], NOW);
         match r {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
                 assert_eq!(arr.len(), 1); // hxllo only.
@@ -1192,31 +1016,31 @@ mod tests {
 
     #[test]
     fn copy_basic() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("src"), VortexValue::from("val"));
-        let r = exec(&mut shard, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("val"));
+        let r = exec(&h.keyspace, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
         assert_static(r, RESP_ONE);
-        assert!(shard.exists(&VortexKey::from("dst"), NOW));
+        assert!(h.exists(&VortexKey::from("dst"), NOW));
         // Source still exists.
-        assert!(shard.exists(&VortexKey::from("src"), NOW));
+        assert!(h.exists(&VortexKey::from("src"), NOW));
     }
 
     #[test]
     fn copy_no_replace() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("src"), VortexValue::from("v1"));
-        shard.set(VortexKey::from("dst"), VortexValue::from("v2"));
-        let r = exec(&mut shard, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("v1"));
+        h.set(VortexKey::from("dst"), VortexValue::from("v2"));
+        let r = exec(&h.keyspace, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
         assert_static(r, RESP_ZERO); // Destination exists, no REPLACE.
     }
 
     #[test]
     fn copy_with_replace() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("src"), VortexValue::from("new_val"));
-        shard.set(VortexKey::from("dst"), VortexValue::from("old_val"));
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("new_val"));
+        h.set(VortexKey::from("dst"), VortexValue::from("old_val"));
         let r = exec(
-            &mut shard,
+            &h.keyspace,
             cmd_copy,
             &[b"COPY", b"src", b"dst", b"REPLACE"],
             NOW,
@@ -1228,22 +1052,101 @@ mod tests {
 
     #[test]
     fn randomkey_empty() {
-        let mut shard = new_shard();
-        let r = exec(&mut shard, cmd_randomkey, &[b"RANDOMKEY"], NOW);
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_randomkey, &[b"RANDOMKEY"], NOW);
         assert_static(r, RESP_NIL);
     }
 
     #[test]
     fn randomkey_nonempty() {
-        let mut shard = new_shard();
-        shard.set(VortexKey::from("only"), VortexValue::from("one"));
-        let r = exec(&mut shard, cmd_randomkey, &[b"RANDOMKEY"], NOW);
+        let h = new_harness();
+        h.set(VortexKey::from("only"), VortexValue::from("one"));
+        let r = exec(&h.keyspace, cmd_randomkey, &[b"RANDOMKEY"], NOW);
         match r {
             CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
                 assert_eq!(b.as_ref(), b"only");
             }
             _ => panic!("Expected BulkString"),
         }
+    }
+
+    // ── Lazy expiry double-checked locking tests ────────────────────
+
+    /// When GET encounters an expired key, the double-checked locking
+    /// mechanism must clean it up (not just return nil).
+    #[test]
+    fn lazy_expiry_get_cleans_up_expired_key() {
+        let h = new_harness();
+        // Insert key with TTL deadline = 1000 ns.
+        h.set_with_ttl(VortexKey::from("ek"), VortexValue::from("val"), 1000);
+
+        // Before expiry: key exists.
+        assert_eq!(h.keyspace.dbsize(), 1);
+
+        // GET at now=2000 → nil AND key removed from table.
+        let r = exec(
+            &h.keyspace,
+            super::super::string::cmd_get,
+            &[b"GET", b"ek"],
+            2000,
+        );
+        assert_static(r, RESP_NIL);
+
+        // Key must be cleaned up — dbsize should be 0.
+        assert_eq!(h.keyspace.dbsize(), 0);
+    }
+
+    /// When TTL encounters an expired key, it returns -2 AND cleans up.
+    #[test]
+    fn lazy_expiry_ttl_cleans_up_expired_key() {
+        let h = new_harness();
+        h.set_with_ttl(VortexKey::from("tk"), VortexValue::from("val"), 1000);
+        assert_eq!(h.keyspace.dbsize(), 1);
+
+        // TTL at now=2000 → -2 (missing).
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], 2000);
+        assert_static(r, RESP_NEG_TWO);
+
+        // Key cleaned up.
+        assert_eq!(h.keyspace.dbsize(), 0);
+    }
+
+    /// When TYPE encounters an expired key, it returns "none" AND cleans up.
+    #[test]
+    fn lazy_expiry_type_cleans_up_expired_key() {
+        let h = new_harness();
+        h.set_with_ttl(VortexKey::from("typekey"), VortexValue::from("val"), 1000);
+        assert_eq!(h.keyspace.dbsize(), 1);
+
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"typekey"], 2000);
+        match r {
+            CmdResult::Resp(vortex_proto::RespFrame::SimpleString(s)) => assert_eq!(s, "none"),
+            other => panic!("expected SimpleString(none), got {:?}", other),
+        }
+
+        assert_eq!(h.keyspace.dbsize(), 0);
+    }
+
+    /// EXISTS with expired keys should return 0 AND clean up.
+    #[test]
+    fn lazy_expiry_exists_cleans_up_expired_key() {
+        let h = new_harness();
+        h.set_with_ttl(VortexKey::from("ex1"), VortexValue::from("v1"), 1000);
+        h.set_with_ttl(VortexKey::from("ex2"), VortexValue::from("v2"), 1000);
+        h.set(VortexKey::from("live"), VortexValue::from("v3"));
+        assert_eq!(h.keyspace.dbsize(), 3);
+
+        // EXISTS ex1 ex2 live at now=2000 → only "live" counted.
+        let r = exec(
+            &h.keyspace,
+            cmd_exists,
+            &[b"EXISTS", b"ex1", b"ex2", b"live"],
+            2000,
+        );
+        assert_integer(r, 1);
+
+        // Expired keys cleaned up.
+        assert_eq!(h.keyspace.dbsize(), 1);
     }
 
     // ── glob_match tests ────────────────────────────────────────────

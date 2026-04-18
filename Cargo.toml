@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "smoketests",
     "crates/vortex-common",
     "crates/vortex-memory",
     "crates/vortex-sync",
@@ -51,6 +52,7 @@ tikv-jemalloc-ctl = "0.6"
 # ── Concurrency ──
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
+parking_lot = "0.12"
 
 # ── I/O ──
 polling = "3"
@@ -111,3 +113,10 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+lto = "thin"
+split-debuginfo = "unpacked"

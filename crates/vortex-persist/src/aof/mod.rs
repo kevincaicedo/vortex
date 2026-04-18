@@ -15,24 +15,32 @@
 //!   buffer absorbs write bursts; fsync is periodic or explicit.
 //! - **Three fsync modes:** `always` (durability per command), `everysec`
 //!   (default, <3% overhead), `no` (OS-managed).
+//! - **Global LSN ordering:** each mutation is assigned a monotonic LSN from
+//!   `ConcurrentKeyspace::next_lsn()` (inside the shard write-lock critical
+//!   section). The LSN prefixes every record, enabling deterministic K-Way
+//!   merge replay across per-reactor files on startup.
 //!
-//! ## File Format
+//! ## File Format (v2)
 //!
 //! ```text
 //! ┌────────────────────────────────────┐
 //! │ Header (16 bytes)                  │
 //! │  magic: "VXAOF\x00" (6 bytes)     │
-//! │  version: u16 LE (1)              │
-//! │  shard_id: u16 LE                 │
+//! │  version: u16 LE (2)              │
+//! │  reactor_id: u16 LE               │
 //! │  created_at: u48 LE (unix secs)   │
 //! ├────────────────────────────────────┤
-//! │ Record 0: raw RESP command bytes   │
-//! │ Record 1: raw RESP command bytes   │
+//! │ Record 0:                          │
+//! │   LSN: u64 LE (8 bytes)           │
+//! │   RESP command bytes               │
+//! │ Record 1:                          │
+//! │   LSN: u64 LE (8 bytes)           │
+//! │   RESP command bytes               │
 //! │ ...                                │
 //! └────────────────────────────────────┘
 //! ```
 //!
-//! Each record is a complete RESP array (e.g., `*3\r\n$3\r\nSET\r\n...`).
+//! Each record is `[LSN: 8 bytes LE] [complete RESP array]`.
 //! Records are variable-length and self-delimiting via RESP framing.
 //! No per-record headers or checksums — the RESP parser validates integrity
 //! on replay. Truncated trailing records (from crash mid-write) are detected

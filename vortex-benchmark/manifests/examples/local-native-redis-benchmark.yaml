@@ -1,0 +1,29 @@
+schema_version: 1
+name: local-native-redis-benchmark
+description: Quick native local command sweep for Vortex and Redis using redis-benchmark.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+commands:
+  - GET
+  - SET
+  - INCR
+duration: 8s
+environment:
+  mode: native
+  port_base: 17379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 30000
+    clients: 20
+    pipeline: 8
+    keyspace_size: 100000

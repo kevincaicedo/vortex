@@ -1,17 +1,19 @@
 //! Command handler dispatch for VortexDB engine.
 //!
-//! Each command is a free function `cmd_xxx(shard, args, now_nanos) -> CmdResult`
+//! Each command is a free function `cmd_xxx(keyspace, args, now_nanos) -> CmdResult`
 //! dispatched via a static match on the command name. No trait objects, no
 //! dynamic dispatch — the compiler inlines the entire chain.
 
-pub mod key;
-pub mod server;
-pub mod string;
+pub(crate) mod context;
+pub(crate) mod key;
+pub(crate) mod pattern;
+pub(crate) mod server;
+pub(crate) mod string;
 
 use vortex_common::{VortexKey, VortexValue};
 use vortex_proto::{FrameRef, RespFrame};
 
-use crate::Shard;
+use crate::ConcurrentKeyspace;
 
 /// Nanoseconds per second.
 pub const NS_PER_SEC: u64 = 1_000_000_000;
@@ -49,7 +51,7 @@ pub static ERR_NOT_FLOAT: &[u8] = b"-ERR value is not a valid float\r\n";
 pub static ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
 pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of range\r\n";
 
-/// Execute a command by name.
+/// Execute a command against the shared concurrent keyspace.
 ///
 /// `name` must be an uppercase ASCII command name (already normalized by
 /// the CommandRouter). Returns `None` if the command is unknown to the
@@ -57,70 +59,67 @@ pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of
 /// reactor directly).
 #[inline]
 pub fn execute_command(
-    shard: &mut Shard,
+    keyspace: &ConcurrentKeyspace,
     name: &[u8],
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> Option<CmdResult> {
-    // String commands — ordered by frequency in typical workloads.
     match name {
-        b"GET" => Some(string::cmd_get(shard, frame, now_nanos)),
-        b"SET" => Some(string::cmd_set(shard, frame, now_nanos)),
-        b"INCR" => Some(string::cmd_incr(shard, frame, now_nanos)),
-        b"DECR" => Some(string::cmd_decr(shard, frame, now_nanos)),
-        b"INCRBY" => Some(string::cmd_incrby(shard, frame, now_nanos)),
-        b"DECRBY" => Some(string::cmd_decrby(shard, frame, now_nanos)),
-        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(shard, frame, now_nanos)),
-        b"MGET" => Some(string::cmd_mget(shard, frame, now_nanos)),
-        b"MSET" => Some(string::cmd_mset(shard, frame, now_nanos)),
-        b"MSETNX" => Some(string::cmd_msetnx(shard, frame, now_nanos)),
-        b"SETNX" => Some(string::cmd_setnx(shard, frame, now_nanos)),
-        b"SETEX" => Some(string::cmd_setex(shard, frame, now_nanos)),
-        b"PSETEX" => Some(string::cmd_psetex(shard, frame, now_nanos)),
-        b"GETSET" => Some(string::cmd_getset(shard, frame, now_nanos)),
-        b"GETDEL" => Some(string::cmd_getdel(shard, frame, now_nanos)),
-        b"GETEX" => Some(string::cmd_getex(shard, frame, now_nanos)),
-        b"APPEND" => Some(string::cmd_append(shard, frame, now_nanos)),
-        b"STRLEN" => Some(string::cmd_strlen(shard, frame, now_nanos)),
-        b"GETRANGE" => Some(string::cmd_getrange(shard, frame, now_nanos)),
-        b"SETRANGE" => Some(string::cmd_setrange(shard, frame, now_nanos)),
-        // Key management commands.
-        b"DEL" => Some(key::cmd_del(shard, frame, now_nanos)),
-        b"UNLINK" => Some(key::cmd_unlink(shard, frame, now_nanos)),
-        b"EXISTS" => Some(key::cmd_exists(shard, frame, now_nanos)),
-        b"EXPIRE" => Some(key::cmd_expire(shard, frame, now_nanos)),
-        b"PEXPIRE" => Some(key::cmd_pexpire(shard, frame, now_nanos)),
-        b"EXPIREAT" => Some(key::cmd_expireat(shard, frame, now_nanos)),
-        b"PEXPIREAT" => Some(key::cmd_pexpireat(shard, frame, now_nanos)),
-        b"PERSIST" => Some(key::cmd_persist(shard, frame, now_nanos)),
-        b"TTL" => Some(key::cmd_ttl(shard, frame, now_nanos)),
-        b"PTTL" => Some(key::cmd_pttl(shard, frame, now_nanos)),
-        b"EXPIRETIME" => Some(key::cmd_expiretime(shard, frame, now_nanos)),
-        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(shard, frame, now_nanos)),
-        b"TYPE" => Some(key::cmd_type(shard, frame, now_nanos)),
-        b"RENAME" => Some(key::cmd_rename(shard, frame, now_nanos)),
-        b"RENAMENX" => Some(key::cmd_renamenx(shard, frame, now_nanos)),
-        b"KEYS" => Some(key::cmd_keys(shard, frame, now_nanos)),
-        b"SCAN" => Some(key::cmd_scan(shard, frame, now_nanos)),
-        b"RANDOMKEY" => Some(key::cmd_randomkey(shard, frame, now_nanos)),
-        b"TOUCH" => Some(key::cmd_touch(shard, frame, now_nanos)),
-        b"COPY" => Some(key::cmd_copy(shard, frame, now_nanos)),
-        // Server & connection commands.
-        b"PING" => Some(server::cmd_ping(shard, frame, now_nanos)),
-        b"ECHO" => Some(server::cmd_echo(shard, frame, now_nanos)),
-        b"QUIT" => Some(server::cmd_quit(shard, frame, now_nanos)),
-        b"DBSIZE" => Some(server::cmd_dbsize(shard, frame, now_nanos)),
-        b"FLUSHDB" => Some(server::cmd_flushdb(shard, frame, now_nanos)),
-        b"FLUSHALL" => Some(server::cmd_flushall(shard, frame, now_nanos)),
-        b"INFO" => Some(server::cmd_info(shard, frame, now_nanos)),
-        b"COMMAND" => Some(server::cmd_command(shard, frame, now_nanos)),
-        b"SELECT" => Some(server::cmd_select(shard, frame, now_nanos)),
-        b"TIME" => Some(server::cmd_time(shard, frame, now_nanos)),
-        b"MULTI" => Some(server::cmd_multi(shard, frame, now_nanos)),
-        b"EXEC" => Some(server::cmd_exec(shard, frame, now_nanos)),
-        b"DISCARD" => Some(server::cmd_discard(shard, frame, now_nanos)),
-        b"WATCH" => Some(server::cmd_watch(shard, frame, now_nanos)),
-        b"UNWATCH" => Some(server::cmd_unwatch(shard, frame, now_nanos)),
+        b"GET" => Some(string::cmd_get(keyspace, frame, now_nanos)),
+        b"SET" => Some(string::cmd_set(keyspace, frame, now_nanos)),
+        b"INCR" => Some(string::cmd_incr(keyspace, frame, now_nanos)),
+        b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos)),
+        b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos)),
+        b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos)),
+        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(keyspace, frame, now_nanos)),
+        b"MGET" => Some(string::cmd_mget(keyspace, frame, now_nanos)),
+        b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos)),
+        b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos)),
+        b"SETNX" => Some(string::cmd_setnx(keyspace, frame, now_nanos)),
+        b"SETEX" => Some(string::cmd_setex(keyspace, frame, now_nanos)),
+        b"PSETEX" => Some(string::cmd_psetex(keyspace, frame, now_nanos)),
+        b"GETSET" => Some(string::cmd_getset(keyspace, frame, now_nanos)),
+        b"GETDEL" => Some(string::cmd_getdel(keyspace, frame, now_nanos)),
+        b"GETEX" => Some(string::cmd_getex(keyspace, frame, now_nanos)),
+        b"APPEND" => Some(string::cmd_append(keyspace, frame, now_nanos)),
+        b"STRLEN" => Some(string::cmd_strlen(keyspace, frame, now_nanos)),
+        b"GETRANGE" => Some(string::cmd_getrange(keyspace, frame, now_nanos)),
+        b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos)),
+        b"DEL" => Some(key::cmd_del(keyspace, frame, now_nanos)),
+        b"UNLINK" => Some(key::cmd_unlink(keyspace, frame, now_nanos)),
+        b"EXISTS" => Some(key::cmd_exists(keyspace, frame, now_nanos)),
+        b"EXPIRE" => Some(key::cmd_expire(keyspace, frame, now_nanos)),
+        b"PEXPIRE" => Some(key::cmd_pexpire(keyspace, frame, now_nanos)),
+        b"EXPIREAT" => Some(key::cmd_expireat(keyspace, frame, now_nanos)),
+        b"PEXPIREAT" => Some(key::cmd_pexpireat(keyspace, frame, now_nanos)),
+        b"PERSIST" => Some(key::cmd_persist(keyspace, frame, now_nanos)),
+        b"TTL" => Some(key::cmd_ttl(keyspace, frame, now_nanos)),
+        b"PTTL" => Some(key::cmd_pttl(keyspace, frame, now_nanos)),
+        b"EXPIRETIME" => Some(key::cmd_expiretime(keyspace, frame, now_nanos)),
+        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(keyspace, frame, now_nanos)),
+        b"TYPE" => Some(key::cmd_type(keyspace, frame, now_nanos)),
+        b"RENAME" => Some(key::cmd_rename(keyspace, frame, now_nanos)),
+        b"RENAMENX" => Some(key::cmd_renamenx(keyspace, frame, now_nanos)),
+        b"KEYS" => Some(key::cmd_keys(keyspace, frame, now_nanos)),
+        b"SCAN" => Some(key::cmd_scan(keyspace, frame, now_nanos)),
+        b"RANDOMKEY" => Some(key::cmd_randomkey(keyspace, frame, now_nanos)),
+        b"TOUCH" => Some(key::cmd_touch(keyspace, frame, now_nanos)),
+        b"COPY" => Some(key::cmd_copy(keyspace, frame, now_nanos)),
+        b"PING" => Some(server::cmd_ping(keyspace, frame, now_nanos)),
+        b"ECHO" => Some(server::cmd_echo(keyspace, frame, now_nanos)),
+        b"QUIT" => Some(server::cmd_quit(keyspace, frame, now_nanos)),
+        b"DBSIZE" => Some(server::cmd_dbsize(keyspace, frame, now_nanos)),
+        b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos)),
+        b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos)),
+        b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos)),
+        b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos)),
+        b"SELECT" => Some(server::cmd_select(keyspace, frame, now_nanos)),
+        b"TIME" => Some(server::cmd_time(keyspace, frame, now_nanos)),
+        b"MULTI" => Some(server::cmd_multi(keyspace, frame, now_nanos)),
+        b"EXEC" => Some(server::cmd_exec(keyspace, frame, now_nanos)),
+        b"DISCARD" => Some(server::cmd_discard(keyspace, frame, now_nanos)),
+        b"WATCH" => Some(server::cmd_watch(keyspace, frame, now_nanos)),
+        b"UNWATCH" => Some(server::cmd_unwatch(keyspace, frame, now_nanos)),
         _ => None,
     }
 }
@@ -251,6 +250,50 @@ pub fn owned_value_to_resp(val: VortexValue) -> CmdResult {
 #[inline]
 pub fn int_resp(n: i64) -> CmdResult {
     CmdResult::Resp(RespFrame::integer(n))
+}
+
+#[cfg(test)]
+pub(crate) mod test_harness {
+    use crate::concurrent_keyspace::ConcurrentKeyspace;
+    use vortex_common::{VortexKey, VortexValue};
+
+    pub struct TestHarness {
+        pub keyspace: ConcurrentKeyspace,
+    }
+
+    impl TestHarness {
+        pub fn new() -> Self {
+            Self {
+                keyspace: ConcurrentKeyspace::new(64),
+            }
+        }
+
+        pub fn set(&self, key: VortexKey, value: VortexValue) {
+            let idx = self.keyspace.shard_index(key.as_bytes());
+            self.keyspace.write_shard_by_index(idx).insert(key, value);
+        }
+
+        pub fn set_with_ttl(&self, key: VortexKey, value: VortexValue, ttl_deadline: u64) {
+            let idx = self.keyspace.shard_index(key.as_bytes());
+            self.keyspace
+                .write_shard_by_index(idx)
+                .insert_with_ttl(key, value, ttl_deadline);
+        }
+
+        pub fn get(&self, key: &VortexKey, now: u64) -> Option<VortexValue> {
+            let idx = self.keyspace.shard_index(key.as_bytes());
+            let mut guard = self.keyspace.write_shard_by_index(idx);
+            guard.get_or_expire(key, now).cloned()
+        }
+
+        pub fn exists(&self, key: &VortexKey, now: u64) -> bool {
+            self.get(key, now).is_some()
+        }
+
+        pub fn len(&self) -> usize {
+            self.keyspace.dbsize()
+        }
+    }
 }
 
 #[cfg(all(test, not(miri)))]

@@ -14,6 +14,7 @@
 //! With power-of-two groups this visits every group before cycling.
 
 use std::alloc::{self, Layout};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ahash::RandomState;
 use vortex_common::{VortexKey, VortexValue};
@@ -41,6 +42,9 @@ const LOAD_FACTOR_D: usize = 8;
 
 /// Minimum allocation is 1 group (16 slots).
 const MIN_GROUPS: usize = 1;
+
+/// Per-shard flush threshold for global memory accounting.
+pub(crate) const MEMORY_ACCOUNTING_FLUSH_THRESHOLD: isize = 16 * 1024;
 
 // ── H₂ fingerprint ─────────────────────────────────────────────────
 
@@ -349,6 +353,10 @@ pub struct SwissTable {
     len: usize,
     /// Number of non-EMPTY slots (live + tombstones). Drives resize.
     occupied: usize,
+    /// Exact shard-local memory usage for live entries.
+    local_memory_used: usize,
+    /// Pending delta not yet flushed to the global atomic.
+    local_memory_drift: isize,
 }
 
 impl SwissTable {
@@ -377,6 +385,8 @@ impl SwissTable {
             values: vec![None; num_slots],
             len: 0,
             occupied: 0,
+            local_memory_used: 0,
+            local_memory_drift: 0,
         }
     }
 
@@ -391,6 +401,46 @@ impl SwissTable {
     }
 
     #[inline]
+    pub fn local_memory_used(&self) -> usize {
+        self.local_memory_used
+    }
+
+    #[inline]
+    pub fn local_memory_drift(&self) -> isize {
+        self.local_memory_drift
+    }
+
+    #[inline]
+    pub fn record_memory_delta(&mut self, delta: isize) {
+        if delta >= 0 {
+            self.local_memory_used = self.local_memory_used.saturating_add(delta as usize);
+        } else {
+            self.local_memory_used = self.local_memory_used.saturating_sub((-delta) as usize);
+        }
+        self.local_memory_drift += delta;
+    }
+
+    #[inline]
+    pub fn flush_memory_drift(&mut self, global_memory_used: &AtomicUsize) {
+        let drift = self.local_memory_drift;
+        if drift.unsigned_abs() <= MEMORY_ACCOUNTING_FLUSH_THRESHOLD as usize {
+            return;
+        }
+
+        if drift > 0 {
+            global_memory_used.fetch_add(drift as usize, Ordering::Relaxed);
+        } else {
+            let bytes = drift.unsigned_abs();
+            let _ =
+                global_memory_used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
+        }
+
+        self.local_memory_drift = 0;
+    }
+
+    #[inline]
     fn capacity(&self) -> usize {
         self.raw.num_slots()
     }
@@ -398,6 +448,35 @@ impl SwissTable {
     #[inline]
     fn growth_limit(&self) -> usize {
         self.capacity() * LOAD_FACTOR_N / LOAD_FACTOR_D
+    }
+
+    #[inline]
+    fn entry_memory_usage(key: &VortexKey, value: &VortexValue) -> usize {
+        size_of::<Entry>() + key.memory_usage() + value.memory_usage()
+    }
+
+    #[inline]
+    fn slot_memory_usage(&self, slot: usize) -> usize {
+        let key = self.keys[slot].as_ref().expect("live slot must have key");
+        let value = self.values[slot]
+            .as_ref()
+            .expect("live slot must have value");
+        Self::entry_memory_usage(key, value)
+    }
+
+    pub fn delete_slot(&mut self, slot: usize) -> Option<VortexValue> {
+        let bytes = self.slot_memory_usage(slot);
+
+        let entry = unsafe { self.raw.entry_mut(slot) };
+        entry.mark_deleted();
+        unsafe {
+            self.raw.set_ctrl(slot, CTRL_DELETED);
+        }
+
+        self.len -= 1;
+        self.record_memory_delta(-(bytes as isize));
+        self.keys[slot] = None;
+        self.values[slot].take()
     }
 
     #[inline]
@@ -425,6 +504,7 @@ impl SwissTable {
 
         // Phase 1: probe for existing key.
         if let Some(slot) = self.find_slot(key_bytes, hash) {
+            let old_bytes = self.slot_memory_usage(slot);
             let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
             self.keys[slot] = Some(key);
             let previous = self.values[slot].replace(value);
@@ -441,6 +521,8 @@ impl SwissTable {
             // and resize rewrites every borrowed pointer into the new table.
             Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, ttl);
             unsafe { self.raw.set_ctrl(slot, h2) };
+            let new_bytes = Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe { &*value_ptr });
+            self.record_memory_delta(new_bytes as isize - old_bytes as isize);
             return previous;
         }
 
@@ -468,6 +550,9 @@ impl SwissTable {
         if was_empty {
             self.occupied += 1;
         }
+        self.record_memory_delta(Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe {
+            &*value_ptr
+        }) as isize);
         None
     }
 
@@ -576,6 +661,10 @@ impl SwissTable {
             self.occupied += 1;
         }
 
+        self.record_memory_delta(Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe {
+            &*value_ptr
+        }) as isize);
+
         (self.values[slot].as_mut().expect("just inserted"), false)
     }
 
@@ -585,17 +674,7 @@ impl SwissTable {
         let hash = self.hash_key(key_bytes);
         let slot = self.find_slot(key_bytes, hash)?;
 
-        // Tombstone the slot.
-        let entry = unsafe { self.raw.entry_mut(slot) };
-        entry.mark_deleted();
-        unsafe {
-            self.raw.set_ctrl(slot, CTRL_DELETED);
-        }
-
-        self.len -= 1;
-        // `occupied` stays the same — tombstone still blocks probe chains.
-        self.keys[slot] = None;
-        self.values[slot].take()
+        self.delete_slot(slot)
     }
 
     /// Check existence with a pre-computed hash (no rehashing).
@@ -636,6 +715,9 @@ impl SwissTable {
         if was_empty {
             self.occupied += 1;
         }
+        self.record_memory_delta(Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe {
+            &*value_ptr
+        }) as isize);
     }
 
     /// Returns `true` if the key exists.
@@ -836,14 +918,7 @@ impl SwissTable {
 
         let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
 
-        let entry = unsafe { self.raw.entry_mut(slot) };
-        entry.mark_deleted();
-        unsafe {
-            self.raw.set_ctrl(slot, CTRL_DELETED);
-        }
-        self.len -= 1;
-        self.keys[slot] = None;
-        let value = self.values[slot].take()?;
+        let value = self.delete_slot(slot)?;
         Some((value, ttl))
     }
 
@@ -910,6 +985,7 @@ impl SwissTable {
 
         // Phase 1: probe for existing key.
         if let Some(slot) = self.find_slot(key_bytes, hash) {
+            let old_bytes = self.slot_memory_usage(slot);
             self.keys[slot] = Some(key);
             let previous = self.values[slot].replace(value);
 
@@ -929,6 +1005,8 @@ impl SwissTable {
                 ttl_deadline,
             );
             unsafe { self.raw.set_ctrl(slot, h2) };
+            let new_bytes = Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe { &*value_ptr });
+            self.record_memory_delta(new_bytes as isize - old_bytes as isize);
             return previous;
         }
 
@@ -960,6 +1038,9 @@ impl SwissTable {
         if was_empty {
             self.occupied += 1;
         }
+        self.record_memory_delta(Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe {
+            &*value_ptr
+        }) as isize);
         None
     }
 
@@ -982,13 +1063,7 @@ impl SwissTable {
 
         let entry = unsafe { self.raw.entry(slot) };
         if entry.is_expired(now_nanos) {
-            // Tombstone — same as remove but we already have the slot.
-            let entry_mut = unsafe { self.raw.entry_mut(slot) };
-            entry_mut.mark_deleted();
-            unsafe { self.raw.set_ctrl(slot, CTRL_DELETED) };
-            self.len -= 1;
-            self.keys[slot] = None;
-            self.values[slot] = None;
+            let _ = self.delete_slot(slot);
             return None;
         }
 
@@ -1005,12 +1080,7 @@ impl SwissTable {
 
         let entry = unsafe { self.raw.entry(slot) };
         if entry.is_expired(now_nanos) {
-            let entry_mut = unsafe { self.raw.entry_mut(slot) };
-            entry_mut.mark_deleted();
-            unsafe { self.raw.set_ctrl(slot, CTRL_DELETED) };
-            self.len -= 1;
-            self.keys[slot] = None;
-            self.values[slot] = None;
+            let _ = self.delete_slot(slot);
             return false;
         }
 
@@ -1030,12 +1100,7 @@ impl SwissTable {
 
         let entry = unsafe { self.raw.entry(slot) };
         if entry.is_expired(now_nanos) {
-            let entry_mut = unsafe { self.raw.entry_mut(slot) };
-            entry_mut.mark_deleted();
-            unsafe { self.raw.set_ctrl(slot, CTRL_DELETED) };
-            self.len -= 1;
-            self.keys[slot] = None;
-            self.values[slot] = None;
+            let _ = self.delete_slot(slot);
             return false;
         }
 
@@ -1097,14 +1162,12 @@ impl SwissTable {
             for bit in matches {
                 let slot = probe.pos * GROUP_SIZE + bit;
                 let entry = unsafe { self.raw.entry(slot) };
-                if entry.ttl_deadline() == deadline_nanos {
-                    // Deadline match → tombstone the entry.
-                    let entry_mut = unsafe { self.raw.entry_mut(slot) };
-                    entry_mut.mark_deleted();
-                    unsafe { self.raw.set_ctrl(slot, CTRL_DELETED) };
-                    self.len -= 1;
-                    self.keys[slot] = None;
-                    self.values[slot] = None;
+                if entry.ttl_deadline() == deadline_nanos
+                    && self.keys[slot]
+                        .as_ref()
+                        .is_some_and(|key| self.hash_key_bytes(key.as_bytes()) == hash)
+                {
+                    let _ = self.delete_slot(slot);
                     return true;
                 }
             }
@@ -1165,6 +1228,17 @@ impl Drop for SwissTable {
     }
 }
 
+// SAFETY: SwissTable's raw pointers (ctrl, entries) are owned heap allocations
+// not shared with any other owner. All stored data (VortexKey, VortexValue, Entry)
+// is Send + Sync. The raw pointers exist solely as an implementation detail of
+// the custom SIMD-probed hash table layout. When behind a RwLock, the lock
+// ensures exclusive write access and shared read access.
+unsafe impl Send for SwissTable {}
+// SAFETY: Read access to SwissTable through &SwissTable only touches immutable
+// data (find_slot, get, contains_key, iter, total_slots). All mutation requires
+// &mut SwissTable. Combined with parking_lot::RwLock, this guarantees safety.
+unsafe impl Sync for SwissTable {}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1194,6 +1268,46 @@ mod tests {
         let removed = table.remove(&key);
         assert!(removed.is_some());
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn local_memory_accounting_tracks_insert_replace_remove() {
+        let mut table = SwissTable::new();
+        let key = VortexKey::from("mem-key");
+
+        assert_eq!(table.local_memory_used(), 0);
+
+        table.insert(key.clone(), VortexValue::from("one"));
+        let first = table.local_memory_used();
+        assert!(first > 0);
+
+        table.insert(key.clone(), VortexValue::from_bytes(&[b'x'; 128]));
+        let second = table.local_memory_used();
+        assert!(second > first);
+
+        table.remove(&key);
+        assert_eq!(table.local_memory_used(), 0);
+    }
+
+    #[test]
+    fn local_memory_drift_flushes_in_threshold_chunks() {
+        let mut table = SwissTable::new();
+        let global = AtomicUsize::new(0);
+        let key = VortexKey::from("flush-key");
+        let value = VortexValue::from_bytes(&vec![b'x'; 20_000]);
+
+        table.insert(key.clone(), value);
+        assert!(table.local_memory_used() > 0);
+        assert_eq!(global.load(Ordering::Relaxed), 0);
+
+        table.flush_memory_drift(&global);
+        let flushed = global.load(Ordering::Relaxed);
+        assert!(flushed >= MEMORY_ACCOUNTING_FLUSH_THRESHOLD as usize);
+        assert_eq!(table.local_memory_drift(), 0);
+
+        table.remove(&key);
+        table.flush_memory_drift(&global);
+        assert!(global.load(Ordering::Relaxed) < flushed);
     }
 
     #[test]
@@ -1282,6 +1396,30 @@ mod tests {
         }
         // After resize, occupied == len (tombstones cleaned).
         assert_eq!(table.len, table.occupied);
+    }
+
+    #[test]
+    fn remove_expired_by_hash_requires_full_hash_match() {
+        let mut table = SwissTable::with_capacity(1);
+        let key = VortexKey::from("ttl-key");
+        let deadline = 5;
+
+        table.insert_with_ttl(key.clone(), VortexValue::from("value"), deadline);
+
+        let real_hash = table.hash_key_bytes(key.as_bytes());
+        let fake_hash = real_hash ^ 1;
+
+        assert_ne!(fake_hash, real_hash);
+        assert_eq!(h2_from_hash(fake_hash), h2_from_hash(real_hash));
+        assert!(table.find_slot(key.as_bytes(), fake_hash).is_some());
+
+        assert!(!table.remove_expired_by_hash(fake_hash, deadline));
+        assert!(table.contains_key(&key));
+        assert_eq!(table.len(), 1);
+
+        assert!(table.remove_expired_by_hash(real_hash, deadline));
+        assert!(!table.contains_key(&key));
+        assert_eq!(table.len(), 0);
     }
 
     #[test]

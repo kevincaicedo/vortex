@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vortex-benchmark"
+version = "0.1.0a0"
+description = "Phase 2 CLI and setup subsystem for VortexDB benchmarks"
+requires-python = ">=3.9"
+dependencies = [
+	"matplotlib>=3.7",
+	"PyYAML>=6.0",
+]
+
+[project.scripts]
+vortex_bench = "vortex_benchmark.cli:main"

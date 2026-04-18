@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DEFAULT_MANIFEST="$ROOT/vortex-benchmark/manifests/examples/local-native-full-cycle.yaml"
+OUTPUT_BASE="$ROOT/vortex-benchmark/.artifacts/local-dev"
+
+REPORT_TITLE="Local Native Benchmark Cycle"
+LABEL="cycle"
+OUTPUT_DIR=""
+STATE_FILE=""
+TEARDOWN_DONE=0
+
+declare -a FORWARD_ARGS=()
+HAS_SELECTION=0
+
+usage() {
+    cat <<'EOF'
+Usage: just benchmark-local [wrapper options] [vortex_bench options]
+
+Wrapper options:
+  --manifest PATH        Alias for --workload-manifest PATH
+  --workflow PATH        Alias for --workload-manifest PATH
+  --output-dir PATH      Artifact root for this cycle
+  --report-title TITLE   Markdown/JSON report title override
+  --label LABEL          Slug suffix used when auto-creating the output dir
+  --help                 Show this help
+
+When no selection flags are provided, the wrapper defaults to:
+  vortex-benchmark/manifests/examples/local-native-full-cycle.yaml
+
+Examples:
+  just benchmark-local
+  just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
+  just benchmark-local --db vortex,redis --native --backend redis-benchmark --command GET,SET,INCR
+  just benchmark-local --db vortex,redis --native --backend memtier_benchmark --workload uniform-read_heavy
+  just benchmark-local --db vortex,redis --native --backend custom-rust --workload multi_key_only
+EOF
+}
+
+mark_selection() {
+    HAS_SELECTION=1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --manifest|--workflow)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a path" >&2; exit 1; }
+            FORWARD_ARGS+=("--workload-manifest" "$2")
+            LABEL="$(basename "$2")"
+            HAS_SELECTION=1
+            shift 2
+            ;;
+        --output-dir)
+            [[ $# -ge 2 ]] || { echo "error: --output-dir requires a path" >&2; exit 1; }
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --report-title)
+            [[ $# -ge 2 ]] || { echo "error: --report-title requires a value" >&2; exit 1; }
+            REPORT_TITLE="$2"
+            shift 2
+            ;;
+        --label)
+            [[ $# -ge 2 ]] || { echo "error: --label requires a value" >&2; exit 1; }
+            LABEL="$2"
+            shift 2
+            ;;
+        --state-file)
+            echo "error: benchmark-local manages --state-file automatically" >&2
+            exit 1
+            ;;
+        --workload-manifest|--workload|--command|--command-group|--backend|--duration)
+            mark_selection
+            FORWARD_ARGS+=("$1")
+            if [[ "$1" != "--duration" ]]; then
+                [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 1; }
+                FORWARD_ARGS+=("$2")
+                shift 2
+            else
+                [[ $# -ge 2 ]] || { echo "error: --duration requires a value" >&2; exit 1; }
+                FORWARD_ARGS+=("$2")
+                shift 2
+            fi
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ $HAS_SELECTION -eq 0 ]]; then
+    FORWARD_ARGS+=("--workload-manifest" "$DEFAULT_MANIFEST")
+    LABEL="local-native-full-cycle"
+fi
+
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+SAFE_LABEL="$(printf '%s' "$LABEL" | tr -cs '[:alnum:]_-' '-')"
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="$OUTPUT_BASE/$STAMP-$SAFE_LABEL"
+fi
+
+mkdir -p "$OUTPUT_DIR/environments"
+STATE_FILE="$OUTPUT_DIR/environments/$STAMP-local-cycle.json"
+
+cleanup() {
+    if [[ $TEARDOWN_DONE -eq 0 && -f "$STATE_FILE" ]]; then
+        bash "$ROOT/vortex-benchmark/bin/vortex_bench" teardown --state-file "$STATE_FILE" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+echo "local benchmark output root: $OUTPUT_DIR"
+
+bash "$ROOT/vortex-benchmark/bin/vortex_bench" \
+    --setup \
+    --output-dir "$OUTPUT_DIR" \
+    --state-file "$STATE_FILE" \
+    "${FORWARD_ARGS[@]}"
+
+bash "$ROOT/vortex-benchmark/bin/vortex_bench" \
+    report \
+    --results-dir "$OUTPUT_DIR/results" \
+    --output-dir "$OUTPUT_DIR" \
+    --title "$REPORT_TITLE"
+
+bash "$ROOT/vortex-benchmark/bin/vortex_bench" teardown --state-file "$STATE_FILE"
+TEARDOWN_DONE=1
+
+echo "state file: $STATE_FILE"
+echo "latest report markdown: $OUTPUT_DIR/reports/latest/report.md"
+echo "latest report json: $OUTPUT_DIR/reports/latest/report.json"
+echo "latest report csv: $OUTPUT_DIR/reports/latest/report.csv"
+echo "history index: $OUTPUT_DIR/reports/index.json"

@@ -11,12 +11,12 @@ use crate::backend::{
     ACCEPT_CONN_ID, Completion, IoBackend, OpType, PollingBackend, decode_token, encode_token,
 };
 use crate::connection::{ConnectionFlags, ConnectionMeta, ConnectionSlab, ConnectionState};
-use crate::pool::{CrossChannel, CrossMessage};
 use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
-use vortex_common::{ShardId, Timestamp};
-use vortex_engine::Shard;
+use vortex_common::Timestamp;
+use vortex_engine::ConcurrentKeyspace;
 use vortex_engine::commands::{CmdResult, arg_bytes, arg_count, execute_command};
+use vortex_engine::concurrent_keyspace::DEFAULT_SHARD_COUNT;
 use vortex_memory::{ArenaAllocator, BufferPool};
 use vortex_persist::aof::format::is_mutation;
 use vortex_persist::aof::rewrite::AofRewriter;
@@ -132,43 +132,91 @@ pub struct Reactor {
     draining: bool,
     /// Configuration.
     config: ReactorConfig,
-    /// Incoming cross-reactor SPSC channels.
-    cross_rx: Vec<CrossChannel>,
     /// Per-iteration bump allocator for transient response building.
     arena: ArenaAllocator,
     /// Reusable scatter-gather writer for iovec responses.
     iovec_writer: IovecWriter,
     /// Command dispatch router with PHF lookup.
     command_router: CommandRouter,
-    /// Engine shard owned by this reactor. All key-value data lives here.
-    shard: Shard,
+    /// Shared concurrent keyspace — all reactors operate on the same data.
+    keyspace: Arc<ConcurrentKeyspace>,
     /// Cached monotonic timestamp (nanoseconds) for the current event-loop iteration.
     /// Avoids re-reading the clock for every command in a batch.
     cached_nanos: u64,
     /// AOF writer (None if persistence disabled).
+    /// Per-reactor AOF writer. Each reactor owns its own file, avoiding
+    /// cross-reactor synchronization on the I/O hot path. Global ordering
+    /// is provided by the LSN prefix (from `ConcurrentKeyspace::next_lsn()`)
+    /// and K-Way merge on replay.
     aof_writer: Option<AofFileWriter>,
     /// Reusable scratch buffer for serializing RESP frames to AOF.
     /// 4 KB is enough for any single command (max key 512 bytes + value + overhead).
     aof_scratch: Vec<u8>,
+    /// Active expiry: current shard index being swept by this reactor.
+    /// Each reactor sweeps different shards in round-robin fashion to
+    /// distribute expiry load across the pool.
+    expiry_shard_cursor: usize,
+    /// Active expiry: current slot offset within the current shard.
+    expiry_slot_cursor: usize,
 }
 
 impl Reactor {
-    /// Creates a new reactor with the polling backend.
+    /// Creates a new reactor with the polling backend and a fresh keyspace.
+    ///
+    /// This constructor creates its own `ConcurrentKeyspace`. For production
+    /// use, prefer [`with_shared_keyspace`](Self::with_shared_keyspace)
+    /// which accepts a pool-owned `Arc<ConcurrentKeyspace>`.
     pub fn new(
         id: usize,
         config: ReactorConfig,
         coordinator: Arc<ShutdownCoordinator>,
     ) -> std::io::Result<Self> {
         let backend = Box::new(PollingBackend::new()?);
-        Self::with_backend(id, config, coordinator, backend)
+        let keyspace = Arc::new(ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT));
+        Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, 1)
     }
 
-    /// Creates a new reactor with a specific backend.
+    /// Creates a new reactor with a specific backend and a fresh keyspace.
     pub fn with_backend(
         id: usize,
         config: ReactorConfig,
         coordinator: Arc<ShutdownCoordinator>,
         backend: Box<dyn IoBackend>,
+    ) -> std::io::Result<Self> {
+        let keyspace = Arc::new(ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT));
+        Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, 1)
+    }
+
+    /// Creates a new reactor with a shared keyspace (used by `ReactorPool`).
+    ///
+    /// The keyspace is already populated (e.g. from AOF replay) before
+    /// the reactor starts accepting connections.
+    /// Creates a new reactor with a shared keyspace (used by `ReactorPool`).
+    ///
+    /// The keyspace is already populated (e.g. from AOF replay) before
+    /// the reactor starts accepting connections.
+    ///
+    /// `num_reactors` controls active-expiry cursor staggering so each
+    /// reactor sweeps a distinct shard region, avoiding duplicate work.
+    pub fn with_shared_keyspace(
+        id: usize,
+        config: ReactorConfig,
+        coordinator: Arc<ShutdownCoordinator>,
+        keyspace: Arc<ConcurrentKeyspace>,
+        num_reactors: usize,
+    ) -> std::io::Result<Self> {
+        let backend = Box::new(PollingBackend::new()?);
+        Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, num_reactors)
+    }
+
+    /// Internal constructor — all public constructors delegate here.
+    fn with_keyspace_and_backend(
+        id: usize,
+        config: ReactorConfig,
+        coordinator: Arc<ShutdownCoordinator>,
+        keyspace: Arc<ConcurrentKeyspace>,
+        backend: Box<dyn IoBackend>,
+        num_reactors: usize,
     ) -> std::io::Result<Self> {
         // Create the listener socket with SO_REUSEPORT + SO_REUSEADDR + SO_INCOMING_CPU.
         let listener_fd = crate::accept::create_listener(config.bind_addr, Some(id))?;
@@ -187,11 +235,10 @@ impl Reactor {
             tracing::warn!(error = %e, "failed to register fixed buffers (non-fatal on polling)");
         }
 
-        let mut shard = Shard::new_with_time(ShardId::new(id as u16), Timestamp::now().as_nanos());
-
         // Initialize AOF writer if persistence is enabled.
+        // NOTE: AOF replay is now handled at the pool level (before reactor creation).
+        // The reactor only opens the writer for appending new mutations.
         let aof_writer = if let Some(ref aof_cfg) = config.aof_config {
-            // Per-shard AOF path: base.aof → base-shard0.aof for multi-reactor.
             let aof_path = if id == 0 {
                 aof_cfg.path.clone()
             } else {
@@ -209,40 +256,6 @@ impl Reactor {
                     .path
                     .with_file_name(format!("{stem}-shard{id}.{ext}"))
             };
-
-            // Replay existing AOF before accepting connections.
-            let reader = vortex_persist::aof::reader::AofReader::new(&aof_path);
-            if reader.exists() {
-                tracing::info!(
-                    reactor_id = id,
-                    path = %aof_path.display(),
-                    "replaying AOF..."
-                );
-                match reader.replay(&mut shard) {
-                    Ok(stats) => {
-                        tracing::info!(
-                            reactor_id = id,
-                            commands = stats.commands_replayed,
-                            bytes = stats.bytes_read,
-                            truncated = stats.bytes_truncated,
-                            duration_ms = stats.duration_ms,
-                            "AOF replay complete"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            reactor_id = id,
-                            error = %e,
-                            "AOF replay failed — starting with empty shard"
-                        );
-                        // Reset shard to empty on failed replay.
-                        shard = Shard::new_with_time(
-                            ShardId::new(id as u16),
-                            Timestamp::now().as_nanos(),
-                        );
-                    }
-                }
-            }
 
             match AofFileWriter::open(&aof_path, id as u16, aof_cfg.fsync_policy) {
                 Ok(w) => {
@@ -267,6 +280,11 @@ impl Reactor {
             None
         };
 
+        // Stagger the starting shard cursor by reactor ID so each reactor
+        // sweeps a distinct region, distributing expiry work evenly.
+        // With K shards and N reactors, spacing = K/N.
+        let expiry_shard_cursor = id * (keyspace.num_shards() / num_reactors.max(1)).max(1);
+
         Ok(Self {
             id,
             backend,
@@ -284,14 +302,15 @@ impl Reactor {
             coordinator,
             draining: false,
             config,
-            cross_rx: Vec::new(),
             arena: ArenaAllocator::new(vortex_memory::arena::DEFAULT_ARENA_CAPACITY),
             iovec_writer: IovecWriter::new(),
             command_router: CommandRouter::new(),
-            shard,
+            keyspace,
             cached_nanos: Timestamp::now().as_nanos(),
             aof_writer,
             aof_scratch: vec![0u8; 4096],
+            expiry_shard_cursor,
+            expiry_slot_cursor: 0,
         })
     }
 
@@ -395,17 +414,26 @@ impl Reactor {
                 self.tick_timers();
             }
 
-            // 5. Drain cross-reactor message queues.
-            self.drain_cross_reactor_queue();
-
-            // 5.5 Active expiry sweep — run at most 3 iterations per event loop
-            // tick. Re-sweep if >25% of sampled entries were expired.
+            // 5. Active expiry sweep — staggered deterministic shard cursors.
+            // Each reactor sweeps different shards in round-robin, staggered
+            // by reactor_id * (K / N), distributing load across the pool.
+            // Re-sweep if >25% of sampled entries were expired (max 3 iters).
             {
                 let now = self.cached_nanos;
+                let num_shards = self.keyspace.num_shards();
                 const MAX_EXPIRY_ITERS: usize = 3;
                 const MAX_EFFORT: usize = 20;
                 for _ in 0..MAX_EXPIRY_ITERS {
-                    let (expired, sampled) = self.shard.run_active_expiry(now, MAX_EFFORT);
+                    let shard_idx = self.expiry_shard_cursor % num_shards;
+                    let (expired, sampled) = self.keyspace.run_active_expiry_on_shard(
+                        shard_idx,
+                        self.expiry_slot_cursor,
+                        MAX_EFFORT,
+                        now,
+                    );
+                    // Advance cursors for next sweep.
+                    self.expiry_slot_cursor = self.expiry_slot_cursor.wrapping_add(MAX_EFFORT);
+                    self.expiry_shard_cursor = self.expiry_shard_cursor.wrapping_add(1);
                     if sampled == 0 || expired * 4 <= sampled {
                         break;
                     }
@@ -476,36 +504,6 @@ impl Reactor {
     /// Returns whether the reactor is currently running.
     pub fn is_running(&self) -> bool {
         self.running
-    }
-
-    /// Set the incoming cross-reactor SPSC channels.
-    ///
-    /// Called by [`ReactorPool`] before `run()` to install the messaging mesh.
-    pub fn set_cross_channels(&mut self, channels: Vec<CrossChannel>) {
-        self.cross_rx = channels;
-    }
-
-    // ── Cross-reactor messaging ────────────────────────────────────
-
-    /// Drain all incoming cross-reactor SPSC channels (non-blocking).
-    fn drain_cross_reactor_queue(&mut self) {
-        let mut shutdown_requested = false;
-        for channel in &self.cross_rx {
-            while let Some(msg) = channel.pop() {
-                match msg {
-                    CrossMessage::Shutdown => {
-                        shutdown_requested = true;
-                    }
-                    CrossMessage::Ping => {
-                        tracing::debug!(reactor_id = self.id, "cross-reactor ping received");
-                    }
-                }
-            }
-        }
-        if shutdown_requested && !self.draining {
-            tracing::info!(reactor_id = self.id, "cross-reactor shutdown received");
-            self.enter_drain_mode();
-        }
     }
 
     // ── Accept handler ─────────────────────────────────────────────
@@ -881,7 +879,8 @@ impl Reactor {
     /// Dispatch a parsed tape frame through the engine.
     ///
     /// Uses O(1) perfect-hash lookup with SWAR uppercase normalization,
-    /// then routes to `vortex_engine::commands::execute_command()`.
+    /// then routes to `vortex_engine::commands::execute_command()` against
+    /// the shared `ConcurrentKeyspace`.
     /// Returns `(CommandResponse, should_close)` — the bool signals QUIT.
     fn dispatch_command(&mut self, frame: &FrameRef<'_>) -> (CommandResponse, bool) {
         static RESP_ERR_WRONG_ARGC_PREFIX: &[u8] =
@@ -910,21 +909,23 @@ impl Reactor {
 
         match self.command_router.dispatch(frame) {
             DispatchResult::Dispatch { meta, name, .. } => {
-                // Route through the engine for all recognized commands.
+                // Route through the engine against the shared ConcurrentKeyspace.
                 let now = self.cached_nanos;
-                match execute_command(&mut self.shard, name, frame, now) {
+                match execute_command(&self.keyspace, name, frame, now) {
                     Some(CmdResult::Static(buf)) => {
                         let close = meta.name == "QUIT";
                         // AOF: log mutation commands after successful execution.
                         if !close && self.aof_writer.is_some() && is_mutation(name) {
-                            self.append_to_aof(frame);
+                            let lsn = self.keyspace.next_lsn();
+                            self.append_to_aof(lsn, frame);
                         }
                         (CommandResponse::Static(buf), close)
                     }
                     Some(CmdResult::Resp(f)) => {
                         // AOF: log mutation commands after successful execution.
                         if self.aof_writer.is_some() && is_mutation(name) {
-                            self.append_to_aof(frame);
+                            let lsn = self.keyspace.next_lsn();
+                            self.append_to_aof(lsn, frame);
                         }
                         (CommandResponse::Frame(f), false)
                     }
@@ -945,12 +946,13 @@ impl Reactor {
         }
     }
 
-    /// Append a mutation command to the AOF file.
+    /// Append a mutation command to the AOF file with its global LSN.
     ///
     /// Serializes the frame's RESP encoding into the scratch buffer, then
-    /// writes it to the AOF. This is the only AOF hot-path code.
+    /// writes it with the LSN prefix to the AOF. This is the only AOF
+    /// hot-path code.
     #[inline]
-    fn append_to_aof(&mut self, frame: &FrameRef<'_>) {
+    fn append_to_aof(&mut self, lsn: u64, frame: &FrameRef<'_>) {
         // Serialize frame RESP into scratch buffer.
         let written = match frame.write_resp_to(&mut self.aof_scratch) {
             Some(n) => n,
@@ -968,7 +970,7 @@ impl Reactor {
         };
 
         if let Some(ref mut writer) = self.aof_writer {
-            if let Err(e) = writer.append(&self.aof_scratch[..written]) {
+            if let Err(e) = writer.append_with_lsn(lsn, &self.aof_scratch[..written]) {
                 tracing::error!(error = %e, "AOF write failed");
             }
         }
@@ -976,15 +978,18 @@ impl Reactor {
 
     /// Handle BGREWRITEAOF command.
     ///
-    /// Rewrites the AOF file by dumping current shard state. This is done
-    /// inline (not in a background thread) since the reactor is single-threaded.
-    /// The old AOF file is atomically swapped via rename.
+    /// Rewrites the AOF by dumping the current keyspace state as a minimal
+    /// set of SET commands. The rewrite runs synchronously on the reactor
+    /// thread (blocking — acceptable for alpha) and swaps the file atomically.
     fn handle_bgrewriteaof(&mut self) -> (CommandResponse, bool) {
-        let Some(ref aof_cfg) = self.config.aof_config else {
-            return (
-                CommandResponse::Static(b"-ERR AOF is not enabled\r\n"),
-                false,
-            );
+        let aof_cfg = match &self.config.aof_config {
+            Some(cfg) => cfg.clone(),
+            None => {
+                return (
+                    CommandResponse::Static(b"-ERR AOF is not enabled\r\n"),
+                    false,
+                );
+            }
         };
 
         let aof_path = if self.id == 0 {
@@ -1005,37 +1010,31 @@ impl Reactor {
                 .with_file_name(format!("{stem}-shard{}.{ext}", self.id))
         };
 
-        match AofRewriter::rewrite(&self.shard, &aof_path, self.id as u16) {
-            Ok((_tmp_path, _keys)) => {
-                // Re-open the AOF writer on the new (compacted) file.
+        match AofRewriter::rewrite(&self.keyspace, &aof_path, self.id as u16) {
+            Ok((new_path, keys_written)) => {
+                // Swap the writer to the new file.
                 if let Some(ref mut writer) = self.aof_writer {
-                    match AofFileWriter::open(&aof_path, self.id as u16, aof_cfg.fsync_policy) {
-                        Ok(new_writer) => {
-                            *writer = new_writer;
-                            tracing::info!(
-                                reactor_id = self.id,
-                                "AOF rewrite complete, writer swapped"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                reactor_id = self.id,
-                                error = %e,
-                                "failed to reopen AOF after rewrite"
-                            );
-                        }
+                    if let Err(e) = writer.swap_file(&new_path) {
+                        tracing::error!(error = %e, "AOF rewrite swap failed");
+                        return (
+                            CommandResponse::Frame(RespFrame::Error(
+                                format!("ERR AOF rewrite swap failed: {e}").into(),
+                            )),
+                            false,
+                        );
                     }
                 }
+                tracing::info!(reactor_id = self.id, keys_written, "BGREWRITEAOF completed");
                 (
-                    CommandResponse::Static(b"+Background append only file rewriting started\r\n"),
+                    CommandResponse::Static(b"+Background AOF rewrite started\r\n"),
                     false,
                 )
             }
             Err(e) => {
-                tracing::error!(reactor_id = self.id, error = %e, "AOF rewrite failed");
+                tracing::error!(error = %e, "BGREWRITEAOF failed");
                 (
                     CommandResponse::Frame(RespFrame::Error(
-                        format!("ERR AOF rewrite failed: {e}").into(),
+                        format!("ERR BGREWRITEAOF failed: {e}").into(),
                     )),
                     false,
                 )
@@ -1476,11 +1475,11 @@ mod tests {
         let tape = RespTape::parse_pipeline(wire).expect("valid RESP");
         let frame = tape.iter().next().expect("at least one frame");
         let mut router = CommandRouter::new();
-        let mut shard = Shard::new(ShardId::new(0));
+        let keyspace = ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT);
         let now = Timestamp::now().as_nanos();
         match router.dispatch(&frame) {
             DispatchResult::Dispatch { meta, name, .. } => {
-                match execute_command(&mut shard, name, &frame, now) {
+                match execute_command(&keyspace, name, &frame, now) {
                     Some(CmdResult::Static(buf)) => {
                         let close = meta.name == "QUIT";
                         (CommandResponse::Static(buf), close)

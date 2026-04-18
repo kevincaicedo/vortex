@@ -1,0 +1,23 @@
+schema_version: 1
+name: read-heavy-native
+description: Native Vortex plus Redis setup for a read-heavy baseline comparison.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+workloads:
+  - uniform-read_heavy
+duration: 60s
+environment:
+  mode: native
+  port_base: 16379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+settings:
+  clients: 50
+  pipeline: 16
+  keyspace_size: 1000000
+  value_size_bytes: 256

@@ -1,33 +1,22 @@
-//! Multi-reactor orchestration: spawning, CPU pinning, and cross-reactor messaging.
+//! Multi-reactor orchestration: spawning and CPU pinning.
 //!
 //! [`ReactorPool`] spawns one reactor per CPU core (or a configured count),
-//! pins each thread to its core, creates the SPSC cross-reactor messaging
-//! mesh, and manages lifecycle (startup → running → drain → shutdown).
+//! pins each thread to its core, and manages lifecycle
+//! (startup → running → drain → shutdown).
+//!
+//! The pool creates a single shared [`ConcurrentKeyspace`] and distributes
+//! `Arc` handles to every reactor. AOF replay happens once at the pool level
+//! before spawning reactor threads.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use vortex_sync::SpscRingBuffer;
+use vortex_engine::concurrent_keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
+use vortex_persist::aof::reader::AofReader;
 
 use crate::reactor::{AofConfig, Reactor, ReactorConfig};
 use crate::shutdown::ShutdownCoordinator;
-
-/// Capacity of each cross-reactor SPSC ring buffer.
-pub const CROSS_CHANNEL_CAP: usize = 4096;
-
-/// Type alias for a cross-reactor SPSC channel (shared via `Arc`).
-pub type CrossChannel = Arc<SpscRingBuffer<CrossMessage, CROSS_CHANNEL_CAP>>;
-
-/// Messages exchanged between reactors via SPSC channels.
-#[derive(Debug)]
-pub enum CrossMessage {
-    /// Shutdown signal — reactor enters drain mode.
-    Shutdown,
-    /// Health-check ping.
-    Ping,
-    // TODO(Phase 3): TransferConnection { fd: RawFd, addr: SocketAddr }
-}
 
 /// Configuration for the reactor pool.
 pub struct ReactorPoolConfig {
@@ -45,6 +34,8 @@ pub struct ReactorPoolConfig {
     pub connection_timeout: u32,
     /// AOF persistence configuration (None = disabled).
     pub aof_config: Option<AofConfig>,
+    /// Number of ConcurrentKeyspace shards (must be power of 2, default 4096).
+    pub shard_count: usize,
 }
 
 impl Default for ReactorPoolConfig {
@@ -57,6 +48,7 @@ impl Default for ReactorPoolConfig {
             buffer_count: 1024,
             connection_timeout: 300,
             aof_config: None,
+            shard_count: DEFAULT_SHARD_COUNT,
         }
     }
 }
@@ -71,23 +63,21 @@ struct ReactorHandle {
 
 /// Pool of reactor threads — one per CPU core.
 ///
-/// Each reactor is pinned to a CPU core and owns its own listener socket
-/// with `SO_REUSEPORT`. Cross-reactor communication uses per-pair SPSC
-/// ring buffers with no locks on the hot path.
+/// All reactors share a single [`ConcurrentKeyspace`] via `Arc`. The pool
+/// owns the keyspace lifetime and handles AOF replay before spawning.
 pub struct ReactorPool {
     handles: Vec<ReactorHandle>,
     coordinator: Arc<ShutdownCoordinator>,
-    /// Channel mesh: `cross_channels[from][to]` for sending from reactor
-    /// `from` to reactor `to`. Entry is `None` when `from == to`.
-    #[allow(dead_code)]
-    cross_channels: Vec<Vec<Option<CrossChannel>>>,
+    /// Shared keyspace across all reactors.
+    keyspace: Arc<ConcurrentKeyspace>,
 }
 
 impl ReactorPool {
     /// Spawn `N` reactor threads (one per CPU core by default).
     ///
-    /// Each thread is pinned to a CPU core via `core_affinity`, creates its
-    /// own SO_REUSEPORT listener, and runs an independent event loop.
+    /// Creates a shared `ConcurrentKeyspace`, replays AOF if configured,
+    /// then pins each reactor thread to a CPU core with its own
+    /// SO_REUSEPORT listener.
     pub fn spawn(config: ReactorPoolConfig) -> std::io::Result<Self> {
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
         let num_reactors = if config.threads == 0 {
@@ -98,18 +88,62 @@ impl ReactorPool {
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
 
-        // Build the N×N cross-reactor SPSC channel mesh.
-        let mut cross_channels: Vec<Vec<Option<CrossChannel>>> = Vec::with_capacity(num_reactors);
-        for from in 0..num_reactors {
-            let mut row = Vec::with_capacity(num_reactors);
-            for to in 0..num_reactors {
-                if from == to {
-                    row.push(None);
+        // ── Create shared ConcurrentKeyspace ────────────────────────
+        let keyspace = Arc::new(ConcurrentKeyspace::new(config.shard_count));
+        tracing::info!(
+            shard_count = config.shard_count,
+            "shared ConcurrentKeyspace created"
+        );
+
+        // ── AOF replay into shared keyspace ─────────────────────────
+        // Collect all per-reactor AOF file paths, then replay via K-Way
+        // merge (ordered by global LSN) into the shared keyspace ONCE,
+        // before spawning reactor threads.
+        if let Some(ref aof_cfg) = config.aof_config {
+            let mut aof_paths = Vec::with_capacity(num_reactors);
+            for i in 0..num_reactors {
+                let aof_path = if i == 0 {
+                    aof_cfg.path.clone()
                 } else {
-                    row.push(Some(Arc::new(SpscRingBuffer::new())));
+                    let stem = aof_cfg
+                        .path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let ext = aof_cfg
+                        .path
+                        .extension()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    aof_cfg
+                        .path
+                        .with_file_name(format!("{stem}-shard{i}.{ext}"))
+                };
+                aof_paths.push(aof_path);
+            }
+
+            tracing::info!(
+                num_files = aof_paths.len(),
+                "starting K-Way merge AOF replay into shared keyspace..."
+            );
+            match AofReader::replay_merge(&aof_paths, &keyspace) {
+                Ok(stats) => {
+                    tracing::info!(
+                        files_merged = stats.files_merged,
+                        commands = stats.commands_replayed,
+                        bytes = stats.bytes_read,
+                        max_lsn = stats.max_lsn,
+                        duration_ms = stats.duration_ms,
+                        "AOF K-Way merge replay complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "AOF K-Way merge replay failed — data may be missing"
+                    );
                 }
             }
-            cross_channels.push(row);
         }
 
         // Distribute resources evenly across reactors.
@@ -118,15 +152,10 @@ impl ReactorPool {
 
         let mut handles = Vec::with_capacity(num_reactors);
 
-        for (i, _) in cross_channels.iter().enumerate().take(num_reactors) {
+        for i in 0..num_reactors {
             let core_id = core_ids.get(i).copied();
             let coord_clone = Arc::clone(&coordinator);
-
-            // Gather incoming channels for this reactor: channels[j][i] for all j ≠ i.
-            let incoming: Vec<CrossChannel> = (0..num_reactors)
-                .filter(|&j| j != i)
-                .filter_map(|j| cross_channels[j][i].as_ref().map(Arc::clone))
-                .collect();
+            let ks_clone = Arc::clone(&keyspace);
 
             let reactor_config = ReactorConfig {
                 bind_addr: config.bind_addr,
@@ -152,16 +181,23 @@ impl ReactorPool {
                         }
                     }
 
-                    let mut reactor = match Reactor::new(i, reactor_config, coord_clone) {
+                    let mut reactor = match Reactor::with_shared_keyspace(
+                        i,
+                        reactor_config,
+                        coord_clone,
+                        ks_clone,
+                        num_reactors,
+                    ) {
                         Ok(r) => r,
                         Err(e) => {
-                            tracing::error!(reactor_id = i, error = %e, "failed to create reactor");
+                            tracing::error!(
+                                reactor_id = i,
+                                error = %e,
+                                "failed to create reactor"
+                            );
                             return;
                         }
                     };
-
-                    // Install cross-reactor incoming channels.
-                    reactor.set_cross_channels(incoming);
 
                     reactor.run();
                 })?;
@@ -178,7 +214,7 @@ impl ReactorPool {
         Ok(Self {
             handles,
             coordinator,
-            cross_channels,
+            keyspace,
         })
     }
 
@@ -218,6 +254,11 @@ impl ReactorPool {
     /// Returns a reference to the shared shutdown coordinator.
     pub fn coordinator(&self) -> &Arc<ShutdownCoordinator> {
         &self.coordinator
+    }
+
+    /// Returns a reference to the shared keyspace.
+    pub fn keyspace(&self) -> &Arc<ConcurrentKeyspace> {
+        &self.keyspace
     }
 }
 

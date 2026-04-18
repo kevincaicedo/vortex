@@ -1,8 +1,11 @@
 //! AOF file header and format constants.
 //!
-//! The AOF uses a minimal 16-byte header for format identification and shard
-//! association. Records are raw RESP bytes — no per-record framing beyond
-//! what RESP provides natively.
+//! **Format v2 (P1.6):** Each mutation record is prefixed with an 8-byte LSN
+//! (Logical Sequence Number, LE u64) for global causal ordering across
+//! per-reactor AOF files. Recovery uses K-Way merge on LSN.
+//!
+//! The AOF uses a minimal 16-byte header for format identification and
+//! reactor association. Records are `[LSN: 8 bytes LE] [raw RESP bytes]`.
 
 use std::io::{self, Read, Write};
 
@@ -10,10 +13,14 @@ use std::io::{self, Read, Write};
 pub const AOF_MAGIC: &[u8; 6] = b"VXAOF\x00";
 
 /// Current AOF format version.
-pub const AOF_VERSION: u16 = 1;
+/// v1: raw RESP records (no LSN). v2: LSN-prefixed records.
+pub const AOF_VERSION: u16 = 2;
 
 /// Header size in bytes (fixed).
 pub const AOF_HEADER_SIZE: usize = 16;
+
+/// Size of the LSN prefix per record (8 bytes, u64 LE).
+pub const LSN_SIZE: usize = 8;
 
 /// Fsync policy for the AOF writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,27 +50,28 @@ impl AofFsyncPolicy {
 /// ```text
 /// Offset  Size  Field
 /// 0       6     magic ("VXAOF\0")
-/// 6       2     version (u16 LE)
-/// 8       2     shard_id (u16 LE)
+/// 6       2     version (u16 LE)  — 1 = legacy (no LSN), 2 = LSN-prefixed
+/// 8       2     reactor_id (u16 LE)
 /// 10      6     created_at (u48 LE, unix seconds)
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct AofHeader {
     pub version: u16,
-    pub shard_id: u16,
+    /// Reactor ID that owns this AOF file (was `shard_id` in v1).
+    pub reactor_id: u16,
     pub created_at: u64, // truncated to 48 bits on write
 }
 
 impl AofHeader {
     /// Create a new header with current timestamp.
-    pub fn new(shard_id: u16) -> Self {
+    pub fn new(reactor_id: u16) -> Self {
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         Self {
             version: AOF_VERSION,
-            shard_id,
+            reactor_id,
             created_at,
         }
     }
@@ -73,7 +81,7 @@ impl AofHeader {
         let mut buf = [0u8; AOF_HEADER_SIZE];
         buf[0..6].copy_from_slice(AOF_MAGIC);
         buf[6..8].copy_from_slice(&self.version.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.shard_id.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.reactor_id.to_le_bytes());
         // Pack created_at as 6-byte LE (48-bit timestamp — good until year 8919766).
         let ts_bytes = self.created_at.to_le_bytes();
         buf[10..16].copy_from_slice(&ts_bytes[..6]);
@@ -99,14 +107,14 @@ impl AofHeader {
         }
 
         let version = u16::from_le_bytes([buf[6], buf[7]]);
-        if version != AOF_VERSION {
+        if version != AOF_VERSION && version != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported AOF version {version}, expected {AOF_VERSION}"),
+                format!("unsupported AOF version {version}, expected 1 or {AOF_VERSION}"),
             ));
         }
 
-        let shard_id = u16::from_le_bytes([buf[8], buf[9]]);
+        let reactor_id = u16::from_le_bytes([buf[8], buf[9]]);
 
         // Unpack 48-bit timestamp.
         let mut ts_bytes = [0u8; 8];
@@ -115,7 +123,7 @@ impl AofHeader {
 
         Ok(Self {
             version,
-            shard_id,
+            reactor_id,
             created_at,
         })
     }
@@ -171,14 +179,14 @@ mod tests {
     fn header_round_trip() {
         let header = AofHeader {
             version: AOF_VERSION,
-            shard_id: 42,
+            reactor_id: 42,
             created_at: 1_711_900_800,
         };
         let bytes = header.to_bytes();
         let mut cursor = std::io::Cursor::new(&bytes);
         let parsed = AofHeader::read_from(&mut cursor).unwrap();
         assert_eq!(parsed.version, AOF_VERSION);
-        assert_eq!(parsed.shard_id, 42);
+        assert_eq!(parsed.reactor_id, 42);
         assert_eq!(parsed.created_at, 1_711_900_800);
     }
 

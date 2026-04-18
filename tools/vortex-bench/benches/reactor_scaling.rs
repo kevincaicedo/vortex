@@ -45,6 +45,7 @@ fn reactor_scaling(c: &mut Criterion) {
                     buffer_count: 1024,
                     connection_timeout: 0,
                     aof_config: None,
+                    shard_count: 64,
                 };
 
                 let mut pool = ReactorPool::spawn(config).expect("pool creation");

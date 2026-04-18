@@ -4,8 +4,10 @@ use std::mem::size_of;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use vortex_common::{ShardId, VortexKey, VortexValue};
 use vortex_engine::commands::execute_command;
-use vortex_engine::{Entry, ExpiryEntry, ExpiryWheel, Shard, SwissTable};
+use vortex_engine::{ConcurrentKeyspace, Entry, ExpiryEntry, ExpiryWheel, Shard, SwissTable};
 use vortex_proto::RespTape;
+
+const BENCH_CONCURRENT_SHARDS: usize = 64;
 
 // ── 0.3.2 — Swiss Table Benchmarks ─────────────────────────────────
 
@@ -312,11 +314,26 @@ fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
     buf
 }
 
+fn insert_keyspace_value(keyspace: &ConcurrentKeyspace, key: VortexKey, value: VortexValue) {
+    let shard_index = keyspace.shard_index(key.as_bytes());
+    let mut guard = keyspace.write_shard_by_index(shard_index);
+    guard.insert(key, value);
+}
+
+fn prefill_keyspace(n: usize) -> ConcurrentKeyspace {
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, n);
+    for i in 0..n {
+        let key = VortexKey::from(format!("key:{i:08}").as_bytes());
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(i as i64));
+    }
+    keyspace
+}
+
 fn bench_cmd_get_inline(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     // Pre-populate with inline-sized key+value.
     let key = VortexKey::from(b"mykey" as &[u8]);
-    shard.set(key, VortexValue::from_bytes(b"myvalue"));
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"myvalue"));
 
     let cmd = make_resp(&[b"GET", b"mykey"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -324,7 +341,7 @@ fn bench_cmd_get_inline(c: &mut Criterion) {
     c.bench_function("cmd_get_inline", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"GET", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
             black_box(r);
         });
     });
@@ -335,28 +352,28 @@ fn bench_cmd_set_inline(c: &mut Criterion) {
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_set_inline", |b| {
-        // Pre-create shard: benchmark measures overwrite (hot-path SET).
-        let mut shard = Shard::new(ShardId::new(0));
+        // Pre-create keyspace: benchmark measures overwrite (hot-path SET).
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
         let key = VortexKey::from(b"mykey" as &[u8]);
-        shard.set(key, VortexValue::from_bytes(b"old"));
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"old"));
 
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"SET", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_get_miss(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let cmd = make_resp(&[b"GET", b"nosuchkey"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_get_miss", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"GET", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
             black_box(r);
         });
     });
@@ -367,26 +384,26 @@ fn bench_cmd_incr(c: &mut Criterion) {
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_incr", |b| {
-        let mut shard = Shard::new(ShardId::new(0));
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
         let key = VortexKey::from(b"counter" as &[u8]);
-        shard.set(key, VortexValue::Integer(0));
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(0));
 
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"INCR", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"INCR", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_mget_100(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 100);
     // Pre-populate 100 keys.
     let mut parts: Vec<Vec<u8>> = vec![b"MGET".to_vec()];
     for i in 0..100 {
         let key_str = format!("key:{i:04}");
         let key = VortexKey::from(key_str.as_bytes());
-        shard.set(key, VortexValue::Integer(i));
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(i));
         parts.push(key_str.into_bytes());
     }
 
@@ -397,7 +414,7 @@ fn bench_cmd_mget_100(c: &mut Criterion) {
     c.bench_function("cmd_mget_100", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"MGET", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"MGET", &frame, 0);
             black_box(r);
         });
     });
@@ -415,16 +432,16 @@ fn bench_cmd_mset_100(c: &mut Criterion) {
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_mset_100", |b| {
-        // Pre-create shard with capacity; measures overwrite path.
-        let mut shard = Shard::new(ShardId::new(0));
+        // Pre-create keyspace with capacity; measures overwrite path.
+        let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 100);
         for i in 0..100 {
             let key = VortexKey::from(format!("key:{i:04}").as_bytes());
-            shard.set(key, VortexValue::from_bytes(b"old"));
+            insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"old"));
         }
 
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"MSET", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"MSET", &frame, 0);
             black_box(r);
         });
     });
@@ -435,22 +452,99 @@ fn bench_cmd_append_inline(c: &mut Criterion) {
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_append_inline", |b| {
-        let mut shard = Shard::new(ShardId::new(0));
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
         let key = VortexKey::from(b"mykey" as &[u8]);
-        shard.set(key.clone(), VortexValue::from_bytes(b"hello"));
+        insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"hello"));
 
         b.iter(|| {
             // Reset value to inline before each append (keeps it short).
-            shard.set(key.clone(), VortexValue::from_bytes(b"hello"));
+            insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"hello"));
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"APPEND", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"APPEND", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_concurrent_cmd_get_inline(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"myvalue"));
+
+    let cmd = make_resp(&[b"GET", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("concurrent_cmd_get_inline", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_concurrent_cmd_set_inline(c: &mut Criterion) {
+    let cmd = make_resp(&[b"SET", b"mykey", b"myvalue"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("concurrent_cmd_set_inline", |b| {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        insert_keyspace_value(
+            &keyspace,
+            VortexKey::from(b"mykey" as &[u8]),
+            VortexValue::from_bytes(b"old"),
+        );
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_concurrent_cmd_mget_100(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 100);
+    let mut parts: Vec<Vec<u8>> = vec![b"MGET".to_vec()];
+    for i in 0..100 {
+        let key_bytes = format!("key:{i:04}").into_bytes();
+        insert_keyspace_value(
+            &keyspace,
+            VortexKey::from(key_bytes.as_slice()),
+            VortexValue::Integer(i),
+        );
+        parts.push(key_bytes);
+    }
+
+    let refs: Vec<&[u8]> = parts.iter().map(|part| part.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("concurrent_cmd_mget_100", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"MGET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_concurrent_cmd_dbsize_10k(c: &mut Criterion) {
+    let keyspace = prefill_keyspace(10_000);
+    let cmd = make_resp(&[b"DBSIZE"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("concurrent_cmd_dbsize_10k", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"DBSIZE", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_throughput_get_set_mix(c: &mut Criterion) {
-    // 50/50 GET/SET mix over 1M-key shard, measuring single-core throughput.
+    // 50/50 GET/SET mix over 1M-key keyspace, measuring single-core throughput.
     let n_keys = 1_000_000usize;
     let n_tapes = 1000usize;
     let batch = 100_000usize;
@@ -470,11 +564,11 @@ fn bench_throughput_get_set_mix(c: &mut Criterion) {
         .map(|c| RespTape::parse_pipeline(c).unwrap())
         .collect();
 
-    // Pre-fill shard once (reused across iterations).
-    let mut shard = Shard::new(ShardId::new(0));
+    // Pre-fill keyspace once (reused across iterations).
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, n_keys);
     for i in 0..n_keys {
         let key = VortexKey::from(format!("k:{i:08}").as_bytes());
-        shard.set(key, VortexValue::from_bytes(b"val"));
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
     }
 
     c.bench_function("throughput_get_set_mix", |b| {
@@ -483,11 +577,11 @@ fn bench_throughput_get_set_mix(c: &mut Criterion) {
                 let idx = i % n_tapes;
                 if i & 1 == 0 {
                     let frame = set_tapes[idx].iter().next().unwrap();
-                    let r = execute_command(&mut shard, b"SET", &frame, 0);
+                    let r = execute_command(&keyspace, b"SET", &frame, 0);
                     black_box(r);
                 } else {
                     let frame = get_tapes[idx].iter().next().unwrap();
-                    let r = execute_command(&mut shard, b"GET", &frame, 0);
+                    let r = execute_command(&keyspace, b"GET", &frame, 0);
                     black_box(r);
                 }
             }
@@ -502,23 +596,23 @@ fn bench_cmd_del_inline(c: &mut Criterion) {
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_del_inline", |b| {
-        let mut shard = Shard::new(ShardId::new(0));
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
         let key = VortexKey::from(b"mykey" as &[u8]);
 
         b.iter(|| {
             // Re-insert so DEL always finds the key.
-            shard.set(key.clone(), VortexValue::from_bytes(b"val"));
+            insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"val"));
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"DEL", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"DEL", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_exists(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let key = VortexKey::from(b"mykey" as &[u8]);
-    shard.set(key, VortexValue::from_bytes(b"val"));
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
 
     let cmd = make_resp(&[b"EXISTS", b"mykey"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -526,16 +620,16 @@ fn bench_cmd_exists(c: &mut Criterion) {
     c.bench_function("cmd_exists", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"EXISTS", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_expire(c: &mut Criterion) {
-    let mut shard = Shard::new_with_time(ShardId::new(0), 1_000_000_000_000);
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let key = VortexKey::from(b"mykey" as &[u8]);
-    shard.set(key, VortexValue::from_bytes(b"val"));
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
 
     let cmd = make_resp(&[b"EXPIRE", b"mykey", b"3600"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -543,7 +637,7 @@ fn bench_cmd_expire(c: &mut Criterion) {
     c.bench_function("cmd_expire", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"EXPIRE", &frame, 1_000_000_000_000);
+            let r = execute_command(black_box(&keyspace), b"EXPIRE", &frame, 1_000_000_000_000);
             black_box(r);
         });
     });
@@ -551,10 +645,16 @@ fn bench_cmd_expire(c: &mut Criterion) {
 
 fn bench_cmd_ttl(c: &mut Criterion) {
     let now: u64 = 1_000_000_000_000;
-    let mut shard = Shard::new_with_time(ShardId::new(0), now);
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let key = VortexKey::from(b"mykey" as &[u8]);
-    shard.set(key.clone(), VortexValue::from_bytes(b"val"));
-    shard.expire(&key, now + 3600 * 1_000_000_000);
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
+    // Set TTL via EXPIRE command.
+    {
+        let expire_cmd = make_resp(&[b"EXPIRE", b"mykey", b"3600"]);
+        let expire_tape = RespTape::parse_pipeline(&expire_cmd).unwrap();
+        let frame = expire_tape.iter().next().unwrap();
+        execute_command(&keyspace, b"EXPIRE", &frame, now);
+    }
 
     let cmd = make_resp(&[b"TTL", b"mykey"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -562,16 +662,16 @@ fn bench_cmd_ttl(c: &mut Criterion) {
     c.bench_function("cmd_ttl", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"TTL", &frame, now);
+            let r = execute_command(black_box(&keyspace), b"TTL", &frame, now);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_type(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let key = VortexKey::from(b"mykey" as &[u8]);
-    shard.set(key, VortexValue::from_bytes(b"val"));
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
 
     let cmd = make_resp(&[b"TYPE", b"mykey"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -579,17 +679,17 @@ fn bench_cmd_type(c: &mut Criterion) {
     c.bench_function("cmd_type", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"TYPE", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"TYPE", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_scan_10k(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 10_000);
     for i in 0..10_000 {
         let key = VortexKey::from(format!("key:{i:06}").as_str());
-        shard.set(key, VortexValue::Integer(i));
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(i));
     }
 
     c.bench_function("cmd_scan_10k", |b| {
@@ -601,7 +701,7 @@ fn bench_cmd_scan_10k(c: &mut Criterion) {
                 let cmd = make_resp(&[b"SCAN", cur_str.as_bytes(), b"COUNT", b"100"]);
                 let tape = RespTape::parse_pipeline(&cmd).unwrap();
                 let frame = tape.iter().next().unwrap();
-                let r = execute_command(black_box(&mut shard), b"SCAN", &frame, 0);
+                let r = execute_command(black_box(&keyspace), b"SCAN", &frame, 0);
                 // Extract next cursor from response.
                 if let Some(vortex_engine::commands::CmdResult::Resp(
                     vortex_proto::RespFrame::Array(Some(ref arr)),
@@ -624,10 +724,10 @@ fn bench_cmd_scan_10k(c: &mut Criterion) {
 }
 
 fn bench_cmd_keys_star_10k(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 10_000);
     for i in 0..10_000 {
         let key = VortexKey::from(format!("key:{i:06}").as_str());
-        shard.set(key, VortexValue::Integer(i));
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(i));
     }
 
     let cmd = make_resp(&[b"KEYS", b"*"]);
@@ -636,7 +736,7 @@ fn bench_cmd_keys_star_10k(c: &mut Criterion) {
     c.bench_function("cmd_keys_star_10k", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"KEYS", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"KEYS", &frame, 0);
             black_box(r);
         });
     });
@@ -646,19 +746,9 @@ fn bench_cmd_keys_star_10k(c: &mut Criterion) {
 
 // ── Task 3.9 — Prefetch Pipeline Benchmarks ─────────────────────────
 
-/// Helper: build a shard with N keys of format "key:{i:08}".
-fn prefill_shard(n: usize) -> Shard {
-    let mut shard = Shard::new(ShardId::new(0));
-    for i in 0..n {
-        let key = VortexKey::from(format!("key:{i:08}").as_bytes());
-        shard.set(key, VortexValue::Integer(i as i64));
-    }
-    shard
-}
-
-/// MGET 100 keys from a 1M-entry shard (measures full command latency at scale).
+/// MGET 100 keys from a 1M-entry keyspace (measures full command latency at scale).
 fn bench_cmd_mget_100_1m(c: &mut Criterion) {
-    let mut shard = prefill_shard(1_000_000);
+    let keyspace = prefill_keyspace(1_000_000);
 
     // Build MGET command with 100 keys scattered across the keyspace.
     let mut parts: Vec<Vec<u8>> = vec![b"MGET".to_vec()];
@@ -672,7 +762,7 @@ fn bench_cmd_mget_100_1m(c: &mut Criterion) {
     c.bench_function("cmd_mget_100_1m", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"MGET", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"MGET", &frame, 0);
             black_box(r);
         });
     });
@@ -755,9 +845,9 @@ fn bench_table_batch_100_1m_no_prefetch(c: &mut Criterion) {
     });
 }
 
-/// DEL 100 keys from a 1M-entry shard (measures full command latency at scale).
+/// DEL 100 keys from a 1M-entry keyspace (measures full command latency at scale).
 fn bench_cmd_del_100_1m(c: &mut Criterion) {
-    let mut shard = prefill_shard(1_000_000);
+    let keyspace = prefill_keyspace(1_000_000);
 
     let del_keys: Vec<Vec<u8>> = (0..100)
         .map(|i| format!("key:{:08}", i * 10_000).into_bytes())
@@ -776,18 +866,18 @@ fn bench_cmd_del_100_1m(c: &mut Criterion) {
             // Re-insert deleted keys so each iteration deletes 100.
             for k in &del_keys {
                 let key = VortexKey::from(k.as_slice());
-                shard.set(key, VortexValue::Integer(0));
+                insert_keyspace_value(&keyspace, key, VortexValue::Integer(0));
             }
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"DEL", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"DEL", &frame, 0);
             black_box(r);
         });
     });
 }
 
-/// EXISTS 100 keys from 1M-entry shard (measures full command latency at scale).
+/// EXISTS 100 keys from 1M-entry keyspace (measures full command latency at scale).
 fn bench_cmd_exists_100_1m(c: &mut Criterion) {
-    let mut shard = prefill_shard(1_000_000);
+    let keyspace = prefill_keyspace(1_000_000);
 
     let mut parts: Vec<Vec<u8>> = vec![b"EXISTS".to_vec()];
     for i in 0..100 {
@@ -800,32 +890,32 @@ fn bench_cmd_exists_100_1m(c: &mut Criterion) {
     c.bench_function("cmd_exists_100_1m", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"EXISTS", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"EXISTS", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_ping(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let cmd = make_resp(&[b"PING"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
 
     c.bench_function("cmd_ping", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"PING", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"PING", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_dbsize(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 10_000);
     // Fill with 10K keys to make DBSIZE non-trivial.
     for i in 0..10_000 {
         let key = VortexKey::from(format!("key:{i:06}").as_str());
-        shard.set(key, VortexValue::Integer(i));
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(i));
     }
     let cmd = make_resp(&[b"DBSIZE"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -833,17 +923,17 @@ fn bench_cmd_dbsize(c: &mut Criterion) {
     c.bench_function("cmd_dbsize", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"DBSIZE", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"DBSIZE", &frame, 0);
             black_box(r);
         });
     });
 }
 
 fn bench_cmd_info(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 1_000);
     for i in 0..1_000 {
         let key = VortexKey::from(format!("key:{i:06}").as_str());
-        shard.set(key, VortexValue::Integer(i));
+        insert_keyspace_value(&keyspace, key, VortexValue::Integer(i));
     }
     let cmd = make_resp(&[b"INFO"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -851,7 +941,7 @@ fn bench_cmd_info(c: &mut Criterion) {
     c.bench_function("cmd_info", |b| {
         b.iter(|| {
             let frame = tape.iter().next().unwrap();
-            let r = execute_command(black_box(&mut shard), b"INFO", &frame, 0);
+            let r = execute_command(black_box(&keyspace), b"INFO", &frame, 0);
             black_box(r);
         });
     });
@@ -947,10 +1037,10 @@ fn bench_throughput_get_set_1m(c: &mut Criterion) {
         .map(|c| RespTape::parse_pipeline(c).unwrap())
         .collect();
 
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, n_keys);
     for i in 0..n_keys {
         let key = VortexKey::from(format!("k:{i:08}").as_bytes());
-        shard.set(key, VortexValue::from_bytes(b"val"));
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
     }
 
     c.bench_function("throughput_get_set_1m", |b| {
@@ -959,11 +1049,11 @@ fn bench_throughput_get_set_1m(c: &mut Criterion) {
                 let idx = i % n_tapes;
                 if i & 1 == 0 {
                     let frame = set_tapes[idx].iter().next().unwrap();
-                    let r = execute_command(&mut shard, b"SET", &frame, 0);
+                    let r = execute_command(&keyspace, b"SET", &frame, 0);
                     black_box(r);
                 } else {
                     let frame = get_tapes[idx].iter().next().unwrap();
-                    let r = execute_command(&mut shard, b"GET", &frame, 0);
+                    let r = execute_command(&keyspace, b"GET", &frame, 0);
                     black_box(r);
                 }
             }
@@ -1012,11 +1102,11 @@ fn bench_memory_per_entry(c: &mut Criterion) {
 /// Measures p50, p99, p999 using hdrhistogram.
 /// We capture 100K GET latencies into a histogram and report percentiles.
 fn bench_latency_distribution_get(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
-    // Pre-fill with 100K entries for a realistically populated shard.
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 100_000);
+    // Pre-fill with 100K entries for a realistically populated keyspace.
     for i in 0..100_000 {
         let key = VortexKey::from(format!("k:{i:08}").as_bytes());
-        shard.set(key, VortexValue::from_bytes(b"value"));
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"value"));
     }
 
     let cmd = make_resp(&[b"GET", b"k:00050000"]);
@@ -1029,7 +1119,7 @@ fn bench_latency_distribution_get(c: &mut Criterion) {
             for _ in 0..10_000 {
                 let start = std::time::Instant::now();
                 let frame = tape.iter().next().unwrap();
-                let r = execute_command(black_box(&mut shard), b"GET", &frame, 0);
+                let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
                 black_box(r);
                 let elapsed = start.elapsed().as_nanos() as u64;
                 let _ = hist.record(elapsed);
@@ -1044,10 +1134,10 @@ fn bench_latency_distribution_get(c: &mut Criterion) {
 
 /// Latency distribution for point SET operations.
 fn bench_latency_distribution_set(c: &mut Criterion) {
-    let mut shard = Shard::new(ShardId::new(0));
+    let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 100_000);
     for i in 0..100_000 {
         let key = VortexKey::from(format!("k:{i:08}").as_bytes());
-        shard.set(key, VortexValue::from_bytes(b"old"));
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"old"));
     }
 
     let cmd = make_resp(&[b"SET", b"k:00050000", b"newvalue"]);
@@ -1059,7 +1149,7 @@ fn bench_latency_distribution_set(c: &mut Criterion) {
             for _ in 0..10_000 {
                 let start = std::time::Instant::now();
                 let frame = tape.iter().next().unwrap();
-                let r = execute_command(black_box(&mut shard), b"SET", &frame, 0);
+                let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
                 black_box(r);
                 let elapsed = start.elapsed().as_nanos() as u64;
                 let _ = hist.record(elapsed);
@@ -1212,6 +1302,10 @@ criterion_group!(
     bench_cmd_mget_100,
     bench_cmd_mset_100,
     bench_cmd_append_inline,
+    bench_concurrent_cmd_get_inline,
+    bench_concurrent_cmd_set_inline,
+    bench_concurrent_cmd_mget_100,
+    bench_concurrent_cmd_dbsize_10k,
     bench_cmd_del_inline,
     bench_cmd_exists,
     bench_cmd_expire,

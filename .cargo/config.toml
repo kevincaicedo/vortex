@@ -1,0 +1,7 @@
+[target.'cfg(any(target_os = "linux", target_os = "macos"))']
+rustflags = [
+    "-C",
+    "force-frame-pointers=yes",
+    "-C",
+    "symbol-mangling-version=v0",
+]

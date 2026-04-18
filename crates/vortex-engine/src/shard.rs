@@ -167,58 +167,6 @@ impl Shard {
         self.data.get_or_insert_with(key, default_fn)
     }
 
-    /// SET + options: handles NX (only set if key doesn't exist),
-    /// XX (only set if key exists), GET (return old value), KEEPTTL.
-    ///
-    /// Returns `SetResult` indicating what happened.
-    pub(crate) fn set_with_options(
-        &mut self,
-        key: VortexKey,
-        value: VortexValue,
-        options: SetOptions,
-    ) -> SetResult {
-        let exists = self.data.contains_key(&key);
-
-        // NX: only set if NOT exists
-        if options.nx && exists {
-            return if options.get {
-                SetResult::NotSetGet(self.data.get(&key).cloned())
-            } else {
-                SetResult::NotSet
-            };
-        }
-        // XX: only set if EXISTS
-        if options.xx && !exists {
-            return if options.get {
-                SetResult::NotSetGet(None)
-            } else {
-                SetResult::NotSet
-            };
-        }
-
-        // Preserve old TTL if KEEPTTL and key already exists.
-        let effective_ttl = if options.keepttl && exists {
-            self.data.get_entry_ttl(&key).unwrap_or(0)
-        } else {
-            options.ttl_deadline
-        };
-
-        let old = if effective_ttl != 0 {
-            let hash = self.data.hash_key_bytes(key.as_bytes());
-            let prev = self.data.insert_with_ttl(key, value, effective_ttl);
-            self.expiry.register(hash, effective_ttl);
-            prev
-        } else {
-            self.data.insert(key, value)
-        };
-
-        if options.get {
-            SetResult::OkGet(old)
-        } else {
-            SetResult::Ok
-        }
-    }
-
     /// Prefetch the control byte group for a key (for MGET batching — read path).
     #[inline]
     pub fn prefetch(&self, key: &VortexKey) {
@@ -311,6 +259,11 @@ impl Shard {
     /// DBSIZE: returns the number of keys.
     pub fn dbsize(&self) -> VortexResult<usize> {
         Ok(self.data.len())
+    }
+
+    /// Returns the exact live-entry memory tracked by the underlying table.
+    pub fn memory_used(&self) -> usize {
+        self.data.local_memory_used()
     }
 
     /// Returns the number of keys that have a TTL set.

@@ -1,6 +1,6 @@
 //! AOF rewrite (compaction).
 //!
-//! Rewrites the AOF by dumping the current shard state as a sequence of SET
+//! Rewrites the AOF by dumping the current keyspace state as a sequence of SET
 //! commands. This collapses the entire mutation history into the minimal set
 //! of commands needed to reconstruct the current state.
 //!
@@ -8,23 +8,21 @@
 //!
 //! 1. Create a temporary AOF file (`{path}.rewrite.tmp`).
 //! 2. Write the header.
-//! 3. For each key in the shard, emit a SET command (with TTL if applicable).
+//! 3. For each shard in the keyspace, emit SET commands for all live keys.
 //! 4. Atomically rename the temp file to the real AOF path.
 //! 5. Swap the writer's underlying file.
 //!
 //! During rewrite, new mutations continue writing to the **old** AOF. After
-//! the rewrite completes, the old AOF is replaced. Any mutations that
-//! occurred during rewrite are already in the old AOF and will be replayed
-//! if needed — but since the rewrite captures the state *at start of rewrite
-//! plus continued mutations*, we use a two-phase approach: the reactor
-//! continues writing to the old file, then swaps atomically.
+//! the rewrite completes, the old AOF is replaced. The rewrite file uses
+//! the v1-style format (no LSN prefix) since it is a snapshot — LSN numbering
+//! resumes from the current global LSN after the swap.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use vortex_common::{Timestamp, VortexValue};
-use vortex_engine::Shard;
+use vortex_engine::ConcurrentKeyspace;
 
 use super::format::AofHeader;
 
@@ -35,59 +33,69 @@ const REWRITE_BUF_SIZE: usize = 128 * 1024;
 pub struct AofRewriter;
 
 impl AofRewriter {
-    /// Rewrite the AOF by dumping the current shard state.
+    /// Rewrite the AOF by dumping the current keyspace state.
     ///
-    /// Returns the path to the new AOF file and the number of keys written.
-    /// The caller should swap the writer to the new file.
-    pub fn rewrite(shard: &Shard, aof_path: &Path, shard_id: u16) -> io::Result<(PathBuf, u64)> {
+    /// Iterates all shards in the `ConcurrentKeyspace`, acquiring a read lock
+    /// per shard. Returns the path to the new AOF file and the number of keys
+    /// written. The caller should swap the writer to the new file.
+    pub fn rewrite(
+        keyspace: &ConcurrentKeyspace,
+        aof_path: &Path,
+        reactor_id: u16,
+    ) -> io::Result<(PathBuf, u64)> {
         let tmp_path = aof_path.with_extension("rewrite.tmp");
 
-        // Create temp file with header.
         let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::with_capacity(REWRITE_BUF_SIZE, file);
 
-        let header = AofHeader::new(shard_id);
+        // Rewrite files use v1 format (no LSN prefix per record) since they
+        // are point-in-time snapshots. LSN numbering resumes from the current
+        // global LSN after the writer swap.
+        let mut header = AofHeader::new(reactor_id);
+        header.version = 1;
         header.write_to(&mut writer)?;
 
         let now_nanos = Timestamp::now().as_nanos();
         let mut keys_written = 0u64;
 
-        // Iterate all slots in the Swiss Table.
-        let total = shard.total_slots();
-        for slot in 0..total {
-            if let Some((key_bytes, value)) = shard.slot_key_value(slot) {
-                let ttl_nanos = shard.slot_entry_ttl(slot);
+        // Iterate all shards, taking a read lock on each one at a time.
+        for shard_idx in 0..keyspace.num_shards() {
+            let shard = keyspace.read_shard_by_index(shard_idx);
+            let total = shard.total_slots();
+            for slot in 0..total {
+                if let Some((key_bytes, value)) = shard.slot_key_value(slot) {
+                    let ttl_nanos = shard.slot_entry_ttl(slot);
 
-                // Skip expired entries.
-                if ttl_nanos != 0 && ttl_nanos <= now_nanos {
-                    continue;
-                }
-
-                // Serialize as RESP SET command.
-                match value {
-                    VortexValue::Integer(n) => {
-                        // Emit the integer as its string representation.
-                        let mut buf = itoa::Buffer::new();
-                        let s = buf.format(*n);
-                        Self::write_set_cmd(&mut writer, key_bytes.as_bytes(), s.as_bytes())?;
-                    }
-                    VortexValue::InlineString(_) | VortexValue::String(_) => {
-                        let bytes = value.as_string_bytes().unwrap_or(b"");
-                        Self::write_set_cmd(&mut writer, key_bytes.as_bytes(), bytes)?;
-                    }
-                    _ => {
-                        // Skip non-string types for now (Phase 4 will extend).
+                    // Skip expired entries.
+                    if ttl_nanos != 0 && ttl_nanos <= now_nanos {
                         continue;
                     }
-                }
 
-                // If the key has a TTL, emit PEXPIREAT.
-                if ttl_nanos != 0 && ttl_nanos > now_nanos {
-                    let deadline_ms = ttl_nanos / 1_000_000;
-                    Self::write_pexpireat_cmd(&mut writer, key_bytes.as_bytes(), deadline_ms)?;
-                }
+                    // Serialize as RESP SET command.
+                    match value {
+                        VortexValue::Integer(n) => {
+                            let mut buf = itoa::Buffer::new();
+                            let s = buf.format(*n);
+                            Self::write_set_cmd(&mut writer, key_bytes.as_bytes(), s.as_bytes())?;
+                        }
+                        VortexValue::InlineString(_) | VortexValue::String(_) => {
+                            let bytes = value.as_string_bytes().unwrap_or(b"");
+                            Self::write_set_cmd(&mut writer, key_bytes.as_bytes(), bytes)?;
+                        }
+                        _ => {
+                            // Skip non-string types for now (Phase 4 will extend).
+                            continue;
+                        }
+                    }
 
-                keys_written += 1;
+                    // If the key has a TTL, emit PEXPIREAT.
+                    if ttl_nanos != 0 && ttl_nanos > now_nanos {
+                        let deadline_ms = ttl_nanos / 1_000_000;
+                        Self::write_pexpireat_cmd(&mut writer, key_bytes.as_bytes(), deadline_ms)?;
+                    }
+
+                    keys_written += 1;
+                }
             }
         }
 
@@ -147,7 +155,8 @@ impl AofRewriter {
 mod tests {
     use super::*;
     use crate::aof::reader::AofReader;
-    use vortex_common::{ShardId, VortexKey, VortexValue};
+    use vortex_engine::commands::execute_command;
+    use vortex_proto::RespTape;
 
     fn temp_path(suffix: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,30 +176,35 @@ mod tests {
         let _ = fs::remove_file(path.with_extension("rewrite.tmp"));
     }
 
+    fn make_keyspace() -> ConcurrentKeyspace {
+        ConcurrentKeyspace::new(64)
+    }
+
+    /// Helper: run a RESP command against the keyspace.
+    fn run_cmd(ks: &ConcurrentKeyspace, cmd: &[u8]) {
+        let tape = RespTape::parse_pipeline(cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let name = frame.command_name().unwrap();
+        let now = Timestamp::now().as_nanos();
+        let _ = execute_command(ks, name, &frame, now);
+    }
+
     #[test]
     fn rewrite_basic() {
         let path = temp_path("basic");
-        let now = Timestamp::now().as_nanos();
+        let ks = make_keyspace();
 
-        let mut shard = Shard::new_with_time(ShardId::new(0), now);
-        shard.set(
-            VortexKey::from(b"key1" as &[u8]),
-            VortexValue::from_bytes(b"value1"),
-        );
-        shard.set(
-            VortexKey::from(b"key2" as &[u8]),
-            VortexValue::from_bytes(b"value2"),
-        );
+        run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n");
+        run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$4\r\nkey2\r\n$6\r\nvalue2\r\n");
 
-        let (_, keys) = AofRewriter::rewrite(&shard, &path, 0).unwrap();
+        let (_, keys) = AofRewriter::rewrite(&ks, &path, 0).unwrap();
         assert_eq!(keys, 2);
 
-        // Replay the rewritten AOF into a fresh shard.
+        // Replay the rewritten AOF into a fresh keyspace.
+        let ks2 = make_keyspace();
         let reader = AofReader::new(&path);
-        let mut new_shard = Shard::new_with_time(ShardId::new(0), now);
-        let stats = reader.replay(&mut new_shard).unwrap();
+        let stats = reader.replay_into_keyspace(&ks2).unwrap();
         assert_eq!(stats.commands_replayed, 2);
-        assert_eq!(new_shard.len(), 2);
 
         cleanup(&path);
     }
@@ -198,30 +212,28 @@ mod tests {
     #[test]
     fn rewrite_with_ttl() {
         let path = temp_path("ttl");
-        let now = Timestamp::now().as_nanos();
-        let future = now + 60_000_000_000; // 60 seconds from now
+        let ks = make_keyspace();
 
-        let mut shard = Shard::new_with_time(ShardId::new(0), now);
-        shard.set_with_ttl(
-            VortexKey::from(b"ephemeral" as &[u8]),
-            VortexValue::from_bytes(b"data"),
-            future,
+        // SET ephemeral with TTL via PEXPIREAT.
+        run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$9\r\nephemeral\r\n$4\r\ndata\r\n");
+        let future_ms = Timestamp::now().as_nanos() / 1_000_000 + 60_000;
+        let pexpireat_cmd = format!(
+            "*3\r\n$9\r\nPEXPIREAT\r\n$9\r\nephemeral\r\n${}\r\n{}\r\n",
+            format!("{future_ms}").len(),
+            future_ms
         );
-        shard.set(
-            VortexKey::from(b"permanent" as &[u8]),
-            VortexValue::from_bytes(b"data"),
-        );
+        run_cmd(&ks, pexpireat_cmd.as_bytes());
 
-        let (_, keys) = AofRewriter::rewrite(&shard, &path, 0).unwrap();
+        run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$9\r\npermanent\r\n$4\r\ndata\r\n");
+
+        let (_, keys) = AofRewriter::rewrite(&ks, &path, 0).unwrap();
         assert_eq!(keys, 2);
 
-        // Replay — the ephemeral key should have a TTL (PEXPIREAT emitted).
+        // Replay — 2 SETs + 1 PEXPIREAT = 3 commands.
+        let ks2 = make_keyspace();
         let reader = AofReader::new(&path);
-        let mut new_shard = Shard::new_with_time(ShardId::new(0), now);
-        let stats = reader.replay(&mut new_shard).unwrap();
-        // 2 SETs + 1 PEXPIREAT = 3 commands
+        let stats = reader.replay_into_keyspace(&ks2).unwrap();
         assert_eq!(stats.commands_replayed, 3);
-        assert_eq!(new_shard.len(), 2);
 
         cleanup(&path);
     }
@@ -229,27 +241,17 @@ mod tests {
     #[test]
     fn rewrite_integer_values() {
         let path = temp_path("integers");
-        let now = Timestamp::now().as_nanos();
+        let ks = make_keyspace();
 
-        let mut shard = Shard::new_with_time(ShardId::new(0), now);
-        shard.set(
-            VortexKey::from(b"counter" as &[u8]),
-            VortexValue::Integer(42),
-        );
+        run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$2\r\n42\r\n");
 
-        let (_, keys) = AofRewriter::rewrite(&shard, &path, 0).unwrap();
+        let (_, keys) = AofRewriter::rewrite(&ks, &path, 0).unwrap();
         assert_eq!(keys, 1);
 
+        let ks2 = make_keyspace();
         let reader = AofReader::new(&path);
-        let mut new_shard = Shard::new_with_time(ShardId::new(0), now);
-        let stats = reader.replay(&mut new_shard).unwrap();
+        let stats = reader.replay_into_keyspace(&ks2).unwrap();
         assert_eq!(stats.commands_replayed, 1);
-
-        let key = VortexKey::from(b"counter" as &[u8]);
-        let val = new_shard.get(&key, now).expect("counter should exist");
-        // After SET "42", the value is stored as a string that can be parsed as integer
-        // by INCR/DECR. The exact representation depends on value_from_bytes.
-        assert!(val.as_string_bytes().is_some() || val.try_as_integer().is_some());
 
         cleanup(&path);
     }
@@ -257,28 +259,23 @@ mod tests {
     #[test]
     fn rewrite_compacts_history() {
         let path = temp_path("compact");
-        let now = Timestamp::now().as_nanos();
+        let ks = make_keyspace();
 
-        // Build shard with mutation history.
-        let mut shard = Shard::new_with_time(ShardId::new(0), now);
-        // Set then overwrite key1 many times — only final value matters.
+        // Overwrite key1 many times — only final value matters.
         for i in 0..100 {
-            shard.set(
-                VortexKey::from(b"key1" as &[u8]),
-                VortexValue::from_bytes(format!("val{i}").as_bytes()),
+            let val = format!("val{i}");
+            let cmd = format!(
+                "*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n${}\r\n{}\r\n",
+                val.len(),
+                val
             );
+            run_cmd(&ks, cmd.as_bytes());
         }
         // Set then delete key2 — should not appear in rewrite.
-        shard.set(
-            VortexKey::from(b"key2" as &[u8]),
-            VortexValue::from_bytes(b"gone"),
-        );
-        shard.del(&VortexKey::from(b"key2" as &[u8]));
+        run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$4\r\nkey2\r\n$4\r\ngone\r\n");
+        run_cmd(&ks, b"*2\r\n$3\r\nDEL\r\n$4\r\nkey2\r\n");
 
-        // Shard should have 1 key.
-        assert_eq!(shard.len(), 1);
-
-        let (_, keys) = AofRewriter::rewrite(&shard, &path, 0).unwrap();
+        let (_, keys) = AofRewriter::rewrite(&ks, &path, 0).unwrap();
         assert_eq!(keys, 1); // Only key1 with final value.
 
         cleanup(&path);

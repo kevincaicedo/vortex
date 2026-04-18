@@ -5,7 +5,7 @@
 //! This crate implements the **thread-per-core** reactor architecture:
 //!
 //! - Each CPU core runs a dedicated [`Reactor`] with its own event loop,
-//!   memory arena, io_uring instance (Linux), and keyspace shard.
+//!   memory arena, and io_uring instance (Linux).
 //! - Connections are pinned to cores via `SO_REUSEPORT`.
 //! - The [`IoBackend`] trait abstracts over io_uring (Linux) and polling
 //!   (cross-platform fallback via epoll/kqueue/IOCP).
@@ -32,7 +32,7 @@ pub mod shutdown;
 pub mod timer;
 
 pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
-pub use pool::{CrossMessage, ReactorPool, ReactorPoolConfig};
+pub use pool::{ReactorPool, ReactorPoolConfig};
 pub use reactor::{AofConfig, Reactor, ReactorConfig};
 pub use shutdown::ShutdownCoordinator;
 pub use timer::TimerWheel;

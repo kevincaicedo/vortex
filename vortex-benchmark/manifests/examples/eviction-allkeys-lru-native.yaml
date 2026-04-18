@@ -1,0 +1,30 @@
+schema_version: 1
+name: eviction-allkeys-lru-native
+description: Native Redis write-pressure scenario used to validate eviction reporting in CI.
+databases:
+  - redis
+backends:
+  - memtier_benchmark
+workloads:
+  - uniform-write_heavy
+duration: 20s
+environment:
+  mode: native
+  port_base: 16579
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  maxmemory: 64mb
+  eviction_policy: allkeys-lru
+settings:
+  memtier_benchmark:
+    clients: 20
+    pipeline: 1
+    keyspace_size: 200000
+    data_size: 1024
+    thread_sweep:
+      - 1
+      - 4

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "mixed-container",
+  "description": "Containerized mixed workload comparison across all supported databases.",
+  "databases": [
+    "vortex",
+    "redis",
+    "dragonfly",
+    "valkey"
+  ],
+  "backends": [
+    "redis-benchmark",
+    "memtier_benchmark"
+  ],
+  "workloads": [
+    "uniform-mixed",
+    "zipfian-mixed",
+    "multi-key operations"
+  ],
+  "command_groups": [
+    "strings",
+    "transactions"
+  ],
+  "duration": "90s",
+  "environment": {
+    "mode": "container",
+    "port_base": 16379
+  },
+  "resource_config": {
+    "cpus": 4,
+    "memory": "2g",
+    "threads": 4
+  },
+  "settings": {
+    "clients": 100,
+    "pipeline": 16,
+    "keyspace_size": 1000000,
+    "value_size_bytes": 384,
+    "thread_sweep": [
+      1,
+      2,
+      4,
+      8
+    ]
+  }
+}

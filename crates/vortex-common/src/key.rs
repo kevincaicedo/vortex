@@ -67,6 +67,16 @@ impl VortexKey {
     pub fn is_inline(&self) -> bool {
         matches!(self, Self::Inline { .. })
     }
+
+    /// Returns a rough estimate of the key's memory usage in bytes.
+    #[inline]
+    pub fn memory_usage(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Inline { .. } => 0,
+                Self::Heap(bytes) => bytes.len(),
+            }
+    }
 }
 
 impl AsRef<[u8]> for VortexKey {

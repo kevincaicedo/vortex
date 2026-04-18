@@ -70,6 +70,7 @@ fn main() {
         buffer_count: config.fixed_buffers,
         connection_timeout: config.connection_timeout_secs as u32,
         aof_config,
+        shard_count: vortex_engine::DEFAULT_SHARD_COUNT,
     };
 
     let mut pool = match ReactorPool::spawn(pool_config) {

@@ -1,0 +1,51 @@
+schema_version: 1
+name: local-native-full-cycle
+description: Native local developer cycle that exercises Vortex and Redis across redis-benchmark, memtier_benchmark, and custom-rust.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+  - memtier_benchmark
+  - custom-rust
+commands:
+  - GET
+  - SET
+  - INCR
+workloads:
+  - uniform-read_heavy
+  - multi_key_only
+duration: 8s
+environment:
+  mode: native
+  port_base: 17679
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 30000
+    clients: 20
+    pipeline: 8
+    keyspace_size: 100000
+  memtier_benchmark:
+    clients: 16
+    pipeline: 4
+    keyspace_size: 100000
+    data_size: 256
+    thread_sweep:
+      - 1
+      - 4
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 1
+      - 4
+    keyspace_size: 50000
+    ops_per_thread: 6000
+    warmup_ops: 500
+    value_size: 64

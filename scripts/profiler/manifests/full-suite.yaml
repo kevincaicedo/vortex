@@ -1,0 +1,18 @@
+schema_version: 1
+name: full-suite
+description: Complete profiling gauntlet — CPU, memory, and cache under mixed workload
+
+modes:
+  - all
+
+server:
+  threads: 4
+  aof: false
+
+workload:
+  command: SET,GET,INCR
+  duration: 20
+  clients: 50
+
+profiler:
+  frequency: 99

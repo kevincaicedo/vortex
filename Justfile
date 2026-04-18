@@ -12,6 +12,14 @@ build:
 test:
     cargo test --workspace
 
+# Run smoke tests against a freshly spawned Vortex server
+smoke *ARGS:
+    bash smoketests/scripts/run-local.sh {{ARGS}}
+
+# List smoke-test command coverage and support status
+smoke-list *ARGS:
+    cargo run -p vortex-smoketests -- list {{ARGS}}
+
 # Run clippy lints
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -43,6 +51,19 @@ bench-validate:
 # Validate benchmarks (CI mode — fail on missed targets)
 bench-validate-ci:
     bash scripts/validate-benchmarks.sh --ci --json
+
+# Run the new unified benchmark CLI and setup subsystem
+benchmark *ARGS:
+    bash vortex-benchmark/bin/vortex_bench {{ARGS}}
+
+# Run a full local benchmark cycle: setup, run, report, teardown
+benchmark-local *ARGS:
+    bash vortex-benchmark/bin/vortex_bench_local {{ARGS}}
+
+# Profiling tool manager — see `just profiler --help`
+profiler *ARGS:
+    bash scripts/profiler.sh {{ARGS}}
+
 
 # Run the RESP parser fuzzer for 60 seconds
 fuzz duration="60":
@@ -78,9 +99,9 @@ coverage:
     cargo llvm-cov --workspace --lcov --output-path lcov.info
     @echo "Coverage report written to lcov.info"
 
-# Generate flamegraph (requires cargo-flamegraph)
-flamegraph:
-    bash scripts/flamegraph.sh
+# Generate flamegraph (shorthand for `just profiler --flamegraph`)
+flamegraph *ARGS:
+    bash scripts/profiler.sh --flamegraph {{ARGS}}
 
 # Run comparison benchmarks against Redis/Dragonfly/Valkey
 compare *ARGS:

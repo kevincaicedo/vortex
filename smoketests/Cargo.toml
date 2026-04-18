@@ -1,0 +1,12 @@
+[package]
+name = "vortex-smoketests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap.workspace = true
+redis = "0.32"

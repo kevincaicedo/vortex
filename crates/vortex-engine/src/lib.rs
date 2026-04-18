@@ -16,6 +16,7 @@
 
 pub mod command;
 pub mod commands;
+pub mod concurrent_keyspace;
 pub mod entry;
 pub mod expiry;
 pub mod morph;
@@ -24,6 +25,7 @@ pub mod shard;
 pub mod table;
 
 pub use command::{Command, CommandContext};
+pub use concurrent_keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 pub use entry::{Entry, EntryValue};
 pub use expiry::{ExpiryEntry, ExpiryWheel};
 pub use morph::{AccessProfile, DefaultMorphMonitor, DisabledMorphMonitor, MorphMonitor};

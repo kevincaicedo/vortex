@@ -161,7 +161,7 @@ impl AofFileWriter {
     /// If the file already exists and has content, we append to it (the header
     /// is already present). If it's empty or doesn't exist, we write a fresh
     /// header.
-    pub fn open(path: &Path, shard_id: u16, policy: AofFsyncPolicy) -> io::Result<Self> {
+    pub fn open(path: &Path, reactor_id: u16, policy: AofFsyncPolicy) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         let file_len = file.metadata()?.len();
@@ -169,7 +169,7 @@ impl AofFileWriter {
 
         if file_len == 0 {
             // New file — write header.
-            let header = AofHeader::new(shard_id);
+            let header = AofHeader::new(reactor_id);
             header.write_to(&mut writer)?;
             writer.flush()?;
         }
@@ -228,12 +228,37 @@ impl AofFileWriter {
     ///
     /// `resp_bytes` is the exact RESP wire representation of the command,
     /// e.g., `*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n`.
+    ///
+    /// **Deprecated:** Use [`append_with_lsn`] for v2 format. This method
+    /// is kept only for BGREWRITEAOF rewrite files (which don't need LSNs).
     #[inline]
     pub fn append(&mut self, resp_bytes: &[u8]) -> io::Result<()> {
         self.writer.write_all(resp_bytes)?;
         self.pending_writes += 1;
         self.total_writes += 1;
         self.total_bytes += resp_bytes.len() as u64;
+
+        if self.policy == AofFsyncPolicy::Always {
+            self.flush_and_sync()?;
+        }
+
+        Ok(())
+    }
+
+    /// Append a mutation command to the AOF with an LSN prefix (v2 format).
+    ///
+    /// Writes `[LSN: 8 bytes LE] [RESP bytes]` as a single record.
+    /// The LSN is assigned inside the shard write-lock by the reactor,
+    /// guaranteeing causal ordering across per-reactor AOF files.
+    ///
+    /// This is the **primary hot path** for AOF v2.
+    #[inline]
+    pub fn append_with_lsn(&mut self, lsn: u64, resp_bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(&lsn.to_le_bytes())?;
+        self.writer.write_all(resp_bytes)?;
+        self.pending_writes += 1;
+        self.total_writes += 1;
+        self.total_bytes += (super::format::LSN_SIZE + resp_bytes.len()) as u64;
 
         if self.policy == AofFsyncPolicy::Always {
             self.flush_and_sync()?;
@@ -391,7 +416,7 @@ mod tests {
         // Verify header was written.
         let mut file = File::open(&path).unwrap();
         let header = AofHeader::read_from(&mut file).unwrap();
-        assert_eq!(header.shard_id, 0);
+        assert_eq!(header.reactor_id, 0);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
 use super::{CmdResult, RESP_EMPTY_ARRAY, RESP_OK, arg_bytes, arg_count};
-use crate::Shard;
+use crate::ConcurrentKeyspace;
 
 // ── Pre-computed static responses ───────────────────────────────────
 
@@ -21,7 +21,11 @@ static ERR_MULTI_NOT_IMPL: &[u8] = b"-ERR MULTI/EXEC is not yet implemented\r\n"
 /// If no argument: +PONG\r\n.
 /// If argument: return it as bulk string.
 #[inline]
-pub fn cmd_ping(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_ping(
+    _keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     let argc = arg_count(frame);
     if argc <= 1 {
         return CmdResult::Static(RESP_PONG);
@@ -38,7 +42,11 @@ pub fn cmd_ping(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> Cm
 ///
 /// Returns the message as a bulk string.
 #[inline]
-pub fn cmd_echo(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_echo(
+    _keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     if let Some(msg) = arg_bytes(frame, 1) {
         CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(msg)))
     } else {
@@ -50,7 +58,11 @@ pub fn cmd_echo(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> Cm
 ///
 /// Returns +OK. Connection close is handled by the reactor layer.
 #[inline]
-pub fn cmd_quit(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_quit(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     CmdResult::Static(RESP_OK)
 }
 
@@ -60,8 +72,12 @@ pub fn cmd_quit(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> C
 ///
 /// Returns the number of keys in the shard as an integer.
 #[inline]
-pub fn cmd_dbsize(shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
-    super::int_resp(shard.len() as i64)
+pub fn cmd_dbsize(
+    keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    super::int_resp(keyspace.cmd_dbsize(now_nanos) as i64)
 }
 
 /// FLUSHDB [ASYNC|SYNC]
@@ -69,8 +85,12 @@ pub fn cmd_dbsize(shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> 
 /// Removes all keys from the shard. Also clears the expiry wheel.
 /// Phase 3: ASYNC is accepted but executes synchronously.
 #[inline]
-pub fn cmd_flushdb(shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
-    shard.flush();
+pub fn cmd_flushdb(
+    keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
+    keyspace.cmd_flush_all();
     CmdResult::Static(RESP_OK)
 }
 
@@ -78,8 +98,12 @@ pub fn cmd_flushdb(shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) ->
 ///
 /// Same as FLUSHDB in single-shard Phase 3.
 #[inline]
-pub fn cmd_flushall(shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
-    shard.flush();
+pub fn cmd_flushall(
+    keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
+    keyspace.cmd_flush_all();
     CmdResult::Static(RESP_OK)
 }
 
@@ -89,9 +113,10 @@ pub fn cmd_flushall(shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -
 ///
 /// Returns a bulk string with server statistics.
 /// Sections: server, clients, memory, keyspace. Default = all.
-pub fn cmd_info(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_info(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let section = arg_bytes(frame, 1).unwrap_or(b"all");
     let all = eq_ci(section, b"all") || eq_ci(section, b"everything");
+    let (keys, expires) = keyspace.info_keyspace(now_nanos);
 
     let mut buf = Vec::with_capacity(512);
 
@@ -105,7 +130,7 @@ pub fn cmd_info(shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> Cmd
         write_info_memory(&mut buf);
     }
     if all || eq_ci(section, b"keyspace") {
-        write_info_keyspace(&mut buf, shard);
+        write_info_keyspace(&mut buf, keys, expires);
     }
 
     CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::from(buf)))
@@ -141,10 +166,8 @@ fn write_info_memory(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"used_memory_human:0B\r\n\r\n");
 }
 
-fn write_info_keyspace(buf: &mut Vec<u8>, shard: &Shard) {
+fn write_info_keyspace(buf: &mut Vec<u8>, keys: usize, expires: usize) {
     buf.extend_from_slice(b"# Keyspace\r\n");
-    let keys = shard.len();
-    let expires = shard.expires_count();
     if keys > 0 {
         buf.extend_from_slice(b"db0:keys=");
         itoa_append(buf, keys as i64);
@@ -169,7 +192,11 @@ fn itoa_append(buf: &mut Vec<u8>, n: i64) {
 /// - COMMAND (no args): returns metadata for all commands.
 /// - COMMAND COUNT: returns number of registered commands.
 /// - COMMAND INFO cmd [cmd ...]: returns metadata for specific commands.
-pub fn cmd_command(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_command(
+    _keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     let argc = arg_count(frame);
 
     if argc <= 1 {
@@ -542,7 +569,11 @@ fn collect_all_command_metas() -> Vec<&'static CommandMeta> {
 ///
 /// Accept 0 (single DB in Phase 3), reject N>0.
 #[inline]
-pub fn cmd_select(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_select(
+    _keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     if let Some(idx_bytes) = arg_bytes(frame, 1) {
         if idx_bytes == b"0" {
             return CmdResult::Static(RESP_OK);
@@ -555,7 +586,11 @@ pub fn cmd_select(_shard: &mut Shard, frame: &FrameRef<'_>, _now_nanos: u64) -> 
 ///
 /// Returns [unix_seconds_string, microseconds_string] as a two-element array.
 #[inline]
-pub fn cmd_time(_shard: &mut Shard, _frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_time(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
     // Convert nanoseconds to seconds + microseconds remainder.
     // If now_nanos is 0 (testing), use system clock.
     let (secs, usecs) = if now_nanos == 0 {
@@ -585,31 +620,51 @@ pub fn cmd_time(_shard: &mut Shard, _frame: &FrameRef<'_>, now_nanos: u64) -> Cm
 
 /// MULTI — stub.
 #[inline]
-pub fn cmd_multi(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_multi(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     CmdResult::Static(ERR_MULTI_NOT_IMPL)
 }
 
 /// EXEC — stub.
 #[inline]
-pub fn cmd_exec(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_exec(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     CmdResult::Static(b"-ERR EXEC without MULTI\r\n")
 }
 
 /// DISCARD — stub.
 #[inline]
-pub fn cmd_discard(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_discard(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     CmdResult::Static(b"-ERR DISCARD without MULTI\r\n")
 }
 
 /// WATCH key [key ...] — stub.
 #[inline]
-pub fn cmd_watch(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_watch(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     CmdResult::Static(ERR_MULTI_NOT_IMPL)
 }
 
 /// UNWATCH — stub.
 #[inline]
-pub fn cmd_unwatch(_shard: &mut Shard, _frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_unwatch(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
     CmdResult::Static(RESP_OK)
 }
 
@@ -626,7 +681,7 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use vortex_common::ShardId;
+    use crate::commands::test_harness::TestHarness;
     use vortex_proto::RespTape;
 
     fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
@@ -640,12 +695,12 @@ mod tests {
         buf
     }
 
-    fn exec(shard: &mut Shard, parts: &[&[u8]]) -> CmdResult {
+    fn exec(h: &TestHarness, parts: &[&[u8]]) -> CmdResult {
         let wire = make_resp(parts);
         let tape = RespTape::parse_pipeline(&wire).expect("valid RESP");
         let frame = tape.iter().next().unwrap();
         let name_upper: Vec<u8> = parts[0].iter().map(|b| b.to_ascii_uppercase()).collect();
-        crate::commands::execute_command(shard, &name_upper, &frame, 0)
+        crate::commands::execute_command(&h.keyspace, &name_upper, &frame, 0)
             .expect("command should be recognized")
     }
 
@@ -698,15 +753,15 @@ mod tests {
 
     #[test]
     fn ping_no_args() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"PING"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"PING"]);
         assert_static(&r, RESP_PONG);
     }
 
     #[test]
     fn ping_with_message() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"PING", b"hello"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"PING", b"hello"]);
         match &r {
             CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
                 assert_eq!(b.as_ref(), b"hello" as &[u8]);
@@ -719,8 +774,8 @@ mod tests {
 
     #[test]
     fn echo_returns_message() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"ECHO", b"world"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"ECHO", b"world"]);
         match &r {
             CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
                 assert_eq!(b.as_ref(), b"world" as &[u8]);
@@ -733,8 +788,8 @@ mod tests {
 
     #[test]
     fn quit_returns_ok() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"QUIT"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"QUIT"]);
         assert_static(&r, RESP_OK);
     }
 
@@ -742,19 +797,19 @@ mod tests {
 
     #[test]
     fn dbsize_empty() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"DBSIZE"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"DBSIZE"]);
         assert_integer(&r, 0);
     }
 
     #[test]
     fn dbsize_with_keys() {
-        let mut shard = Shard::new(ShardId::new(0));
+        let h = TestHarness::new();
         use vortex_common::{VortexKey, VortexValue};
-        shard.set(VortexKey::from("a"), VortexValue::from_bytes(b"1"));
-        shard.set(VortexKey::from("b"), VortexValue::from_bytes(b"2"));
-        shard.set(VortexKey::from("c"), VortexValue::from_bytes(b"3"));
-        let r = exec(&mut shard, &[b"DBSIZE"]);
+        h.set(VortexKey::from("a"), VortexValue::from_bytes(b"1"));
+        h.set(VortexKey::from("b"), VortexValue::from_bytes(b"2"));
+        h.set(VortexKey::from("c"), VortexValue::from_bytes(b"3"));
+        let r = exec(&h, &[b"DBSIZE"]);
         assert_integer(&r, 3);
     }
 
@@ -762,32 +817,32 @@ mod tests {
 
     #[test]
     fn flushdb_empties_shard() {
-        let mut shard = Shard::new(ShardId::new(0));
+        let h = TestHarness::new();
         use vortex_common::{VortexKey, VortexValue};
-        shard.set(VortexKey::from("a"), VortexValue::from_bytes(b"1"));
-        shard.set(VortexKey::from("b"), VortexValue::from_bytes(b"2"));
-        assert_eq!(shard.len(), 2);
-        let r = exec(&mut shard, &[b"FLUSHDB"]);
+        h.set(VortexKey::from("a"), VortexValue::from_bytes(b"1"));
+        h.set(VortexKey::from("b"), VortexValue::from_bytes(b"2"));
+        assert_eq!(h.len(), 2);
+        let r = exec(&h, &[b"FLUSHDB"]);
         assert_static(&r, RESP_OK);
-        assert_eq!(shard.len(), 0);
+        assert_eq!(h.len(), 0);
     }
 
     #[test]
     fn flushall_empties_shard() {
-        let mut shard = Shard::new(ShardId::new(0));
+        let h = TestHarness::new();
         use vortex_common::{VortexKey, VortexValue};
-        shard.set(VortexKey::from("x"), VortexValue::from_bytes(b"val"));
-        let r = exec(&mut shard, &[b"FLUSHALL"]);
+        h.set(VortexKey::from("x"), VortexValue::from_bytes(b"val"));
+        let r = exec(&h, &[b"FLUSHALL"]);
         assert_static(&r, RESP_OK);
-        assert_eq!(shard.len(), 0);
+        assert_eq!(h.len(), 0);
     }
 
     // ── INFO ──
 
     #[test]
     fn info_all_contains_sections() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"INFO"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"INFO"]);
         assert_bulk_contains(&r, b"# Server");
         assert_bulk_contains(&r, b"# Clients");
         assert_bulk_contains(&r, b"# Memory");
@@ -796,8 +851,8 @@ mod tests {
 
     #[test]
     fn info_server_section() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"INFO", b"server"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"INFO", b"server"]);
         assert_bulk_contains(&r, b"# Server");
         assert_bulk_contains(&r, b"vortex_version:");
         assert_bulk_contains(&r, b"redis_version:");
@@ -805,11 +860,11 @@ mod tests {
 
     #[test]
     fn info_keyspace_with_keys() {
-        let mut shard = Shard::new(ShardId::new(0));
+        let h = TestHarness::new();
         use vortex_common::{VortexKey, VortexValue};
-        shard.set(VortexKey::from("k1"), VortexValue::from_bytes(b"v1"));
-        shard.set(VortexKey::from("k2"), VortexValue::from_bytes(b"v2"));
-        let r = exec(&mut shard, &[b"INFO", b"keyspace"]);
+        h.set(VortexKey::from("k1"), VortexValue::from_bytes(b"v1"));
+        h.set(VortexKey::from("k2"), VortexValue::from_bytes(b"v2"));
+        let r = exec(&h, &[b"INFO", b"keyspace"]);
         assert_bulk_contains(&r, b"db0:keys=2");
     }
 
@@ -817,8 +872,8 @@ mod tests {
 
     #[test]
     fn command_count_returns_positive() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"COMMAND", b"COUNT"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"COMMAND", b"COUNT"]);
         match &r {
             CmdResult::Resp(RespFrame::Integer(n)) => {
                 assert!(*n > 100, "expected > 100 commands, got {n}");
@@ -829,16 +884,16 @@ mod tests {
 
     #[test]
     fn command_info_known() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"COMMAND", b"INFO", b"GET"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"COMMAND", b"INFO", b"GET"]);
         // Should return a 1-element array with GET metadata.
         assert_array_len(&r, 1);
     }
 
     #[test]
     fn command_info_unknown() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"COMMAND", b"INFO", b"NONEXISTENT"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"COMMAND", b"INFO", b"NONEXISTENT"]);
         // Should return array with Null entry.
         assert_array_len(&r, 1);
     }
@@ -847,15 +902,15 @@ mod tests {
 
     #[test]
     fn select_zero_ok() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"SELECT", b"0"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"SELECT", b"0"]);
         assert_static(&r, RESP_OK);
     }
 
     #[test]
     fn select_nonzero_error() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"SELECT", b"1"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"SELECT", b"1"]);
         assert_static(&r, ERR_DB_INDEX);
     }
 
@@ -863,15 +918,15 @@ mod tests {
 
     #[test]
     fn time_returns_two_element_array() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"TIME"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"TIME"]);
         assert_array_len(&r, 2);
     }
 
     #[test]
     fn time_values_are_numeric() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"TIME"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"TIME"]);
         match &r {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
                 // Both should be bulk strings containing numeric values.
@@ -893,36 +948,36 @@ mod tests {
 
     #[test]
     fn multi_returns_error() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"MULTI"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"MULTI"]);
         assert_static(&r, ERR_MULTI_NOT_IMPL);
     }
 
     #[test]
     fn exec_without_multi() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"EXEC"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"EXEC"]);
         assert_static(&r, b"-ERR EXEC without MULTI\r\n");
     }
 
     #[test]
     fn discard_without_multi() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"DISCARD"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"DISCARD"]);
         assert_static(&r, b"-ERR DISCARD without MULTI\r\n");
     }
 
     #[test]
     fn watch_returns_error() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"WATCH", b"mykey"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"WATCH", b"mykey"]);
         assert_static(&r, ERR_MULTI_NOT_IMPL);
     }
 
     #[test]
     fn unwatch_returns_ok() {
-        let mut shard = Shard::new(ShardId::new(0));
-        let r = exec(&mut shard, &[b"UNWATCH"]);
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"UNWATCH"]);
         assert_static(&r, RESP_OK);
     }
 }
