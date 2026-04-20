@@ -115,6 +115,8 @@ impl Drop for ShardWriteGuard<'_> {
 pub struct ConcurrentKeyspace {
     /// Shard array — each shard is cache-line padded to 128 bytes.
     shards: Box<[Shard]>,
+    /// Per-shard count of keys that currently carry a TTL deadline.
+    expiry_key_count: Box<[CachePadded<AtomicUsize>]>,
     /// Bitmask for shard selection: `hash & mask` == `hash % num_shards`.
     /// Valid because `num_shards` is always a power of two.
     mask: u64,
@@ -141,6 +143,7 @@ impl std::fmt::Debug for ConcurrentKeyspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConcurrentKeyspace")
             .field("num_shards", &self.shards.len())
+            .field("ttl_keys", &self.total_expiry_keys())
             .field(
                 "global_memory_used",
                 &self.global_memory_used.load(Ordering::Relaxed),
@@ -171,9 +174,13 @@ impl ConcurrentKeyspace {
         let shards: Vec<Shard> = (0..num_shards)
             .map(|_| CachePadded::new(RwLock::new(SwissTable::with_hasher(table_hasher.clone()))))
             .collect();
+        let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
 
         Self {
             shards: shards.into_boxed_slice(),
+            expiry_key_count: expiry_key_count.into_boxed_slice(),
             mask: (num_shards - 1) as u64,
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
@@ -208,9 +215,13 @@ impl ConcurrentKeyspace {
                 )))
             })
             .collect();
+        let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
 
         Self {
             shards: shards.into_boxed_slice(),
+            expiry_key_count: expiry_key_count.into_boxed_slice(),
             mask: (num_shards - 1) as u64,
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
@@ -228,6 +239,28 @@ impl ConcurrentKeyspace {
             guard,
             global_memory_used: &self.global_memory_used,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn update_expiry_count(&self, shard_idx: usize, had_ttl: bool, has_ttl: bool) {
+        debug_assert!(shard_idx < self.expiry_key_count.len());
+        match (had_ttl, has_ttl) {
+            (false, true) => {
+                self.expiry_key_count[shard_idx].fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.expiry_key_count[shard_idx].fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn total_expiry_keys(&self) -> usize {
+        self.expiry_key_count
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
     }
 
     // ─── Shard routing ──────────────────────────────────────────────
@@ -385,10 +418,17 @@ impl ConcurrentKeyspace {
     /// `verify_binary_search_always_finds` in the M2 lab.
     #[inline]
     pub fn sorted_shard_indices(&self, keys: &[&[u8]]) -> (Vec<usize>, Vec<usize>) {
-        let per_key: Vec<usize> = keys.iter().map(|k| self.shard_index(k)).collect();
-        let mut unique = per_key.clone();
-        unique.sort_unstable();
-        unique.dedup();
+        let mut per_key = Vec::with_capacity(keys.len());
+        let mut unique = Vec::with_capacity(keys.len().min(self.shards.len()));
+
+        for &key in keys {
+            let shard_idx = self.shard_index(key);
+            per_key.push(shard_idx);
+            if let Err(pos) = unique.binary_search(&shard_idx) {
+                unique.insert(pos, shard_idx);
+            }
+        }
+
         (unique, per_key)
     }
 
@@ -492,7 +532,7 @@ impl ConcurrentKeyspace {
         F: FnOnce(&mut SwissTable) -> R,
     {
         debug_assert!(shard_idx < self.shards.len());
-        let mut guard = unsafe { self.shards.get_unchecked(shard_idx) }.write();
+        let mut guard = self.write_shard_by_index(shard_idx);
         f(&mut guard)
     }
 
@@ -519,7 +559,7 @@ impl ConcurrentKeyspace {
         now_nanos: u64,
     ) -> (usize, usize) {
         debug_assert!(shard_idx < self.shards.len());
-        let mut guard = unsafe { self.shards.get_unchecked(shard_idx) }.write();
+        let mut guard = self.write_shard_by_index(shard_idx);
         let total_slots = guard.total_slots();
         if total_slots == 0 {
             return (0, 0);
@@ -543,10 +583,9 @@ impl ConcurrentKeyspace {
             }
         }
 
-        // Flush accumulated memory drift to the global counter.
-        // We hold a raw RwLockWriteGuard (not ShardWriteGuard), so the
-        // Drop-based auto-flush does not apply — flush explicitly.
-        guard.flush_memory_drift(&self.global_memory_used);
+        if expired != 0 {
+            self.expiry_key_count[shard_idx].fetch_sub(expired, Ordering::Relaxed);
+        }
 
         (expired, sampled)
     }
@@ -571,6 +610,9 @@ impl ConcurrentKeyspace {
             // Replace with a fresh empty table to release all memory.
             *guard = SwissTable::with_hasher(self.table_hasher.clone());
         }
+        for count in self.expiry_key_count.iter() {
+            count.store(0, Ordering::Relaxed);
+        }
         self.global_memory_used.store(0, Ordering::Relaxed);
     }
 
@@ -585,6 +627,9 @@ impl ConcurrentKeyspace {
         let had_entries = guards.iter().any(|guard| !guard.is_empty());
         for guard in &mut guards {
             **guard = SwissTable::with_hasher(self.table_hasher.clone());
+        }
+        for count in self.expiry_key_count.iter() {
+            count.store(0, Ordering::Relaxed);
         }
         self.global_memory_used.store(0, Ordering::Relaxed);
 

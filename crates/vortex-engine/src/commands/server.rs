@@ -5,7 +5,7 @@
 
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
-use super::{CmdResult, ExecutedCommand, RESP_EMPTY_ARRAY, RESP_OK, arg_bytes, arg_count};
+use super::{CmdResult, CommandArgs, ExecutedCommand, RESP_EMPTY_ARRAY, RESP_OK};
 use crate::ConcurrentKeyspace;
 
 // ── Pre-computed static responses ───────────────────────────────────
@@ -26,12 +26,14 @@ pub fn cmd_ping(
     frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> CmdResult {
-    let argc = arg_count(frame);
-    if argc <= 1 {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(RESP_PONG);
+    };
+    if args.len() <= 1 {
         return CmdResult::Static(RESP_PONG);
     }
     // PING message — return message as bulk string.
-    if let Some(msg) = arg_bytes(frame, 1) {
+    if let Some(msg) = args.get(1) {
         CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(msg)))
     } else {
         CmdResult::Static(RESP_PONG)
@@ -47,7 +49,7 @@ pub fn cmd_echo(
     frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> CmdResult {
-    if let Some(msg) = arg_bytes(frame, 1) {
+    if let Some(msg) = CommandArgs::collect(frame).and_then(|args| args.get(1)) {
         CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(msg)))
     } else {
         CmdResult::Static(b"$-1\r\n")
@@ -112,7 +114,9 @@ pub fn cmd_flushall(
 /// Returns a bulk string with server statistics.
 /// Sections: server, clients, memory, keyspace. Default = all.
 pub fn cmd_info(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let section = arg_bytes(frame, 1).unwrap_or(b"all");
+    let section = CommandArgs::collect(frame)
+        .and_then(|args| args.get(1))
+        .unwrap_or(b"all");
     let all = eq_ci(section, b"all") || eq_ci(section, b"everything");
     let (keys, expires) = keyspace.info_keyspace(now_nanos);
 
@@ -195,19 +199,22 @@ pub fn cmd_command(
     frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> CmdResult {
-    let argc = arg_count(frame);
+    let Some(args) = CommandArgs::collect(frame) else {
+        return cmd_command_all();
+    };
+    let argc = args.len();
 
     if argc <= 1 {
         // COMMAND (no subcommand) — return all command metadata.
         return cmd_command_all();
     }
 
-    let sub = arg_bytes(frame, 1).unwrap_or(b"");
+    let sub = args.get(1).unwrap_or(b"");
     if eq_ci(sub, b"count") {
         return cmd_command_count();
     }
     if eq_ci(sub, b"info") {
-        return cmd_command_info(frame);
+        return cmd_command_info(&args);
     }
     if eq_ci(sub, b"docs") {
         // COMMAND DOCS — not implemented, return empty array.
@@ -241,11 +248,11 @@ fn cmd_command_count() -> CmdResult {
 }
 
 /// COMMAND INFO cmd [cmd ...]
-fn cmd_command_info(frame: &FrameRef<'_>) -> CmdResult {
-    let argc = arg_count(frame);
+fn cmd_command_info(args: &CommandArgs<'_>) -> CmdResult {
+    let argc = args.len();
     let mut frames = Vec::with_capacity(argc.saturating_sub(2));
     for i in 2..argc {
-        if let Some(name_bytes) = arg_bytes(frame, i) {
+        if let Some(name_bytes) = args.get(i) {
             // Uppercase for lookup.
             let mut buf = [0u8; 32];
             let len = name_bytes.len().min(32);
@@ -572,7 +579,7 @@ pub fn cmd_select(
     frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> CmdResult {
-    if let Some(idx_bytes) = arg_bytes(frame, 1) {
+    if let Some(idx_bytes) = CommandArgs::collect(frame).and_then(|args| args.get(1)) {
         if idx_bytes == b"0" {
             return CmdResult::Static(RESP_OK);
         }
@@ -722,7 +729,10 @@ mod tests {
                     1 => b":1\r\n",
                     -1 => b":-1\r\n",
                     -2 => b":-2\r\n",
-                    _ => panic!("expected Integer({expected}), got Static({:?})", std::str::from_utf8(s)),
+                    _ => panic!(
+                        "expected Integer({expected}), got Static({:?})",
+                        std::str::from_utf8(s)
+                    ),
                 };
                 assert_eq!(*s, expected_bytes, "static integer mismatch for {expected}");
             }

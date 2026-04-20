@@ -119,8 +119,8 @@ impl PendingWritev {
             let iov = &mut self.iovecs[self.iov_start];
             if bytes_written < iov.iov_len {
                 // SAFETY: advancing within the currently outstanding iovec segment.
-                iov.iov_base = unsafe { (iov.iov_base as *mut u8).add(bytes_written) }
-                    .cast::<libc::c_void>();
+                iov.iov_base =
+                    unsafe { (iov.iov_base as *mut u8).add(bytes_written) }.cast::<libc::c_void>();
                 iov.iov_len -= bytes_written;
                 self.total_len -= bytes_written;
                 return;
@@ -915,10 +915,9 @@ impl Reactor {
                                 if !scatter_gather {
                                     // Try direct serialization into write buffer first.
                                     let remaining = &mut write_buf[write_cursor..];
-                                    if let Some(n) = RespSerializer::serialize_to_slice(
-                                        &resp_frame,
-                                        remaining,
-                                    ) {
+                                    if let Some(n) =
+                                        RespSerializer::serialize_to_slice(&resp_frame, remaining)
+                                    {
                                         write_cursor += n;
                                         continue;
                                     }
@@ -1779,10 +1778,7 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         // SAFETY: remaining iovec points to static storage used in the test.
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                remaining[0].iov_base.cast::<u8>(),
-                remaining[0].iov_len,
-            )
+            std::slice::from_raw_parts(remaining[0].iov_base.cast::<u8>(), remaining[0].iov_len)
         };
         assert_eq!(bytes, b"efg");
     }

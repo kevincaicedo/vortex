@@ -77,6 +77,11 @@ fn mget_value_to_frame(value: &VortexValue) -> RespFrame {
     }
 }
 
+#[inline]
+fn ttl_present(ttl_deadline: Option<u64>) -> bool {
+    matches!(ttl_deadline, Some(deadline) if deadline != 0)
+}
+
 pub(crate) fn remove_if_expired(table: &mut SwissTable, key: &VortexKey, now_nanos: u64) -> bool {
     match table.get_entry_ttl(key) {
         Some(deadline) if deadline != 0 && deadline <= now_nanos => {
@@ -104,7 +109,7 @@ fn set_with_options_on_table(
     value: VortexValue,
     options: SetOptions,
     now_nanos: u64,
-) -> SetResult {
+) -> (SetResult, bool) {
     let _ = remove_if_expired(table, &key, now_nanos);
 
     // Plain SET is the hot path in the benchmark workload. It does not need
@@ -115,16 +120,15 @@ fn set_with_options_on_table(
         } else {
             table.insert(key, value);
         }
-        return SetResult::Ok;
+        return (SetResult::Ok, options.ttl_deadline != 0);
     }
 
     let mut existing_for_notset_get = None;
     let mut existing_ttl = 0u64;
     let exists = match table.get_with_ttl(&key) {
         Some((current, ttl)) if ttl == 0 || ttl > now_nanos => {
-            if options.keepttl {
-                existing_ttl = ttl;
-            }
+            existing_ttl = ttl;
+            if options.keepttl {}
             if options.get && (options.nx || options.xx) {
                 existing_for_notset_get = Some(current.clone());
             }
@@ -135,17 +139,20 @@ fn set_with_options_on_table(
 
     if options.nx && exists {
         return if options.get {
-            SetResult::NotSetGet(existing_for_notset_get)
+            (
+                SetResult::NotSetGet(existing_for_notset_get),
+                existing_ttl != 0,
+            )
         } else {
-            SetResult::NotSet
+            (SetResult::NotSet, existing_ttl != 0)
         };
     }
 
     if options.xx && !exists {
         return if options.get {
-            SetResult::NotSetGet(None)
+            (SetResult::NotSetGet(None), false)
         } else {
-            SetResult::NotSet
+            (SetResult::NotSet, false)
         };
     }
 
@@ -162,9 +169,9 @@ fn set_with_options_on_table(
     };
 
     if options.get {
-        SetResult::OkGet(previous)
+        (SetResult::OkGet(previous), effective_ttl != 0)
     } else {
-        SetResult::Ok
+        (SetResult::Ok, effective_ttl != 0)
     }
 }
 
@@ -174,10 +181,17 @@ fn increment_table_by(
     delta: i64,
     now_nanos: u64,
 ) -> Result<i64, &'static [u8]> {
-    let _ = remove_if_expired(table, &key, now_nanos);
-
-    match table.get_mut(&key) {
-        Some(value) => {
+    // Fused path: single probe to find the key, then check expiry in-place.
+    // Avoids the separate remove_if_expired → get_mut → insert triple-probe.
+    match table.get_with_ttl_mut(&key) {
+        Some((value, ttl)) => {
+            // Check if expired
+            if ttl != 0 && ttl <= now_nanos {
+                // Expired — remove and treat as not-found.
+                table.remove(&key);
+                table.insert(key, VortexValue::Integer(delta));
+                return Ok(delta);
+            }
             let (result, delta_bytes) = {
                 let old_bytes = value.memory_usage();
                 let current = match value {
@@ -213,21 +227,28 @@ fn increment_table_by_float(
     increment: f64,
     now_nanos: u64,
 ) -> Result<Bytes, &'static [u8]> {
-    let _ = remove_if_expired(table, &key, now_nanos);
-
-    let current = match table.get_mut(&key) {
-        Some(value) => match value {
-            VortexValue::Integer(number) => *number as f64,
-            VortexValue::InlineString(inline) => std::str::from_utf8(inline.as_bytes())
-                .ok()
-                .and_then(|text| text.parse().ok())
-                .ok_or(ERR_NOT_FLOAT)?,
-            VortexValue::String(bytes) => std::str::from_utf8(bytes.as_ref())
-                .ok()
-                .and_then(|text| text.parse().ok())
-                .ok_or(ERR_NOT_FLOAT)?,
-            _ => return Err(ERR_WRONG_TYPE),
-        },
+    // Fused path: single probe, then inline expiry check.
+    let current = match table.get_with_ttl_mut(&key) {
+        Some((value, ttl)) => {
+            if ttl != 0 && ttl <= now_nanos {
+                // Expired — remove and treat as not-found.
+                table.remove(&key);
+                0.0
+            } else {
+                match value {
+                    VortexValue::Integer(number) => *number as f64,
+                    VortexValue::InlineString(inline) => std::str::from_utf8(inline.as_bytes())
+                        .ok()
+                        .and_then(|text| text.parse().ok())
+                        .ok_or(ERR_NOT_FLOAT)?,
+                    VortexValue::String(bytes) => std::str::from_utf8(bytes.as_ref())
+                        .ok()
+                        .and_then(|text| text.parse().ok())
+                        .ok_or(ERR_NOT_FLOAT)?,
+                    _ => return Err(ERR_WRONG_TYPE),
+                }
+            }
+        }
         None => 0.0,
     };
 
@@ -325,39 +346,53 @@ fn getrange_from_value(
     start: i64,
     end: i64,
 ) -> Result<Option<Bytes>, &'static [u8]> {
-    let source = match value {
-        VortexValue::InlineString(inline) => inline.as_bytes().to_vec(),
-        VortexValue::String(bytes) => bytes.to_vec(),
+    fn range_bounds(len: usize, start: i64, end: i64) -> Option<(usize, usize)> {
+        if len == 0 {
+            return None;
+        }
+
+        let len_i64 = len as i64;
+        let start_index = if start < 0 {
+            (len_i64 + start).max(0) as usize
+        } else {
+            start.min(len_i64) as usize
+        };
+        let end_index = if end < 0 {
+            (len_i64 + end).max(0) as usize
+        } else {
+            end.min(len_i64 - 1).max(0) as usize
+        };
+
+        if start_index > end_index || start_index >= len {
+            None
+        } else {
+            Some((start_index, end_index.min(len - 1)))
+        }
+    }
+
+    match value {
+        VortexValue::InlineString(inline) => Ok(match range_bounds(inline.len(), start, end) {
+            Some((start_index, end_index)) => Some(Bytes::copy_from_slice(
+                &inline.as_bytes()[start_index..=end_index],
+            )),
+            None => Some(Bytes::new()),
+        }),
+        VortexValue::String(bytes) => Ok(match range_bounds(bytes.len(), start, end) {
+            Some((start_index, end_index)) => Some(bytes.slice(start_index..=end_index)),
+            None => Some(Bytes::new()),
+        }),
         VortexValue::Integer(number) => {
             let mut buffer = itoa::Buffer::new();
-            buffer.format(*number).as_bytes().to_vec()
+            let text = buffer.format(*number);
+            Ok(match range_bounds(text.len(), start, end) {
+                Some((start_index, end_index)) => Some(Bytes::copy_from_slice(
+                    &text.as_bytes()[start_index..=end_index],
+                )),
+                None => Some(Bytes::new()),
+            })
         }
-        _ => return Err(ERR_WRONG_TYPE),
-    };
-
-    if source.is_empty() {
-        return Ok(Some(Bytes::new()));
+        _ => Err(ERR_WRONG_TYPE),
     }
-
-    let len = source.len() as i64;
-    let start_index = if start < 0 {
-        (len + start).max(0) as usize
-    } else {
-        start.min(len) as usize
-    };
-    let end_index = if end < 0 {
-        (len + end).max(0) as usize
-    } else {
-        end.min(len - 1).max(0) as usize
-    };
-
-    if start_index > end_index || start_index >= source.len() {
-        return Ok(Some(Bytes::new()));
-    }
-
-    Ok(Some(Bytes::copy_from_slice(
-        &source[start_index..=end_index.min(source.len() - 1)],
-    )))
 }
 
 fn setrange_in_table(
@@ -543,20 +578,6 @@ fn random_live_key_from_table(table: &SwissTable, seed: u64, now_nanos: u64) -> 
     None
 }
 
-fn count_live_expires(table: &SwissTable, now_nanos: u64) -> usize {
-    let mut count = 0usize;
-    for slot in 0..table.total_slots() {
-        if table.slot_key_value(slot).is_none() {
-            continue;
-        }
-        let ttl = table.slot_entry_ttl(slot);
-        if ttl != 0 && ttl > now_nanos {
-            count += 1;
-        }
-    }
-    count
-}
-
 fn encode_scan_cursor(shard_index: usize, slot_index: usize) -> u64 {
     ((shard_index as u64) << SCAN_CURSOR_SHARD_SHIFT) | slot_index as u64
 }
@@ -571,6 +592,48 @@ fn decode_scan_cursor(cursor: u64) -> (usize, usize) {
 // ── ConcurrentKeyspace command methods ─────────────────────────────────
 
 impl ConcurrentKeyspace {
+    #[inline]
+    fn cleanup_expired_key(
+        &self,
+        shard_index: usize,
+        table: &mut SwissTable,
+        key: &VortexKey,
+        now_nanos: u64,
+    ) -> bool {
+        let had_ttl = ttl_present(table.get_entry_ttl(key));
+        let removed = remove_if_expired(table, key, now_nanos);
+        if removed {
+            self.update_expiry_count(shard_index, had_ttl, false);
+        }
+        removed
+    }
+
+    #[inline]
+    fn cleanup_expired_prehashed(
+        &self,
+        shard_index: usize,
+        table: &mut SwissTable,
+        key_bytes: &[u8],
+        hash: u64,
+        now_nanos: u64,
+    ) -> bool {
+        let had_expired_ttl = matches!(
+            table.get_with_ttl_prehashed(key_bytes, hash),
+            Some((_, ttl)) if ttl != 0 && ttl <= now_nanos
+        );
+        if !had_expired_ttl {
+            return false;
+        }
+
+        let _ = table.get_or_expire_prehashed(key_bytes, hash, now_nanos);
+        let has_ttl = matches!(
+            table.get_with_ttl_prehashed(key_bytes, hash),
+            Some((_, ttl)) if ttl != 0
+        );
+        self.update_expiry_count(shard_index, true, has_ttl);
+        true
+    }
+
     pub(crate) fn get_value(&self, key: &VortexKey, now_nanos: u64) -> Option<VortexValue> {
         let shard_index = self.shard_index(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
@@ -580,7 +643,7 @@ impl ConcurrentKeyspace {
                 // Expired — drop read lock, escalate to write lock, double-check.
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                remove_if_expired(&mut wguard, key, now_nanos);
+                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
                 None
             }
             None => None,
@@ -595,8 +658,38 @@ impl ConcurrentKeyspace {
     ) -> MutationOutcome<Option<VortexValue>> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let had_ttl = ttl_present(guard.get_entry_ttl(&key));
         let previous = guard.insert_with_ttl(key, value, ttl_deadline_nanos);
+        self.update_expiry_count(shard_index, had_ttl, true);
         MutationOutcome::new(previous, Some(self.next_lsn()))
+    }
+
+    /// Fast path for plain `SET key value` (no options, no TTL).
+    ///
+    /// Eliminates three redundant table probes:
+    /// - No `remove_if_expired` probe (insert overwrites unconditionally)
+    /// - No `get_entry_ttl` pre-probe (fused into `insert_no_ttl`)
+    /// - Single probe in `insert_no_ttl` returns old TTL status
+    ///
+    /// # Why skipping `remove_if_expired` is correct
+    ///
+    /// Plain SET unconditionally overwrites the key with TTL=0, so any
+    /// expired value is replaced regardless. The expiry count is still
+    /// correctly maintained via the `old_had_ttl` return value.
+    #[inline]
+    pub(crate) fn set_value_plain(
+        &self,
+        key: VortexKey,
+        value: VortexValue,
+    ) -> MutationOutcome<()> {
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        // Pre-hash for the table BEFORE acquiring the write lock.
+        let table_hash = self.table_hash_key(key_bytes);
+        let mut guard = self.write_shard_by_index(shard_index);
+        let (_old, old_had_ttl) = guard.insert_no_ttl_prehashed(key, value, table_hash);
+        self.update_expiry_count(shard_index, old_had_ttl, false);
+        MutationOutcome::new((), Some(self.next_lsn()))
     }
 
     pub(crate) fn set_value_with_options(
@@ -608,7 +701,10 @@ impl ConcurrentKeyspace {
     ) -> MutationOutcome<SetResult> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
-        let result = set_with_options_on_table(&mut guard, key, value, options, now_nanos);
+        let had_ttl = ttl_present(guard.get_entry_ttl(&key));
+        let (result, has_ttl) =
+            set_with_options_on_table(&mut guard, key, value, options, now_nanos);
+        self.update_expiry_count(shard_index, had_ttl, has_ttl);
         let changed = matches!(&result, SetResult::Ok | SetResult::OkGet(_));
         MutationOutcome::new(result, changed.then(|| self.next_lsn()))
     }
@@ -676,7 +772,13 @@ impl ConcurrentKeyspace {
             let mut wguard = self.write_shard_by_index(shard_idx);
             while expired_cursor < expired.len() && expired[expired_cursor].shard_idx == shard_idx {
                 let lookup = expired[expired_cursor];
-                let _ = wguard.get_or_expire_prehashed(keys[lookup.output_idx], lookup.hash, now_nanos);
+                let _ = self.cleanup_expired_prehashed(
+                    shard_idx,
+                    &mut wguard,
+                    keys[lookup.output_idx],
+                    lookup.hash,
+                    now_nanos,
+                );
                 expired_cursor += 1;
             }
         }
@@ -692,7 +794,10 @@ impl ConcurrentKeyspace {
         let (mut guards, sorted_shards, per_key_shards) = self.multi_write(&key_refs);
         for ((key, value), shard_index) in pairs.into_iter().zip(per_key_shards) {
             let position = ConcurrentKeyspace::guard_position(&sorted_shards, shard_index);
-            guards[position].1.insert(key, value);
+            let table = &mut *guards[position].1;
+            let had_ttl = ttl_present(table.get_entry_ttl(&key));
+            table.insert(key, value);
+            self.update_expiry_count(shard_index, had_ttl, false);
         }
         MutationOutcome::new((), Some(self.next_lsn()))
     }
@@ -716,7 +821,7 @@ impl ConcurrentKeyspace {
         {
             let position = ConcurrentKeyspace::guard_position(&sorted_shards, shard_index);
             let table = &mut *guards[position].1;
-            let _ = remove_if_expired(table, key, now_nanos);
+            let _ = self.cleanup_expired_key(shard_index, table, key, now_nanos);
             if table.contains_key(key) {
                 return MutationOutcome::new(false, None);
             }
@@ -739,7 +844,9 @@ impl ConcurrentKeyspace {
     ) -> MutationOutcome<Option<VortexValue>> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let had_ttl = ttl_present(guard.get_entry_ttl(key));
         let removed = remove_live_value(&mut guard, key, now_nanos);
+        self.update_expiry_count(shard_index, had_ttl, false);
         let changed = removed.is_some();
         MutationOutcome::new(removed, changed.then(|| self.next_lsn()))
     }
@@ -752,7 +859,13 @@ impl ConcurrentKeyspace {
     ) -> Result<MutationOutcome<i64>, &'static [u8]> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let ttl_deadline = guard.get_entry_ttl(&key);
         let result = increment_table_by(&mut guard, key, delta, now_nanos)?;
+        self.update_expiry_count(
+            shard_index,
+            ttl_present(ttl_deadline),
+            matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
+        );
         Ok(MutationOutcome::new(result, Some(self.next_lsn())))
     }
 
@@ -764,7 +877,13 @@ impl ConcurrentKeyspace {
     ) -> Result<MutationOutcome<Bytes>, &'static [u8]> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let ttl_deadline = guard.get_entry_ttl(&key);
         let result = increment_table_by_float(&mut guard, key, increment, now_nanos)?;
+        self.update_expiry_count(
+            shard_index,
+            ttl_present(ttl_deadline),
+            matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
+        );
         Ok(MutationOutcome::new(result, Some(self.next_lsn())))
     }
 
@@ -776,7 +895,13 @@ impl ConcurrentKeyspace {
     ) -> Result<MutationOutcome<usize>, &'static [u8]> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let ttl_deadline = guard.get_entry_ttl(&key);
         let length = append_to_table(&mut guard, key, append_bytes, now_nanos)?;
+        self.update_expiry_count(
+            shard_index,
+            ttl_present(ttl_deadline),
+            matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
+        );
         Ok(MutationOutcome::new(length, Some(self.next_lsn())))
     }
 
@@ -798,7 +923,7 @@ impl ConcurrentKeyspace {
             Some(_) => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                remove_if_expired(&mut wguard, key, now_nanos);
+                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
                 Ok(None)
             }
             None => Ok(None),
@@ -822,7 +947,7 @@ impl ConcurrentKeyspace {
             Some(_) => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                remove_if_expired(&mut wguard, key, now_nanos);
+                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
                 Ok(None)
             }
             None => Ok(None),
@@ -838,7 +963,9 @@ impl ConcurrentKeyspace {
     ) -> Result<MutationOutcome<usize>, &'static [u8]> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let had_ttl = ttl_present(guard.get_entry_ttl(&key));
         let length = setrange_in_table(&mut guard, key, offset, new_bytes, now_nanos)?;
+        self.update_expiry_count(shard_index, had_ttl, false);
         Ok(MutationOutcome::new(length, Some(self.next_lsn())))
     }
 
@@ -857,9 +984,12 @@ impl ConcurrentKeyspace {
 
         for (key, shard_index) in keys.iter().zip(per_key_shards.iter().copied()) {
             let position = ConcurrentKeyspace::guard_position(&sorted_shards, shard_index);
-            if remove_live_value(&mut guards[position].1, key, now_nanos).is_some() {
+            let table = &mut *guards[position].1;
+            let had_ttl = ttl_present(table.get_entry_ttl(key));
+            if remove_live_value(table, key, now_nanos).is_some() {
                 deleted += 1;
             }
+            self.update_expiry_count(shard_index, had_ttl, false);
         }
 
         MutationOutcome::new(deleted, (deleted != 0).then(|| self.next_lsn()))
@@ -880,7 +1010,7 @@ impl ConcurrentKeyspace {
                 Some(_) => {
                     drop(guard);
                     let mut wguard = self.write_shard_by_index(shard_index);
-                    remove_if_expired(&mut wguard, key, now_nanos);
+                    self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
                     0
                 }
                 None => 0,
@@ -909,7 +1039,7 @@ impl ConcurrentKeyspace {
             for &idx in &expired_indices {
                 let shard_index = per_key_shards[idx];
                 let mut wguard = self.write_shard_by_index(shard_index);
-                remove_if_expired(&mut wguard, &keys[idx], now_nanos);
+                self.cleanup_expired_key(shard_index, &mut wguard, &keys[idx], now_nanos);
             }
         }
 
@@ -924,15 +1054,19 @@ impl ConcurrentKeyspace {
     ) -> MutationOutcome<bool> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
-        let _ = remove_if_expired(&mut guard, key, now_nanos);
+        let _ = self.cleanup_expired_key(shard_index, &mut guard, key, now_nanos);
+        let had_ttl = ttl_present(guard.get_entry_ttl(key));
         let updated = guard.set_entry_ttl(key, deadline_nanos);
+        self.update_expiry_count(shard_index, had_ttl, updated);
         MutationOutcome::new(updated, updated.then(|| self.next_lsn()))
     }
 
     pub(crate) fn persist_key(&self, key: &VortexKey) -> MutationOutcome<bool> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+        let had_ttl = ttl_present(guard.get_entry_ttl(key));
         let updated = guard.clear_entry_ttl(key);
+        self.update_expiry_count(shard_index, had_ttl, false);
         MutationOutcome::new(updated, updated.then(|| self.next_lsn()))
     }
 
@@ -945,7 +1079,7 @@ impl ConcurrentKeyspace {
             Some((_, deadline)) if deadline <= now_nanos => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                remove_if_expired(&mut wguard, key, now_nanos);
+                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
                 TtlState::Missing
             }
             Some((_, deadline)) => TtlState::Deadline(deadline),
@@ -960,7 +1094,7 @@ impl ConcurrentKeyspace {
             Some(_) => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                remove_if_expired(&mut wguard, key, now_nanos);
+                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
                 None
             }
             None => None,
@@ -978,11 +1112,24 @@ impl ConcurrentKeyspace {
         let destination_shard = self.shard_index(new_key.as_bytes());
 
         if source_shard == destination_shard {
+            let destination = new_key.clone();
             let mut guard = self.write_shard_by_index(source_shard);
-            let same_key = old_key == &new_key;
-            let renamed = rename_within_table(&mut guard, old_key, new_key, now_nanos, nx)?;
+            let old_had_ttl = ttl_present(guard.get_entry_ttl(old_key));
+            let new_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
+            let same_key = old_key == &destination;
+            let renamed = rename_within_table(&mut guard, old_key, new_key, now_nanos, nx);
+            let old_has_ttl = ttl_present(guard.get_entry_ttl(old_key));
+            let new_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
+            self.update_expiry_count(source_shard, old_had_ttl, old_has_ttl);
+            if !same_key {
+                self.update_expiry_count(source_shard, new_had_ttl, new_has_ttl);
+            }
+            let renamed = renamed?;
             let changed = renamed && !same_key;
-            return Ok(MutationOutcome::new(renamed, changed.then(|| self.next_lsn())));
+            return Ok(MutationOutcome::new(
+                renamed,
+                changed.then(|| self.next_lsn()),
+            ));
         }
 
         let key_refs = [old_key.as_bytes(), new_key.as_bytes()];
@@ -998,11 +1145,13 @@ impl ConcurrentKeyspace {
             (&mut *right[0].1, &mut *left[dst_position].1)
         };
 
-        let _ = remove_if_expired(src_table, old_key, now_nanos);
+        let _ = self.cleanup_expired_key(source_shard, src_table, old_key, now_nanos);
+        let _ = self.cleanup_expired_key(destination_shard, dst_table, &new_key, now_nanos);
+        let old_had_ttl = ttl_present(src_table.get_entry_ttl(old_key));
+        let new_had_ttl = ttl_present(dst_table.get_entry_ttl(&new_key));
         if !src_table.contains_key(old_key) {
             return Err(b"-ERR no such key\r\n");
         }
-        let _ = remove_if_expired(dst_table, &new_key, now_nanos);
         if nx && dst_table.contains_key(&new_key) {
             return Ok(MutationOutcome::new(false, None));
         }
@@ -1016,6 +1165,8 @@ impl ConcurrentKeyspace {
         } else {
             dst_table.insert(new_key, value);
         }
+        self.update_expiry_count(source_shard, old_had_ttl, false);
+        self.update_expiry_count(destination_shard, new_had_ttl, ttl != 0 && ttl > now_nanos);
         Ok(MutationOutcome::new(true, Some(self.next_lsn())))
     }
 
@@ -1106,8 +1257,12 @@ impl ConcurrentKeyspace {
         let destination_shard = self.shard_index(dst.as_bytes());
 
         if source_shard == destination_shard {
+            let destination = dst.clone();
             let mut guard = self.write_shard_by_index(source_shard);
+            let dst_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
             let copied = copy_within_table(&mut guard, src, dst, replace, now_nanos);
+            let dst_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
+            self.update_expiry_count(source_shard, dst_had_ttl, dst_has_ttl);
             return MutationOutcome::new(copied, copied.then(|| self.next_lsn()));
         }
 
@@ -1124,7 +1279,9 @@ impl ConcurrentKeyspace {
             (&mut *right[0].1, &mut *left[dst_position].1)
         };
 
-        let _ = remove_if_expired(src_table, src, now_nanos);
+        let _ = self.cleanup_expired_key(source_shard, src_table, src, now_nanos);
+        let _ = self.cleanup_expired_key(destination_shard, dst_table, &dst, now_nanos);
+        let dst_had_ttl = ttl_present(dst_table.get_entry_ttl(&dst));
         let (value_clone, ttl) = {
             let Some((value, ttl)) = src_table.get_with_ttl(src) else {
                 return MutationOutcome::new(false, None);
@@ -1145,6 +1302,7 @@ impl ConcurrentKeyspace {
         } else {
             dst_table.insert(dst, value_clone);
         }
+        self.update_expiry_count(destination_shard, dst_had_ttl, ttl != 0 && ttl > now_nanos);
         MutationOutcome::new(true, Some(self.next_lsn()))
     }
 
@@ -1158,13 +1316,9 @@ impl ConcurrentKeyspace {
     }
 
     pub(crate) fn info_keyspace(&self, now_nanos: u64) -> (usize, usize) {
+        let _ = now_nanos;
         let keys = self.dbsize();
-        let expires = (0..self.num_shards())
-            .map(|shard_index| {
-                let guard = self.read_shard_by_index(shard_index);
-                count_live_expires(&guard, now_nanos)
-            })
-            .sum();
+        let expires = self.total_expiry_keys();
         (keys, expires)
     }
 }

@@ -11,10 +11,7 @@ use std::os::fd::RawFd;
 #[cfg(not(feature = "sqpoll"))]
 use std::time::Duration;
 
-use io_uring::{
-    IoUring, opcode,
-    types::Fd,
-};
+use io_uring::{IoUring, opcode, types::Fd};
 
 #[cfg(not(feature = "sqpoll"))]
 use io_uring::types::{SubmitArgs, Timespec};

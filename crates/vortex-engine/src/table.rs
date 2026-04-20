@@ -566,6 +566,84 @@ impl SwissTable {
         None
     }
 
+    /// Insert a key-value pair with TTL=0, returning `(old_value, old_had_ttl)`.
+    ///
+    /// Fuses the `get_entry_ttl` + `insert` into a single probe sequence,
+    /// eliminating redundant table lookups on the SET hot path.
+    pub fn insert_no_ttl(
+        &mut self,
+        key: VortexKey,
+        value: VortexValue,
+    ) -> (Option<VortexValue>, bool) {
+        let hash = self.hash_key(key.as_bytes());
+        self.insert_no_ttl_prehashed(key, value, hash)
+    }
+
+    /// Same as `insert_no_ttl` but accepts a pre-computed table hash.
+    /// Callers can compute the hash BEFORE acquiring the shard write lock
+    /// to reduce lock hold time.
+    #[inline]
+    pub fn insert_no_ttl_prehashed(
+        &mut self,
+        key: VortexKey,
+        value: VortexValue,
+        hash: u64,
+    ) -> (Option<VortexValue>, bool) {
+        if self.occupied >= self.growth_limit() {
+            self.resize();
+        }
+
+        let h2 = h2_from_hash(hash);
+        let key_bytes = key.as_bytes();
+
+        if let Some(slot) = self.find_slot(key_bytes, hash) {
+            let old_bytes = self.slot_memory_usage(slot);
+            let old_ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+            self.keys[slot] = Some(key);
+            let previous = self.values[slot].replace(value);
+
+            let key_ptr =
+                self.keys[slot].as_ref().expect("live slot must have key") as *const VortexKey;
+            let value_ptr = self.values[slot]
+                .as_ref()
+                .expect("live slot must have value")
+                as *const VortexValue;
+
+            let entry = unsafe { self.raw.entry_mut(slot) };
+            Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);
+            unsafe { self.raw.set_ctrl(slot, h2) };
+            let new_bytes = Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe { &*value_ptr });
+            self.record_memory_delta(new_bytes as isize - old_bytes as isize);
+            return (previous, old_ttl != 0);
+        }
+
+        let slot = self.find_insert_slot(hash);
+        let was_empty = unsafe { *self.raw.ctrl_at(slot) == CTRL_EMPTY };
+
+        self.keys[slot] = Some(key);
+        self.values[slot] = Some(value);
+
+        let key_ptr = self.keys[slot].as_ref().expect("new slot must have key") as *const VortexKey;
+        let value_ptr = self.values[slot]
+            .as_ref()
+            .expect("new slot must have value") as *const VortexValue;
+
+        let entry = unsafe { self.raw.entry_mut(slot) };
+        Self::write_entry(entry, h2, unsafe { &*key_ptr }, unsafe { &*value_ptr }, 0);
+        unsafe {
+            self.raw.set_ctrl(slot, h2);
+        }
+
+        self.len += 1;
+        if was_empty {
+            self.occupied += 1;
+        }
+        self.record_memory_delta(Self::entry_memory_usage(unsafe { &*key_ptr }, unsafe {
+            &*value_ptr
+        }) as isize);
+        (None, false)
+    }
+
     /// Get a reference to the value for a key.
     pub fn get(&self, key: &VortexKey) -> Option<&VortexValue> {
         let key_bytes = key.as_bytes();
@@ -939,6 +1017,17 @@ impl SwissTable {
         let slot = self.find_slot(key_bytes, hash)?;
         let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
         let value = self.values[slot].as_ref()?;
+        Some((value, ttl))
+    }
+
+    /// Mutable variant of [`get_with_ttl`](Self::get_with_ttl).
+    /// Returns `(&mut VortexValue, ttl_deadline)` in a single probe.
+    pub fn get_with_ttl_mut(&mut self, key: &VortexKey) -> Option<(&mut VortexValue, u64)> {
+        let key_bytes = key.as_bytes();
+        let hash = self.hash_key(key_bytes);
+        let slot = self.find_slot(key_bytes, hash)?;
+        let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+        let value = self.values[slot].as_mut()?;
         Some((value, ttl))
     }
 

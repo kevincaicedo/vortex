@@ -10,6 +10,7 @@ pub(crate) mod pattern;
 pub(crate) mod server;
 pub(crate) mod string;
 
+use smallvec::SmallVec;
 use vortex_common::{VortexKey, VortexValue};
 use vortex_proto::{FrameRef, RespFrame};
 
@@ -43,7 +44,10 @@ pub struct InlineResp {
 impl InlineResp {
     #[inline]
     pub fn bulk_from_payload(payload: &[u8]) -> Self {
-        debug_assert!(payload.len() <= 23, "InlineResp only supports tiny bulk strings");
+        debug_assert!(
+            payload.len() <= 23,
+            "InlineResp only supports tiny bulk strings"
+        );
 
         let mut buf = [0u8; 32];
         let mut cursor = 0usize;
@@ -211,6 +215,43 @@ pub fn execute_command(
 
 // ── Argument extraction helpers ─────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+pub struct CommandArgs<'a> {
+    args: SmallVec<[&'a [u8]; 8]>,
+}
+
+impl<'a> CommandArgs<'a> {
+    #[inline]
+    pub fn collect(frame: &FrameRef<'a>) -> Option<Self> {
+        let mut children = frame.children()?;
+        let mut args = SmallVec::with_capacity(frame.element_count()? as usize);
+        while let Some(child) = children.next() {
+            args.push(child.as_bytes()?);
+        }
+        Some(Self { args })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.args.len()
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&'a [u8]> {
+        self.args.get(index).copied()
+    }
+
+    #[inline]
+    pub fn i64(&self, index: usize) -> Option<i64> {
+        parse_i64(self.get(index)?)
+    }
+
+    #[inline]
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &'a [u8]> + '_ {
+        self.args.iter().skip(start).copied()
+    }
+}
+
 /// Extract the Nth child's bytes from a FrameRef (0-indexed).
 /// Child 0 is the command name.
 #[inline]
@@ -296,7 +337,9 @@ pub fn value_from_bytes(bytes: &[u8]) -> VortexValue {
 #[inline]
 pub fn value_to_resp(val: &VortexValue) -> CmdResult {
     match val {
-        VortexValue::InlineString(ib) => CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes())),
+        VortexValue::InlineString(ib) => {
+            CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes()))
+        }
         VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b.clone())),
         VortexValue::Integer(n) => CmdResult::Inline(InlineResp::bulk_from_i64(*n)),
         _ => CmdResult::Static(ERR_WRONG_TYPE),
@@ -307,7 +350,9 @@ pub fn value_to_resp(val: &VortexValue) -> CmdResult {
 #[inline]
 pub fn owned_value_to_resp(val: VortexValue) -> CmdResult {
     match val {
-        VortexValue::InlineString(ib) => CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes())),
+        VortexValue::InlineString(ib) => {
+            CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes()))
+        }
         VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b)),
         VortexValue::Integer(n) => CmdResult::Inline(InlineResp::bulk_from_i64(n)),
         _ => CmdResult::Static(ERR_WRONG_TYPE),
@@ -328,6 +373,7 @@ pub fn int_resp(n: i64) -> CmdResult {
 
 #[cfg(test)]
 pub(crate) mod test_harness {
+    use crate::commands::context::SetOptions;
     use crate::concurrent_keyspace::ConcurrentKeyspace;
     use vortex_common::{VortexKey, VortexValue};
 
@@ -343,21 +389,25 @@ pub(crate) mod test_harness {
         }
 
         pub fn set(&self, key: VortexKey, value: VortexValue) {
-            let idx = self.keyspace.shard_index(key.as_bytes());
-            self.keyspace.write_shard_by_index(idx).insert(key, value);
+            let _ = self
+                .keyspace
+                .set_value_with_options(key, value, SetOptions::default(), 0);
         }
 
         pub fn set_with_ttl(&self, key: VortexKey, value: VortexValue, ttl_deadline: u64) {
-            let idx = self.keyspace.shard_index(key.as_bytes());
-            self.keyspace
-                .write_shard_by_index(idx)
-                .insert_with_ttl(key, value, ttl_deadline);
+            let _ = self.keyspace.set_value_with_options(
+                key,
+                value,
+                SetOptions {
+                    ttl_deadline,
+                    ..SetOptions::default()
+                },
+                0,
+            );
         }
 
         pub fn get(&self, key: &VortexKey, now: u64) -> Option<VortexValue> {
-            let idx = self.keyspace.shard_index(key.as_bytes());
-            let mut guard = self.keyspace.write_shard_by_index(idx);
-            guard.get_or_expire(key, now).cloned()
+            self.keyspace.get_value(key, now)
         }
 
         pub fn exists(&self, key: &VortexKey, now: u64) -> bool {

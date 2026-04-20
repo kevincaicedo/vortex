@@ -12,11 +12,11 @@ use vortex_proto::{FrameRef, RespFrame};
 
 use super::context::TtlState;
 use super::{
-    CmdResult, ExecutedCommand, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO, RESP_NIL,
-    RESP_OK, RESP_ONE, RESP_ZERO, arg_bytes, arg_count, arg_i64, int_resp, key_from_bytes,
+    CmdResult, CommandArgs, ExecutedCommand, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO,
+    RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, arg_bytes, int_resp, key_from_bytes,
 };
-use crate::commands::context::MutationOutcome;
 use crate::ConcurrentKeyspace;
+use crate::commands::context::MutationOutcome;
 
 // ── Error constants ─────────────────────────────────────────────────
 
@@ -34,11 +34,14 @@ pub fn cmd_del(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    let argc = arg_count(frame);
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS)),
+    };
     if argc < 2 {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
-    // Single-key fast path: avoid Vec allocation.
+    // Single-key fast path: skip CommandArgs::collect SmallVec allocation.
     if argc == 2 {
         if let Some(kb) = arg_bytes(frame, 1) {
             let key = key_from_bytes(kb);
@@ -47,11 +50,12 @@ pub fn cmd_del(
         }
         return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
     let mut keys = Vec::with_capacity(argc - 1);
-    for i in 1..argc {
-        if let Some(kb) = arg_bytes(frame, i) {
-            keys.push(key_from_bytes(kb));
-        }
+    for kb in args.iter_from(1) {
+        keys.push(key_from_bytes(kb));
     }
     let outcome = keyspace.delete_keys(&keys, now_nanos);
     ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn)
@@ -77,11 +81,14 @@ pub fn cmd_exists(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    let argc = arg_count(frame);
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return CmdResult::Static(ERR_WRONG_ARGS),
+    };
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
     }
-    // Single-key fast path: avoid Vec allocation.
+    // Single-key fast path: skip CommandArgs::collect.
     if argc == 2 {
         if let Some(kb) = arg_bytes(frame, 1) {
             let key = key_from_bytes(kb);
@@ -89,11 +96,12 @@ pub fn cmd_exists(
         }
         return CmdResult::Static(RESP_ZERO);
     }
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
     let mut keys = Vec::with_capacity(argc - 1);
-    for i in 1..argc {
-        if let Some(kb) = arg_bytes(frame, i) {
-            keys.push(key_from_bytes(kb));
-        }
+    for kb in args.iter_from(1) {
+        keys.push(key_from_bytes(kb));
     }
     int_resp(keyspace.count_existing(&keys, now_nanos))
 }
@@ -147,7 +155,10 @@ pub fn cmd_persist(
     frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> ExecutedCommand {
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let Some(kb) = args.get(1) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let key = key_from_bytes(kb);
@@ -175,14 +186,17 @@ fn expire_generic(
     now_nanos: u64,
     mode: ExpireMode,
 ) -> ExecutedCommand {
-    let argc = arg_count(frame);
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
     if argc < 3 {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(kb) = args.get(1) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
-    let Some(time_val) = arg_i64(frame, 2) else {
+    let Some(time_val) = args.i64(2) else {
         return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
     };
 
@@ -192,7 +206,7 @@ fn expire_generic(
     let mut gt = false;
     let mut lt = false;
     for i in 3..argc {
-        if let Some(flag) = arg_bytes(frame, i) {
+        if let Some(flag) = args.get(i) {
             match flag.len() {
                 2 => {
                     let upper = [flag[0] | 0x20, flag[1] | 0x20];
@@ -302,7 +316,10 @@ fn expire_generic(
 /// TTL key
 #[inline]
 pub fn cmd_ttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(kb) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
@@ -316,7 +333,10 @@ pub fn cmd_ttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
 /// PTTL key
 #[inline]
 pub fn cmd_pttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(kb) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
@@ -334,7 +354,10 @@ pub fn cmd_expiretime(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(kb) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
@@ -352,7 +375,10 @@ pub fn cmd_pexpiretime(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(kb) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
@@ -368,7 +394,10 @@ pub fn cmd_pexpiretime(
 /// TYPE key
 #[inline]
 pub fn cmd_type(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(kb) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(kb) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let key = key_from_bytes(kb);
@@ -387,14 +416,17 @@ pub fn cmd_rename(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    let argc = arg_count(frame);
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
     if argc < 3 {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
-    let Some(old_kb) = arg_bytes(frame, 1) else {
+    let Some(old_kb) = args.get(1) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
-    let Some(new_kb) = arg_bytes(frame, 2) else {
+    let Some(new_kb) = args.get(2) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let old_key = key_from_bytes(old_kb);
@@ -419,14 +451,17 @@ pub fn cmd_renamenx(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    let argc = arg_count(frame);
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
     if argc < 3 {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
-    let Some(old_kb) = arg_bytes(frame, 1) else {
+    let Some(old_kb) = args.get(1) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
-    let Some(new_kb) = arg_bytes(frame, 2) else {
+    let Some(new_kb) = args.get(2) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let old_key = key_from_bytes(old_kb);
@@ -449,11 +484,14 @@ pub fn cmd_renamenx(
 
 /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
 pub fn cmd_scan(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let argc = arg_count(frame);
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let argc = args.len();
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
     }
-    let Some(cursor_val) = arg_i64(frame, 1) else {
+    let Some(cursor_val) = args.i64(1) else {
         return CmdResult::Static(super::ERR_NOT_INTEGER);
     };
     let cursor = cursor_val as u64;
@@ -465,20 +503,20 @@ pub fn cmd_scan(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
 
     let mut i = 2;
     while i < argc {
-        if let Some(opt) = arg_bytes(frame, i) {
+        if let Some(opt) = args.get(i) {
             if eq_ci(opt, b"MATCH") {
                 i += 1;
-                pattern = arg_bytes(frame, i);
+                pattern = args.get(i);
             } else if eq_ci(opt, b"COUNT") {
                 i += 1;
-                if let Some(n) = arg_i64(frame, i) {
+                if let Some(n) = args.i64(i) {
                     if n > 0 {
                         count = n as usize;
                     }
                 }
             } else if eq_ci(opt, b"TYPE") {
                 i += 1;
-                type_filter = arg_bytes(frame, i);
+                type_filter = args.get(i);
             }
         }
         i += 1;
@@ -507,7 +545,10 @@ fn scan_response(cursor: u64, keys: &[VortexKey]) -> CmdResult {
 
 /// KEYS pattern
 pub fn cmd_keys(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(pat) = arg_bytes(frame, 1) else {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(pat) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
     let mut results = Vec::new();
@@ -556,14 +597,17 @@ pub fn cmd_copy(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    let argc = arg_count(frame);
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
     if argc < 3 {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
-    let Some(src_kb) = arg_bytes(frame, 1) else {
+    let Some(src_kb) = args.get(1) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
-    let Some(dst_kb) = arg_bytes(frame, 2) else {
+    let Some(dst_kb) = args.get(2) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
 
@@ -571,7 +615,7 @@ pub fn cmd_copy(
     let mut replace = false;
     let mut i = 3;
     while i < argc {
-        if let Some(opt) = arg_bytes(frame, i) {
+        if let Some(opt) = args.get(i) {
             if eq_ci(opt, b"REPLACE") {
                 replace = true;
             } else if eq_ci(opt, b"DB") {
@@ -682,7 +726,11 @@ mod tests {
                         std::str::from_utf8(s)
                     ),
                 };
-                assert_eq!(s, expected_bytes, "Static integer mismatch for {}", expected);
+                assert_eq!(
+                    s, expected_bytes,
+                    "Static integer mismatch for {}",
+                    expected
+                );
             }
             other => panic!("Expected Integer({}), got {:?}", expected, other),
         }

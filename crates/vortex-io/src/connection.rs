@@ -60,7 +60,7 @@ impl std::fmt::Display for InvalidTransition {
 ///  0      4     fd
 ///  4      1     state
 ///  5      1     flags
-///  6      2     shard_id
+///  6      2     reserved
 ///  8      4     read_buf_offset
 /// 12      4     read_buf_len
 /// 16      4     write_buf_offset
@@ -81,8 +81,6 @@ pub struct ConnectionMeta {
     state: u8,
     /// Bitflags (see [`ConnectionFlags`]).
     pub flags: u8,
-    /// Assigned shard index (Phase 3+).
-    pub shard_id: u16,
     /// Index into the reactor's read-buffer array.
     pub read_buf_offset: u32,
     /// Bytes currently in the read buffer.
@@ -121,7 +119,6 @@ impl ConnectionMeta {
             fd,
             state: ConnectionState::New as u8,
             flags: 0,
-            shard_id: 0,
             read_buf_offset: buf_index,
             read_buf_len: 0,
             write_buf_offset: buf_index,
