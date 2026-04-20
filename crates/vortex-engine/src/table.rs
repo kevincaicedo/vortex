@@ -362,11 +362,21 @@ pub struct SwissTable {
 impl SwissTable {
     /// Creates a new empty table (minimum 16 slots).
     pub fn new() -> Self {
-        Self::with_capacity(GROUP_SIZE)
+        Self::with_capacity_and_hasher(GROUP_SIZE, RandomState::new())
+    }
+
+    /// Creates a new empty table with an explicit shared hasher.
+    pub fn with_hasher(hasher: RandomState) -> Self {
+        Self::with_capacity_and_hasher(GROUP_SIZE, hasher)
     }
 
     /// Creates a new table pre-sized for `cap` entries (respecting load factor).
     pub fn with_capacity(cap: usize) -> Self {
+        Self::with_capacity_and_hasher(cap, RandomState::new())
+    }
+
+    /// Creates a new table pre-sized for `cap` entries with an explicit hasher.
+    pub fn with_capacity_and_hasher(cap: usize, hasher: RandomState) -> Self {
         let min_slots = if cap == 0 { GROUP_SIZE } else { cap };
         let required = min_slots
             .checked_mul(LOAD_FACTOR_D)
@@ -380,7 +390,7 @@ impl SwissTable {
 
         Self {
             raw: RawTable::allocate(num_groups),
-            hasher: RandomState::new(),
+            hasher,
             keys: vec![None; num_slots],
             values: vec![None; num_slots],
             len: 0,
@@ -926,6 +936,20 @@ impl SwissTable {
     pub fn get_with_ttl(&self, key: &VortexKey) -> Option<(&VortexValue, u64)> {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
+        let slot = self.find_slot(key_bytes, hash)?;
+        let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
+        let value = self.values[slot].as_ref()?;
+        Some((value, ttl))
+    }
+
+    /// Like [`get_with_ttl`](Self::get_with_ttl) but uses raw bytes and a
+    /// pre-computed hash so batch pipelines do not rebuild `VortexKey`s or
+    /// re-hash the same key on the hot path.
+    pub fn get_with_ttl_prehashed(
+        &self,
+        key_bytes: &[u8],
+        hash: u64,
+    ) -> Option<(&VortexValue, u64)> {
         let slot = self.find_slot(key_bytes, hash)?;
         let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();
         let value = self.values[slot].as_ref()?;

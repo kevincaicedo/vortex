@@ -21,6 +21,8 @@ from vortex_benchmark.models import (
     SUPPORTED_EVICTION_POLICIES,
 )
 
+SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
+
 
 def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_file: bool) -> None:
     parser.add_argument(
@@ -87,6 +89,26 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         "--eviction-policy",
         choices=SUPPORTED_EVICTION_POLICIES,
         help="Database eviction policy for supported databases.",
+    )
+    parser.add_argument(
+        "--io-backend",
+        choices=SUPPORTED_VORTEX_IO_BACKENDS,
+        help="Vortex I/O backend override for setup scenarios. Choices: auto, uring, polling.",
+    )
+    parser.add_argument(
+        "--ring-size",
+        type=int,
+        help="Vortex io_uring submission queue size override for setup scenarios.",
+    )
+    parser.add_argument(
+        "--fixed-buffers",
+        type=int,
+        help="Vortex fixed I/O buffer count override for setup scenarios.",
+    )
+    parser.add_argument(
+        "--sqpoll-idle-ms",
+        type=int,
+        help="Vortex SQPOLL idle timeout override for setup scenarios.",
     )
     parser.add_argument(
         "--no-build-vortex",

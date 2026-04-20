@@ -11,6 +11,9 @@ just profiler --check
 # CPU flamegraph under SET,GET load
 just profiler --command SET,GET
 
+# Force the uring backend explicitly for a profiling run
+just profiler --flamegraph --io-backend uring --ring-size 4096 --sqpoll-idle-ms 1000 --command SET,GET
+
 # Full CPU suite (flamegraph + perf/samply/instruments)
 just profiler --cpu --command SET,GET --duration 20
 
@@ -135,6 +138,9 @@ just profiler --cpu --command SET --maxmemory 64mb --eviction allkeys-lru
 | `--aof` | Enable AOF persistence | disabled |
 | `--maxmemory SIZE` | Set max memory (e.g., 64mb) | unlimited |
 | `--eviction POLICY` | Set eviction policy | noeviction |
+| `--io-backend auto|uring|polling` | Explicit Vortex I/O backend | auto |
+| `--ring-size N` | Override io_uring ring size | binary default |
+| `--sqpoll-idle-ms N` | Override io_uring SQPOLL idle timeout (ms) | binary default |
 | `--host HOST` | Bind address | 127.0.0.1 |
 | `--port PORT` | Bind port | 16379 |
 | `--bin PATH` | Use pre-built binary | auto-build |

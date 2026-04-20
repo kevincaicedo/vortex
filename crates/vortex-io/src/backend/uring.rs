@@ -8,7 +8,16 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use io_uring::{IoUring, opcode, types::Fd};
+#[cfg(not(feature = "sqpoll"))]
+use std::time::Duration;
+
+use io_uring::{
+    IoUring, opcode,
+    types::Fd,
+};
+
+#[cfg(not(feature = "sqpoll"))]
+use io_uring::types::{SubmitArgs, Timespec};
 
 use super::{Completion, IoBackend};
 
@@ -204,14 +213,87 @@ impl IoBackend for IoUringBackend {
     }
 
     fn flush(&mut self) -> io::Result<usize> {
-        let n = self.ring.submit()?;
-        Ok(n)
+        #[cfg(feature = "sqpoll")]
+        {
+            // SQPOLL mode: call submit() to sync the SQ tail pointer and
+            // wake the kernel poll thread if it has gone idle. Without this,
+            // SQEs pushed after the thread parks would never be seen.
+            let n = self.ring.submit()?;
+            Ok(n)
+        }
+        #[cfg(not(feature = "sqpoll"))]
+        {
+            // Non-SQPOLL: submission is deferred to completions() so both
+            // submit and wait happen in a single io_uring_enter syscall.
+            Ok(0)
+        }
     }
 
     fn completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         let start = out.len();
 
-        // Non-blocking drain of the completion queue.
+        #[cfg(feature = "sqpoll")]
+        {
+            // SQPOLL mode: the kernel thread submits SQEs for us (we
+            // already synced the SQ in flush()). Drain completions with
+            // adaptive backoff: spin → yield → park.
+            let mut backoff = 0u32;
+            loop {
+                let cq = self.ring.completion();
+                let mut got_any = false;
+                for cqe in cq {
+                    out.push(Completion {
+                        token: cqe.user_data(),
+                        result: cqe.result(),
+                        flags: cqe.flags(),
+                    });
+                    got_any = true;
+                }
+                if got_any || backoff >= 120 {
+                    break;
+                }
+                if backoff < 10 {
+                    std::hint::spin_loop();
+                } else if backoff < 110 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::park_timeout(std::time::Duration::from_micros(1));
+                }
+                backoff += 1;
+            }
+        }
+
+        #[cfg(not(feature = "sqpoll"))]
+        {
+            // Combined submit + wait: submit_with_args atomically submits
+            // all pending SQEs and waits for at least 1 CQE with a timeout.
+            // This replaces the previous pattern of ring.submit() in flush()
+            // followed by submit_with_args(1, ...) in completions() — two
+            // io_uring_enter syscalls per iteration reduced to one.
+            let timeout = Timespec::from(Duration::from_millis(1));
+            let args = SubmitArgs::new().timespec(&timeout);
+            match self.ring.submitter().submit_with_args(1, &args) {
+                Ok(_) | Err(_) => {}
+            }
+
+            let cq = self.ring.completion();
+            for cqe in cq {
+                out.push(Completion {
+                    token: cqe.user_data(),
+                    result: cqe.result(),
+                    flags: cqe.flags(),
+                });
+            }
+        }
+
+        Ok(out.len() - start)
+    }
+
+    fn drain_cq(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
+        let start = out.len();
+
+        // Non-blocking CQ peek — no syscall. Just read whatever the kernel
+        // has already placed in the completion ring.
         let cq = self.ring.completion();
         for cqe in cq {
             out.push(Completion {
@@ -221,62 +303,17 @@ impl IoBackend for IoUringBackend {
             });
         }
 
-        // If no completions were ready, wait for work.
-        if out.len() == start {
-            #[cfg(feature = "sqpoll")]
-            {
-                // SQPOLL mode: the kernel thread is submitting SQEs for us.
-                // Use adaptive backoff instead of a blocking syscall:
-                //   Phase 1: spin → yield → park
-                let mut backoff = 0u32;
-                loop {
-                    let cq = self.ring.completion();
-                    let mut got_any = false;
-                    for cqe in cq {
-                        out.push(Completion {
-                            token: cqe.user_data(),
-                            result: cqe.result(),
-                            flags: cqe.flags(),
-                        });
-                        got_any = true;
-                    }
-                    if got_any || backoff >= 120 {
-                        break;
-                    }
-                    if backoff < 10 {
-                        // Spin phase — fastest response latency.
-                        std::hint::spin_loop();
-                    } else if backoff < 110 {
-                        // Yield phase — relinquish CPU slice briefly.
-                        std::thread::yield_now();
-                    } else {
-                        // Park phase — sleep for a very short time.
-                        std::thread::park_timeout(std::time::Duration::from_micros(1));
-                    }
-                    backoff += 1;
-                }
-            }
-
-            #[cfg(not(feature = "sqpoll"))]
-            {
-                // Standard mode: submit pending SQEs and wait briefly (1ms).
-                // Keeps the reactor responsive for shutdown checks and timer
-                // ticks while avoiding CPU-burning spin loops.
-                match self
-                    .ring
-                    .submit_and_wait_with_timeout(1, std::time::Duration::from_millis(1))
-                {
-                    Ok(_) | Err(_) => {}
-                }
-                let cq = self.ring.completion();
-                for cqe in cq {
-                    out.push(Completion {
-                        token: cqe.user_data(),
-                        result: cqe.result(),
-                        flags: cqe.flags(),
-                    });
-                }
-            }
+        // If we got completions, also submit any pending SQEs that were
+        // queued during processing (e.g. write SQEs from handle_read).
+        #[cfg(not(feature = "sqpoll"))]
+        if out.len() > start {
+            // Non-SQPOLL: explicit submit needed.
+            let _ = self.ring.submit()?;
+        }
+        #[cfg(feature = "sqpoll")]
+        if out.len() > start {
+            // SQPOLL: sync SQ tail to wake kernel thread if needed.
+            let _ = self.ring.submit()?;
         }
 
         Ok(out.len() - start)

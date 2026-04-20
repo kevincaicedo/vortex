@@ -14,6 +14,9 @@ class DragonflyAdapter(DatabaseAdapter):
     container_supported = True
     image = "docker.dragonflydb.io/dragonflydb/dragonfly:latest"
 
+    def prepare_container(self, request: StartRequest) -> None:
+        return None
+
     def resolve_runtime_config(self, request: StartRequest) -> dict[str, object]:
         runtime_config = {
             "maxmemory": str(request.runtime_config.get("maxmemory", DEFAULT_DRAGONFLY_MAXMEMORY))

@@ -120,6 +120,10 @@ pub struct ConcurrentKeyspace {
     mask: u64,
     /// Fixed-seed hasher for deterministic shard routing.
     hasher: RandomState,
+    /// Shared SwissTable hasher cloned into every shard table in this keyspace.
+    /// This keeps table hashing random per process while still allowing
+    /// batch commands to pre-hash once before taking shard locks.
+    table_hasher: RandomState,
     /// Global approximate memory counter — updated in threshold-flushed chunks.
     global_memory_used: AtomicUsize,
     /// Global Logical Sequence Number (LSN) counter.
@@ -163,14 +167,16 @@ impl ConcurrentKeyspace {
             "num_shards must be in [{MIN_SHARD_COUNT}, {MAX_SHARD_COUNT}], got {num_shards}"
         );
 
+        let table_hasher = RandomState::new();
         let shards: Vec<Shard> = (0..num_shards)
-            .map(|_| CachePadded::new(RwLock::new(SwissTable::new())))
+            .map(|_| CachePadded::new(RwLock::new(SwissTable::with_hasher(table_hasher.clone()))))
             .collect();
 
         Self {
             shards: shards.into_boxed_slice(),
             mask: (num_shards - 1) as u64,
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
+            table_hasher,
             global_memory_used: AtomicUsize::new(0),
             global_lsn: AtomicU64::new(0),
         }
@@ -193,14 +199,21 @@ impl ConcurrentKeyspace {
         );
 
         let per_shard = total_capacity.div_ceil(num_shards);
+        let table_hasher = RandomState::new();
         let shards: Vec<Shard> = (0..num_shards)
-            .map(|_| CachePadded::new(RwLock::new(SwissTable::with_capacity(per_shard))))
+            .map(|_| {
+                CachePadded::new(RwLock::new(SwissTable::with_capacity_and_hasher(
+                    per_shard,
+                    table_hasher.clone(),
+                )))
+            })
             .collect();
 
         Self {
             shards: shards.into_boxed_slice(),
             mask: (num_shards - 1) as u64,
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
+            table_hasher,
             global_memory_used: AtomicUsize::new(0),
             global_lsn: AtomicU64::new(0),
         }
@@ -273,6 +286,12 @@ impl ConcurrentKeyspace {
     #[inline(always)]
     pub fn hash_key(&self, key: &[u8]) -> u64 {
         self.hasher.hash_one(key)
+    }
+
+    /// Hash a key using the shared SwissTable hasher for this keyspace.
+    #[inline(always)]
+    pub(crate) fn table_hash_key(&self, key: &[u8]) -> u64 {
+        self.table_hasher.hash_one(key)
     }
 
     // ─── Single-key lock acquisition ────────────────────────────────
@@ -550,9 +569,26 @@ impl ConcurrentKeyspace {
         for shard in self.shards.iter() {
             let mut guard = shard.write();
             // Replace with a fresh empty table to release all memory.
-            *guard = SwissTable::new();
+            *guard = SwissTable::with_hasher(self.table_hasher.clone());
         }
         self.global_memory_used.store(0, Ordering::Relaxed);
+    }
+
+    /// FLUSHDB / FLUSHALL with an optional AOF LSN allocated while all shard
+    /// write locks are held.
+    pub(crate) fn flush_all_with_lsn(&self) -> Option<u64> {
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            guards.push(shard.write());
+        }
+
+        let had_entries = guards.iter().any(|guard| !guard.is_empty());
+        for guard in &mut guards {
+            **guard = SwissTable::with_hasher(self.table_hasher.clone());
+        }
+        self.global_memory_used.store(0, Ordering::Relaxed);
+
+        had_entries.then(|| self.next_lsn())
     }
 
     /// Returns the exact memory usage across all shards.

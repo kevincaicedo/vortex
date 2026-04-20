@@ -4,20 +4,23 @@
 //! MGET, GETSET, GETDEL, GETEX, GETRANGE, SETRANGE, APPEND, INCR, INCRBY,
 //! INCRBYFLOAT, DECR, DECRBY, STRLEN.
 
-use bytes::Bytes;
-use vortex_common::VortexValue;
+use smallvec::SmallVec;
 use vortex_proto::{FrameRef, RespFrame};
 
-use crate::shard::{SetOptions, SetResult};
-
+#[cfg(test)]
+use bytes::Bytes;
 #[cfg(test)]
 use vortex_common::VortexKey;
+#[cfg(test)]
+use vortex_common::VortexValue;
 
 use super::{
-    CmdResult, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, NS_PER_MS, NS_PER_SEC, RESP_NIL,
-    RESP_OK, RESP_ZERO, arg_bytes, arg_count, arg_i64, int_resp, key_from_bytes,
+    CmdResult, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand, NS_PER_MS,
+    NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, arg_bytes, arg_count, arg_i64, int_resp,
+    key_from_bytes,
     owned_value_to_resp, value_from_bytes, value_to_resp,
 };
+use crate::commands::context::{MutationOutcome, SetOptions, SetResult};
 use crate::ConcurrentKeyspace;
 
 #[cfg(test)]
@@ -61,19 +64,23 @@ pub fn cmd_get(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
 /// SET key value [EX seconds | PX milliseconds | EXAT unix-time-seconds |
 ///   PXAT unix-time-milliseconds | KEEPTTL] [NX | XX] [GET]
 #[inline]
-pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_set(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 {
-        return CmdResult::Static(ERR_SYNTAX);
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
 
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let val_bytes = match arg_bytes(frame, 2) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
@@ -90,14 +97,14 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
     while i < argc {
         let opt = match arg_bytes(frame, i) {
             Some(b) => b,
-            None => return CmdResult::Static(ERR_SYNTAX),
+            None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
         };
         match opt_upper(opt) {
             OptToken::EX => {
                 i += 1;
                 let secs = match arg_i64(frame, i) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 ttl_deadline = now_nanos + secs * NS_PER_SEC;
             }
@@ -105,7 +112,7 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
                 i += 1;
                 let ms = match arg_i64(frame, i) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 ttl_deadline = now_nanos + ms * NS_PER_MS;
             }
@@ -113,7 +120,7 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
                 i += 1;
                 let secs = match arg_i64(frame, i) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 ttl_deadline = secs * NS_PER_SEC;
             }
@@ -121,7 +128,7 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
                 i += 1;
                 let ms = match arg_i64(frame, i) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 ttl_deadline = ms * NS_PER_MS;
             }
@@ -129,14 +136,14 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
             OptToken::XX => xx = true,
             OptToken::GET => get = true,
             OptToken::KEEPTTL => keepttl = true,
-            OptToken::Unknown => return CmdResult::Static(ERR_SYNTAX),
+            OptToken::Unknown => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
         }
         i += 1;
     }
 
     // NX and XX are mutually exclusive.
     if nx && xx {
-        return CmdResult::Static(ERR_SYNTAX);
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
 
     let options = SetOptions {
@@ -147,14 +154,16 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
         keepttl,
     };
 
-    match keyspace.set_value_with_options(key, value, options, now_nanos) {
+    let outcome = keyspace.set_value_with_options(key, value, options, now_nanos);
+    let response = match outcome.value {
         SetResult::Ok => CmdResult::Static(RESP_OK),
         SetResult::NotSet => CmdResult::Static(RESP_NIL),
         SetResult::OkGet(Some(old)) => owned_value_to_resp(old),
         SetResult::OkGet(None) => CmdResult::Static(RESP_NIL),
         SetResult::NotSetGet(Some(old)) => owned_value_to_resp(old),
         SetResult::NotSetGet(None) => CmdResult::Static(RESP_NIL),
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── SETNX ───────────────────────────────────────────────────────────────────
@@ -163,19 +172,23 @@ pub fn cmd_set(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
 ///
 /// Returns 1 if set, 0 if key already exists.
 #[inline]
-pub fn cmd_setnx(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_setnx(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let val_bytes = match arg_bytes(frame, 2) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
-    match keyspace.set_value_with_options(
+    let outcome = keyspace.set_value_with_options(
         key,
         value,
         SetOptions {
@@ -183,36 +196,42 @@ pub fn cmd_setnx(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos:
             ..SetOptions::default()
         },
         now_nanos,
-    ) {
+    );
+    let response = match outcome.value {
         SetResult::Ok => CmdResult::Static(super::RESP_ONE),
         SetResult::NotSet => CmdResult::Static(RESP_ZERO),
         _ => CmdResult::Static(RESP_ZERO),
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── SETEX ───────────────────────────────────────────────────────────────────
 
 /// SETEX key seconds value — SET with EXpire.
 #[inline]
-pub fn cmd_setex(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_setex(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let secs = match arg_i64(frame, 2) {
         Some(s) if s > 0 => s as u64,
-        _ => return CmdResult::Static(ERR_NOT_INTEGER),
+        _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
     };
     let val_bytes = match arg_bytes(frame, 3) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
     let deadline = now_nanos + secs * NS_PER_SEC;
-    keyspace.set_value_with_ttl(key, value, deadline);
-    CmdResult::Static(RESP_OK)
+    let outcome = keyspace.set_value_with_ttl(key, value, deadline);
+    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn)
 }
 
 // ── PSETEX ──────────────────────────────────────────────────────────────────
@@ -223,25 +242,25 @@ pub fn cmd_psetex(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let ms = match arg_i64(frame, 2) {
         Some(s) if s > 0 => s as u64,
-        _ => return CmdResult::Static(ERR_NOT_INTEGER),
+        _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
     };
     let val_bytes = match arg_bytes(frame, 3) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
     let deadline = now_nanos + ms * NS_PER_MS;
-    keyspace.set_value_with_ttl(key, value, deadline);
-    CmdResult::Static(RESP_OK)
+    let outcome = keyspace.set_value_with_ttl(key, value, deadline);
+    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn)
 }
 
 // ── MGET ────────────────────────────────────────────────────────────────────
@@ -252,49 +271,30 @@ pub fn cmd_mget(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
     if argc < 2 {
         return CmdResult::Static(ERR_SYNTAX);
     }
-    let mut keys = Vec::with_capacity(argc - 1);
+    let mut keys: SmallVec<[&[u8]; 16]> = SmallVec::with_capacity(argc - 1);
     if let Some(mut children) = frame.children() {
         children.next(); // skip command name
         for child in children {
             if let Some(bytes) = child.as_bytes() {
-                keys.push(key_from_bytes(bytes));
+                keys.push(bytes);
             }
         }
     }
 
-    let mut frames = Vec::with_capacity(keys.len());
-    for value in keyspace.mget_values(&keys, now_nanos) {
-        match value {
-            Some(val) => match val {
-                VortexValue::InlineString(ib) => {
-                    frames.push(RespFrame::bulk_string(Bytes::copy_from_slice(
-                        ib.as_bytes(),
-                    )));
-                }
-                VortexValue::String(b) => {
-                    frames.push(RespFrame::bulk_string(b.clone()));
-                }
-                VortexValue::Integer(n) => {
-                    let mut buf = itoa::Buffer::new();
-                    let s = buf.format(n);
-                    frames.push(RespFrame::bulk_string(Bytes::copy_from_slice(s.as_bytes())));
-                }
-                _ => frames.push(RespFrame::null_bulk_string()),
-            },
-            None => frames.push(RespFrame::null_bulk_string()),
-        }
-    }
-
-    CmdResult::Resp(RespFrame::Array(Some(frames)))
+    CmdResult::Resp(RespFrame::Array(Some(keyspace.mget_frames(&keys, now_nanos))))
 }
 
 // ── MSET ────────────────────────────────────────────────────────────────────
 
 /// MSET key value [key value ...] — Sets multiple key-value pairs.
-pub fn cmd_mset(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, _now_nanos: u64) -> CmdResult {
+pub fn cmd_mset(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 || (argc - 1) % 2 != 0 {
-        return CmdResult::Static(ERR_SYNTAX);
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
 
     let mut pairs = Vec::with_capacity((argc - 1) / 2);
@@ -309,9 +309,8 @@ pub fn cmd_mset(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, _now_nanos:
         }
     }
 
-    keyspace.mset_values(pairs);
-
-    CmdResult::Static(RESP_OK)
+    let outcome = keyspace.mset_values(pairs);
+    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn)
 }
 
 // ── MSETNX ──────────────────────────────────────────────────────────────────
@@ -323,10 +322,10 @@ pub fn cmd_msetnx(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 || (argc - 1) % 2 != 0 {
-        return CmdResult::Static(ERR_SYNTAX);
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
 
     let mut pairs = Vec::with_capacity((argc - 1) / 2);
@@ -343,11 +342,13 @@ pub fn cmd_msetnx(
         }
     }
 
-    if keyspace.msetnx_values(pairs, now_nanos) {
+    let outcome = keyspace.msetnx_values(pairs, now_nanos);
+    let response = if outcome.value {
         CmdResult::Static(super::RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── GETSET ──────────────────────────────────────────────────────────────────
@@ -360,19 +361,19 @@ pub fn cmd_getset(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let val_bytes = match arg_bytes(frame, 2) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
-    match keyspace.set_value_with_options(
+    let outcome = keyspace.set_value_with_options(
         key,
         value,
         SetOptions {
@@ -380,11 +381,13 @@ pub fn cmd_getset(
             ..SetOptions::default()
         },
         now_nanos,
-    ) {
+    );
+    let response = match outcome.value {
         SetResult::OkGet(Some(old)) => owned_value_to_resp(old),
         SetResult::OkGet(None) => CmdResult::Static(RESP_NIL),
         _ => CmdResult::Static(RESP_NIL),
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── GETDEL ──────────────────────────────────────────────────────────────────
@@ -395,16 +398,18 @@ pub fn cmd_getdel(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let key = key_from_bytes(key_bytes);
-    match keyspace.remove_value(&key, now_nanos) {
+    let outcome = keyspace.remove_value(&key, now_nanos);
+    let response = match outcome.value {
         Some(val) => owned_value_to_resp(val),
         None => CmdResult::Static(RESP_NIL),
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── GETEX ───────────────────────────────────────────────────────────────────
@@ -413,10 +418,14 @@ pub fn cmd_getdel(
 ///
 /// Get value and optionally set/remove TTL.
 #[inline]
-pub fn cmd_getex(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_getex(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let key = key_from_bytes(key_bytes);
     let argc = arg_count(frame);
@@ -424,57 +433,62 @@ pub fn cmd_getex(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos:
     // First, get the value.
     let val = match keyspace.get_value(&key, now_nanos) {
         Some(v) => v,
-        None => return CmdResult::Static(RESP_NIL),
+        None => return ExecutedCommand::from(CmdResult::Static(RESP_NIL)),
     };
 
     // Then apply TTL modification if specified.
+    let mut aof_lsn = None;
     if argc >= 3 {
         let opt = match arg_bytes(frame, 2) {
             Some(b) => b,
-            None => return CmdResult::Static(ERR_SYNTAX),
+            None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
         };
         match opt_upper(opt) {
             OptToken::EX => {
                 let secs = match arg_i64(frame, 3) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                keyspace.expire_key(&key, now_nanos + secs * NS_PER_SEC, now_nanos);
+                aof_lsn = keyspace
+                    .expire_key(&key, now_nanos + secs * NS_PER_SEC, now_nanos)
+                    .aof_lsn;
             }
             OptToken::PX => {
                 let ms = match arg_i64(frame, 3) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                keyspace.expire_key(&key, now_nanos + ms * NS_PER_MS, now_nanos);
+                aof_lsn = keyspace
+                    .expire_key(&key, now_nanos + ms * NS_PER_MS, now_nanos)
+                    .aof_lsn;
             }
             OptToken::EXAT => {
                 let secs = match arg_i64(frame, 3) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                keyspace.expire_key(&key, secs * NS_PER_SEC, now_nanos);
+                aof_lsn = keyspace.expire_key(&key, secs * NS_PER_SEC, now_nanos).aof_lsn;
             }
             OptToken::PXAT => {
                 let ms = match arg_i64(frame, 3) {
                     Some(s) if s > 0 => s as u64,
-                    _ => return CmdResult::Static(ERR_NOT_INTEGER),
+                    _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                keyspace.expire_key(&key, ms * NS_PER_MS, now_nanos);
+                aof_lsn = keyspace.expire_key(&key, ms * NS_PER_MS, now_nanos).aof_lsn;
             }
             OptToken::KEEPTTL => { /* PERSIST alias in GETEX context */ }
             _ => {
                 // Check for "PERSIST" keyword.
                 if eq_ci(opt, b"PERSIST") {
-                    keyspace.persist_key(&key);
+                    aof_lsn = keyspace.persist_key(&key).aof_lsn;
                 } else {
-                    return CmdResult::Static(ERR_SYNTAX);
+                    return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
                 }
             }
         }
     }
 
-    owned_value_to_resp(val)
+    ExecutedCommand::with_aof_lsn(owned_value_to_resp(val), aof_lsn)
 }
 
 // ── INCR / INCRBY / DECR / DECRBY ──────────────────────────────────────────
@@ -490,28 +504,38 @@ fn incr_by(
     frame: &FrameRef<'_>,
     delta: i64,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let key = key_from_bytes(key_bytes);
 
     match keyspace.increment_by(key, delta, now_nanos) {
-        Ok(result) => int_resp(result),
-        Err(err) => CmdResult::Static(err),
+        Ok(MutationOutcome { value, aof_lsn }) => {
+            ExecutedCommand::with_aof_lsn(int_resp(value), aof_lsn)
+        }
+        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
     }
 }
 
 /// INCR key — Increment by 1.
 #[inline]
-pub fn cmd_incr(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_incr(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     incr_by(keyspace, frame, 1, now_nanos)
 }
 
 /// DECR key — Decrement by 1.
 #[inline]
-pub fn cmd_decr(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_decr(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     incr_by(keyspace, frame, -1, now_nanos)
 }
 
@@ -521,10 +545,10 @@ pub fn cmd_incrby(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let delta = match arg_i64(frame, 2) {
         Some(d) => d,
-        None => return CmdResult::Static(ERR_NOT_INTEGER),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
     };
     incr_by(keyspace, frame, delta, now_nanos)
 }
@@ -535,10 +559,10 @@ pub fn cmd_decrby(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let delta = match arg_i64(frame, 2) {
         Some(d) => d,
-        None => return CmdResult::Static(ERR_NOT_INTEGER),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
     };
     incr_by(keyspace, frame, -delta, now_nanos)
 }
@@ -552,14 +576,14 @@ pub fn cmd_incrbyfloat(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let incr_bytes = match arg_bytes(frame, 2) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let incr: f64 = match std::str::from_utf8(incr_bytes)
@@ -567,18 +591,21 @@ pub fn cmd_incrbyfloat(
         .and_then(|s| s.parse().ok())
     {
         Some(f) => f,
-        None => return CmdResult::Static(ERR_NOT_FLOAT),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_FLOAT)),
     };
 
     if incr.is_nan() || incr.is_infinite() {
-        return CmdResult::Static(ERR_NOT_FLOAT);
+        return ExecutedCommand::from(CmdResult::Static(ERR_NOT_FLOAT));
     }
 
     let key = key_from_bytes(key_bytes);
 
     match keyspace.increment_by_float(key, incr, now_nanos) {
-        Ok(bytes) => CmdResult::Resp(RespFrame::bulk_string(bytes)),
-        Err(err) => CmdResult::Static(err),
+        Ok(MutationOutcome { value, aof_lsn }) => ExecutedCommand::with_aof_lsn(
+            CmdResult::Resp(RespFrame::bulk_string(value)),
+            aof_lsn,
+        ),
+        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
     }
 }
 
@@ -591,21 +618,23 @@ pub fn cmd_append(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let append_bytes = match arg_bytes(frame, 2) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
 
     match keyspace.append_value(key, append_bytes, now_nanos) {
-        Ok(length) => int_resp(length as i64),
-        Err(err) => CmdResult::Static(err),
+        Ok(MutationOutcome { value, aof_lsn }) => {
+            ExecutedCommand::with_aof_lsn(int_resp(value as i64), aof_lsn)
+        }
+        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
     }
 }
 
@@ -671,24 +700,26 @@ pub fn cmd_setrange(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let key_bytes = match arg_bytes(frame, 1) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let offset = match arg_i64(frame, 2) {
         Some(o) if o >= 0 => o as usize,
-        _ => return CmdResult::Static(ERR_NOT_INTEGER),
+        _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
     };
     let new_bytes = match arg_bytes(frame, 3) {
         Some(b) => b,
-        None => return CmdResult::Static(ERR_SYNTAX),
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
 
     let key = key_from_bytes(key_bytes);
     match keyspace.setrange_value(key, offset, new_bytes, now_nanos) {
-        Ok(length) => int_resp(length as i64),
-        Err(err) => CmdResult::Static(err),
+        Ok(MutationOutcome { value, aof_lsn }) => {
+            ExecutedCommand::with_aof_lsn(int_resp(value as i64), aof_lsn)
+        }
+        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
     }
 }
 
@@ -766,6 +797,22 @@ mod tests {
     use crate::commands::test_harness::TestHarness;
     use vortex_proto::RespTape;
 
+    trait ResultView {
+        fn as_cmd_result(&self) -> &CmdResult;
+    }
+
+    impl ResultView for CmdResult {
+        fn as_cmd_result(&self) -> &CmdResult {
+            self
+        }
+    }
+
+    impl ResultView for ExecutedCommand {
+        fn as_cmd_result(&self) -> &CmdResult {
+            &self.response
+        }
+    }
+
     /// Helper: parse a raw RESP command and return (tape, shard).
     /// Caller must do `tape.iter().next().unwrap()` to get the FrameRef.
     fn make_tape(input: &[u8]) -> RespTape {
@@ -773,16 +820,18 @@ mod tests {
     }
 
     /// Assert a CmdResult is a static byte slice.
-    fn assert_static(result: &CmdResult, expected: &[u8]) {
-        match result {
+    fn assert_static(result: &impl ResultView, expected: &[u8]) {
+        match result.as_cmd_result() {
             CmdResult::Static(b) => assert_eq!(*b, expected, "static mismatch"),
+            CmdResult::Inline(_) => panic!("expected Static, got Inline"),
             CmdResult::Resp(_) => panic!("expected Static, got Resp"),
         }
     }
 
     /// Extract bulk string bytes from a CmdResult::Resp.
-    fn resp_bytes(result: &CmdResult) -> &[u8] {
-        match result {
+    fn resp_bytes(result: &impl ResultView) -> &[u8] {
+        match result.as_cmd_result() {
+            CmdResult::Inline(inline) => inline.payload(),
             CmdResult::Resp(RespFrame::BulkString(Some(b))) => b.as_ref(),
             CmdResult::Resp(other) => panic!("expected BulkString, got {:?}", other),
             CmdResult::Static(b) => {
@@ -791,12 +840,18 @@ mod tests {
         }
     }
 
-    /// Extract integer from a CmdResult::Resp.
-    fn resp_int(result: &CmdResult) -> i64 {
-        match result {
+    /// Extract integer from a CmdResult::Resp or CmdResult::Static.
+    fn resp_int(result: &impl ResultView) -> i64 {
+        match result.as_cmd_result() {
             CmdResult::Resp(RespFrame::Integer(n)) => *n,
             CmdResult::Resp(other) => panic!("expected Integer, got {:?}", other),
+            CmdResult::Inline(_) => panic!("expected Integer, got Inline bulk string"),
             CmdResult::Static(b) => {
+                // Handle static integer responses from int_resp optimization.
+                if *b == b":0\r\n" { return 0; }
+                if *b == b":1\r\n" { return 1; }
+                if *b == b":-1\r\n" { return -1; }
+                if *b == b":-2\r\n" { return -2; }
                 panic!("expected Resp, got Static({:?})", std::str::from_utf8(b))
             }
         }

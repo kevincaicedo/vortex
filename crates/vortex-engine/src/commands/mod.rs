@@ -28,8 +28,93 @@ pub const NS_PER_MS: u64 = 1_000_000;
 pub enum CmdResult {
     /// Pre-computed static RESP bytes — written directly to the wire.
     Static(&'static [u8]),
+    /// Pre-serialized inline RESP bytes for tiny dynamic replies.
+    Inline(InlineResp),
     /// Dynamic RESP frame requiring serialization.
     Resp(RespFrame),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InlineResp {
+    len: u8,
+    buf: [u8; 32],
+}
+
+impl InlineResp {
+    #[inline]
+    pub fn bulk_from_payload(payload: &[u8]) -> Self {
+        debug_assert!(payload.len() <= 23, "InlineResp only supports tiny bulk strings");
+
+        let mut buf = [0u8; 32];
+        let mut cursor = 0usize;
+        buf[cursor] = b'$';
+        cursor += 1;
+
+        let len = payload.len();
+        if len >= 10 {
+            buf[cursor] = b'0' + (len / 10) as u8;
+            cursor += 1;
+        }
+        buf[cursor] = b'0' + (len % 10) as u8;
+        cursor += 1;
+        buf[cursor] = b'\r';
+        cursor += 1;
+        buf[cursor] = b'\n';
+        cursor += 1;
+        buf[cursor..cursor + payload.len()].copy_from_slice(payload);
+        cursor += payload.len();
+        buf[cursor] = b'\r';
+        cursor += 1;
+        buf[cursor] = b'\n';
+        cursor += 1;
+
+        Self {
+            len: cursor as u8,
+            buf,
+        }
+    }
+
+    #[inline]
+    pub fn bulk_from_i64(n: i64) -> Self {
+        let mut itoa_buf = itoa::Buffer::new();
+        let text = itoa_buf.format(n);
+        Self::bulk_from_payload(text.as_bytes())
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        let total = self.len as usize;
+        let payload_start = if self.buf[2] == b'\r' { 4 } else { 5 };
+        &self.buf[payload_start..total - 2]
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecutedCommand {
+    pub response: CmdResult,
+    pub aof_lsn: Option<u64>,
+}
+
+impl ExecutedCommand {
+    #[inline]
+    pub const fn with_aof_lsn(response: CmdResult, aof_lsn: Option<u64>) -> Self {
+        Self { response, aof_lsn }
+    }
+}
+
+impl From<CmdResult> for ExecutedCommand {
+    #[inline]
+    fn from(response: CmdResult) -> Self {
+        Self {
+            response,
+            aof_lsn: None,
+        }
+    }
 }
 
 // Pre-computed RESP constants for zero-allocation hot paths.
@@ -63,63 +148,63 @@ pub fn execute_command(
     name: &[u8],
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> Option<CmdResult> {
+) -> Option<ExecutedCommand> {
     match name {
-        b"GET" => Some(string::cmd_get(keyspace, frame, now_nanos)),
-        b"SET" => Some(string::cmd_set(keyspace, frame, now_nanos)),
-        b"INCR" => Some(string::cmd_incr(keyspace, frame, now_nanos)),
-        b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos)),
-        b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos)),
-        b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos)),
-        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(keyspace, frame, now_nanos)),
-        b"MGET" => Some(string::cmd_mget(keyspace, frame, now_nanos)),
-        b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos)),
-        b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos)),
-        b"SETNX" => Some(string::cmd_setnx(keyspace, frame, now_nanos)),
-        b"SETEX" => Some(string::cmd_setex(keyspace, frame, now_nanos)),
-        b"PSETEX" => Some(string::cmd_psetex(keyspace, frame, now_nanos)),
-        b"GETSET" => Some(string::cmd_getset(keyspace, frame, now_nanos)),
-        b"GETDEL" => Some(string::cmd_getdel(keyspace, frame, now_nanos)),
-        b"GETEX" => Some(string::cmd_getex(keyspace, frame, now_nanos)),
-        b"APPEND" => Some(string::cmd_append(keyspace, frame, now_nanos)),
-        b"STRLEN" => Some(string::cmd_strlen(keyspace, frame, now_nanos)),
-        b"GETRANGE" => Some(string::cmd_getrange(keyspace, frame, now_nanos)),
-        b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos)),
-        b"DEL" => Some(key::cmd_del(keyspace, frame, now_nanos)),
-        b"UNLINK" => Some(key::cmd_unlink(keyspace, frame, now_nanos)),
-        b"EXISTS" => Some(key::cmd_exists(keyspace, frame, now_nanos)),
-        b"EXPIRE" => Some(key::cmd_expire(keyspace, frame, now_nanos)),
-        b"PEXPIRE" => Some(key::cmd_pexpire(keyspace, frame, now_nanos)),
-        b"EXPIREAT" => Some(key::cmd_expireat(keyspace, frame, now_nanos)),
-        b"PEXPIREAT" => Some(key::cmd_pexpireat(keyspace, frame, now_nanos)),
-        b"PERSIST" => Some(key::cmd_persist(keyspace, frame, now_nanos)),
-        b"TTL" => Some(key::cmd_ttl(keyspace, frame, now_nanos)),
-        b"PTTL" => Some(key::cmd_pttl(keyspace, frame, now_nanos)),
-        b"EXPIRETIME" => Some(key::cmd_expiretime(keyspace, frame, now_nanos)),
-        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(keyspace, frame, now_nanos)),
-        b"TYPE" => Some(key::cmd_type(keyspace, frame, now_nanos)),
-        b"RENAME" => Some(key::cmd_rename(keyspace, frame, now_nanos)),
-        b"RENAMENX" => Some(key::cmd_renamenx(keyspace, frame, now_nanos)),
-        b"KEYS" => Some(key::cmd_keys(keyspace, frame, now_nanos)),
-        b"SCAN" => Some(key::cmd_scan(keyspace, frame, now_nanos)),
-        b"RANDOMKEY" => Some(key::cmd_randomkey(keyspace, frame, now_nanos)),
-        b"TOUCH" => Some(key::cmd_touch(keyspace, frame, now_nanos)),
-        b"COPY" => Some(key::cmd_copy(keyspace, frame, now_nanos)),
-        b"PING" => Some(server::cmd_ping(keyspace, frame, now_nanos)),
-        b"ECHO" => Some(server::cmd_echo(keyspace, frame, now_nanos)),
-        b"QUIT" => Some(server::cmd_quit(keyspace, frame, now_nanos)),
-        b"DBSIZE" => Some(server::cmd_dbsize(keyspace, frame, now_nanos)),
-        b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos)),
-        b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos)),
-        b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos)),
-        b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos)),
-        b"SELECT" => Some(server::cmd_select(keyspace, frame, now_nanos)),
-        b"TIME" => Some(server::cmd_time(keyspace, frame, now_nanos)),
-        b"MULTI" => Some(server::cmd_multi(keyspace, frame, now_nanos)),
-        b"EXEC" => Some(server::cmd_exec(keyspace, frame, now_nanos)),
-        b"DISCARD" => Some(server::cmd_discard(keyspace, frame, now_nanos)),
-        b"WATCH" => Some(server::cmd_watch(keyspace, frame, now_nanos)),
-        b"UNWATCH" => Some(server::cmd_unwatch(keyspace, frame, now_nanos)),
+        b"GET" => Some(string::cmd_get(keyspace, frame, now_nanos).into()),
+        b"SET" => Some(string::cmd_set(keyspace, frame, now_nanos).into()),
+        b"INCR" => Some(string::cmd_incr(keyspace, frame, now_nanos).into()),
+        b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos).into()),
+        b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos).into()),
+        b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos).into()),
+        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(keyspace, frame, now_nanos).into()),
+        b"MGET" => Some(string::cmd_mget(keyspace, frame, now_nanos).into()),
+        b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos).into()),
+        b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos).into()),
+        b"SETNX" => Some(string::cmd_setnx(keyspace, frame, now_nanos).into()),
+        b"SETEX" => Some(string::cmd_setex(keyspace, frame, now_nanos).into()),
+        b"PSETEX" => Some(string::cmd_psetex(keyspace, frame, now_nanos).into()),
+        b"GETSET" => Some(string::cmd_getset(keyspace, frame, now_nanos).into()),
+        b"GETDEL" => Some(string::cmd_getdel(keyspace, frame, now_nanos).into()),
+        b"GETEX" => Some(string::cmd_getex(keyspace, frame, now_nanos).into()),
+        b"APPEND" => Some(string::cmd_append(keyspace, frame, now_nanos).into()),
+        b"STRLEN" => Some(string::cmd_strlen(keyspace, frame, now_nanos).into()),
+        b"GETRANGE" => Some(string::cmd_getrange(keyspace, frame, now_nanos).into()),
+        b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos).into()),
+        b"DEL" => Some(key::cmd_del(keyspace, frame, now_nanos).into()),
+        b"UNLINK" => Some(key::cmd_unlink(keyspace, frame, now_nanos).into()),
+        b"EXISTS" => Some(key::cmd_exists(keyspace, frame, now_nanos).into()),
+        b"EXPIRE" => Some(key::cmd_expire(keyspace, frame, now_nanos).into()),
+        b"PEXPIRE" => Some(key::cmd_pexpire(keyspace, frame, now_nanos).into()),
+        b"EXPIREAT" => Some(key::cmd_expireat(keyspace, frame, now_nanos).into()),
+        b"PEXPIREAT" => Some(key::cmd_pexpireat(keyspace, frame, now_nanos).into()),
+        b"PERSIST" => Some(key::cmd_persist(keyspace, frame, now_nanos).into()),
+        b"TTL" => Some(key::cmd_ttl(keyspace, frame, now_nanos).into()),
+        b"PTTL" => Some(key::cmd_pttl(keyspace, frame, now_nanos).into()),
+        b"EXPIRETIME" => Some(key::cmd_expiretime(keyspace, frame, now_nanos).into()),
+        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(keyspace, frame, now_nanos).into()),
+        b"TYPE" => Some(key::cmd_type(keyspace, frame, now_nanos).into()),
+        b"RENAME" => Some(key::cmd_rename(keyspace, frame, now_nanos).into()),
+        b"RENAMENX" => Some(key::cmd_renamenx(keyspace, frame, now_nanos).into()),
+        b"KEYS" => Some(key::cmd_keys(keyspace, frame, now_nanos).into()),
+        b"SCAN" => Some(key::cmd_scan(keyspace, frame, now_nanos).into()),
+        b"RANDOMKEY" => Some(key::cmd_randomkey(keyspace, frame, now_nanos).into()),
+        b"TOUCH" => Some(key::cmd_touch(keyspace, frame, now_nanos).into()),
+        b"COPY" => Some(key::cmd_copy(keyspace, frame, now_nanos).into()),
+        b"PING" => Some(server::cmd_ping(keyspace, frame, now_nanos).into()),
+        b"ECHO" => Some(server::cmd_echo(keyspace, frame, now_nanos).into()),
+        b"QUIT" => Some(server::cmd_quit(keyspace, frame, now_nanos).into()),
+        b"DBSIZE" => Some(server::cmd_dbsize(keyspace, frame, now_nanos).into()),
+        b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos).into()),
+        b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos).into()),
+        b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos).into()),
+        b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos).into()),
+        b"SELECT" => Some(server::cmd_select(keyspace, frame, now_nanos).into()),
+        b"TIME" => Some(server::cmd_time(keyspace, frame, now_nanos).into()),
+        b"MULTI" => Some(server::cmd_multi(keyspace, frame, now_nanos).into()),
+        b"EXEC" => Some(server::cmd_exec(keyspace, frame, now_nanos).into()),
+        b"DISCARD" => Some(server::cmd_discard(keyspace, frame, now_nanos).into()),
+        b"WATCH" => Some(server::cmd_watch(keyspace, frame, now_nanos).into()),
+        b"UNWATCH" => Some(server::cmd_unwatch(keyspace, frame, now_nanos).into()),
         _ => None,
     }
 }
@@ -211,18 +296,9 @@ pub fn value_from_bytes(bytes: &[u8]) -> VortexValue {
 #[inline]
 pub fn value_to_resp(val: &VortexValue) -> CmdResult {
     match val {
-        VortexValue::InlineString(ib) => CmdResult::Resp(RespFrame::bulk_string(
-            bytes::Bytes::copy_from_slice(ib.as_bytes()),
-        )),
+        VortexValue::InlineString(ib) => CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes())),
         VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b.clone())),
-        VortexValue::Integer(n) => {
-            // Serialize integer as its string representation (Redis behavior).
-            let mut buf = itoa::Buffer::new();
-            let s = buf.format(*n);
-            CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
-                s.as_bytes(),
-            )))
-        }
+        VortexValue::Integer(n) => CmdResult::Inline(InlineResp::bulk_from_i64(*n)),
         _ => CmdResult::Static(ERR_WRONG_TYPE),
     }
 }
@@ -231,25 +307,23 @@ pub fn value_to_resp(val: &VortexValue) -> CmdResult {
 #[inline]
 pub fn owned_value_to_resp(val: VortexValue) -> CmdResult {
     match val {
-        VortexValue::InlineString(ib) => CmdResult::Resp(RespFrame::bulk_string(
-            bytes::Bytes::copy_from_slice(ib.as_bytes()),
-        )),
+        VortexValue::InlineString(ib) => CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes())),
         VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b)),
-        VortexValue::Integer(n) => {
-            let mut buf = itoa::Buffer::new();
-            let s = buf.format(n);
-            CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
-                s.as_bytes(),
-            )))
-        }
+        VortexValue::Integer(n) => CmdResult::Inline(InlineResp::bulk_from_i64(n)),
         _ => CmdResult::Static(ERR_WRONG_TYPE),
     }
 }
 
-/// Integer response.
+/// Integer response — uses pre-computed static bytes for common values.
 #[inline]
 pub fn int_resp(n: i64) -> CmdResult {
-    CmdResult::Resp(RespFrame::integer(n))
+    match n {
+        0 => CmdResult::Static(RESP_ZERO),
+        1 => CmdResult::Static(RESP_ONE),
+        -1 => CmdResult::Static(RESP_NEG_ONE),
+        -2 => CmdResult::Static(RESP_NEG_TWO),
+        _ => CmdResult::Resp(RespFrame::integer(n)),
+    }
 }
 
 #[cfg(test)]

@@ -412,8 +412,12 @@ mod tests {
         let frame = tape.iter().next().unwrap();
         let now = Timestamp::now().as_nanos();
         match execute_command(ks, b"GET", &frame, now) {
-            Some(CmdResult::Static(s)) if std::ptr::eq(s, RESP_NIL) => None,
-            Some(CmdResult::Resp(RespFrame::BulkString(Some(bytes)))) => Some(bytes.to_vec()),
+            Some(executed) => match executed.response {
+                CmdResult::Static(s) if std::ptr::eq(s, RESP_NIL) => None,
+                CmdResult::Inline(inline) => Some(inline.payload().to_vec()),
+                CmdResult::Resp(RespFrame::BulkString(Some(bytes))) => Some(bytes.to_vec()),
+                _ => None,
+            },
             _ => None,
         }
     }

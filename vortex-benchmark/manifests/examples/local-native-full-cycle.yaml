@@ -40,11 +40,14 @@ settings:
     thread_sweep:
       - 1
       - 4
+      - 8
+      - 16
   custom-rust:
     profile: release
     thread_sweep:
       - 1
       - 4
+      - 8
     keyspace_size: 50000
     ops_per_thread: 6000
     warmup_ops: 500

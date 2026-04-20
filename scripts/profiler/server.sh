@@ -55,6 +55,15 @@ build_server_args() {
     if [[ -n "$eviction" ]]; then
         args+=("--eviction-policy" "$eviction")
     fi
+    if [[ -n "${IO_BACKEND:-}" ]]; then
+        args+=("--io-backend" "$IO_BACKEND")
+    fi
+    if [[ -n "${RING_SIZE:-}" ]]; then
+        args+=("--ring-size" "$RING_SIZE")
+    fi
+    if [[ -n "${SQPOLL_IDLE_MS:-}" ]]; then
+        args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    fi
 
     printf '%s\n' "${args[@]}"
 }

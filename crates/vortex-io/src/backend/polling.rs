@@ -28,7 +28,7 @@ use std::os::fd::{BorrowedFd, RawFd};
 
 use polling::{Event, Events, PollMode, Poller};
 
-use super::{Completion, IoBackend};
+use super::{Completion, IoBackend, OpType, decode_token};
 
 /// Interest flag: fd is registered for read-readiness.
 const INTEREST_READABLE: u8 = 1;
@@ -69,11 +69,24 @@ enum PendingOp {
 // on the same thread. PollingBackend is single-threaded (thread-per-core).
 unsafe impl Send for PendingOp {}
 
+struct ArmedRead {
+    fd: RawFd,
+    buf_ptr: *mut u8,
+    buf_len: usize,
+    token: u64,
+}
+
+// SAFETY: ArmedRead stores reactor-owned raw buffer pointers and is only used
+// by the single-threaded polling backend.
+unsafe impl Send for ArmedRead {}
+
 /// Cross-platform I/O backend using the `polling` crate.
 pub struct PollingBackend {
     poller: Poller,
     events: Events,
     pending: VecDeque<PendingOp>,
+    armed_reads: Vec<Option<ArmedRead>>,
+    ready_read_tokens: Vec<u64>,
     /// Per-fd interest flags indexed by `RawFd`. 0 = not registered.
     /// Bit 0 (`INTEREST_READABLE`): registered for read-readiness.
     /// Bit 1 (`INTEREST_WRITABLE`): registered for write-readiness.
@@ -87,6 +100,8 @@ impl PollingBackend {
             poller: Poller::new()?,
             events: Events::new(),
             pending: VecDeque::with_capacity(256),
+            armed_reads: Vec::new(),
+            ready_read_tokens: Vec::with_capacity(64),
             registered: vec![0u8; 64],
         })
     }
@@ -97,6 +112,13 @@ impl PollingBackend {
         let idx = fd as usize;
         if idx >= self.registered.len() {
             self.registered.resize(idx + 1, 0);
+        }
+    }
+
+    #[inline]
+    fn ensure_read_capacity(&mut self, conn_id: usize) {
+        if conn_id >= self.armed_reads.len() {
+            self.armed_reads.resize_with(conn_id + 1, || None);
         }
     }
 
@@ -170,6 +192,36 @@ impl PollingBackend {
                     }
                 }
             }
+        }
+    }
+
+    fn rearm_ready_reads(&mut self) {
+        self.ready_read_tokens.clear();
+        for event in self.events.iter() {
+            if !event.readable {
+                continue;
+            }
+            let token = event.key as u64;
+            let (conn_id, _, op) = decode_token(token);
+            if matches!(op, OpType::Read) && conn_id < self.armed_reads.len() {
+                self.ready_read_tokens.push(token);
+            }
+        }
+
+        for token in self.ready_read_tokens.drain(..) {
+            let (conn_id, _, _) = decode_token(token);
+            let Some(read) = self.armed_reads.get_mut(conn_id).and_then(Option::take) else {
+                continue;
+            };
+            if read.token != token {
+                continue;
+            }
+            self.pending.push_back(PendingOp::Read {
+                fd: read.fd,
+                buf_ptr: read.buf_ptr,
+                buf_len: read.buf_len,
+                token: read.token,
+            });
         }
     }
 }
@@ -259,6 +311,7 @@ impl IoBackend for PollingBackend {
         // Immediately retry pending ops now that readiness has been signalled.
         // This avoids deferring to the next reactor iteration.
         if !self.events.is_empty() {
+            self.rearm_ready_reads();
             self.drain_pending(out);
         }
 
@@ -391,7 +444,10 @@ impl PollingBackend {
             if (self.registered[fd as usize] & INTEREST_READABLE) == 0 {
                 self.register_interest(fd, Event::readable(token as usize));
             }
-            self.pending.push_back(PendingOp::Read {
+            let (conn_id, _, op) = decode_token(token);
+            debug_assert!(matches!(op, OpType::Read));
+            self.ensure_read_capacity(conn_id);
+            self.armed_reads[conn_id] = Some(ArmedRead {
                 fd,
                 buf_ptr,
                 buf_len,
@@ -484,6 +540,11 @@ impl PollingBackend {
     }
 
     fn do_close(&mut self, fd: RawFd, token: u64, out: &mut Vec<Completion>) {
+        let (conn_id, _, _) = decode_token(token);
+        if conn_id < self.armed_reads.len() {
+            self.armed_reads[conn_id] = None;
+        }
+
         // Remove from poller if registered.
         let fd_idx = fd as usize;
         if fd_idx < self.registered.len() && self.registered[fd_idx] != 0 {

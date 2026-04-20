@@ -22,6 +22,7 @@ parking_lot = { workspace = true }
 itoa = { workspace = true }
 ryu = { workspace = true }
 bytes = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

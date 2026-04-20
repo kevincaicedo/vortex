@@ -12,9 +12,10 @@ use vortex_proto::{FrameRef, RespFrame};
 
 use super::context::TtlState;
 use super::{
-    CmdResult, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE,
-    RESP_ZERO, arg_bytes, arg_count, arg_i64, int_resp, key_from_bytes,
+    CmdResult, ExecutedCommand, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO, RESP_NIL,
+    RESP_OK, RESP_ONE, RESP_ZERO, arg_bytes, arg_count, arg_i64, int_resp, key_from_bytes,
 };
+use crate::commands::context::MutationOutcome;
 use crate::ConcurrentKeyspace;
 
 // ── Error constants ─────────────────────────────────────────────────
@@ -28,10 +29,23 @@ static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
 /// DEL key [key ...]
 /// Removes the specified keys. Returns the number of keys removed.
 #[inline]
-pub fn cmd_del(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_del(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 2 {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    }
+    // Single-key fast path: avoid Vec allocation.
+    if argc == 2 {
+        if let Some(kb) = arg_bytes(frame, 1) {
+            let key = key_from_bytes(kb);
+            let outcome = keyspace.delete_keys(std::slice::from_ref(&key), now_nanos);
+            return ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn);
+        }
+        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
     let mut keys = Vec::with_capacity(argc - 1);
     for i in 1..argc {
@@ -39,7 +53,8 @@ pub fn cmd_del(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
             keys.push(key_from_bytes(kb));
         }
     }
-    int_resp(keyspace.delete_keys(&keys, now_nanos))
+    let outcome = keyspace.delete_keys(&keys, now_nanos);
+    ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn)
 }
 
 /// UNLINK key [key ...]
@@ -50,7 +65,7 @@ pub fn cmd_unlink(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     cmd_del(keyspace, frame, now_nanos)
 }
 
@@ -65,6 +80,14 @@ pub fn cmd_exists(
     let argc = arg_count(frame);
     if argc < 2 {
         return CmdResult::Static(ERR_WRONG_ARGS);
+    }
+    // Single-key fast path: avoid Vec allocation.
+    if argc == 2 {
+        if let Some(kb) = arg_bytes(frame, 1) {
+            let key = key_from_bytes(kb);
+            return int_resp(keyspace.count_existing(std::slice::from_ref(&key), now_nanos));
+        }
+        return CmdResult::Static(RESP_ZERO);
     }
     let mut keys = Vec::with_capacity(argc - 1);
     for i in 1..argc {
@@ -83,7 +106,7 @@ pub fn cmd_expire(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     expire_generic(keyspace, frame, now_nanos, ExpireMode::RelativeSeconds)
 }
 
@@ -93,7 +116,7 @@ pub fn cmd_pexpire(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     expire_generic(keyspace, frame, now_nanos, ExpireMode::RelativeMillis)
 }
 
@@ -103,7 +126,7 @@ pub fn cmd_expireat(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     expire_generic(keyspace, frame, now_nanos, ExpireMode::AbsoluteSeconds)
 }
 
@@ -113,7 +136,7 @@ pub fn cmd_pexpireat(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     expire_generic(keyspace, frame, now_nanos, ExpireMode::AbsoluteMillis)
 }
 
@@ -123,16 +146,18 @@ pub fn cmd_persist(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     _now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let Some(kb) = arg_bytes(frame, 1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let key = key_from_bytes(kb);
-    if keyspace.persist_key(&key) {
+    let outcome = keyspace.persist_key(&key);
+    let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 #[derive(Clone, Copy)]
@@ -149,16 +174,16 @@ fn expire_generic(
     frame: &FrameRef<'_>,
     now_nanos: u64,
     mode: ExpireMode,
-) -> CmdResult {
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
     let Some(kb) = arg_bytes(frame, 1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let Some(time_val) = arg_i64(frame, 2) else {
-        return CmdResult::Static(super::ERR_NOT_INTEGER);
+        return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
     };
 
     // Parse optional flags (NX, XX, GT, LT).
@@ -176,10 +201,10 @@ fn expire_generic(
                         b"xx" => xx = true,
                         b"gt" => gt = true,
                         b"lt" => lt = true,
-                        _ => return CmdResult::Static(super::ERR_SYNTAX),
+                        _ => return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX)),
                     }
                 }
-                _ => return CmdResult::Static(super::ERR_SYNTAX),
+                _ => return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX)),
             }
         }
     }
@@ -189,22 +214,26 @@ fn expire_generic(
         ExpireMode::RelativeSeconds => {
             if time_val <= 0 {
                 let key = key_from_bytes(kb);
-                return if keyspace.remove_value(&key, now_nanos).is_some() {
+                let outcome = keyspace.remove_value(&key, now_nanos);
+                let response = if outcome.value.is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
                 };
+                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
             }
             now_nanos + (time_val as u64) * NS_PER_SEC
         }
         ExpireMode::RelativeMillis => {
             if time_val <= 0 {
                 let key = key_from_bytes(kb);
-                return if keyspace.remove_value(&key, now_nanos).is_some() {
+                let outcome = keyspace.remove_value(&key, now_nanos);
+                let response = if outcome.value.is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
                 };
+                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
             }
             now_nanos + (time_val as u64) * NS_PER_MS
         }
@@ -212,11 +241,13 @@ fn expire_generic(
             let deadline = (time_val as u64) * NS_PER_SEC;
             if deadline <= now_nanos {
                 let key = key_from_bytes(kb);
-                return if keyspace.remove_value(&key, now_nanos).is_some() {
+                let outcome = keyspace.remove_value(&key, now_nanos);
+                let response = if outcome.value.is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
                 };
+                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
             }
             deadline
         }
@@ -224,11 +255,13 @@ fn expire_generic(
             let deadline = (time_val as u64) * NS_PER_MS;
             if deadline <= now_nanos {
                 let key = key_from_bytes(kb);
-                return if keyspace.remove_value(&key, now_nanos).is_some() {
+                let outcome = keyspace.remove_value(&key, now_nanos);
+                let response = if outcome.value.is_some() {
                     CmdResult::Static(RESP_ONE)
                 } else {
                     CmdResult::Static(RESP_ZERO)
                 };
+                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
             }
             deadline
         }
@@ -237,29 +270,31 @@ fn expire_generic(
     let key = key_from_bytes(kb);
 
     let current_ttl = match keyspace.ttl_state(&key, now_nanos) {
-        TtlState::Missing => return CmdResult::Static(RESP_ZERO),
+        TtlState::Missing => return ExecutedCommand::from(CmdResult::Static(RESP_ZERO)),
         TtlState::Persistent => 0,
         TtlState::Deadline(deadline) => deadline,
     };
 
     if nx && current_ttl != 0 {
-        return CmdResult::Static(RESP_ZERO);
+        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
     if xx && current_ttl == 0 {
-        return CmdResult::Static(RESP_ZERO);
+        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
     if gt && current_ttl != 0 && deadline_nanos <= current_ttl {
-        return CmdResult::Static(RESP_ZERO);
+        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
     if lt && current_ttl != 0 && deadline_nanos >= current_ttl {
-        return CmdResult::Static(RESP_ZERO);
+        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
 
-    if keyspace.expire_key(&key, deadline_nanos, now_nanos) {
+    let outcome = keyspace.expire_key(&key, deadline_nanos, now_nanos);
+    let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── TTL / PTTL / EXPIRETIME / PEXPIRETIME ───────────────────────────
@@ -351,23 +386,29 @@ pub fn cmd_rename(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
     let Some(old_kb) = arg_bytes(frame, 1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let Some(new_kb) = arg_bytes(frame, 2) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let old_key = key_from_bytes(old_kb);
     let new_key = key_from_bytes(new_kb);
     match keyspace.rename_key(&old_key, new_key, now_nanos, false) {
-        Ok(true) => CmdResult::Static(RESP_OK),
-        Ok(false) => CmdResult::Static(RESP_ZERO),
-        Err(msg) => CmdResult::Static(msg),
+        Ok(MutationOutcome { value, aof_lsn }) => {
+            let response = if value {
+                CmdResult::Static(RESP_OK)
+            } else {
+                CmdResult::Static(RESP_ZERO)
+            };
+            ExecutedCommand::with_aof_lsn(response, aof_lsn)
+        }
+        Err(msg) => ExecutedCommand::from(CmdResult::Static(msg)),
     }
 }
 
@@ -377,24 +418,30 @@ pub fn cmd_renamenx(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
-) -> CmdResult {
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
     let Some(old_kb) = arg_bytes(frame, 1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let Some(new_kb) = arg_bytes(frame, 2) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let old_key = key_from_bytes(old_kb);
     let new_key = key_from_bytes(new_kb);
 
     match keyspace.rename_key(&old_key, new_key, now_nanos, true) {
-        Ok(true) => CmdResult::Static(RESP_ONE),
-        Ok(false) => CmdResult::Static(RESP_ZERO),
-        Err(msg) => CmdResult::Static(msg),
+        Ok(MutationOutcome { value, aof_lsn }) => {
+            let response = if value {
+                CmdResult::Static(RESP_ONE)
+            } else {
+                CmdResult::Static(RESP_ZERO)
+            };
+            ExecutedCommand::with_aof_lsn(response, aof_lsn)
+        }
+        Err(msg) => ExecutedCommand::from(CmdResult::Static(msg)),
     }
 }
 
@@ -504,16 +551,20 @@ pub fn cmd_touch(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos:
 // ── COPY ────────────────────────────────────────────────────────────
 
 /// COPY source destination [DB destination-db] [REPLACE]
-pub fn cmd_copy(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+pub fn cmd_copy(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
     let argc = arg_count(frame);
     if argc < 3 {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     }
     let Some(src_kb) = arg_bytes(frame, 1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let Some(dst_kb) = arg_bytes(frame, 2) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
 
     // Parse optional flags.
@@ -534,11 +585,13 @@ pub fn cmd_copy(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
     let src_key = key_from_bytes(src_kb);
     let dst_key = key_from_bytes(dst_kb);
 
-    if keyspace.copy_key(&src_key, dst_key, replace, now_nanos) {
+    let outcome = keyspace.copy_key(&src_key, dst_key, replace, now_nanos);
+    let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
-    }
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
 }
 
 // ── Glob pattern matcher ────────────────────────────────────────────
@@ -590,21 +643,25 @@ mod tests {
     }
 
     /// Parse RESP bytes and execute command via handler function.
-    fn exec(
+    fn exec<R>(
         keyspace: &ConcurrentKeyspace,
-        handler: fn(&ConcurrentKeyspace, &FrameRef<'_>, u64) -> CmdResult,
+        handler: fn(&ConcurrentKeyspace, &FrameRef<'_>, u64) -> R,
         parts: &[&[u8]],
         now: u64,
-    ) -> CmdResult {
+    ) -> CmdResult
+    where
+        R: Into<ExecutedCommand>,
+    {
         let data = make_resp(parts);
         let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
         let frame = tape.iter().next().unwrap();
-        handler(keyspace, &frame, now)
+        handler(keyspace, &frame, now).into().response
     }
 
     fn assert_static(result: CmdResult, expected: &[u8]) {
         match result {
             CmdResult::Static(s) => assert_eq!(s, expected, "Static mismatch"),
+            CmdResult::Inline(_) => panic!("Expected Static, got Inline"),
             CmdResult::Resp(_) => panic!("Expected Static, got Resp"),
         }
     }
@@ -612,11 +669,21 @@ mod tests {
     fn assert_integer(result: CmdResult, expected: i64) {
         match result {
             CmdResult::Resp(RespFrame::Integer(n)) => assert_eq!(n, expected),
-            CmdResult::Static(s) => panic!(
-                "Expected Integer({}), got Static({:?})",
-                expected,
-                std::str::from_utf8(s)
-            ),
+            CmdResult::Static(s) => {
+                // int_resp may return static bytes for common values (0, 1, -1, -2).
+                let expected_bytes = match expected {
+                    0 => super::RESP_ZERO,
+                    1 => super::RESP_ONE,
+                    -1 => super::RESP_NEG_ONE,
+                    -2 => super::RESP_NEG_TWO,
+                    _ => panic!(
+                        "Expected Integer({}), got Static({:?})",
+                        expected,
+                        std::str::from_utf8(s)
+                    ),
+                };
+                assert_eq!(s, expected_bytes, "Static integer mismatch for {}", expected);
+            }
             other => panic!("Expected Integer({}), got {:?}", expected, other),
         }
     }

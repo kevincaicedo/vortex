@@ -18,11 +18,16 @@ run_flamegraph() {
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
     [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
+    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
+    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
+    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
-    # On macOS, DTrace requires sudo. We must request it synchronously before backgrounding.
-    if [[ "$OS" == "macos" ]]; then
-        info "cargo flamegraph on macOS requires sudo (DTrace). Requesting privileges..."
-        ensure_sudo_access "sudo access required for Flamegraph on macOS"
+    # cargo flamegraph uses elevated profiling on both Linux (--root perf)
+    # and macOS (DTrace). Request sudo synchronously before backgrounding so
+    # HOST_PASSWORD from .env can prime the sudo session and avoid a blocking prompt.
+    if [[ "$OS" == "linux" || "$OS" == "macos" ]]; then
+        info "cargo flamegraph requires sudo on ${OS}. Requesting privileges..."
+        ensure_sudo_access "sudo access required for Flamegraph on ${OS}"
     fi
 
     info "Running: cargo flamegraph --profile profiling --bin vortex-server -F ${frequency}"
@@ -49,8 +54,18 @@ run_flamegraph() {
     wait_for_load "$duration"
 
     info "Stopping flamegraph by cleanly shutting down server..."
-    if [[ "$OS" == "macos" ]]; then
+    if [[ "$OS" == "linux" || "$OS" == "macos" ]]; then
         run_with_sudo "sudo access required to stop the flamegraph target" pkill -INT -x vortex-server || true
+        local attempts=0
+        while run_with_sudo "sudo access required to inspect the flamegraph target" pgrep -x vortex-server >/dev/null 2>&1; do
+            if [[ $attempts -ge 20 ]]; then
+                warn "Flamegraph target is still draining; sending a second signal to force shutdown"
+                run_with_sudo "sudo access required to force the flamegraph target to stop" pkill -INT -x vortex-server || true
+                break
+            fi
+            sleep 0.25
+            attempts=$((attempts + 1))
+        done
     else
         pkill -INT -x vortex-server || true
     fi
@@ -145,6 +160,9 @@ run_samply() {
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
     [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
+    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
+    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
+    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
     info "Running: samply record"
     (cd "$REPO_ROOT" && exec samply record --save-only \

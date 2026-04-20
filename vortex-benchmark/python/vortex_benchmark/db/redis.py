@@ -31,6 +31,9 @@ class RedisAdapter(DatabaseAdapter):
     def prepare_native(self, request: StartRequest) -> None:
         require_command("redis-server")
 
+    def prepare_container(self, request: StartRequest) -> None:
+        return None
+
     def validate_runtime_config(self, request: StartRequest) -> None:
         return None
 

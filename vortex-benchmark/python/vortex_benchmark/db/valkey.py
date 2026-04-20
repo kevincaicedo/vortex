@@ -25,6 +25,9 @@ class ValkeyAdapter(DatabaseAdapter):
     def resolve_threads(self, request: StartRequest) -> int:
         return request.threads or max(1, min(request.cpus, 4))
 
+    def prepare_container(self, request: StartRequest) -> None:
+        return None
+
     def validate_runtime_config(self, request: StartRequest) -> None:
         return None
 

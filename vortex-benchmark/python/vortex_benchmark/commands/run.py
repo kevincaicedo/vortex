@@ -12,6 +12,9 @@ from vortex_benchmark.models import EnvironmentState, split_csv_values, timestam
 from vortex_benchmark.telemetry import capture_host_metadata
 
 
+VORTEX_ONLY_RUNTIME_KEYS = {"io_backend", "ring_size", "fixed_buffers", "sqpoll_idle_ms"}
+
+
 def has_run_selection(args) -> bool:
     return any(
         (
@@ -42,6 +45,8 @@ def _validate_runtime_config(state: EnvironmentState, spec, selected_databases: 
         if service.database not in selected_databases:
             continue
         for key, expected in spec.runtime_config.items():
+            if service.database != "vortex" and key in VORTEX_ONLY_RUNTIME_KEYS:
+                continue
             actual = (service.runtime_config or {}).get(key)
             if actual != expected:
                 mismatches.append(

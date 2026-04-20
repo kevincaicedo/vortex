@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use vortex_common::{ShardId, VortexKey, VortexValue};
+use vortex_common::{VortexKey, VortexValue};
 use vortex_engine::commands::execute_command;
-use vortex_engine::{ConcurrentKeyspace, Entry, ExpiryEntry, ExpiryWheel, Shard, SwissTable};
+use vortex_engine::{ConcurrentKeyspace, Entry, SwissTable};
 use vortex_proto::RespTape;
 
 const BENCH_CONCURRENT_SHARDS: usize = 64;
@@ -205,97 +205,6 @@ fn bench_entry_write_integer(c: &mut Criterion) {
                 black_box(entry);
             },
             criterion::BatchSize::SmallInput,
-        );
-    });
-}
-
-// ── 3.3 — Expiry Benchmarks ───────────────────────────────────────
-
-const NS_PER_SEC: u64 = 1_000_000_000;
-
-fn bench_expiry_register(c: &mut Criterion) {
-    c.bench_function("expiry_register", |b| {
-        let mut wheel = ExpiryWheel::new();
-        wheel.set_time(NS_PER_SEC);
-        let mut counter = 0u64;
-
-        b.iter(|| {
-            counter = counter.wrapping_add(1);
-            wheel.register(black_box(counter), black_box(10 * NS_PER_SEC));
-        });
-    });
-}
-
-fn bench_expiry_tick_20(c: &mut Criterion) {
-    // Measure the core drain of 20 expired entries from a slot.
-    let deadline = 5 * NS_PER_SEC;
-    let now = 6 * NS_PER_SEC;
-
-    c.bench_function("expiry_tick_20", |b| {
-        b.iter_batched(
-            || {
-                // Setup: a Vec with 20 expired entries (simulates one slot).
-                (0u64..20)
-                    .map(|i| ExpiryEntry {
-                        key_hash: i,
-                        deadline_nanos: deadline,
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |mut entries| {
-                let mut expired = Vec::with_capacity(20);
-                let mut i = 0;
-                while i < entries.len() {
-                    if entries[i].deadline_nanos <= now {
-                        expired.push(entries.swap_remove(i));
-                    } else {
-                        i += 1;
-                    }
-                }
-                black_box(&expired);
-            },
-            criterion::BatchSize::SmallInput,
-        );
-    });
-}
-
-fn bench_lazy_expiry_overhead(c: &mut Criterion) {
-    // Measure shard.get() with lazy expiry on a non-expired key.
-    // The overhead vs plain Swiss Table GET (~5 ns) is the is_expired branch.
-    c.bench_function("lazy_expiry_overhead", |b| {
-        let mut shard = Shard::new(ShardId::new(0));
-        let key = VortexKey::from("bench_key");
-        shard.set_with_ttl(key.clone(), VortexValue::from("value"), 999 * NS_PER_SEC);
-
-        b.iter(|| {
-            black_box(shard.get(black_box(&key), black_box(NS_PER_SEC)));
-        });
-    });
-}
-
-fn bench_active_sweep_100k(c: &mut Criterion) {
-    c.bench_function("active_sweep_100K", |b| {
-        b.iter_batched_ref(
-            || {
-                let mut shard = Shard::new_with_time(ShardId::new(0), 0);
-                // Place 20 entries in each of 5000 second-slots (slots 1..=5000).
-                for slot in 1u64..=5000 {
-                    let deadline = slot * NS_PER_SEC;
-                    for j in 0..20u64 {
-                        let idx = (slot - 1) * 20 + j;
-                        let key = VortexKey::from(format!("key:{idx:08}").as_str());
-                        shard.set_with_ttl(key, VortexValue::Integer(idx as i64), deadline);
-                    }
-                }
-                (shard, NS_PER_SEC) // start sweeping from t=1s
-            },
-            |(shard, now)| {
-                // Sweep 20 entries from one second-slot.
-                let result = shard.run_active_expiry(black_box(*now), black_box(20));
-                *now += NS_PER_SEC;
-                black_box(result);
-            },
-            criterion::BatchSize::LargeInput,
         );
     });
 }
@@ -703,9 +612,12 @@ fn bench_cmd_scan_10k(c: &mut Criterion) {
                 let frame = tape.iter().next().unwrap();
                 let r = execute_command(black_box(&keyspace), b"SCAN", &frame, 0);
                 // Extract next cursor from response.
-                if let Some(vortex_engine::commands::CmdResult::Resp(
+                if let Some(vortex_engine::commands::ExecutedCommand {
+                    response: vortex_engine::commands::CmdResult::Resp(
                     vortex_proto::RespFrame::Array(Some(ref arr)),
-                )) = r
+                    ),
+                    ..
+                }) = r
                 {
                     if let vortex_proto::RespFrame::BulkString(Some(c)) = &arr[0] {
                         cursor = std::str::from_utf8(c).unwrap().parse().unwrap();
@@ -1289,11 +1201,6 @@ criterion_group!(
     bench_entry_is_expired,
     bench_entry_write_integer,
     bench_entry_read_integer,
-    // 3.3 — Expiry benchmarks
-    bench_expiry_register,
-    bench_expiry_tick_20,
-    bench_lazy_expiry_overhead,
-    bench_active_sweep_100k,
     // 3.10.3 — Command-level benchmarks
     bench_cmd_get_inline,
     bench_cmd_set_inline,

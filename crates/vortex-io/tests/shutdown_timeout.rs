@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use vortex_io::{ReactorPool, ReactorPoolConfig};
+use vortex_io::{IoBackendMode, ReactorPool, ReactorPoolConfig};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
 fn free_port() -> u16 {
@@ -36,6 +36,9 @@ fn shutdown_timeout_forces_exit() {
         connection_timeout: 0,
         aof_config: None,
         shard_count: 64,
+        io_backend: IoBackendMode::Polling,
+        ring_size: 4096,
+        sqpoll_idle_ms: 1000,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -103,6 +106,9 @@ fn zero_timeout_triggers_force_kill() {
         connection_timeout: 0,
         aof_config: None,
         shard_count: 64,
+        io_backend: IoBackendMode::Polling,
+        ring_size: 4096,
+        sqpoll_idle_ms: 1000,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

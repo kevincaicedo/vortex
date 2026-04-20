@@ -5,12 +5,12 @@
 
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::backend::{
     ACCEPT_CONN_ID, Completion, IoBackend, OpType, PollingBackend, decode_token, encode_token,
 };
 use crate::connection::{ConnectionFlags, ConnectionMeta, ConnectionSlab, ConnectionState};
+use crate::pool::IoBackendMode;
 use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
 use vortex_common::Timestamp;
@@ -18,7 +18,6 @@ use vortex_engine::ConcurrentKeyspace;
 use vortex_engine::commands::{CmdResult, arg_bytes, arg_count, execute_command};
 use vortex_engine::concurrent_keyspace::DEFAULT_SHARD_COUNT;
 use vortex_memory::{ArenaAllocator, BufferPool};
-use vortex_persist::aof::format::is_mutation;
 use vortex_persist::aof::rewrite::AofRewriter;
 use vortex_persist::aof::writer::AofFileWriter;
 use vortex_proto::{
@@ -48,10 +47,91 @@ enum CommandResponse {
     /// Pre-computed static response (PONG, OK, ERR).
     /// Copied directly into the connection write buffer.
     Static(&'static [u8]),
+    /// Tiny dynamic response already serialized into inline RESP bytes.
+    Inline(vortex_engine::commands::InlineResp),
     /// Dynamic RESP frame requiring serialization.
     /// Uses `serialize_to_iovecs()` + `submit_writev()` for large responses,
     /// or `serialize_to_slice()` + memcpy for small ones.
     Frame(RespFrame),
+}
+
+struct PendingWritev {
+    writer: IovecWriter,
+    frames: Vec<RespFrame>,
+    iovecs: Vec<libc::iovec>,
+    iov_start: usize,
+    total_len: usize,
+}
+
+impl PendingWritev {
+    fn new() -> Self {
+        Self {
+            writer: IovecWriter::new(),
+            frames: Vec::new(),
+            iovecs: Vec::new(),
+            iov_start: 0,
+            total_len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.writer.clear();
+        self.frames.clear();
+        self.iovecs.clear();
+        self.iov_start = 0;
+        self.total_len = 0;
+    }
+
+    fn push_static(&mut self, buf: &'static [u8]) {
+        self.writer.push_static(buf);
+    }
+
+    fn push_bytes(&mut self, buf: &[u8]) {
+        self.writer.push_bytes(buf);
+    }
+
+    fn push_inline(&mut self, buf: &[u8]) {
+        self.writer.push_scratch(buf);
+    }
+
+    fn push_frame(&mut self, frame: RespFrame) {
+        self.frames.push(frame);
+        let idx = self.frames.len() - 1;
+        RespSerializer::serialize_to_iovecs(&self.frames[idx], &mut self.writer);
+    }
+
+    fn finalize(&mut self) {
+        self.total_len = self.writer.total_len();
+        self.iovecs = self.writer.as_raw_iovecs();
+        self.iov_start = 0;
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.total_len
+    }
+
+    fn remaining_iovecs(&self) -> &[libc::iovec] {
+        &self.iovecs[self.iov_start..]
+    }
+
+    fn advance(&mut self, mut bytes_written: usize) {
+        while bytes_written > 0 && self.iov_start < self.iovecs.len() {
+            let iov = &mut self.iovecs[self.iov_start];
+            if bytes_written < iov.iov_len {
+                // SAFETY: advancing within the currently outstanding iovec segment.
+                iov.iov_base = unsafe { (iov.iov_base as *mut u8).add(bytes_written) }
+                    .cast::<libc::c_void>();
+                iov.iov_len -= bytes_written;
+                self.total_len -= bytes_written;
+                return;
+            }
+
+            let consumed = iov.iov_len;
+            bytes_written -= consumed;
+            self.total_len -= consumed;
+            self.iov_start += 1;
+        }
+    }
 }
 
 /// Configuration for a single reactor.
@@ -68,6 +148,12 @@ pub struct ReactorConfig {
     pub connection_timeout: u32,
     /// AOF persistence configuration (None = disabled).
     pub aof_config: Option<AofConfig>,
+    /// I/O backend selection.
+    pub io_backend: IoBackendMode,
+    /// io_uring submission queue size.
+    pub ring_size: u32,
+    /// SQPOLL idle timeout in milliseconds.
+    pub sqpoll_idle_ms: u32,
 }
 
 /// AOF configuration passed to each reactor.
@@ -88,7 +174,48 @@ impl Default for ReactorConfig {
             buffer_count: 1024,
             connection_timeout: 300,
             aof_config: None,
+            io_backend: IoBackendMode::Auto,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         }
+    }
+}
+
+fn try_make_uring_backend(config: &ReactorConfig) -> std::io::Result<Box<dyn IoBackend>> {
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    {
+        return Ok(Box::new(crate::backend::IoUringBackend::new(
+            config.ring_size,
+            config.sqpoll_idle_ms,
+        )?));
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    {
+        let _ = config;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "io_uring backend is not available in this build",
+        ))
+    }
+}
+
+fn make_backend(config: &ReactorConfig) -> std::io::Result<Box<dyn IoBackend>> {
+    match config.io_backend {
+        IoBackendMode::Polling => Ok(Box::new(PollingBackend::new()?)),
+        IoBackendMode::Uring => try_make_uring_backend(config),
+        IoBackendMode::Auto => match try_make_uring_backend(config) {
+            Ok(backend) => Ok(backend),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    ring_size = config.ring_size,
+                    sqpoll_idle_ms = config.sqpoll_idle_ms,
+                    "io_uring backend unavailable, falling back to polling"
+                );
+                Ok(Box::new(PollingBackend::new()?))
+            }
+        },
     }
 }
 
@@ -116,9 +243,9 @@ pub struct Reactor {
     cqe_buf: Vec<Completion>,
     /// Hierarchical timing wheel for connection idle timeouts.
     timer_wheel: TimerWheel,
-    /// Wall-clock epoch: `Instant` captured at reactor start.
-    start_time: Instant,
-    /// Cached current time in seconds since `start_time`.
+    /// Monotonic nanosecond epoch captured at reactor start.
+    start_nanos: u64,
+    /// Cached current time in seconds since `start_nanos`.
     now_secs: u32,
     /// Reusable buffer for expired timer entries.
     expired_buf: Vec<ExpiredTimer>,
@@ -134,8 +261,10 @@ pub struct Reactor {
     config: ReactorConfig,
     /// Per-iteration bump allocator for transient response building.
     arena: ArenaAllocator,
-    /// Reusable scatter-gather writer for iovec responses.
-    iovec_writer: IovecWriter,
+    /// Per-connection scatter-gather write state. Each slot owns the RESP
+    /// frames, serializer scratch, and raw iovec array for any in-flight
+    /// WRITEV operation so io_uring can safely complete asynchronously.
+    writev_states: Vec<PendingWritev>,
     /// Command dispatch router with PHF lookup.
     command_router: CommandRouter,
     /// Shared concurrent keyspace — all reactors operate on the same data.
@@ -143,6 +272,10 @@ pub struct Reactor {
     /// Cached monotonic timestamp (nanoseconds) for the current event-loop iteration.
     /// Avoids re-reading the clock for every command in a batch.
     cached_nanos: u64,
+    /// Next time at which the background active-expiry sweep should run.
+    /// Active expiry is opportunistic cleanup; lazy expiry on key access
+    /// remains the correctness path for expired reads.
+    next_active_expiry_nanos: u64,
     /// AOF writer (None if persistence disabled).
     /// Per-reactor AOF writer. Each reactor owns its own file, avoiding
     /// cross-reactor synchronization on the I/O hot path. Global ordering
@@ -171,7 +304,7 @@ impl Reactor {
         config: ReactorConfig,
         coordinator: Arc<ShutdownCoordinator>,
     ) -> std::io::Result<Self> {
-        let backend = Box::new(PollingBackend::new()?);
+        let backend = make_backend(&config)?;
         let keyspace = Arc::new(ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT));
         Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, 1)
     }
@@ -205,12 +338,12 @@ impl Reactor {
         keyspace: Arc<ConcurrentKeyspace>,
         num_reactors: usize,
     ) -> std::io::Result<Self> {
-        let backend = Box::new(PollingBackend::new()?);
+        let backend = make_backend(&config)?;
         Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, num_reactors)
     }
 
     /// Internal constructor — all public constructors delegate here.
-    fn with_keyspace_and_backend(
+    pub(crate) fn with_keyspace_and_backend(
         id: usize,
         config: ReactorConfig,
         coordinator: Arc<ShutdownCoordinator>,
@@ -285,6 +418,8 @@ impl Reactor {
         // With K shards and N reactors, spacing = K/N.
         let expiry_shard_cursor = id * (keyspace.num_shards() / num_reactors.max(1)).max(1);
 
+        let cached_nanos = Timestamp::now().as_nanos();
+
         Ok(Self {
             id,
             backend,
@@ -294,7 +429,7 @@ impl Reactor {
             generations: vec![0u32; max_conn],
             cqe_buf: Vec::with_capacity(MAX_COMPLETIONS),
             timer_wheel: TimerWheel::new(max_conn),
-            start_time: Instant::now(),
+            start_nanos: cached_nanos,
             now_secs: 0,
             expired_buf: Vec::with_capacity(64),
             connection_timeout,
@@ -303,10 +438,13 @@ impl Reactor {
             draining: false,
             config,
             arena: ArenaAllocator::new(vortex_memory::arena::DEFAULT_ARENA_CAPACITY),
-            iovec_writer: IovecWriter::new(),
+            writev_states: std::iter::repeat_with(PendingWritev::new)
+                .take(max_conn)
+                .collect(),
             command_router: CommandRouter::new(),
             keyspace,
-            cached_nanos: Timestamp::now().as_nanos(),
+            cached_nanos,
+            next_active_expiry_nanos: cached_nanos,
             aof_writer,
             aof_scratch: vec![0u8; 4096],
             expiry_shard_cursor,
@@ -317,7 +455,7 @@ impl Reactor {
     /// Runs the reactor event loop. Blocks until shutdown.
     pub fn run(&mut self) {
         self.running = true;
-        self.start_time = Instant::now();
+        self.start_nanos = Timestamp::now().as_nanos();
         tracing::info!(reactor_id = self.id, "reactor starting");
 
         // Submit initial accept.
@@ -328,10 +466,9 @@ impl Reactor {
         }
 
         loop {
-            // Cache wall-clock time once per iteration.
-            self.now_secs = self.start_time.elapsed().as_secs() as u32;
-            // Cache monotonic nanos for engine commands (avoids clock reads per command).
+            // Cache monotonic time once per iteration and derive the seconds view from it.
             self.cached_nanos = Timestamp::now().as_nanos();
+            self.now_secs = ((self.cached_nanos - self.start_nanos) / 1_000_000_000) as u32;
 
             // 1. Flush pending submissions.
             if let Err(e) = self.backend.flush() {
@@ -367,7 +504,7 @@ impl Reactor {
                         }
                         match op {
                             OpType::Read => self.handle_read(conn_id, cqe),
-                            OpType::Write | OpType::Writev => self.handle_write(conn_id, cqe),
+                            OpType::Write | OpType::Writev => self.handle_write(conn_id, op, cqe),
                             OpType::Close => self.handle_close(conn_id),
                             OpType::Accept => unreachable!(),
                         }
@@ -380,8 +517,10 @@ impl Reactor {
             // 3b. Fast-path: process newly submitted ops (e.g., writes after
             //     reads) immediately, collapsing read→process→write into a
             //     single event-loop iteration instead of two.
+            //     Uses drain_cq() for a non-blocking CQ peek — no syscall on
+            //     io_uring, avoiding a third io_uring_enter per iteration.
             self.cqe_buf.clear();
-            if self.backend.completions(&mut self.cqe_buf).is_ok() && !self.cqe_buf.is_empty() {
+            if self.backend.drain_cq(&mut self.cqe_buf).is_ok() && !self.cqe_buf.is_empty() {
                 let mut fast_completions = std::mem::take(&mut self.cqe_buf);
                 for cqe in &fast_completions {
                     let (conn_id, cgen, op) = decode_token(cqe.token);
@@ -397,7 +536,7 @@ impl Reactor {
                             match op {
                                 OpType::Read => self.handle_read(conn_id, cqe),
                                 OpType::Write | OpType::Writev => {
-                                    self.handle_write(conn_id, cqe);
+                                    self.handle_write(conn_id, op, cqe);
                                 }
                                 OpType::Close => self.handle_close(conn_id),
                                 OpType::Accept => unreachable!(),
@@ -418,24 +557,31 @@ impl Reactor {
             // Each reactor sweeps different shards in round-robin, staggered
             // by reactor_id * (K / N), distributing load across the pool.
             // Re-sweep if >25% of sampled entries were expired (max 3 iters).
+            // Throttle the sweep cadence so no-TTL workloads do not pay a
+            // write-lock tax on every event-loop iteration.
             {
                 let now = self.cached_nanos;
-                let num_shards = self.keyspace.num_shards();
-                const MAX_EXPIRY_ITERS: usize = 3;
-                const MAX_EFFORT: usize = 20;
-                for _ in 0..MAX_EXPIRY_ITERS {
-                    let shard_idx = self.expiry_shard_cursor % num_shards;
-                    let (expired, sampled) = self.keyspace.run_active_expiry_on_shard(
-                        shard_idx,
-                        self.expiry_slot_cursor,
-                        MAX_EFFORT,
-                        now,
-                    );
-                    // Advance cursors for next sweep.
-                    self.expiry_slot_cursor = self.expiry_slot_cursor.wrapping_add(MAX_EFFORT);
-                    self.expiry_shard_cursor = self.expiry_shard_cursor.wrapping_add(1);
-                    if sampled == 0 || expired * 4 <= sampled {
-                        break;
+                if now >= self.next_active_expiry_nanos {
+                    let num_shards = self.keyspace.num_shards();
+                    const ACTIVE_EXPIRY_INTERVAL_NANOS: u64 = 1_000_000;
+                    const MAX_EXPIRY_ITERS: usize = 3;
+                    const MAX_EFFORT: usize = 20;
+                    self.next_active_expiry_nanos =
+                        now.saturating_add(ACTIVE_EXPIRY_INTERVAL_NANOS);
+                    for _ in 0..MAX_EXPIRY_ITERS {
+                        let shard_idx = self.expiry_shard_cursor % num_shards;
+                        let (expired, sampled) = self.keyspace.run_active_expiry_on_shard(
+                            shard_idx,
+                            self.expiry_slot_cursor,
+                            MAX_EFFORT,
+                            now,
+                        );
+                        // Advance cursors for next sweep.
+                        self.expiry_slot_cursor = self.expiry_slot_cursor.wrapping_add(MAX_EFFORT);
+                        self.expiry_shard_cursor = self.expiry_shard_cursor.wrapping_add(1);
+                        if sampled == 0 || expired * 4 <= sampled {
+                            break;
+                        }
                     }
                 }
             }
@@ -598,6 +744,7 @@ impl Reactor {
                 self.generations[conn_id] = self.generations[conn_id].wrapping_add(1) & 0xFF_FFFF;
             }
             let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
+            self.writev_states[conn_id].clear();
 
             tracing::debug!(
                 reactor_id = self.id,
@@ -728,7 +875,7 @@ impl Reactor {
                             CommandResponse::Static(buf) => {
                                 if scatter_gather {
                                     // Already in scatter-gather mode — push as static iovec.
-                                    self.iovec_writer.push_static(buf);
+                                    self.writev_states[conn_id].push_static(buf);
                                 } else {
                                     let end = write_cursor + buf.len();
                                     if end > buf_size {
@@ -744,32 +891,47 @@ impl Reactor {
                                     write_cursor = end;
                                 }
                             }
-                            CommandResponse::Frame(ref resp_frame) => {
+                            CommandResponse::Inline(inline) => {
+                                let buf = inline.as_bytes();
+                                if scatter_gather {
+                                    self.writev_states[conn_id].push_inline(buf);
+                                } else {
+                                    let end = write_cursor + buf.len();
+                                    if end <= buf_size {
+                                        write_buf[write_cursor..end].copy_from_slice(buf);
+                                        write_cursor = end;
+                                    } else {
+                                        scatter_gather = true;
+                                        self.writev_states[conn_id].clear();
+                                        if write_cursor > 0 {
+                                            self.writev_states[conn_id]
+                                                .push_bytes(&write_buf[..write_cursor]);
+                                        }
+                                        self.writev_states[conn_id].push_inline(buf);
+                                    }
+                                }
+                            }
+                            CommandResponse::Frame(resp_frame) => {
                                 if !scatter_gather {
                                     // Try direct serialization into write buffer first.
                                     let remaining = &mut write_buf[write_cursor..];
-                                    if let Some(n) =
-                                        RespSerializer::serialize_to_slice(resp_frame, remaining)
-                                    {
+                                    if let Some(n) = RespSerializer::serialize_to_slice(
+                                        &resp_frame,
+                                        remaining,
+                                    ) {
                                         write_cursor += n;
                                         continue;
                                     }
                                     // Doesn't fit — switch entire batch to scatter-gather.
                                     scatter_gather = true;
-                                    self.iovec_writer.clear();
+                                    self.writev_states[conn_id].clear();
                                     if write_cursor > 0 {
                                         // Transfer accumulated write_buf data into iovec.
-                                        // SAFETY: write_buf is pool-allocated and remains
-                                        // valid for the connection lifetime. The pointer
-                                        // stored by push_bytes is consumed before the
-                                        // buffer is released or reused.
-                                        self.iovec_writer.push_bytes(&write_buf[..write_cursor]);
+                                        self.writev_states[conn_id]
+                                            .push_bytes(&write_buf[..write_cursor]);
                                     }
                                 }
-                                RespSerializer::serialize_to_iovecs(
-                                    resp_frame,
-                                    &mut self.iovec_writer,
-                                );
+                                self.writev_states[conn_id].push_frame(resp_frame);
                             }
                         }
                     }
@@ -787,7 +949,7 @@ impl Reactor {
                     | ParseError::InvalidFrame,
                 ) => {
                     if scatter_gather {
-                        self.iovec_writer.push_static(RESP_ERR_PROTOCOL);
+                        self.writev_states[conn_id].push_static(RESP_ERR_PROTOCOL);
                     } else {
                         let end = write_cursor + RESP_ERR_PROTOCOL.len();
                         if end > buf_size {
@@ -830,25 +992,27 @@ impl Reactor {
         // Write all responses, or re-arm read if no complete command was parsed.
         if scatter_gather {
             // Scatter-gather path: submit writev with the assembled iovecs.
-            let total = self.iovec_writer.total_len();
+            self.writev_states[conn_id].finalize();
+            let total = self.writev_states[conn_id].remaining_len();
             if total > 0 {
                 if let Some(c) = self.connections.get_mut(conn_id) {
                     c.write_buf_len = total as u32;
                 }
-                let iovecs = self.iovec_writer.as_raw_iovecs();
+                let remaining_iovecs = self.writev_states[conn_id].remaining_iovecs();
                 let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
                 let token = encode_token(conn_id, cgen, OpType::Writev);
-                // NOTE: For the polling backend, writev completes synchronously
-                // so the iovec Vec lifetime is sufficient. For io_uring, the
-                // iovecs must remain valid until the CQE is reaped — a pinned
-                // iovec buffer on the Reactor would be needed for production
-                // io_uring scatter-gather.
-                let _ = self
+                if self
                     .backend
-                    .submit_writev(fd, iovecs.as_ptr(), iovecs.len(), token);
+                    .submit_writev(fd, remaining_iovecs.as_ptr(), remaining_iovecs.len(), token)
+                    .is_err()
+                {
+                    self.writev_states[conn_id].clear();
+                    self.close_connection(conn_id);
+                }
             } else if close_after_write {
                 self.close_connection(conn_id);
             } else {
+                self.writev_states[conn_id].clear();
                 self.submit_read_for(conn_id, fd);
             }
         } else if write_cursor > 0 {
@@ -912,23 +1076,33 @@ impl Reactor {
                 // Route through the engine against the shared ConcurrentKeyspace.
                 let now = self.cached_nanos;
                 match execute_command(&self.keyspace, name, frame, now) {
-                    Some(CmdResult::Static(buf)) => {
-                        let close = meta.name == "QUIT";
-                        // AOF: log mutation commands after successful execution.
-                        if !close && self.aof_writer.is_some() && is_mutation(name) {
-                            let lsn = self.keyspace.next_lsn();
-                            self.append_to_aof(lsn, frame);
+                    Some(executed) => match executed.response {
+                        CmdResult::Static(buf) => {
+                            let close = meta.name == "QUIT";
+                            if !close && self.aof_writer.is_some() {
+                                if let Some(lsn) = executed.aof_lsn {
+                                    self.append_to_aof(lsn, frame);
+                                }
+                            }
+                            (CommandResponse::Static(buf), close)
                         }
-                        (CommandResponse::Static(buf), close)
-                    }
-                    Some(CmdResult::Resp(f)) => {
-                        // AOF: log mutation commands after successful execution.
-                        if self.aof_writer.is_some() && is_mutation(name) {
-                            let lsn = self.keyspace.next_lsn();
-                            self.append_to_aof(lsn, frame);
+                        CmdResult::Inline(inline) => {
+                            if self.aof_writer.is_some() {
+                                if let Some(lsn) = executed.aof_lsn {
+                                    self.append_to_aof(lsn, frame);
+                                }
+                            }
+                            (CommandResponse::Inline(inline), false)
                         }
-                        (CommandResponse::Frame(f), false)
-                    }
+                        CmdResult::Resp(f) => {
+                            if self.aof_writer.is_some() {
+                                if let Some(lsn) = executed.aof_lsn {
+                                    self.append_to_aof(lsn, frame);
+                                }
+                            }
+                            (CommandResponse::Frame(f), false)
+                        }
+                    },
                     None => {
                         // Engine doesn't handle this command — shouldn't happen
                         // since all PHF commands are wired, but handle gracefully.
@@ -1196,7 +1370,7 @@ impl Reactor {
 
     // ── Write handler ──────────────────────────────────────────────
 
-    fn handle_write(&mut self, conn_id: usize, cqe: &Completion) {
+    fn handle_write(&mut self, conn_id: usize, op: OpType, cqe: &Completion) {
         // Ignore late completions for connections being torn down.
         if let Some(c) = self.connections.get(conn_id) {
             if c.is_closing() {
@@ -1218,25 +1392,47 @@ impl Reactor {
         let bytes_written = cqe.result as usize;
 
         if bytes_written < total {
-            // Partial write — shift unwritten bytes to front and resubmit.
-            let write_ptr = self.buffer_pool.ptr(write_idx);
             let remaining = total - bytes_written;
-            // SAFETY: Both source and dest are within the same mmap buffer.
-            unsafe {
-                std::ptr::copy(write_ptr.add(bytes_written), write_ptr, remaining);
+            match op {
+                OpType::Write => {
+                    // Partial write — shift unwritten bytes to front and resubmit.
+                    let write_ptr = self.buffer_pool.ptr(write_idx);
+                    // SAFETY: Both source and dest are within the same mmap buffer.
+                    unsafe {
+                        std::ptr::copy(write_ptr.add(bytes_written), write_ptr, remaining);
+                    }
+                    if let Some(c) = self.connections.get_mut(conn_id) {
+                        c.write_buf_len = remaining as u32;
+                    }
+                    let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
+                    let token = encode_token(conn_id, cgen, OpType::Write);
+                    let _ = self.backend.submit_write_fixed(
+                        fd,
+                        write_ptr as *const u8,
+                        remaining,
+                        write_idx as u16,
+                        token,
+                    );
+                }
+                OpType::Writev => {
+                    self.writev_states[conn_id].advance(bytes_written);
+                    if let Some(c) = self.connections.get_mut(conn_id) {
+                        c.write_buf_len = remaining as u32;
+                    }
+                    let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
+                    let token = encode_token(conn_id, cgen, OpType::Writev);
+                    let remaining_iovecs = self.writev_states[conn_id].remaining_iovecs();
+                    if self
+                        .backend
+                        .submit_writev(fd, remaining_iovecs.as_ptr(), remaining_iovecs.len(), token)
+                        .is_err()
+                    {
+                        self.writev_states[conn_id].clear();
+                        self.close_connection(conn_id);
+                    }
+                }
+                _ => unreachable!(),
             }
-            if let Some(c) = self.connections.get_mut(conn_id) {
-                c.write_buf_len = remaining as u32;
-            }
-            let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
-            let token = encode_token(conn_id, cgen, OpType::Write);
-            let _ = self.backend.submit_write_fixed(
-                fd,
-                write_ptr as *const u8,
-                remaining,
-                write_idx as u16,
-                token,
-            );
         } else if self.draining
             || self
                 .connections
@@ -1244,11 +1440,17 @@ impl Reactor {
                 .is_some_and(|c| (c.flags & ConnectionFlags::CLOSE_AFTER_WRITE) != 0)
         {
             // Drain mode: writes flushed — close connection, don't re-arm read.
+            if matches!(op, OpType::Writev) {
+                self.writev_states[conn_id].clear();
+            }
             self.close_connection(conn_id);
         } else {
             // Write complete — clear write length and re-arm read.
             if let Some(c) = self.connections.get_mut(conn_id) {
                 c.write_buf_len = 0;
+            }
+            if matches!(op, OpType::Writev) {
+                self.writev_states[conn_id].clear();
             }
             self.submit_read_for(conn_id, fd);
         }
@@ -1263,6 +1465,9 @@ impl Reactor {
             let write_idx = c.write_buf_offset as usize;
             self.buffer_pool.release_index(read_idx);
             self.buffer_pool.release_index(write_idx);
+            if conn_id < self.writev_states.len() {
+                self.writev_states[conn_id].clear();
+            }
 
             self.connections.remove(conn_id);
             tracing::debug!(reactor_id = self.id, conn_id, "connection closed");
@@ -1402,17 +1607,10 @@ impl Reactor {
             }
 
             if write_len > 0 {
-                // Write data pending — let the write handler close after flush.
-                let write_ptr = self.buffer_pool.ptr(write_idx) as *const u8;
-                let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
-                let token = encode_token(conn_id, cgen, OpType::Write);
-                let _ = self.backend.submit_write_fixed(
-                    fd,
-                    write_ptr,
-                    write_len,
-                    write_idx as u16,
-                    token,
-                );
+                let _ = (fd, write_idx);
+                if let Some(c) = self.connections.get_mut(conn_id) {
+                    c.flags |= ConnectionFlags::CLOSE_AFTER_WRITE;
+                }
             } else {
                 // No pending writes — close immediately.
                 self.close_connection(conn_id);
@@ -1442,6 +1640,8 @@ impl Reactor {
             // Cancel any pending write.
             let write_token = encode_token(conn_id, cgen, OpType::Write);
             let _ = self.backend.submit_cancel(write_token);
+            let writev_token = encode_token(conn_id, cgen, OpType::Writev);
+            let _ = self.backend.submit_cancel(writev_token);
         }
 
         // Also cancel the accept token.
@@ -1459,6 +1659,9 @@ impl Reactor {
             if let Some(c) = self.connections.get(conn_id) {
                 self.buffer_pool.release_index(c.read_buf_offset as usize);
                 self.buffer_pool.release_index(c.write_buf_offset as usize);
+            }
+            if conn_id < self.writev_states.len() {
+                self.writev_states[conn_id].clear();
             }
         }
     }
@@ -1480,11 +1683,14 @@ mod tests {
         match router.dispatch(&frame) {
             DispatchResult::Dispatch { meta, name, .. } => {
                 match execute_command(&keyspace, name, &frame, now) {
-                    Some(CmdResult::Static(buf)) => {
-                        let close = meta.name == "QUIT";
-                        (CommandResponse::Static(buf), close)
-                    }
-                    Some(CmdResult::Resp(f)) => (CommandResponse::Frame(f), false),
+                    Some(executed) => match executed.response {
+                        CmdResult::Static(buf) => {
+                            let close = meta.name == "QUIT";
+                            (CommandResponse::Static(buf), close)
+                        }
+                        CmdResult::Inline(inline) => (CommandResponse::Inline(inline), false),
+                        CmdResult::Resp(f) => (CommandResponse::Frame(f), false),
+                    },
                     None => (
                         CommandResponse::Static(b"-ERR command not yet implemented\r\n"),
                         false,
@@ -1539,7 +1745,9 @@ mod tests {
         // Acceptable outcomes: static PONG or a bulk-string echo of the attribute child.
         match resp {
             CommandResponse::Static(b) => assert_eq!(b, RESP_PONG),
-            CommandResponse::Frame(_) => { /* bulk string from attribute child — acceptable */ }
+            CommandResponse::Inline(_) | CommandResponse::Frame(_) => {
+                /* bulk string from attribute child — acceptable */
+            }
         }
     }
 
@@ -1555,5 +1763,27 @@ mod tests {
         let (resp, close) = dispatch_wire(b"*1\r\n$4\r\nQUIT\r\n");
         assert!(matches!(resp, CommandResponse::Static(b) if b == b"+OK\r\n"));
         assert!(close);
+    }
+
+    #[test]
+    fn pending_writev_advances_across_segments() {
+        let mut pending = PendingWritev::new();
+        pending.push_static(b"abc");
+        pending.push_static(b"defg");
+        pending.finalize();
+
+        pending.advance(4);
+
+        assert_eq!(pending.remaining_len(), 3);
+        let remaining = pending.remaining_iovecs();
+        assert_eq!(remaining.len(), 1);
+        // SAFETY: remaining iovec points to static storage used in the test.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                remaining[0].iov_base.cast::<u8>(),
+                remaining[0].iov_len,
+            )
+        };
+        assert_eq!(bytes, b"efg");
     }
 }

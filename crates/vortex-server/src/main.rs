@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vortex_io::{AofConfig, ReactorPool, ReactorPoolConfig};
+use vortex_io::{AofConfig, IoBackendMode, ReactorPool, ReactorPoolConfig};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -71,6 +71,13 @@ fn main() {
         connection_timeout: config.connection_timeout_secs as u32,
         aof_config,
         shard_count: vortex_engine::DEFAULT_SHARD_COUNT,
+        io_backend: match config.io_backend {
+            vortex_config::IoBackendKind::Auto => IoBackendMode::Auto,
+            vortex_config::IoBackendKind::Uring => IoBackendMode::Uring,
+            vortex_config::IoBackendKind::Polling => IoBackendMode::Polling,
+        },
+        ring_size: config.ring_size,
+        sqpoll_idle_ms: config.sqpoll_idle_ms,
     };
 
     let mut pool = match ReactorPool::spawn(pool_config) {

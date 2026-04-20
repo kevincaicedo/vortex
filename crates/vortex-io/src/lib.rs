@@ -32,6 +32,7 @@ pub mod shutdown;
 pub mod timer;
 
 pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
+pub use pool::IoBackendMode;
 pub use pool::{ReactorPool, ReactorPoolConfig};
 pub use reactor::{AofConfig, Reactor, ReactorConfig};
 pub use shutdown::ShutdownCoordinator;

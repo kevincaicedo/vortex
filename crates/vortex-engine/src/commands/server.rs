@@ -5,7 +5,7 @@
 
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
-use super::{CmdResult, RESP_EMPTY_ARRAY, RESP_OK, arg_bytes, arg_count};
+use super::{CmdResult, ExecutedCommand, RESP_EMPTY_ARRAY, RESP_OK, arg_bytes, arg_count};
 use crate::ConcurrentKeyspace;
 
 // ── Pre-computed static responses ───────────────────────────────────
@@ -89,9 +89,8 @@ pub fn cmd_flushdb(
     keyspace: &ConcurrentKeyspace,
     _frame: &FrameRef<'_>,
     _now_nanos: u64,
-) -> CmdResult {
-    keyspace.cmd_flush_all();
-    CmdResult::Static(RESP_OK)
+) -> ExecutedCommand {
+    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), keyspace.cmd_flush_all())
 }
 
 /// FLUSHALL [ASYNC|SYNC]
@@ -102,9 +101,8 @@ pub fn cmd_flushall(
     keyspace: &ConcurrentKeyspace,
     _frame: &FrameRef<'_>,
     _now_nanos: u64,
-) -> CmdResult {
-    keyspace.cmd_flush_all();
-    CmdResult::Static(RESP_OK)
+) -> ExecutedCommand {
+    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), keyspace.cmd_flush_all())
 }
 
 // ── 3.6.3 — INFO ───────────────────────────────────────────────────
@@ -702,11 +700,13 @@ mod tests {
         let name_upper: Vec<u8> = parts[0].iter().map(|b| b.to_ascii_uppercase()).collect();
         crate::commands::execute_command(&h.keyspace, &name_upper, &frame, 0)
             .expect("command should be recognized")
+            .response
     }
 
     fn assert_static(r: &CmdResult, expected: &[u8]) {
         match r {
             CmdResult::Static(s) => assert_eq!(*s, expected, "static mismatch"),
+            CmdResult::Inline(_) => panic!("expected Static, got Inline"),
             CmdResult::Resp(f) => panic!("expected Static, got Resp: {f:?}"),
         }
     }
@@ -715,6 +715,16 @@ mod tests {
         match r {
             CmdResult::Resp(RespFrame::Integer(n)) => {
                 assert_eq!(*n, expected, "integer mismatch");
+            }
+            CmdResult::Static(s) => {
+                let expected_bytes: &[u8] = match expected {
+                    0 => b":0\r\n",
+                    1 => b":1\r\n",
+                    -1 => b":-1\r\n",
+                    -2 => b":-2\r\n",
+                    _ => panic!("expected Integer({expected}), got Static({:?})", std::str::from_utf8(s)),
+                };
+                assert_eq!(*s, expected_bytes, "static integer mismatch for {expected}");
             }
             other => panic!("expected Integer({expected}), got {other:?}"),
         }

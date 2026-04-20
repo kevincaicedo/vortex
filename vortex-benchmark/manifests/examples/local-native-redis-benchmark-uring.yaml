@@ -1,0 +1,33 @@
+schema_version: 1
+name: local-native-redis-benchmark-uring
+description: Quick native local command sweep for Vortex and Redis using redis-benchmark with Vortex forced to io_uring.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+commands:
+  - GET
+  - SET
+  - INCR
+duration: 8s
+environment:
+  mode: native
+  port_base: 18379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  io_backend: uring
+  ring_size: 4096
+  fixed_buffers: 1024
+  sqpoll_idle_ms: 1000
+settings:
+  redis-benchmark:
+    requests: 30000
+    clients: 20
+    pipeline: 8
+    keyspace_size: 100000

@@ -8,9 +8,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use vortex_io::{Reactor, ReactorConfig, ShutdownCoordinator};
+use vortex_io::{IoBackendMode, Reactor, ReactorConfig, ShutdownCoordinator};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
 fn free_port() -> u16 {
@@ -46,13 +46,30 @@ fn spawn_reactor() -> (std::thread::JoinHandle<()>, u16, Arc<ShutdownCoordinator
             buffer_count: 128,
             connection_timeout: 0,
             aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
     });
 
-    // Give the reactor time to bind. Retry connection to avoid race.
-    std::thread::sleep(Duration::from_millis(100));
+    // Wait until the listener is actually accepting connections so the test
+    // binary stays stable under parallel execution.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("reactor did not start listening on {addr}: {error}"),
+        }
+    }
 
     (handle, port, coordinator)
 }

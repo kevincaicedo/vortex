@@ -15,3 +15,8 @@ benchmarks/*.md
 **/.artifacts/
 **/.env
 **/.env-*
+
+**/__pycache__/
+**/.pytest_cache/
+**/perf.data
+**/perf.data.*

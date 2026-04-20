@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vortex_io::{Reactor, ReactorConfig, ShutdownCoordinator};
+use vortex_io::{IoBackendMode, Reactor, ReactorConfig, ShutdownCoordinator};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
 fn free_port() -> u16 {
@@ -30,6 +30,9 @@ fn ping_pong_resp() {
             buffer_count: 64,
             connection_timeout: 0,
             aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -82,6 +85,9 @@ fn ping_pong_inline() {
             buffer_count: 64,
             connection_timeout: 0,
             aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -122,6 +128,9 @@ fn unknown_command_returns_error() {
             buffer_count: 64,
             connection_timeout: 0,
             aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

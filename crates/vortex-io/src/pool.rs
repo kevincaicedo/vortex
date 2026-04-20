@@ -18,6 +18,18 @@ use vortex_persist::aof::reader::AofReader;
 use crate::reactor::{AofConfig, Reactor, ReactorConfig};
 use crate::shutdown::ShutdownCoordinator;
 
+/// I/O backend selection for pool-managed reactors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IoBackendMode {
+    /// Prefer io_uring when it is available, otherwise fall back to polling.
+    #[default]
+    Auto,
+    /// Require io_uring and fail startup if it cannot be constructed.
+    Uring,
+    /// Use the polling backend.
+    Polling,
+}
+
 /// Configuration for the reactor pool.
 pub struct ReactorPoolConfig {
     /// Address to bind all reactor listeners on.
@@ -36,6 +48,12 @@ pub struct ReactorPoolConfig {
     pub aof_config: Option<AofConfig>,
     /// Number of ConcurrentKeyspace shards (must be power of 2, default 4096).
     pub shard_count: usize,
+    /// I/O backend selection.
+    pub io_backend: IoBackendMode,
+    /// io_uring submission queue size.
+    pub ring_size: u32,
+    /// SQPOLL idle timeout in milliseconds.
+    pub sqpoll_idle_ms: u32,
 }
 
 impl Default for ReactorPoolConfig {
@@ -49,6 +67,9 @@ impl Default for ReactorPoolConfig {
             connection_timeout: 300,
             aof_config: None,
             shard_count: DEFAULT_SHARD_COUNT,
+            io_backend: IoBackendMode::Auto,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         }
     }
 }
@@ -164,6 +185,9 @@ impl ReactorPool {
                 buffer_count: per_reactor_bufs,
                 connection_timeout: config.connection_timeout,
                 aof_config: config.aof_config.clone(),
+                io_backend: config.io_backend,
+                ring_size: config.ring_size,
+                sqpoll_idle_ms: config.sqpoll_idle_ms,
             };
 
             let thread = std::thread::Builder::new()

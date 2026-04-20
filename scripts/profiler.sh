@@ -65,6 +65,9 @@ Server configuration:
   --aof              Enable AOF persistence
   --maxmemory SIZE   Set max memory (e.g. 64mb, 1gb)
   --eviction POLICY  Set eviction policy (e.g. allkeys-lru)
+    --io-backend KIND  Explicit Vortex I/O backend: auto, uring, or polling
+    --ring-size N      io_uring submission queue size override
+    --sqpoll-idle-ms N SQPOLL idle timeout in milliseconds
   --host HOST        Bind address (default: 127.0.0.1)
   --port PORT        Bind port (default: 16379)
   --bin PATH         Use pre-built binary instead of building
@@ -128,6 +131,9 @@ THREADS=4
 AOF=false
 MAXMEMORY=""
 EVICTION=""
+IO_BACKEND=""
+RING_SIZE=""
+SQPOLL_IDLE_MS=""
 BIN_OVERRIDE=""
 
 # Profiler tuning
@@ -174,6 +180,9 @@ while [[ $# -gt 0 ]]; do
         --aof)          AOF=true;                shift ;;
         --maxmemory)    MAXMEMORY="$2";          shift 2 ;;
         --eviction)     EVICTION="$2";           shift 2 ;;
+        --io-backend)   IO_BACKEND="$2";         shift 2 ;;
+        --ring-size)    RING_SIZE="$2";          shift 2 ;;
+        --sqpoll-idle-ms) SQPOLL_IDLE_MS="$2";   shift 2 ;;
         --bin)          BIN_OVERRIDE="$2";       shift 2 ;;
 
         # Profiler tuning
@@ -306,6 +315,9 @@ if [[ -n "$MANIFEST" ]]; then printf "  Manifest:  %s\n" "$MANIFEST"; fi
 if $AOF; then printf "  AOF:       enabled\n"; fi
 if [[ -n "$MAXMEMORY" ]]; then printf "  MaxMemory: %s\n" "$MAXMEMORY"; fi
 if [[ -n "$EVICTION" ]]; then printf "  Eviction:  %s\n" "$EVICTION"; fi
+if [[ -n "$IO_BACKEND" ]]; then printf "  I/O:       %s\n" "$IO_BACKEND"; fi
+if [[ -n "$RING_SIZE" ]]; then printf "  RingSize:  %s\n" "$RING_SIZE"; fi
+if [[ -n "$SQPOLL_IDLE_MS" ]]; then printf "  SQPOLL:    %s ms\n" "$SQPOLL_IDLE_MS"; fi
 echo ""
 
 # Common args passed to every profiling function:

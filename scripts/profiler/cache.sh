@@ -17,6 +17,9 @@ run_cachegrind() {
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
     [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
+    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
+    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
+    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
     if [[ -n "$command" ]]; then
         (
@@ -66,6 +69,9 @@ run_callgrind() {
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
     [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
+    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
+    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
+    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
     if [[ -n "$command" ]]; then
         (

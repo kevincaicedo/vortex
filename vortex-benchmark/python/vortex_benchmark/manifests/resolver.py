@@ -13,7 +13,11 @@ from vortex_benchmark.catalog import (
     resolve_command_group_name,
     resolve_workload_name,
 )
-from vortex_benchmark.manifests.loader import BenchmarkManifest, load_manifest
+from vortex_benchmark.manifests.loader import (
+    BenchmarkManifest,
+    SUPPORTED_VORTEX_IO_BACKENDS,
+    load_manifest,
+)
 from vortex_benchmark.models import (
     DEFAULT_CPUS,
     DEFAULT_MEMORY,
@@ -144,6 +148,26 @@ def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(SUPPORTED_EVICTION_POLICIES)
         raise ValueError(f"eviction_policy must be one of: {supported}")
 
+    io_backend = runtime_config.get("io_backend")
+    if io_backend is not None and io_backend not in SUPPORTED_VORTEX_IO_BACKENDS:
+        supported = ", ".join(SUPPORTED_VORTEX_IO_BACKENDS)
+        raise ValueError(f"io_backend must be one of: {supported}")
+
+    ring_size = runtime_config.get("ring_size")
+    if ring_size is not None:
+        if not isinstance(ring_size, int) or ring_size <= 0:
+            raise ValueError("ring_size must be a positive integer when provided")
+        if ring_size & (ring_size - 1) != 0:
+            raise ValueError("ring_size must be a power of two")
+
+    fixed_buffers = runtime_config.get("fixed_buffers")
+    if fixed_buffers is not None and (not isinstance(fixed_buffers, int) or fixed_buffers <= 0):
+        raise ValueError("fixed_buffers must be a positive integer when provided")
+
+    sqpoll_idle_ms = runtime_config.get("sqpoll_idle_ms")
+    if sqpoll_idle_ms is not None and (not isinstance(sqpoll_idle_ms, int) or sqpoll_idle_ms <= 0):
+        raise ValueError("sqpoll_idle_ms must be a positive integer when provided")
+
     return runtime_config
 
 
@@ -228,6 +252,22 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
         manifest_runtime_config.get("eviction_policy"),
         None,
     )
+    io_backend = _coalesce_scalar(
+        getattr(args, "io_backend", None), manifest_runtime_config.get("io_backend"), None
+    )
+    ring_size = _coalesce_scalar(
+        getattr(args, "ring_size", None), manifest_runtime_config.get("ring_size"), None
+    )
+    fixed_buffers = _coalesce_scalar(
+        getattr(args, "fixed_buffers", None),
+        manifest_runtime_config.get("fixed_buffers"),
+        None,
+    )
+    sqpoll_idle_ms = _coalesce_scalar(
+        getattr(args, "sqpoll_idle_ms", None),
+        manifest_runtime_config.get("sqpoll_idle_ms"),
+        None,
+    )
 
     if port_base <= 0:
         raise ValueError("port base must be a positive integer")
@@ -258,6 +298,10 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
                 "aof_fsync": aof_fsync,
                 "maxmemory": maxmemory.strip() if isinstance(maxmemory, str) else maxmemory,
                 "eviction_policy": eviction_policy,
+                "io_backend": io_backend,
+                "ring_size": ring_size,
+                "fixed_buffers": fixed_buffers,
+                "sqpoll_idle_ms": sqpoll_idle_ms,
             }.items()
             if value is not None
         }

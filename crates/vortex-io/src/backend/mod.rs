@@ -183,7 +183,21 @@ pub trait IoBackend {
     fn flush(&mut self) -> std::io::Result<usize>;
 
     /// Drain available completions into `out`. Returns the count of completions.
+    ///
+    /// This may block briefly (up to ~1 ms) if no completions are ready.
+    /// For io_uring this combines submit + wait into a single syscall.
     fn completions(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize>;
+
+    /// Non-blocking drain of the completion queue.
+    ///
+    /// Appends any immediately-available CQEs to `out` without issuing a
+    /// syscall (io_uring) or blocking (polling). Used by the reactor's
+    /// fast-path to collapse read→process→write into one iteration.
+    fn drain_cq(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize> {
+        // Default: delegate to completions(). Backends that can do a cheaper
+        // non-blocking peek should override.
+        self.completions(out)
+    }
 }
 
 /// Sentinel connection ID used for accept operations (not tied to a connection).

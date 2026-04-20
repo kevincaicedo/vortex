@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vortex_io::{Reactor, ReactorConfig};
+use vortex_io::{IoBackendMode, Reactor, ReactorConfig};
 use vortex_io::{ReactorPool, ReactorPoolConfig, ShutdownCoordinator};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
@@ -40,6 +40,9 @@ fn graceful_shutdown_single_reactor() {
             buffer_count: 64,
             connection_timeout: 0,
             aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -96,6 +99,9 @@ fn graceful_shutdown_pool() {
         connection_timeout: 0,
         aof_config: None,
         shard_count: 64,
+        io_backend: IoBackendMode::Polling,
+        ring_size: 4096,
+        sqpoll_idle_ms: 1000,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -154,6 +160,9 @@ fn new_connections_refused_during_drain() {
             buffer_count: 64,
             connection_timeout: 0,
             aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

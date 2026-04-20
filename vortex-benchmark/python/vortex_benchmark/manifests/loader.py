@@ -31,8 +31,18 @@ MANIFEST_TOP_LEVEL_KEYS = {
 }
 ENVIRONMENT_KEYS = {"mode", "output_dir", "state_file", "port_base", "build_vortex"}
 RESOURCE_CONFIG_KEYS = {"cpus", "memory", "threads"}
-RUNTIME_CONFIG_KEYS = {"aof_enabled", "aof_fsync", "maxmemory", "eviction_policy"}
+RUNTIME_CONFIG_KEYS = {
+    "aof_enabled",
+    "aof_fsync",
+    "maxmemory",
+    "eviction_policy",
+    "io_backend",
+    "ring_size",
+    "fixed_buffers",
+    "sqpoll_idle_ms",
+}
 SIZE_LITERAL_RE = re.compile(r"^\d+(?:[kmgt]i?b?|[kmgt]b?)?$", re.IGNORECASE)
+SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
 
 
 @dataclass
@@ -179,6 +189,22 @@ def _validate_runtime_config(payload: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(SUPPORTED_EVICTION_POLICIES)
         raise ValueError(f"runtime_config.eviction_policy must be one of: {supported}")
 
+    io_backend = _optional_string(payload.get("io_backend"), "runtime_config.io_backend")
+    if io_backend is not None and io_backend not in SUPPORTED_VORTEX_IO_BACKENDS:
+        supported = ", ".join(SUPPORTED_VORTEX_IO_BACKENDS)
+        raise ValueError(f"runtime_config.io_backend must be one of: {supported}")
+
+    ring_size = _optional_positive_int(payload.get("ring_size"), "runtime_config.ring_size")
+    if ring_size is not None and ring_size & (ring_size - 1) != 0:
+        raise ValueError("runtime_config.ring_size must be a power of two")
+
+    fixed_buffers = _optional_positive_int(
+        payload.get("fixed_buffers"), "runtime_config.fixed_buffers"
+    )
+    sqpoll_idle_ms = _optional_positive_int(
+        payload.get("sqpoll_idle_ms"), "runtime_config.sqpoll_idle_ms"
+    )
+
     normalized: dict[str, Any] = {}
     if aof_enabled is not None:
         normalized["aof_enabled"] = aof_enabled
@@ -188,6 +214,14 @@ def _validate_runtime_config(payload: dict[str, Any]) -> dict[str, Any]:
         normalized["maxmemory"] = maxmemory
     if eviction_policy is not None:
         normalized["eviction_policy"] = eviction_policy
+    if io_backend is not None:
+        normalized["io_backend"] = io_backend
+    if ring_size is not None:
+        normalized["ring_size"] = ring_size
+    if fixed_buffers is not None:
+        normalized["fixed_buffers"] = fixed_buffers
+    if sqpoll_idle_ms is not None:
+        normalized["sqpoll_idle_ms"] = sqpoll_idle_ms
     return normalized
 
 
