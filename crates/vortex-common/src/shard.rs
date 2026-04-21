@@ -2,7 +2,7 @@ use crate::HASH_SLOTS;
 
 /// Shard identifier — a `u16` newtype.
 ///
-/// Shards are assigned to CPU-core-local reactors. The slot calculation
+/// Shards are assigned to each cluster slot (0..16383) based on the CRC-16/XMODEM hash of the key.
 /// is Redis Cluster compatible: `crc16(key) % 16384`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ShardId(u16);

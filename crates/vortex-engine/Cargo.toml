@@ -25,4 +25,14 @@ bytes = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+hdrhistogram = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "table"
+harness = false

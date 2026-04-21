@@ -46,6 +46,9 @@ fn reactor_scaling(c: &mut Criterion) {
                     connection_timeout: 0,
                     aof_config: None,
                     shard_count: 64,
+                    io_backend: vortex_io::IoBackendMode::Auto,
+                    ring_size: 1024,
+                    sqpoll_idle_ms: 4096,
                 };
 
                 let mut pool = ReactorPool::spawn(config).expect("pool creation");

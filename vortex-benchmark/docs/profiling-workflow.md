@@ -314,8 +314,8 @@ Criterion remains mandatory for function-level regression evidence.
 Representative commands:
 
 ```bash
-cargo bench -p vortex-bench --profile profiling -- cmd_get_inline
-cargo bench -p vortex-bench --profile profiling -- concurrent_cmd_get_inline
+cargo bench -p vortex-engine --bench engine --profile profiling -- cmd_get_inline
+cargo bench -p vortex-engine --bench engine --profile profiling -- concurrent_cmd_get_inline
 ```
 
 The point is not to replace Criterion with a system profiler. Criterion answers "did this hot path get slower in isolation?" The OS profiler answers "why?"

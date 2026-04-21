@@ -419,15 +419,14 @@ impl ConcurrentKeyspace {
     #[inline]
     pub fn sorted_shard_indices(&self, keys: &[&[u8]]) -> (Vec<usize>, Vec<usize>) {
         let mut per_key = Vec::with_capacity(keys.len());
-        let mut unique = Vec::with_capacity(keys.len().min(self.shards.len()));
 
         for &key in keys {
-            let shard_idx = self.shard_index(key);
-            per_key.push(shard_idx);
-            if let Err(pos) = unique.binary_search(&shard_idx) {
-                unique.insert(pos, shard_idx);
-            }
+            per_key.push(self.shard_index(key));
         }
+
+        let mut unique = per_key.clone();
+        unique.sort_unstable();
+        unique.dedup();
 
         (unique, per_key)
     }

@@ -61,12 +61,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Defaults ──
 REQUESTS=100000
-CLIENTS=50
-PIPELINE=16
+CLIENTS=100
+PIPELINE=1
 # redis-benchmark built-in tests (full list for Redis-compatible servers)
-DEFAULT_TESTS="PING_INLINE,PING_MBULK,SET,GET,INCR,LPUSH,RPUSH,LPOP,RPOP,SADD,HSET,SPOP,MSET"
+DEFAULT_TESTS="PING_INLINE,PING_MBULK,SET,GET,INCR,MGET,MSET"
 # Subset that Vortex supports (no list/set/hash commands yet)
-VORTEX_BUILTIN_TESTS="PING_INLINE,PING_MBULK,SET,GET,INCR,MSET"
+VORTEX_BUILTIN_TESTS="PING_INLINE,PING_MBULK,SET,GET,INCR,MGET,MSET"
 TESTS=""
 PORT_BASE=16379
 RESULTS_DIR="$(mktemp -d)"
@@ -83,9 +83,9 @@ DOCKER_ALL=false
 NATIVE_MODE=false
 DOCKER_CPUS=4
 DOCKER_MEMORY="2g"
-MEMTIER_THREADS="1,2,4,8"
+MEMTIER_THREADS="1,2,4"
 MEMTIER_REQUESTS=2000
-MEMTIER_CLIENTS=50
+MEMTIER_CLIENTS=100
 MEMTIER_PIPELINE=1
 MEMTIER_DATA_SIZE=384
 MEMTIER_RATIO="1:15"
@@ -494,7 +494,7 @@ if [[ "$DOCKER_ALL" == true ]]; then
 else
     log_info "Starting VortexDB (native) on port $PORT..."
     VORTEX_LOG="$RESULTS_DIR/vortex.log"
-    "$PROJECT_ROOT/target/release/vortex-server" --threads "$DOCKER_CPUS" --io-backend uring --bind "127.0.0.1:$PORT" >"$VORTEX_LOG" 2>&1 &
+    "$PROJECT_ROOT/target/release/vortex-server" --threads "$DOCKER_CPUS" --bind "127.0.0.1:$PORT" >"$VORTEX_LOG" 2>&1 &
     VORTEX_PID=$!
     kv_set "port_vortex" "$PORT"
     PORT=$((PORT + 1))

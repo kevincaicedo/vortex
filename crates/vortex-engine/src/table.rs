@@ -1002,6 +1002,17 @@ impl SwissTable {
     pub fn remove_with_ttl(&mut self, key: &VortexKey) -> Option<(VortexValue, u64)> {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
+        self.remove_with_ttl_prehashed(key_bytes, hash)
+    }
+
+    /// Like [`remove_with_ttl`](Self::remove_with_ttl) but uses raw bytes and a
+    /// pre-computed hash so delete-style commands can skip `VortexKey`
+    /// materialization on the hot path.
+    pub fn remove_with_ttl_prehashed(
+        &mut self,
+        key_bytes: &[u8],
+        hash: u64,
+    ) -> Option<(VortexValue, u64)> {
         let slot = self.find_slot(key_bytes, hash)?;
 
         let ttl = unsafe { self.raw.entry(slot) }.ttl_deadline();

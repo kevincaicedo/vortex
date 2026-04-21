@@ -30,7 +30,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run benchmarks
-        run: cargo bench -p vortex-bench --benches -- --output-format bencher --sample-size 20 --measurement-time 3 --warm-up-time 1 | tee bench-output.txt
+        run: |
+          cargo bench -p vortex-engine --bench engine -- --output-format bencher --sample-size 20 --measurement-time 3 --warm-up-time 1 | tee bench-output.txt
+          cargo bench -p vortex-engine --bench table -- --output-format bencher --sample-size 20 --measurement-time 3 --warm-up-time 1 | tee bench-output.txt
+          cargo bench -p vortex-bench --benches -- --output-format bencher --sample-size 20 --measurement-time 3 --warm-up-time 1 | tee -a bench-output.txt
 
       - name: Ensure gh-pages branch exists
         id: ensure-gh-pages

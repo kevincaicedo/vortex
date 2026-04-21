@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use vortex_engine::concurrent_keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
+use vortex_engine::keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 use vortex_persist::aof::reader::AofReader;
 
 use crate::reactor::{AofConfig, Reactor, ReactorConfig};

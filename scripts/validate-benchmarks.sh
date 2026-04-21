@@ -40,7 +40,7 @@ if $CI_MODE; then
     # Reduced sampling for CI to keep total runtime under 5 minutes
     BENCH_ARGS="$BENCH_ARGS --sample-size 20 --measurement-time 3 --warm-up-time 1"
 fi
-cargo bench -p vortex-bench --bench engine -- $BENCH_ARGS 2>/dev/null | tee "$BENCH_OUTPUT"
+cargo bench -p vortex-engine --bench engine -- $BENCH_ARGS 2>/dev/null | tee "$BENCH_OUTPUT"
 echo ""
 
 # ── Parse results ──

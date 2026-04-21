@@ -32,10 +32,6 @@ path = "src/bin/loadgen.rs"
 bench = false
 
 [[bench]]
-name = "engine"
-harness = false
-
-[[bench]]
 name = "parser"
 harness = false
 

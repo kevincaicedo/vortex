@@ -374,7 +374,7 @@ pub fn int_resp(n: i64) -> CmdResult {
 #[cfg(test)]
 pub(crate) mod test_harness {
     use crate::commands::context::SetOptions;
-    use crate::concurrent_keyspace::ConcurrentKeyspace;
+    use crate::keyspace::ConcurrentKeyspace;
     use vortex_common::{VortexKey, VortexValue};
 
     pub struct TestHarness {

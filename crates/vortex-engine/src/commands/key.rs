@@ -44,9 +44,11 @@ pub fn cmd_del(
     // Single-key fast path: skip CommandArgs::collect SmallVec allocation.
     if argc == 2 {
         if let Some(kb) = arg_bytes(frame, 1) {
-            let key = key_from_bytes(kb);
-            let outcome = keyspace.delete_keys(std::slice::from_ref(&key), now_nanos);
-            return ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn);
+            let outcome = keyspace.delete_key_bytes(kb, now_nanos);
+            return ExecutedCommand::with_aof_lsn(
+                int_resp(i64::from(outcome.value)),
+                outcome.aof_lsn,
+            );
         }
         return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
@@ -316,14 +318,10 @@ fn expire_generic(
 /// TTL key
 #[inline]
 pub fn cmd_ttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(args) = CommandArgs::collect(frame) else {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
-    let Some(kb) = args.get(1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
-    };
-    let key = key_from_bytes(kb);
-    match keyspace.ttl_state(&key, now_nanos) {
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
         TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
         TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
         TtlState::Deadline(deadline) => int_resp(((deadline - now_nanos) / NS_PER_SEC) as i64),
@@ -333,14 +331,10 @@ pub fn cmd_ttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
 /// PTTL key
 #[inline]
 pub fn cmd_pttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(args) = CommandArgs::collect(frame) else {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
-    let Some(kb) = args.get(1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
-    };
-    let key = key_from_bytes(kb);
-    match keyspace.ttl_state(&key, now_nanos) {
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
         TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
         TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
         TtlState::Deadline(deadline) => int_resp(((deadline - now_nanos) / NS_PER_MS) as i64),
@@ -354,14 +348,10 @@ pub fn cmd_expiretime(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    let Some(args) = CommandArgs::collect(frame) else {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
-    let Some(kb) = args.get(1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
-    };
-    let key = key_from_bytes(kb);
-    match keyspace.ttl_state(&key, now_nanos) {
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
         TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
         TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
         TtlState::Deadline(deadline) => int_resp((deadline / NS_PER_SEC) as i64),
@@ -375,14 +365,10 @@ pub fn cmd_pexpiretime(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    let Some(args) = CommandArgs::collect(frame) else {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
-    let Some(kb) = args.get(1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
-    };
-    let key = key_from_bytes(kb);
-    match keyspace.ttl_state(&key, now_nanos) {
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
         TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
         TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
         TtlState::Deadline(deadline) => int_resp((deadline / NS_PER_MS) as i64),

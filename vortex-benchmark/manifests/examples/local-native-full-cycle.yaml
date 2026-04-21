@@ -15,7 +15,7 @@ commands:
 workloads:
   - uniform-read_heavy
   - multi_key_only
-duration: 8s
+duration: 10s
 environment:
   mode: native
   port_base: 17679
@@ -29,19 +29,18 @@ runtime_config:
 settings:
   redis-benchmark:
     requests: 30000
-    clients: 20
-    pipeline: 8
+    clients: 100
+    pipeline: 1
     keyspace_size: 100000
   memtier_benchmark:
-    clients: 16
-    pipeline: 4
+    clients: 100
+    pipeline: 1
     keyspace_size: 100000
     data_size: 256
     thread_sweep:
       - 1
       - 4
       - 8
-      - 16
   custom-rust:
     profile: release
     thread_sweep:

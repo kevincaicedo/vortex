@@ -328,21 +328,27 @@ pub fn cmd_mset(
     frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> ExecutedCommand {
-    let Some(args) = CommandArgs::collect(frame) else {
-        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
-    let argc = args.len();
     if argc < 3 || (argc - 1) % 2 != 0 {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
 
+    let Some(mut children) = frame.children() else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    };
+    let _ = children.next();
     let mut pairs = Vec::with_capacity((argc - 1) / 2);
-    let mut index = 1;
-    while index < argc {
-        if let (Some(kb), Some(vb)) = (args.get(index), args.get(index + 1)) {
-            pairs.push((key_from_bytes(kb), value_from_bytes(vb)));
-        }
-        index += 2;
+    while let (Some(key_arg), Some(value_arg)) = (children.next(), children.next()) {
+        let Some(key_bytes) = key_arg.as_bytes() else {
+            return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+        };
+        let Some(value_bytes) = value_arg.as_bytes() else {
+            return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+        };
+        pairs.push((key_from_bytes(key_bytes), value_from_bytes(value_bytes)));
     }
 
     let outcome = keyspace.mset_values(pairs);
@@ -359,21 +365,27 @@ pub fn cmd_msetnx(
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    let Some(args) = CommandArgs::collect(frame) else {
-        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
-    let argc = args.len();
     if argc < 3 || (argc - 1) % 2 != 0 {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
 
+    let Some(mut children) = frame.children() else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    };
+    let _ = children.next();
     let mut pairs = Vec::with_capacity((argc - 1) / 2);
-    let mut index = 1;
-    while index < argc {
-        if let (Some(key_bytes), Some(value_bytes)) = (args.get(index), args.get(index + 1)) {
-            pairs.push((key_from_bytes(key_bytes), value_from_bytes(value_bytes)));
-        }
-        index += 2;
+    while let (Some(key_arg), Some(value_arg)) = (children.next(), children.next()) {
+        let Some(key_bytes) = key_arg.as_bytes() else {
+            return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+        };
+        let Some(value_bytes) = value_arg.as_bytes() else {
+            return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+        };
+        pairs.push((key_from_bytes(key_bytes), value_from_bytes(value_bytes)));
     }
 
     let outcome = keyspace.msetnx_values(pairs, now_nanos);

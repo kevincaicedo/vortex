@@ -15,13 +15,13 @@
 //! - [`Entry`] — 64-byte cache-line-aligned hash table entry (Phase 3.2)
 
 pub mod commands;
-pub mod concurrent_keyspace;
 pub mod entry;
+pub mod keyspace;
 pub mod morph;
 pub mod prefetch;
 pub mod table;
 
-pub use concurrent_keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 pub use entry::{Entry, EntryValue};
+pub use keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 pub use morph::{AccessProfile, DefaultMorphMonitor, DisabledMorphMonitor, MorphMonitor};
 pub use table::SwissTable;

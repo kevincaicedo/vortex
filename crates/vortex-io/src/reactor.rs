@@ -16,7 +16,7 @@ use crate::timer::{ExpiredTimer, TimerWheel};
 use vortex_common::Timestamp;
 use vortex_engine::ConcurrentKeyspace;
 use vortex_engine::commands::{CmdResult, arg_bytes, arg_count, execute_command};
-use vortex_engine::concurrent_keyspace::DEFAULT_SHARD_COUNT;
+use vortex_engine::keyspace::DEFAULT_SHARD_COUNT;
 use vortex_memory::{ArenaAllocator, BufferPool};
 use vortex_persist::aof::rewrite::AofRewriter;
 use vortex_persist::aof::writer::AofFileWriter;

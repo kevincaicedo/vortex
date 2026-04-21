@@ -245,13 +245,16 @@ bash scripts/compare.sh -n 200000 -c 100 -P 32 --native --latency --markdown --m
 ### Run Micro-Benchmarks
 
 ```sh
-# All 69 Criterion benchmarks
+# Engine micro-benchmarks
+cargo bench -p vortex-engine --bench engine
+
+# Shared parser/reactor/support benchmarks
 cargo bench -p vortex-bench
 
 # Specific benchmark group
-cargo bench -p vortex-bench -- swiss_table
-cargo bench -p vortex-bench -- cmd_get
-cargo bench -p vortex-bench -- throughput
+cargo bench -p vortex-engine --bench engine -- swiss_table
+cargo bench -p vortex-engine --bench engine -- cmd_get
+cargo bench -p vortex-engine --bench engine -- throughput
 
 # Validate against Phase 3 performance targets
 just bench-validate

@@ -42,7 +42,12 @@ deny:
 
 # Run benchmarks
 bench:
+    cargo bench -p vortex-engine
     cargo bench -p vortex-bench
+
+# Run engine micro-benchmarks only
+bench-engine *ARGS:
+    cargo bench -p vortex-engine {{ARGS}}
 
 # Validate benchmarks against Phase 3 performance targets
 bench-validate:
