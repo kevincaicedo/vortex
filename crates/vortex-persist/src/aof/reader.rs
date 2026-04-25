@@ -23,10 +23,10 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use vortex_common::Timestamp;
+use vortex_common::{Timestamp, current_unix_time_nanos};
 use vortex_engine::ConcurrentKeyspace;
-use vortex_engine::commands::execute_command;
-use vortex_proto::{RespParser, RespTape};
+use vortex_engine::commands::{CmdResult, CommandClock, execute_command};
+use vortex_proto::{FrameRef, ParseError, RespFrame, RespParser, RespTape};
 
 use super::format::{AOF_HEADER_SIZE, AofHeader, LSN_SIZE};
 
@@ -55,6 +55,107 @@ pub struct ReplayStats {
 pub struct AofReader {
     /// Path to the AOF file.
     path: std::path::PathBuf,
+}
+
+struct ReplayRecordFailure {
+    record_offset: usize,
+    lsn: Option<u64>,
+    error: ParseError,
+}
+
+type MergeHeapItem = Reverse<(u64, usize, usize, usize, usize)>;
+
+fn trim_resp_error(buf: &[u8]) -> String {
+    let buf = buf.strip_prefix(b"-").unwrap_or(buf);
+    let buf = buf.strip_suffix(b"\r\n").unwrap_or(buf);
+    String::from_utf8_lossy(buf).into_owned()
+}
+
+fn replay_error_reply(response: &CmdResult) -> String {
+    match response {
+        CmdResult::Static(buf) => trim_resp_error(buf),
+        CmdResult::Inline(inline) => trim_resp_error(inline.as_bytes()),
+        CmdResult::Resp(RespFrame::Error(message)) => String::from_utf8_lossy(message).into_owned(),
+        _ => "error reply".to_string(),
+    }
+}
+
+fn replay_error(
+    path: &Path,
+    offset: usize,
+    lsn: Option<u64>,
+    command: Option<&[u8]>,
+    detail: impl AsRef<str>,
+) -> io::Error {
+    let mut message = format!(
+        "AOF replay failed for {} at offset={offset}",
+        path.display()
+    );
+    if let Some(lsn) = lsn {
+        message.push_str(&format!(", lsn={lsn}"));
+    }
+    if let Some(command) = command {
+        message.push_str(&format!(", command={}", String::from_utf8_lossy(command)));
+    }
+    message.push_str(": ");
+    message.push_str(detail.as_ref());
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn replay_parse_error(
+    path: &Path,
+    offset: usize,
+    lsn: Option<u64>,
+    error: &ParseError,
+) -> io::Error {
+    replay_error(
+        path,
+        offset,
+        lsn,
+        None,
+        format!("invalid RESP record: {error:?}"),
+    )
+}
+
+fn execute_replay_record(
+    path: &Path,
+    keyspace: &ConcurrentKeyspace,
+    record_offset: usize,
+    lsn: Option<u64>,
+    frame: &FrameRef<'_>,
+    clock: CommandClock,
+) -> io::Result<()> {
+    let name = frame.command_name().ok_or_else(|| {
+        replay_error(
+            path,
+            record_offset,
+            lsn,
+            None,
+            "record is not a command array",
+        )
+    })?;
+
+    let executed = execute_command(keyspace, name, frame, clock).ok_or_else(|| {
+        replay_error(
+            path,
+            record_offset,
+            lsn,
+            Some(name),
+            "command is not registered for replay",
+        )
+    })?;
+
+    if executed.response.is_error() {
+        return Err(replay_error(
+            path,
+            record_offset,
+            lsn,
+            Some(name),
+            replay_error_reply(&executed.response),
+        ));
+    }
+
+    Ok(())
 }
 
 impl AofReader {
@@ -111,69 +212,63 @@ impl AofReader {
         file.read_exact(&mut data)?;
 
         let now_nanos = Timestamp::now().as_nanos();
+        let unix_now_nanos = current_unix_time_nanos();
+        let clock = CommandClock::new(now_nanos, unix_now_nanos);
+        let _replay_guard = keyspace.enter_replay_mode();
         let mut offset = 0usize;
         let mut commands_replayed = 0u64;
         let mut max_lsn = 0u64;
 
         while offset < data.len() {
-            // v2: read 8-byte LSN prefix before each RESP record.
-            if is_v2 {
+            let record_offset = offset;
+            let lsn = if is_v2 {
                 if offset + LSN_SIZE > data.len() {
-                    break; // Truncated LSN header.
+                    break;
                 }
                 let lsn = u64::from_le_bytes(
                     data[offset..offset + LSN_SIZE].try_into().expect("8 bytes"),
                 );
+                offset += LSN_SIZE;
                 if lsn > max_lsn {
                     max_lsn = lsn;
                 }
-                offset += LSN_SIZE;
-
-                // v2: parse exactly ONE RESP frame per LSN record to avoid
-                // consuming across LSN boundaries. Use RespParser::parse()
-                // to determine the frame boundary, then feed just that slice
-                // to RespTape for FrameRef-based execution.
-                let frame_size = match RespParser::parse(&data[offset..]) {
-                    Ok((_, consumed)) => consumed,
-                    Err(_) => break,
-                };
-                match RespTape::parse_pipeline(&data[offset..offset + frame_size]) {
-                    Ok(tape) => {
-                        for frame in tape.iter() {
-                            let name = match frame.command_name() {
-                                Some(n) => n,
-                                None => continue,
-                            };
-                            let _ = execute_command(keyspace, name, &frame, now_nanos);
-                            commands_replayed += 1;
-                        }
-                        offset += frame_size;
-                    }
-                    Err(_) => break,
-                }
+                Some(lsn)
             } else {
-                // v1: no LSN interleaving — parse_pipeline can greedily
-                // consume all remaining RESP data safely.
-                match RespTape::parse_pipeline(&data[offset..]) {
-                    Ok(tape) => {
-                        let consumed = tape.consumed();
-                        if consumed == 0 {
-                            break;
-                        }
-                        for frame in tape.iter() {
-                            let name = match frame.command_name() {
-                                Some(n) => n,
-                                None => continue,
-                            };
-                            let _ = execute_command(keyspace, name, &frame, now_nanos);
-                            commands_replayed += 1;
-                        }
-                        offset += consumed;
-                    }
-                    Err(vortex_proto::ParseError::NeedMoreData) => break,
-                    Err(_) => break,
+                None
+            };
+
+            let resp_start = offset;
+            let frame_size = match RespParser::parse(&data[resp_start..]) {
+                Ok((_, consumed)) if consumed > 0 => consumed,
+                Ok(_) => break,
+                Err(ParseError::NeedMoreData) => {
+                    offset = record_offset;
+                    break;
                 }
-            }
+                Err(error) => {
+                    return Err(replay_parse_error(&self.path, record_offset, lsn, &error));
+                }
+            };
+
+            let resp_end = resp_start + frame_size;
+            let tape = RespTape::parse_pipeline(&data[resp_start..resp_end])
+                .map_err(|error| replay_parse_error(&self.path, record_offset, lsn, &error))?;
+            let frame = tape.iter().next().ok_or_else(|| {
+                replay_error(
+                    &self.path,
+                    record_offset,
+                    lsn,
+                    None,
+                    "record contained no command frame",
+                )
+            })?;
+            execute_replay_record(&self.path, keyspace, record_offset, lsn, &frame, clock)?;
+            commands_replayed += 1;
+            offset = resp_end;
+        }
+
+        if max_lsn > 0 {
+            keyspace.set_lsn(max_lsn + 1);
         }
 
         let bytes_truncated = (data.len() - offset) as u64;
@@ -225,7 +320,7 @@ impl AofReader {
             }
             let meta = std::fs::metadata(path)?;
             if meta.len() <= AOF_HEADER_SIZE as u64 {
-                continue; // Empty or header-only file.
+                continue;
             }
 
             let mut file = File::open(path)?;
@@ -241,6 +336,7 @@ impl AofReader {
                 is_v2: header.version >= 2,
                 synthetic_lsn_base: (idx as u64) << 48,
                 record_count: 0,
+                truncated_bytes: 0,
             });
             files_loaded += 1;
         }
@@ -258,48 +354,86 @@ impl AofReader {
             });
         }
 
+        let now_nanos = Timestamp::now().as_nanos();
+        let unix_now_nanos = current_unix_time_nanos();
+        let clock = CommandClock::new(now_nanos, unix_now_nanos);
+        let _replay_guard = keyspace.enter_replay_mode();
+
         // Seed the min-heap with the first record from each file.
-        // Heap elements: Reverse((lsn, reactor_idx, resp_start, resp_len))
-        let mut heap: BinaryHeap<Reverse<(u64, usize, usize, usize)>> = BinaryHeap::new();
+        // Heap elements: Reverse((lsn, cursor_idx, record_offset, resp_start, resp_len))
+        let mut heap: BinaryHeap<MergeHeapItem> = BinaryHeap::new();
         for (ci, cursor) in cursors.iter_mut().enumerate() {
-            if let Some((lsn, resp_start, resp_len)) = cursor.next_record() {
-                heap.push(Reverse((lsn, ci, resp_start, resp_len)));
+            match cursor.next_record() {
+                Ok(Some((lsn, record_offset, resp_start, resp_len))) => {
+                    heap.push(Reverse((lsn, ci, record_offset, resp_start, resp_len)));
+                }
+                Ok(None) => {}
+                Err(failure) => {
+                    return Err(replay_parse_error(
+                        &paths[ci],
+                        failure.record_offset,
+                        failure.lsn,
+                        &failure.error,
+                    ));
+                }
             }
         }
 
-        let now_nanos = Timestamp::now().as_nanos();
         let mut commands_replayed = 0u64;
         let mut total_bytes = 0u64;
         let mut max_lsn = 0u64;
 
         // K-Way merge: always pop the smallest LSN, execute, advance that cursor.
-        while let Some(Reverse((lsn, ci, resp_start, resp_len))) = heap.pop() {
+        while let Some(Reverse((lsn, ci, record_offset, resp_start, resp_len))) = heap.pop() {
             if lsn > max_lsn {
                 max_lsn = lsn;
             }
 
             // Parse and execute the RESP record.
             let resp_data = &cursors[ci].data[resp_start..resp_start + resp_len];
-            match RespTape::parse_pipeline(resp_data) {
-                Ok(tape) => {
-                    for frame in tape.iter() {
-                        let name = match frame.command_name() {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let _ = execute_command(keyspace, name, &frame, now_nanos);
-                        commands_replayed += 1;
-                    }
-                    total_bytes += resp_len as u64;
-                }
-                Err(_) => {
-                    // Corrupt record — skip.
-                }
-            }
+            let tape = RespTape::parse_pipeline(resp_data).map_err(|error| {
+                replay_parse_error(&paths[ci], record_offset, Some(lsn), &error)
+            })?;
+            let frame = tape.iter().next().ok_or_else(|| {
+                replay_error(
+                    &paths[ci],
+                    record_offset,
+                    Some(lsn),
+                    None,
+                    "record contained no command frame",
+                )
+            })?;
+            execute_replay_record(
+                &paths[ci],
+                keyspace,
+                record_offset,
+                Some(lsn),
+                &frame,
+                clock,
+            )?;
+            commands_replayed += 1;
+            total_bytes += resp_len as u64;
 
             // Advance cursor and push next record to heap.
-            if let Some((next_lsn, next_start, next_len)) = cursors[ci].next_record() {
-                heap.push(Reverse((next_lsn, ci, next_start, next_len)));
+            match cursors[ci].next_record() {
+                Ok(Some((next_lsn, next_record_offset, next_start, next_len))) => {
+                    heap.push(Reverse((
+                        next_lsn,
+                        ci,
+                        next_record_offset,
+                        next_start,
+                        next_len,
+                    )));
+                }
+                Ok(None) => {}
+                Err(failure) => {
+                    return Err(replay_parse_error(
+                        &paths[ci],
+                        failure.record_offset,
+                        failure.lsn,
+                        &failure.error,
+                    ));
+                }
             }
         }
 
@@ -309,11 +443,15 @@ impl AofReader {
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
+        let bytes_truncated = cursors
+            .iter()
+            .map(|cursor| cursor.truncated_bytes as u64)
+            .sum();
 
         Ok(ReplayStats {
             commands_replayed,
             bytes_read: total_bytes,
-            bytes_truncated: 0,
+            bytes_truncated,
             duration_ms,
             reactor_id: 0,
             created_at: 0,
@@ -339,22 +477,28 @@ struct AofFileCursor {
     synthetic_lsn_base: u64,
     /// Number of records read so far (for synthetic LSN generation).
     record_count: u64,
+    /// Number of trailing bytes that were discarded as an incomplete record.
+    truncated_bytes: usize,
 }
 
 impl AofFileCursor {
-    /// Read the next record, returning `(lsn, resp_data_start, resp_data_len)`.
+    /// Read the next record, returning `(lsn, record_offset, resp_data_start, resp_data_len)`.
     ///
     /// For v2 files: reads the 8-byte LSN prefix, then parses to find the
     /// RESP record boundary.
     /// For v1 files: assigns a synthetic monotonic LSN.
-    fn next_record(&mut self) -> Option<(u64, usize, usize)> {
+    fn next_record(&mut self) -> Result<Option<(u64, usize, usize, usize)>, ReplayRecordFailure> {
         if self.offset >= self.data.len() {
-            return None;
+            return Ok(None);
         }
+
+        let record_offset = self.offset;
 
         let lsn = if self.is_v2 {
             if self.offset + LSN_SIZE > self.data.len() {
-                return None; // Truncated LSN.
+                self.truncated_bytes = self.data.len() - record_offset;
+                self.offset = self.data.len();
+                return Ok(None);
             }
             let lsn = u64::from_le_bytes(
                 self.data[self.offset..self.offset + LSN_SIZE]
@@ -378,12 +522,23 @@ impl AofFileCursor {
         match RespParser::parse(&self.data[self.offset..]) {
             Ok((_, consumed)) => {
                 if consumed == 0 {
-                    return None;
+                    self.truncated_bytes = self.data.len() - record_offset;
+                    self.offset = self.data.len();
+                    return Ok(None);
                 }
                 self.offset += consumed;
-                Some((lsn, resp_start, consumed))
+                Ok(Some((lsn, record_offset, resp_start, consumed)))
             }
-            Err(_) => None,
+            Err(ParseError::NeedMoreData) => {
+                self.truncated_bytes = self.data.len() - record_offset;
+                self.offset = self.data.len();
+                Ok(None)
+            }
+            Err(error) => Err(ReplayRecordFailure {
+                record_offset,
+                lsn: Some(lsn),
+                error,
+            }),
         }
     }
 }
@@ -393,7 +548,9 @@ mod tests {
     use super::*;
     use crate::aof::format::AofFsyncPolicy;
     use crate::aof::writer::AofFileWriter;
-    use vortex_engine::commands::{CmdResult, RESP_NIL, execute_command};
+    use vortex_common::{Timestamp, current_unix_time_nanos};
+    use vortex_engine::EvictionPolicy;
+    use vortex_engine::commands::{CmdResult, CommandClock, RESP_NIL, execute_command};
     use vortex_proto::frame::RespFrame;
 
     /// Helper: run GET via execute_command and return true if key exists.
@@ -411,7 +568,8 @@ mod tests {
         let tape = RespTape::parse_pipeline(cmd.as_bytes()).unwrap();
         let frame = tape.iter().next().unwrap();
         let now = Timestamp::now().as_nanos();
-        match execute_command(ks, b"GET", &frame, now) {
+        let unix_now = current_unix_time_nanos();
+        match execute_command(ks, b"GET", &frame, CommandClock::new(now, unix_now)) {
             Some(executed) => match executed.response {
                 CmdResult::Static(s) if std::ptr::eq(s, RESP_NIL) => None,
                 CmdResult::Inline(inline) => Some(inline.payload().to_vec()),
@@ -441,6 +599,69 @@ mod tests {
 
     fn make_keyspace() -> ConcurrentKeyspace {
         ConcurrentKeyspace::new(64)
+    }
+
+    fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+        for part in parts {
+            buf.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            buf.extend_from_slice(part);
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf
+    }
+
+    fn append_live_command(
+        writer: &mut AofFileWriter,
+        keyspace: &ConcurrentKeyspace,
+        wire: &[u8],
+        clock: CommandClock,
+    ) {
+        let tape = RespTape::parse_pipeline(wire).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let name = frame.command_name().unwrap();
+        keyspace.enable_aof_recording();
+        let executed = execute_command(keyspace, name, &frame, clock).expect("command executes");
+        keyspace.disable_aof_recording();
+        let lsn = executed.aof_lsn().expect("mutation should allocate an LSN");
+        if let Some(records) = executed.aof_records {
+            for record in records {
+                let payload = make_resp(&[b"DEL", record.key.as_bytes()]);
+                writer.append_with_lsn(record.lsn, &payload).unwrap();
+            }
+        }
+
+        let payload = if let Some(payload) = executed.aof_payload.as_deref() {
+            payload.to_vec()
+        } else {
+            let mut scratch = vec![0u8; wire.len().saturating_add(64)];
+            let written = loop {
+                if let Some(written) = frame.write_resp_to(&mut scratch) {
+                    break written;
+                }
+                scratch.resize(scratch.len() * 2, 0);
+            };
+            scratch[..written].to_vec()
+        };
+
+        writer.append_with_lsn(lsn, &payload).unwrap();
+    }
+
+    fn same_shard_keys(keyspace: &ConcurrentKeyspace, count: usize) -> Vec<Vec<u8>> {
+        let mut found = Vec::with_capacity(count);
+        let target = keyspace.shard_index(b"evict:seed");
+        for index in 0..10_000usize {
+            let key = format!("evict:{index:04}").into_bytes();
+            if keyspace.shard_index(&key) != target {
+                continue;
+            }
+            found.push(key);
+            if found.len() == count {
+                return found;
+            }
+        }
+        panic!("failed to find {count} keys on shard {target}");
     }
 
     #[test]
@@ -547,6 +768,206 @@ mod tests {
     }
 
     #[test]
+    fn replay_applies_eviction_records_before_triggering_write() {
+        let path = temp_path("eviction-records");
+        let source = make_keyspace();
+        let keys = same_shard_keys(&source, 3);
+        let hot = keys[0].clone();
+        let cold = keys[1].clone();
+        let incoming = keys[2].clone();
+        let clock = CommandClock::new(1_000_000_000, current_unix_time_nanos());
+
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            append_live_command(
+                &mut writer,
+                &source,
+                &format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$4\r\nwarm\r\n",
+                    hot.len(),
+                    std::str::from_utf8(&hot).unwrap()
+                )
+                .into_bytes(),
+                clock,
+            );
+            append_live_command(
+                &mut writer,
+                &source,
+                &format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$4\r\ncool\r\n",
+                    cold.len(),
+                    std::str::from_utf8(&cold).unwrap()
+                )
+                .into_bytes(),
+                clock,
+            );
+            source.configure_eviction(source.memory_used(), EvictionPolicy::AllKeysLru);
+            for _ in 0..16 {
+                let _ = get_value(&source, &hot);
+            }
+            append_live_command(
+                &mut writer,
+                &source,
+                &format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$4\r\nmild\r\n",
+                    incoming.len(),
+                    std::str::from_utf8(&incoming).unwrap()
+                )
+                .into_bytes(),
+                clock,
+            );
+            writer.flush_buffer().unwrap();
+        }
+
+        let replayed = make_keyspace();
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&replayed)
+            .unwrap();
+        assert_eq!(stats.commands_replayed, 4);
+        assert!(key_exists(&replayed, &hot));
+        assert!(!key_exists(&replayed, &cold));
+        assert!(key_exists(&replayed, &incoming));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_set_ex_does_not_extend_relative_ttl() {
+        let path = temp_path("set-ex-relative");
+        let source = make_keyspace();
+        let replay_now_unix = current_unix_time_nanos();
+        let live_clock = CommandClock::new(
+            10_000 * 1_000_000_000,
+            replay_now_unix.saturating_sub(120 * 1_000_000_000),
+        );
+
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            append_live_command(
+                &mut writer,
+                &source,
+                b"*5\r\n$3\r\nSET\r\n$7\r\nsession\r\n$5\r\ntoken\r\n$2\r\nEX\r\n$2\r\n60\r\n",
+                live_clock,
+            );
+            writer.flush_buffer().unwrap();
+        }
+
+        let replayed = make_keyspace();
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&replayed)
+            .unwrap();
+        assert_eq!(stats.commands_replayed, 1);
+        assert!(!key_exists(&replayed, b"session"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_setex_does_not_extend_relative_ttl() {
+        let path = temp_path("setex-relative");
+        let source = make_keyspace();
+        let replay_now_unix = current_unix_time_nanos();
+        let live_clock = CommandClock::new(
+            20_000 * 1_000_000_000,
+            replay_now_unix.saturating_sub(120 * 1_000_000_000),
+        );
+
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            append_live_command(
+                &mut writer,
+                &source,
+                b"*4\r\n$5\r\nSETEX\r\n$7\r\nsession\r\n$2\r\n60\r\n$5\r\ntoken\r\n",
+                live_clock,
+            );
+            writer.flush_buffer().unwrap();
+        }
+
+        let replayed = make_keyspace();
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&replayed)
+            .unwrap();
+        assert_eq!(stats.commands_replayed, 1);
+        assert!(!key_exists(&replayed, b"session"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_getex_ex_does_not_extend_relative_ttl() {
+        let path = temp_path("getex-relative");
+        let source = make_keyspace();
+        let replay_now_unix = current_unix_time_nanos();
+        let live_clock = CommandClock::new(
+            30_000 * 1_000_000_000,
+            replay_now_unix.saturating_sub(120 * 1_000_000_000),
+        );
+
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            append_live_command(
+                &mut writer,
+                &source,
+                b"*3\r\n$3\r\nSET\r\n$7\r\nsession\r\n$5\r\ntoken\r\n",
+                live_clock,
+            );
+            append_live_command(
+                &mut writer,
+                &source,
+                b"*4\r\n$5\r\nGETEX\r\n$7\r\nsession\r\n$2\r\nEX\r\n$2\r\n60\r\n",
+                live_clock,
+            );
+            writer.flush_buffer().unwrap();
+        }
+
+        let replayed = make_keyspace();
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&replayed)
+            .unwrap();
+        assert_eq!(stats.commands_replayed, 2);
+        assert!(!key_exists(&replayed, b"session"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_expire_does_not_extend_relative_ttl() {
+        let path = temp_path("expire-relative");
+        let source = make_keyspace();
+        let replay_now_unix = current_unix_time_nanos();
+        let live_clock = CommandClock::new(
+            40_000 * 1_000_000_000,
+            replay_now_unix.saturating_sub(120 * 1_000_000_000),
+        );
+
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            append_live_command(
+                &mut writer,
+                &source,
+                b"*3\r\n$3\r\nSET\r\n$7\r\nsession\r\n$5\r\ntoken\r\n",
+                live_clock,
+            );
+            append_live_command(
+                &mut writer,
+                &source,
+                b"*3\r\n$6\r\nEXPIRE\r\n$7\r\nsession\r\n$2\r\n60\r\n",
+                live_clock,
+            );
+            writer.flush_buffer().unwrap();
+        }
+
+        let replayed = make_keyspace();
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&replayed)
+            .unwrap();
+        assert_eq!(stats.commands_replayed, 2);
+        assert!(!key_exists(&replayed, b"session"));
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn replay_large_batch() {
         let path = temp_path("large-batch");
         let num_keys: u64 = 10_000;
@@ -574,6 +995,56 @@ mod tests {
         assert_eq!(stats.commands_replayed, num_keys);
         assert_eq!(stats.bytes_truncated, 0);
         assert_eq!(stats.max_lsn, num_keys);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_bypasses_noeviction_admission() {
+        let path = temp_path("replay-noeviction");
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            writer
+                .append_with_lsn(
+                    1,
+                    b"*3\r\n$3\r\nSET\r\n$5\r\nlarge\r\n$32\r\n01234567890123456789012345678901\r\n",
+                )
+                .unwrap();
+            writer.flush_buffer().unwrap();
+        }
+
+        let ks = make_keyspace();
+        ks.configure_eviction(1, EvictionPolicy::NoEviction);
+
+        let stats = AofReader::new(&path).replay_into_keyspace(&ks).unwrap();
+        assert_eq!(stats.commands_replayed, 1);
+        assert_eq!(
+            get_value(&ks, b"large").as_deref(),
+            Some(&b"01234567890123456789012345678901"[..])
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_fails_on_command_error() {
+        let path = temp_path("replay-command-error");
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            writer
+                .append_with_lsn(7, b"*2\r\n$3\r\nSET\r\n$3\r\nkey\r\n")
+                .unwrap();
+            writer.flush_buffer().unwrap();
+        }
+
+        let ks = make_keyspace();
+        let error = AofReader::new(&path).replay_into_keyspace(&ks).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("offset="));
+        assert!(message.contains("lsn=7"));
+        assert!(message.contains("command=SET"));
 
         cleanup(&path);
     }
@@ -679,6 +1150,39 @@ mod tests {
 
         let val = get_value(&ks, b"x").expect("key x should exist");
         assert_eq!(val, b"second");
+
+        cleanup(&path0);
+        cleanup(&path1);
+    }
+
+    #[test]
+    fn kway_merge_fails_on_command_error() {
+        let path0 = temp_path("merge-error-r0");
+        let path1 = temp_path("merge-error-r1");
+
+        {
+            let mut w = AofFileWriter::open(&path0, 0, AofFsyncPolicy::No).unwrap();
+            w.append_with_lsn(1, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+                .unwrap();
+            w.flush_buffer().unwrap();
+        }
+
+        {
+            let mut w = AofFileWriter::open(&path1, 1, AofFsyncPolicy::No).unwrap();
+            w.append_with_lsn(2, b"*2\r\n$3\r\nSET\r\n$1\r\nb\r\n")
+                .unwrap();
+            w.flush_buffer().unwrap();
+        }
+
+        let ks = make_keyspace();
+        let paths = vec![path0.clone(), path1.clone()];
+        let error = AofReader::replay_merge(&paths, &ks).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("lsn=2"));
+        assert!(message.contains("command=SET"));
+        assert!(message.contains(path1.file_name().unwrap().to_string_lossy().as_ref()));
 
         cleanup(&path0);
         cleanup(&path1);

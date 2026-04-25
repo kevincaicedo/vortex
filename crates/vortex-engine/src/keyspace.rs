@@ -27,13 +27,19 @@
 //! - `unsafe { get_unchecked }` on the shard array eliminates bounds checks on
 //!   the hot path — the mask guarantees `idx < shards.len()`.
 
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use vortex_common::VortexKey;
 
+use crate::eviction::{
+    EVICTION_SWEEP_WINDOW, EvictionConfig, EvictionConfigState, EvictionPolicy, FrequencySketch,
+    next_random_u64,
+};
 use crate::table::SwissTable;
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -53,6 +59,11 @@ const AHASH_SEED_0: u64 = 0x517c_c1b7_2722_0a95;
 const AHASH_SEED_1: u64 = 0x6c62_272e_07bb_0142;
 const AHASH_SEED_2: u64 = 0x8fbc_2d2b_9e3a_6ee8;
 const AHASH_SEED_3: u64 = 0xcf41_41b0_ed82_a837;
+const WATCH_SHARD_COUNT: usize = 256;
+const TRANSACTION_GATE_COUNTERS: usize = 128;
+const MUTATION_FEATURE_MAXMEMORY: usize = 1 << 0;
+const MUTATION_FEATURE_WATCH: usize = 1 << 1;
+const MUTATION_FEATURE_AOF: usize = 1 << 2;
 
 // ─── Shard type alias ───────────────────────────────────────────────
 
@@ -72,9 +83,75 @@ pub type MultiReadGuards<'a> = (
 /// `(guards_with_shard_id, sorted_unique_shard_indices, per_key_shard_indices)`
 pub type MultiWriteGuards<'a> = (Vec<(usize, ShardWriteGuard<'a>)>, Vec<usize>, Vec<usize>);
 
+#[derive(Debug)]
+pub(crate) struct EvictedKey {
+    pub(crate) lsn: u64,
+    pub(crate) key: VortexKey,
+}
+
+pub(crate) type EvictedKeys = Option<Box<[EvictedKey]>>;
+
+#[derive(Debug)]
+struct WatchSlot {
+    version: u64,
+    refs: usize,
+}
+
+type WatchShard = CachePadded<RwLock<HashMap<VortexKey, WatchSlot>>>;
+
+#[derive(Clone, Debug)]
+pub struct WatchKeyState {
+    pub key: VortexKey,
+    pub version: u64,
+}
+
+#[derive(Debug)]
+struct TransactionGate {
+    active: AtomicBool,
+    readers: Box<[CachePadded<AtomicUsize>]>,
+}
+
+impl Default for TransactionGate {
+    fn default() -> Self {
+        let readers: Vec<CachePadded<AtomicUsize>> = (0..TRANSACTION_GATE_COUNTERS)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
+        Self {
+            active: AtomicBool::new(false),
+            readers: readers.into_boxed_slice(),
+        }
+    }
+}
+
+pub struct CommandGateGuard<'a> {
+    reader: &'a CachePadded<AtomicUsize>,
+}
+
+pub struct TransactionGateGuard<'a> {
+    gate: &'a TransactionGate,
+}
+
+#[derive(Debug)]
+pub(crate) struct EvictionAdmissionError {
+    pub(crate) response: &'static [u8],
+    pub(crate) evicted: EvictedKeys,
+}
+
+impl EvictionAdmissionError {
+    #[inline]
+    fn new(response: &'static [u8], evicted: EvictedKeys) -> Self {
+        Self { response, evicted }
+    }
+}
+
 pub struct ShardWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, SwissTable>,
     global_memory_used: &'a AtomicUsize,
+    strict_memory_accounting: &'a AtomicBool,
+}
+
+pub struct ReplayModeGuard<'a> {
+    keyspace: &'a ConcurrentKeyspace,
 }
 
 impl Deref for ShardWriteGuard<'_> {
@@ -93,7 +170,31 @@ impl DerefMut for ShardWriteGuard<'_> {
 
 impl Drop for ShardWriteGuard<'_> {
     fn drop(&mut self) {
-        self.guard.flush_memory_drift(self.global_memory_used);
+        if self.strict_memory_accounting.load(Ordering::Relaxed) {
+            self.guard.flush_memory_drift_force(self.global_memory_used);
+        } else {
+            self.guard.flush_memory_drift(self.global_memory_used);
+        }
+    }
+}
+
+impl Drop for ReplayModeGuard<'_> {
+    fn drop(&mut self) {
+        self.keyspace.replay_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for CommandGateGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.reader.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl Drop for TransactionGateGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.gate.active.store(false, Ordering::Release);
     }
 }
 
@@ -115,8 +216,12 @@ impl Drop for ShardWriteGuard<'_> {
 pub struct ConcurrentKeyspace {
     /// Shard array — each shard is cache-line padded to 128 bytes.
     shards: Box<[Shard]>,
+    /// Per-shard eviction sweep cursor.
+    clock_hands: Box<[CachePadded<AtomicUsize>]>,
     /// Per-shard count of keys that currently carry a TTL deadline.
     expiry_key_count: Box<[CachePadded<AtomicUsize>]>,
+    /// Global count of keys that currently carry a TTL deadline.
+    expiry_key_total: AtomicUsize,
     /// Bitmask for shard selection: `hash & mask` == `hash % num_shards`.
     /// Valid because `num_shards` is always a power of two.
     mask: u64,
@@ -128,6 +233,18 @@ pub struct ConcurrentKeyspace {
     table_hasher: RandomState,
     /// Global approximate memory counter — updated in threshold-flushed chunks.
     global_memory_used: AtomicUsize,
+    /// When `maxmemory` is active, publish shard-local drift on every write
+    /// guard drop so eviction can rely on the global counter without a full
+    /// keyspace lock sweep.
+    strict_memory_accounting: AtomicBool,
+    /// Hot write-path feature bits. One load tells a mutation whether it must
+    /// take any cold side paths: maxmemory admission, WATCH invalidation, or
+    /// AOF LSN/eviction-record capture.
+    mutation_features: AtomicUsize,
+    /// Replay mode bypasses maxmemory admission and synchronous eviction so
+    /// recovery depends only on the persisted log, not the current runtime
+    /// cache policy.
+    replay_depth: AtomicUsize,
     /// Global Logical Sequence Number (LSN) counter.
     ///
     /// Monotonically increasing, assigned inside shard write-lock critical
@@ -137,6 +254,24 @@ pub struct ConcurrentKeyspace {
     /// - Phase 5 shadow-page epoch tracking
     /// - P2.4 hot-key cache version stamps
     global_lsn: AtomicU64,
+    /// Number of active AOF writers using this keyspace. When zero, mutating
+    /// commands skip LSN allocation and synthetic eviction record capture.
+    aof_recording_refs: AtomicUsize,
+    /// Runtime-configurable eviction state shared across all reactors.
+    eviction: EvictionConfigState,
+    /// Global LFU frequency sketch shared across all shards.
+    frequency_sketch: FrequencySketch,
+    /// Optimistic WATCH side table. It is cold unless clients are actively
+    /// watching keys; normal mutations avoid it behind `watch_active`.
+    watch_shards: Box<[WatchShard]>,
+    /// Number of active WATCH registrations. Zero means write paths skip the
+    /// side table entirely.
+    watch_active: AtomicUsize,
+    /// Global invalidation epoch for full-keyspace writes such as FLUSHALL.
+    watch_epoch: AtomicU64,
+    /// Cross-reactor transaction gate. Normal commands enter as readers;
+    /// EXEC enters exclusively and waits for pre-existing commands to drain.
+    transaction_gate: CachePadded<TransactionGate>,
 }
 
 impl std::fmt::Debug for ConcurrentKeyspace {
@@ -148,8 +283,39 @@ impl std::fmt::Debug for ConcurrentKeyspace {
                 "global_memory_used",
                 &self.global_memory_used.load(Ordering::Relaxed),
             )
+            .field(
+                "replay_mode",
+                &(self.replay_depth.load(Ordering::Relaxed) != 0),
+            )
             .field("global_lsn", &self.global_lsn.load(Ordering::Relaxed))
+            .field("eviction", &self.eviction.load())
             .finish()
+    }
+}
+
+fn make_watch_shards() -> Box<[WatchShard]> {
+    (0..WATCH_SHARD_COUNT)
+        .map(|_| CachePadded::new(RwLock::new(HashMap::new())))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[inline]
+fn evicted_keys_to_box(evicted: Vec<EvictedKey>) -> EvictedKeys {
+    if evicted.is_empty() {
+        None
+    } else {
+        Some(evicted.into_boxed_slice())
+    }
+}
+
+#[inline]
+fn spin_or_yield(spins: &mut usize) {
+    if *spins < 64 {
+        *spins += 1;
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
     }
 }
 
@@ -174,19 +340,154 @@ impl ConcurrentKeyspace {
         let shards: Vec<Shard> = (0..num_shards)
             .map(|_| CachePadded::new(RwLock::new(SwissTable::with_hasher(table_hasher.clone()))))
             .collect();
+        let clock_hands: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
         let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
+        let watch_shards = make_watch_shards();
 
         Self {
             shards: shards.into_boxed_slice(),
+            clock_hands: clock_hands.into_boxed_slice(),
             expiry_key_count: expiry_key_count.into_boxed_slice(),
+            expiry_key_total: AtomicUsize::new(0),
             mask: (num_shards - 1) as u64,
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
             global_memory_used: AtomicUsize::new(0),
+            strict_memory_accounting: AtomicBool::new(false),
+            mutation_features: AtomicUsize::new(0),
+            replay_depth: AtomicUsize::new(0),
             global_lsn: AtomicU64::new(0),
+            aof_recording_refs: AtomicUsize::new(0),
+            eviction: EvictionConfigState::new(),
+            frequency_sketch: FrequencySketch::new(),
+            watch_shards,
+            watch_active: AtomicUsize::new(0),
+            watch_epoch: AtomicU64::new(0),
+            transaction_gate: CachePadded::new(TransactionGate::default()),
         }
+    }
+
+    #[inline]
+    pub fn enter_replay_mode(&self) -> ReplayModeGuard<'_> {
+        self.replay_depth.fetch_add(1, Ordering::Relaxed);
+        ReplayModeGuard { keyspace: self }
+    }
+
+    #[inline]
+    pub(crate) fn replay_mode_active(&self) -> bool {
+        self.replay_depth.load(Ordering::Relaxed) != 0
+    }
+
+    #[inline]
+    pub fn enter_command_gate(&self) -> CommandGateGuard<'_> {
+        self.enter_command_gate_slot(0)
+    }
+
+    #[inline]
+    pub fn enter_command_gate_slot(&self, slot: usize) -> CommandGateGuard<'_> {
+        let gate = &self.transaction_gate;
+        let reader = &gate.readers[slot % gate.readers.len()];
+        let mut spins = 0usize;
+        loop {
+            while gate.active.load(Ordering::Acquire) {
+                spin_or_yield(&mut spins);
+            }
+
+            reader.fetch_add(1, Ordering::Acquire);
+            if !gate.active.load(Ordering::Acquire) {
+                return CommandGateGuard { reader };
+            }
+
+            reader.fetch_sub(1, Ordering::Release);
+            spin_or_yield(&mut spins);
+        }
+    }
+
+    #[inline]
+    pub fn enter_transaction_gate(&self) -> TransactionGateGuard<'_> {
+        let gate = &self.transaction_gate;
+        let mut spins = 0usize;
+        loop {
+            if gate
+                .active
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            spin_or_yield(&mut spins);
+        }
+
+        for reader in gate.readers.iter() {
+            while reader.load(Ordering::Acquire) != 0 {
+                spin_or_yield(&mut spins);
+            }
+        }
+
+        TransactionGateGuard { gate }
+    }
+
+    #[inline]
+    pub fn current_watch_epoch(&self) -> u64 {
+        self.watch_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn watch_key(&self, key: VortexKey) -> WatchKeyState {
+        self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
+        let shard_idx = self.watch_shard_index(key.as_bytes());
+        let mut guard = self.watch_shards[shard_idx].write();
+        let slot = guard.entry(key.clone()).or_insert(WatchSlot {
+            version: 0,
+            refs: 0,
+        });
+        slot.refs += 1;
+        if self.watch_active.fetch_add(1, Ordering::Release) == 0 {
+            self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
+        }
+        WatchKeyState {
+            key,
+            version: slot.version,
+        }
+    }
+
+    pub fn unwatch_keys(&self, keys: &[WatchKeyState]) {
+        for watched in keys {
+            let shard_idx = self.watch_shard_index(watched.key.as_bytes());
+            let mut guard = self.watch_shards[shard_idx].write();
+            if let Some(slot) = guard.get_mut(&watched.key) {
+                if slot.refs > 1 {
+                    slot.refs -= 1;
+                } else {
+                    guard.remove(&watched.key);
+                }
+                if self.watch_active.fetch_sub(1, Ordering::Release) == 1 {
+                    self.disable_mutation_feature(MUTATION_FEATURE_WATCH);
+                }
+            }
+        }
+    }
+
+    pub fn watched_keys_changed(&self, epoch: u64, keys: &[WatchKeyState]) -> bool {
+        if self.current_watch_epoch() != epoch {
+            return true;
+        }
+
+        for watched in keys {
+            let shard_idx = self.watch_shard_index(watched.key.as_bytes());
+            let guard = self.watch_shards[shard_idx].read();
+            let Some(slot) = guard.get(&watched.key) else {
+                return true;
+            };
+            if slot.version != watched.version {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Create a new keyspace pre-sized for `total_capacity` entries spread
@@ -215,19 +516,613 @@ impl ConcurrentKeyspace {
                 )))
             })
             .collect();
+        let clock_hands: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
         let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
+        let watch_shards = make_watch_shards();
 
         Self {
             shards: shards.into_boxed_slice(),
+            clock_hands: clock_hands.into_boxed_slice(),
             expiry_key_count: expiry_key_count.into_boxed_slice(),
+            expiry_key_total: AtomicUsize::new(0),
             mask: (num_shards - 1) as u64,
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
             global_memory_used: AtomicUsize::new(0),
+            strict_memory_accounting: AtomicBool::new(false),
+            mutation_features: AtomicUsize::new(0),
+            replay_depth: AtomicUsize::new(0),
             global_lsn: AtomicU64::new(0),
+            aof_recording_refs: AtomicUsize::new(0),
+            eviction: EvictionConfigState::new(),
+            frequency_sketch: FrequencySketch::new(),
+            watch_shards,
+            watch_active: AtomicUsize::new(0),
+            watch_epoch: AtomicU64::new(0),
+            transaction_gate: CachePadded::new(TransactionGate::default()),
         }
+    }
+
+    #[inline]
+    pub fn eviction_config(&self) -> EvictionConfig {
+        self.eviction.load()
+    }
+
+    #[inline]
+    pub fn max_memory(&self) -> usize {
+        self.eviction.load().max_memory
+    }
+
+    #[inline]
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction.load().policy
+    }
+
+    #[inline]
+    pub fn set_max_memory(&self, max_memory: usize) {
+        let previous = self.max_memory();
+        if previous == 0 && max_memory != 0 {
+            self.enable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+            self.strict_memory_accounting.store(true, Ordering::Relaxed);
+            self.publish_all_memory_drift();
+        }
+
+        self.eviction.set_max_memory(max_memory);
+
+        if previous != 0 && max_memory == 0 {
+            self.strict_memory_accounting
+                .store(false, Ordering::Relaxed);
+            self.disable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+        }
+    }
+
+    #[inline]
+    pub fn set_eviction_policy(&self, policy: EvictionPolicy) {
+        self.eviction.set_policy(policy);
+    }
+
+    #[inline]
+    pub fn configure_eviction(&self, max_memory: usize, policy: EvictionPolicy) {
+        let previous = self.max_memory();
+        if previous == 0 && max_memory != 0 {
+            self.enable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+            self.strict_memory_accounting.store(true, Ordering::Relaxed);
+            self.publish_all_memory_drift();
+        }
+
+        self.eviction.store(max_memory, policy);
+
+        if previous != 0 && max_memory == 0 {
+            self.strict_memory_accounting
+                .store(false, Ordering::Relaxed);
+            self.disable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn mutation_features(&self) -> usize {
+        self.mutation_features.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub(crate) fn mutation_feature_maxmemory(features: usize) -> bool {
+        features & MUTATION_FEATURE_MAXMEMORY != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn mutation_feature_watch(features: usize) -> bool {
+        features & MUTATION_FEATURE_WATCH != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn mutation_feature_aof(features: usize) -> bool {
+        features & MUTATION_FEATURE_AOF != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn next_aof_lsn_with_features(&self, features: usize) -> Option<u64> {
+        Self::mutation_feature_aof(features).then(|| self.next_lsn())
+    }
+
+    #[inline(always)]
+    fn mutation_feature_active(&self, feature: usize) -> bool {
+        self.mutation_features.load(Ordering::Acquire) & feature != 0
+    }
+
+    #[inline(always)]
+    fn enable_mutation_feature(&self, feature: usize) {
+        self.mutation_features.fetch_or(feature, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn disable_mutation_feature(&self, feature: usize) {
+        self.mutation_features
+            .fetch_and(!feature, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn record_access_prehashed(&self, table: &SwissTable, key_bytes: &[u8], hash: u64) {
+        let snapshot = self.eviction_config();
+        if snapshot.max_memory == 0 {
+            return;
+        }
+
+        match snapshot.policy {
+            EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
+                self.frequency_sketch.record(hash);
+                let _ = table.record_access_prehashed(key_bytes, hash, next_random_u64());
+            }
+            EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => {
+                let _ = table.record_access_prehashed(key_bytes, hash, next_random_u64());
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_frequency_hash(&self, hash: u64) {
+        let snapshot = self.eviction_config();
+        self.record_frequency_hash_snapshot(hash, snapshot);
+    }
+
+    #[inline]
+    pub(crate) fn record_frequency_hash_snapshot(&self, hash: u64, snapshot: EvictionConfig) {
+        if snapshot.max_memory != 0 && snapshot.policy.is_lfu() {
+            self.frequency_sketch.record(hash);
+        }
+    }
+
+    #[inline]
+    fn watch_shard_index(&self, key_bytes: &[u8]) -> usize {
+        (self.table_hash_key(key_bytes) as usize) & (WATCH_SHARD_COUNT - 1)
+    }
+
+    #[inline]
+    pub(crate) fn watch_tracking_active(&self) -> bool {
+        self.mutation_feature_active(MUTATION_FEATURE_WATCH)
+    }
+
+    #[inline]
+    pub(crate) fn bump_watch_key(&self, key: &VortexKey) {
+        if !self.watch_tracking_active() {
+            return;
+        }
+        self.bump_watch_key_known_active(key);
+    }
+
+    #[inline]
+    pub(crate) fn bump_watch_key_known_active(&self, key: &VortexKey) {
+        let shard_idx = self.watch_shard_index(key.as_bytes());
+        let mut guard = self.watch_shards[shard_idx].write();
+        if let Some(slot) = guard.get_mut(key) {
+            slot.version = slot.version.wrapping_add(1).max(1);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn bump_watch_key_bytes(&self, key_bytes: &[u8]) {
+        if !self.watch_tracking_active() {
+            return;
+        }
+        self.bump_watch_key(&VortexKey::from(key_bytes));
+    }
+
+    #[inline]
+    pub(crate) fn bump_all_watches(&self) {
+        if self.watch_active.load(Ordering::Acquire) != 0 {
+            self.watch_epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn ensure_memory_for(
+        &self,
+        preferred_shard: usize,
+        additional_bytes: usize,
+        now_nanos: u64,
+    ) -> Result<EvictedKeys, EvictionAdmissionError> {
+        if self.replay_mode_active() {
+            return Ok(None);
+        }
+
+        if additional_bytes == 0 {
+            return Ok(None);
+        }
+
+        let snapshot = self.eviction_config();
+        self.ensure_memory_for_snapshot(preferred_shard, additional_bytes, now_nanos, snapshot)
+    }
+
+    pub(crate) fn ensure_memory_for_snapshot(
+        &self,
+        preferred_shard: usize,
+        additional_bytes: usize,
+        now_nanos: u64,
+        snapshot: EvictionConfig,
+    ) -> Result<EvictedKeys, EvictionAdmissionError> {
+        if additional_bytes == 0 {
+            return Ok(None);
+        }
+
+        if snapshot.max_memory == 0 {
+            return Ok(None);
+        }
+
+        if self
+            .published_memory_used()
+            .saturating_add(additional_bytes)
+            <= snapshot.max_memory
+        {
+            return Ok(None);
+        }
+
+        if snapshot.policy.is_noeviction() {
+            return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
+        }
+
+        let mut evicted = Vec::new();
+        let target_used = snapshot.max_memory.saturating_sub(additional_bytes);
+        let _ = self.evict_until_target(
+            preferred_shard,
+            target_used,
+            snapshot.policy,
+            now_nanos,
+            &mut evicted,
+        );
+
+        if self
+            .published_memory_used()
+            .saturating_add(additional_bytes)
+            <= snapshot.max_memory
+        {
+            Ok(evicted_keys_to_box(evicted))
+        } else {
+            Err(EvictionAdmissionError::new(
+                crate::commands::ERR_OOM,
+                evicted_keys_to_box(evicted),
+            ))
+        }
+    }
+
+    fn evict_until_target(
+        &self,
+        preferred_shard: usize,
+        target_used: usize,
+        policy: EvictionPolicy,
+        now_nanos: u64,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> usize {
+        let shard_count = self.shards.len();
+        if shard_count == 0 {
+            return 0;
+        }
+
+        let start_shard = preferred_shard & (shard_count - 1);
+        let initial_used = self.published_memory_used();
+        let mut current_used = initial_used;
+        let mut passes_without_progress = 0usize;
+
+        while current_used > target_used && passes_without_progress < shard_count {
+            let mut progress = false;
+
+            for offset in 0..shard_count {
+                let shard_idx = (start_shard + offset) & (shard_count - 1);
+                let remaining = current_used.saturating_sub(target_used);
+                let freed = self.evict_from_shard(shard_idx, policy, remaining, now_nanos, evicted);
+                if freed == 0 {
+                    continue;
+                }
+
+                current_used = current_used.saturating_sub(freed);
+                progress = true;
+                if current_used <= target_used {
+                    break;
+                }
+            }
+
+            if progress {
+                passes_without_progress = 0;
+            } else {
+                passes_without_progress += 1;
+            }
+        }
+
+        initial_used.saturating_sub(current_used)
+    }
+
+    fn evict_from_shard(
+        &self,
+        shard_idx: usize,
+        policy: EvictionPolicy,
+        bytes_needed: usize,
+        now_nanos: u64,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> usize {
+        let mut guard = self.write_shard_by_index(shard_idx);
+        let total_slots = guard.total_slots();
+        if total_slots == 0 {
+            return 0;
+        }
+
+        let start_slot = self.clock_hand(shard_idx) % total_slots;
+        let (next_slot, freed_bytes) = match policy {
+            EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => self.evict_random(
+                shard_idx,
+                &mut guard,
+                start_slot,
+                bytes_needed,
+                now_nanos,
+                policy.is_volatile_only(),
+                evicted,
+            ),
+            EvictionPolicy::VolatileTtl => {
+                self.evict_volatile_ttl(shard_idx, &mut guard, start_slot, now_nanos, evicted)
+            }
+            policy if policy.is_lfu() => self.evict_lfu_clock_sweep(
+                shard_idx,
+                &mut guard,
+                start_slot,
+                bytes_needed,
+                now_nanos,
+                policy.is_volatile_only(),
+                evicted,
+            ),
+            _ => self.evict_clock_sweep(
+                shard_idx,
+                &mut guard,
+                start_slot,
+                bytes_needed,
+                now_nanos,
+                policy.is_volatile_only(),
+                evicted,
+            ),
+        };
+        self.set_clock_hand(shard_idx, next_slot);
+        freed_bytes
+    }
+
+    fn evict_clock_sweep(
+        &self,
+        shard_idx: usize,
+        table: &mut SwissTable,
+        start_slot: usize,
+        bytes_needed: usize,
+        now_nanos: u64,
+        volatile_only: bool,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> (usize, usize) {
+        let total_slots = table.total_slots();
+        if total_slots == 0 {
+            return (0, 0);
+        }
+
+        let mut slot = start_slot % total_slots;
+        let mut freed_bytes = 0usize;
+        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
+
+        for _ in 0..sweep_len {
+            let current_slot = slot;
+            slot = (slot + 1) % total_slots;
+
+            let ttl = table.slot_entry_ttl(current_slot);
+            if ttl == 0 && volatile_only {
+                continue;
+            }
+
+            let Some(entry) = table.slot_entry(current_slot) else {
+                continue;
+            };
+
+            if ttl != 0 && ttl <= now_nanos {
+                freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
+                if freed_bytes >= bytes_needed {
+                    break;
+                }
+                continue;
+            }
+
+            if entry.decrement_eviction_counter() {
+                continue;
+            }
+
+            freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
+            if freed_bytes >= bytes_needed {
+                break;
+            }
+        }
+
+        (slot, freed_bytes)
+    }
+
+    fn evict_lfu_clock_sweep(
+        &self,
+        shard_idx: usize,
+        table: &mut SwissTable,
+        start_slot: usize,
+        bytes_needed: usize,
+        now_nanos: u64,
+        volatile_only: bool,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> (usize, usize) {
+        let total_slots = table.total_slots();
+        if total_slots == 0 {
+            return (0, 0);
+        }
+
+        let mut slot = start_slot % total_slots;
+        let mut freed_bytes = 0usize;
+        let mut best_candidate = None;
+        let mut best_frequency = u8::MAX;
+        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
+
+        for _ in 0..sweep_len {
+            let current_slot = slot;
+            slot = (slot + 1) % total_slots;
+
+            let ttl = table.slot_entry_ttl(current_slot);
+            if ttl == 0 && volatile_only {
+                continue;
+            }
+
+            let Some(entry) = table.slot_entry(current_slot) else {
+                continue;
+            };
+
+            if ttl != 0 && ttl <= now_nanos {
+                freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
+                if freed_bytes >= bytes_needed {
+                    return (slot, freed_bytes);
+                }
+                continue;
+            }
+
+            if entry.decrement_eviction_counter() {
+                continue;
+            }
+
+            let Some((key, _)) = table.slot_key_value(current_slot) else {
+                continue;
+            };
+            let frequency = self
+                .frequency_sketch
+                .estimate(table.hash_key_bytes(key.as_bytes()));
+            if best_candidate.is_none() || frequency < best_frequency {
+                best_candidate = Some(current_slot);
+                best_frequency = frequency;
+            }
+        }
+
+        if freed_bytes < bytes_needed {
+            if let Some(candidate) = best_candidate {
+                freed_bytes += self.delete_evictable_slot(shard_idx, table, candidate, evicted);
+            }
+        }
+
+        (slot, freed_bytes)
+    }
+
+    fn evict_random(
+        &self,
+        shard_idx: usize,
+        table: &mut SwissTable,
+        start_slot: usize,
+        bytes_needed: usize,
+        now_nanos: u64,
+        volatile_only: bool,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> (usize, usize) {
+        let total_slots = table.total_slots();
+        if total_slots == 0 {
+            return (0, 0);
+        }
+
+        let random_start = (next_random_u64() as usize) & (total_slots - 1);
+        let mut slot = (start_slot + random_start) % total_slots;
+        let mut freed_bytes = 0usize;
+        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
+
+        for _ in 0..sweep_len {
+            let current_slot = slot;
+            slot = (slot + 1) % total_slots;
+
+            let ttl = table.slot_entry_ttl(current_slot);
+            if ttl == 0 && volatile_only {
+                continue;
+            }
+            if table.slot_entry(current_slot).is_none() {
+                continue;
+            }
+            let _ = now_nanos;
+            freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
+            if freed_bytes >= bytes_needed {
+                break;
+            }
+        }
+
+        (slot, freed_bytes)
+    }
+
+    fn evict_volatile_ttl(
+        &self,
+        shard_idx: usize,
+        table: &mut SwissTable,
+        start_slot: usize,
+        now_nanos: u64,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> (usize, usize) {
+        let total_slots = table.total_slots();
+        if total_slots == 0 {
+            return (0, 0);
+        }
+
+        let mut slot = start_slot % total_slots;
+        let mut best_slot = None;
+        let mut best_deadline = u64::MAX;
+        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
+
+        for _ in 0..sweep_len {
+            let current_slot = slot;
+            slot = (slot + 1) % total_slots;
+            let ttl = table.slot_entry_ttl(current_slot);
+            if ttl == 0 {
+                continue;
+            }
+            if table.slot_entry(current_slot).is_none() {
+                continue;
+            }
+            if ttl <= now_nanos {
+                let freed = self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
+                return (slot, freed);
+            }
+            if ttl < best_deadline {
+                best_deadline = ttl;
+                best_slot = Some(current_slot);
+            }
+        }
+
+        let freed = best_slot
+            .map(|candidate| self.delete_evictable_slot(shard_idx, table, candidate, evicted))
+            .unwrap_or(0);
+        (slot, freed)
+    }
+
+    fn delete_evictable_slot(
+        &self,
+        shard_idx: usize,
+        table: &mut SwissTable,
+        slot: usize,
+        evicted: &mut Vec<EvictedKey>,
+    ) -> usize {
+        let ttl = table.slot_entry_ttl(slot);
+        let bytes = table.slot_memory_bytes(slot);
+        if bytes == 0 {
+            return 0;
+        }
+        let features = self.mutation_features();
+        let record_aof = Self::mutation_feature_aof(features);
+        let track_watch = Self::mutation_feature_watch(features);
+        let Some((key, _)) = table.slot_key_value(slot) else {
+            return 0;
+        };
+        let key = (record_aof || track_watch).then(|| key.clone());
+
+        let _ = table.delete_slot(slot);
+        self.update_expiry_count(shard_idx, ttl != 0, false);
+        if let Some(key) = key {
+            if track_watch {
+                self.bump_watch_key_known_active(&key);
+            }
+            if record_aof {
+                evicted.push(EvictedKey {
+                    lsn: self.next_lsn(),
+                    key,
+                });
+            }
+        }
+        bytes
     }
 
     #[inline(always)]
@@ -238,7 +1133,20 @@ impl ConcurrentKeyspace {
         ShardWriteGuard {
             guard,
             global_memory_used: &self.global_memory_used,
+            strict_memory_accounting: &self.strict_memory_accounting,
         }
+    }
+
+    fn publish_all_memory_drift(&self) {
+        for shard in self.shards.iter() {
+            let mut guard = shard.write();
+            guard.flush_memory_drift_force(&self.global_memory_used);
+        }
+    }
+
+    #[inline]
+    fn published_memory_used(&self) -> usize {
+        self.global_memory_used.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -247,9 +1155,11 @@ impl ConcurrentKeyspace {
         match (had_ttl, has_ttl) {
             (false, true) => {
                 self.expiry_key_count[shard_idx].fetch_add(1, Ordering::Relaxed);
+                self.expiry_key_total.fetch_add(1, Ordering::Relaxed);
             }
             (true, false) => {
                 self.expiry_key_count[shard_idx].fetch_sub(1, Ordering::Relaxed);
+                self.expiry_key_total.fetch_sub(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -257,10 +1167,26 @@ impl ConcurrentKeyspace {
 
     #[inline]
     pub(crate) fn total_expiry_keys(&self) -> usize {
-        self.expiry_key_count
-            .iter()
-            .map(|count| count.load(Ordering::Relaxed))
-            .sum()
+        self.expiry_key_total.load(Ordering::Relaxed)
+    }
+
+    /// Cheap global check used by event loops to skip active-expiry work for
+    /// pure no-TTL workloads.
+    #[inline]
+    pub fn has_expiring_keys(&self) -> bool {
+        self.expiry_key_total.load(Ordering::Relaxed) != 0
+    }
+
+    #[inline]
+    pub(crate) fn clock_hand(&self, shard_idx: usize) -> usize {
+        debug_assert!(shard_idx < self.clock_hands.len());
+        self.clock_hands[shard_idx].load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn set_clock_hand(&self, shard_idx: usize, next_slot: usize) {
+        debug_assert!(shard_idx < self.clock_hands.len());
+        self.clock_hands[shard_idx].store(next_slot, Ordering::Relaxed);
     }
 
     // ─── Shard routing ──────────────────────────────────────────────
@@ -283,6 +1209,37 @@ impl ConcurrentKeyspace {
     #[inline(always)]
     pub fn next_lsn(&self) -> u64 {
         self.global_lsn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn enable_aof_recording(&self) {
+        if self.aof_recording_refs.fetch_add(1, Ordering::Release) == 0 {
+            self.enable_mutation_feature(MUTATION_FEATURE_AOF);
+        }
+    }
+
+    #[inline]
+    pub fn disable_aof_recording(&self) {
+        if let Ok(previous) =
+            self.aof_recording_refs
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |refs| {
+                    (refs != 0).then_some(refs - 1)
+                })
+        {
+            if previous == 1 {
+                self.disable_mutation_feature(MUTATION_FEATURE_AOF);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn aof_recording_enabled(&self) -> bool {
+        self.mutation_feature_active(MUTATION_FEATURE_AOF)
+    }
+
+    #[inline(always)]
+    pub(crate) fn next_aof_lsn(&self) -> Option<u64> {
+        self.aof_recording_enabled().then(|| self.next_lsn())
     }
 
     /// Read the current LSN value (the next LSN to be assigned).
@@ -354,17 +1311,31 @@ impl ConcurrentKeyspace {
     /// Acquire a read lock on a specific shard by index.
     #[inline(always)]
     pub fn read_shard_by_index(&self, idx: usize) -> RwLockReadGuard<'_, SwissTable> {
-        // SAFETY: caller must ensure idx < num_shards.
-        debug_assert!(idx < self.shards.len());
-        unsafe { self.shards.get_unchecked(idx) }.read()
+        self.try_read_shard_by_index(idx)
+            .expect("shard index out of bounds")
     }
 
     /// Acquire a write lock on a specific shard by index.
     #[inline(always)]
     pub fn write_shard_by_index(&self, idx: usize) -> ShardWriteGuard<'_> {
-        // SAFETY: caller must ensure idx < num_shards.
-        debug_assert!(idx < self.shards.len());
-        self.tracked_write_guard(unsafe { self.shards.get_unchecked(idx) }.write())
+        self.try_write_shard_by_index(idx)
+            .expect("shard index out of bounds")
+    }
+
+    /// Acquire a read lock on a specific shard by index, returning `None`
+    /// when `idx` is out of range.
+    #[inline(always)]
+    pub fn try_read_shard_by_index(&self, idx: usize) -> Option<RwLockReadGuard<'_, SwissTable>> {
+        self.shards.get(idx).map(|shard| shard.read())
+    }
+
+    /// Acquire a write lock on a specific shard by index, returning `None`
+    /// when `idx` is out of range.
+    #[inline(always)]
+    pub fn try_write_shard_by_index(&self, idx: usize) -> Option<ShardWriteGuard<'_>> {
+        self.shards
+            .get(idx)
+            .map(|shard| self.tracked_write_guard(shard.write()))
     }
 
     // ─── Closure-based single-key access ────────────────────────────
@@ -484,8 +1455,14 @@ impl ConcurrentKeyspace {
     /// proof `verify_binary_search_always_finds`.
     #[inline(always)]
     pub fn guard_position(sorted_shards: &[usize], shard_idx: usize) -> usize {
-        // SAFETY: shard_idx is always present in sorted_shards by construction.
-        unsafe { sorted_shards.binary_search(&shard_idx).unwrap_unchecked() }
+        Self::try_guard_position(sorted_shards, shard_idx)
+            .expect("shard index must be present in sorted_shards")
+    }
+
+    /// Find the guard index for a shard index in the sorted guards array.
+    #[inline(always)]
+    pub fn try_guard_position(sorted_shards: &[usize], shard_idx: usize) -> Option<usize> {
+        sorted_shards.binary_search(&shard_idx).ok()
     }
 
     // ─── Transaction support ────────────────────────────────────────
@@ -577,13 +1554,22 @@ impl ConcurrentKeyspace {
             sampled += 1;
             if deadline <= now_nanos {
                 // Entry expired — delete directly by slot index (O(1), zero alloc).
+                let watched_key = if self.watch_active.load(Ordering::Acquire) != 0 {
+                    guard.slot_key_value(slot).map(|(key, _)| key.clone())
+                } else {
+                    None
+                };
                 guard.delete_slot(slot);
+                if let Some(key) = watched_key {
+                    self.bump_watch_key(&key);
+                }
                 expired += 1;
             }
         }
 
         if expired != 0 {
             self.expiry_key_count[shard_idx].fetch_sub(expired, Ordering::Relaxed);
+            self.expiry_key_total.fetch_sub(expired, Ordering::Relaxed);
         }
 
         (expired, sampled)
@@ -612,7 +1598,9 @@ impl ConcurrentKeyspace {
         for count in self.expiry_key_count.iter() {
             count.store(0, Ordering::Relaxed);
         }
+        self.expiry_key_total.store(0, Ordering::Relaxed);
         self.global_memory_used.store(0, Ordering::Relaxed);
+        self.bump_all_watches();
     }
 
     /// FLUSHDB / FLUSHALL with an optional AOF LSN allocated while all shard
@@ -630,9 +1618,13 @@ impl ConcurrentKeyspace {
         for count in self.expiry_key_count.iter() {
             count.store(0, Ordering::Relaxed);
         }
+        self.expiry_key_total.store(0, Ordering::Relaxed);
         self.global_memory_used.store(0, Ordering::Relaxed);
+        if had_entries {
+            self.bump_all_watches();
+        }
 
-        had_entries.then(|| self.next_lsn())
+        had_entries.then(|| self.next_aof_lsn()).flatten()
     }
 
     /// Returns the exact memory usage across all shards.
@@ -1016,6 +2008,34 @@ mod tests {
     }
 
     #[test]
+    fn enabling_maxmemory_publishes_pending_memory_drift() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+
+        ks.write(b"tiny", |table| {
+            table.insert(VortexKey::from_bytes(b"tiny"), VortexValue::from("v"));
+        });
+
+        let exact_before = ks.memory_used();
+        assert_eq!(ks.approx_memory_used(), 0);
+
+        ks.configure_eviction(1 << 20, EvictionPolicy::AllKeysLru);
+
+        assert_eq!(ks.approx_memory_used(), exact_before);
+    }
+
+    #[test]
+    fn maxmemory_mode_publishes_small_memory_changes_exactly() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        ks.configure_eviction(1 << 20, EvictionPolicy::AllKeysLru);
+
+        ks.write(b"tiny", |table| {
+            table.insert(VortexKey::from_bytes(b"tiny"), VortexValue::from("v"));
+        });
+
+        assert_eq!(ks.approx_memory_used(), ks.memory_used());
+    }
+
+    #[test]
     fn guard_position_correctness() {
         let sorted = vec![0, 3, 7, 12, 25];
         assert_eq!(ConcurrentKeyspace::guard_position(&sorted, 0), 0);
@@ -1023,6 +2043,15 @@ mod tests {
         assert_eq!(ConcurrentKeyspace::guard_position(&sorted, 7), 2);
         assert_eq!(ConcurrentKeyspace::guard_position(&sorted, 12), 3);
         assert_eq!(ConcurrentKeyspace::guard_position(&sorted, 25), 4);
+    }
+
+    #[test]
+    fn checked_shard_access_returns_none_for_out_of_bounds_index() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+
+        assert!(ks.try_read_shard_by_index(TEST_SHARDS).is_none());
+        assert!(ks.try_write_shard_by_index(TEST_SHARDS).is_none());
+        assert!(ConcurrentKeyspace::try_guard_position(&[0, 3, 7], 5).is_none());
     }
 
     #[test]

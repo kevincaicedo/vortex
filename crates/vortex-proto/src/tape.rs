@@ -135,49 +135,88 @@ pub struct RespTape {
     consumed: usize,
 }
 
+/// Flat tape output borrowing the caller's backing slice.
+///
+/// This keeps the tape entry layout identical to [`RespTape`] but avoids the
+/// extra `Bytes` copy when the caller already owns a stable input buffer.
+pub struct BorrowedRespTape<'a> {
+    entries: Vec<TapeEntry>,
+    backing: &'a [u8],
+    frame_count: usize,
+    consumed: usize,
+}
+
+/// Flat tape view borrowing both the caller's input and caller-owned scratch
+/// entries. This is the allocation-free hot-path parser shape for reactors.
+pub struct BorrowedRespTapeRef<'a> {
+    entries: &'a [TapeEntry],
+    backing: &'a [u8],
+    frame_count: usize,
+    consumed: usize,
+}
+
+fn parse_pipeline_entries_into(
+    bytes: &[u8],
+    entries: &mut Vec<TapeEntry>,
+) -> Result<(usize, usize), ParseError> {
+    entries.clear();
+    if bytes.is_empty() {
+        return Err(ParseError::NeedMoreData);
+    }
+
+    let mut offset: usize = 0;
+    // Pre-size: typical SET command ≈ 37 bytes → 4 entries → ~0.11 entries/byte.
+    let target_entries = bytes.len() / 8;
+    if entries.capacity() < target_entries {
+        entries.reserve(target_entries - entries.capacity());
+    }
+    let mut frame_count: usize = 0;
+
+    while offset < bytes.len() {
+        let snap_entries = entries.len();
+        let snap_offset = offset;
+        match tape_parse_frame(bytes, &mut offset, entries, 0) {
+            Ok(()) => frame_count += 1,
+            Err(error) if frame_count == 0 => {
+                entries.clear();
+                return Err(error);
+            }
+            Err(_) => {
+                entries.truncate(snap_entries);
+                offset = snap_offset;
+                break;
+            }
+        }
+    }
+
+    if frame_count == 0 {
+        return Err(ParseError::NeedMoreData);
+    }
+
+    Ok((frame_count, offset))
+}
+
+fn parse_pipeline_entries(bytes: &[u8]) -> Result<(Vec<TapeEntry>, usize, usize), ParseError> {
+    let mut entries = Vec::new();
+    let (frame_count, consumed) = parse_pipeline_entries_into(bytes, &mut entries)?;
+    Ok((entries, frame_count, consumed))
+}
+
 impl RespTape {
     /// Parse a pipeline from a byte slice (copies input into `Bytes`).
     pub fn parse_pipeline(buf: &[u8]) -> Result<Self, ParseError> {
-        if buf.is_empty() {
-            return Err(ParseError::NeedMoreData);
-        }
         Self::parse_pipeline_bytes(Bytes::copy_from_slice(buf))
     }
 
     /// Parse a pipeline from caller-owned `Bytes` — zero copy.
     pub fn parse_pipeline_bytes(backing: Bytes) -> Result<Self, ParseError> {
-        if backing.is_empty() {
-            return Err(ParseError::NeedMoreData);
-        }
-        let bytes = backing.as_ref();
-        let mut offset: usize = 0;
-        // Pre-size: typical SET command ≈ 37 bytes → 4 entries → ~0.11 entries/byte.
-        let mut entries = Vec::with_capacity(bytes.len() / 8);
-        let mut frame_count: usize = 0;
-
-        while offset < bytes.len() {
-            let snap_entries = entries.len();
-            let snap_offset = offset;
-            match tape_parse_frame(bytes, &mut offset, &mut entries, 0) {
-                Ok(()) => frame_count += 1,
-                Err(error) if frame_count == 0 => return Err(error),
-                Err(_) => {
-                    entries.truncate(snap_entries);
-                    offset = snap_offset;
-                    break;
-                }
-            }
-        }
-
-        if frame_count == 0 {
-            return Err(ParseError::NeedMoreData);
-        }
+        let (entries, frame_count, consumed) = parse_pipeline_entries(backing.as_ref())?;
 
         Ok(Self {
             entries,
             backing,
             frame_count,
-            consumed: offset,
+            consumed,
         })
     }
 
@@ -211,6 +250,106 @@ impl RespTape {
         TapeIter {
             entries: &self.entries,
             backing: self.backing.as_ref(),
+            index: 0,
+        }
+    }
+}
+
+impl<'a> BorrowedRespTape<'a> {
+    /// Parse a pipeline directly from the caller's stable backing slice.
+    pub fn parse_pipeline(backing: &'a [u8]) -> Result<Self, ParseError> {
+        let (entries, frame_count, consumed) = parse_pipeline_entries(backing)?;
+        Ok(Self {
+            entries,
+            backing,
+            frame_count,
+            consumed,
+        })
+    }
+
+    /// Parse a pipeline into caller-owned scratch tape entries.
+    ///
+    /// The returned view borrows `entries`, so callers must finish iterating it
+    /// before mutating or reusing the scratch vector.
+    pub fn parse_pipeline_into(
+        backing: &'a [u8],
+        entries: &'a mut Vec<TapeEntry>,
+    ) -> Result<BorrowedRespTapeRef<'a>, ParseError> {
+        let (frame_count, consumed) = parse_pipeline_entries_into(backing, entries)?;
+        Ok(BorrowedRespTapeRef {
+            entries: entries.as_slice(),
+            backing,
+            frame_count,
+            consumed,
+        })
+    }
+
+    /// Number of top-level frames parsed.
+    #[inline]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    /// Total bytes consumed from the input.
+    #[inline]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    /// Raw tape entries.
+    #[inline]
+    pub fn entries(&self) -> &[TapeEntry] {
+        &self.entries
+    }
+
+    /// Borrowed backing buffer.
+    #[inline]
+    pub fn backing(&self) -> &'a [u8] {
+        self.backing
+    }
+
+    /// Iterate over top-level frames.
+    #[inline]
+    pub fn iter(&self) -> TapeIter<'_> {
+        TapeIter {
+            entries: &self.entries,
+            backing: self.backing,
+            index: 0,
+        }
+    }
+}
+
+impl<'a> BorrowedRespTapeRef<'a> {
+    /// Number of top-level frames parsed.
+    #[inline]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    /// Total bytes consumed from the input.
+    #[inline]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    /// Raw tape entries.
+    #[inline]
+    pub fn entries(&self) -> &[TapeEntry] {
+        self.entries
+    }
+
+    /// Borrowed backing buffer.
+    #[inline]
+    pub fn backing(&self) -> &'a [u8] {
+        self.backing
+    }
+
+    /// Iterate over top-level frames.
+    #[inline]
+    pub fn iter(&self) -> TapeIter<'_> {
+        TapeIter {
+            entries: self.entries,
+            backing: self.backing,
             index: 0,
         }
     }
@@ -1206,6 +1345,40 @@ mod tests {
         assert_eq!(children[0].as_bytes(), Some(b"SET".as_slice()));
         assert_eq!(children[1].as_bytes(), Some(b"foo".as_slice()));
         assert_eq!(children[2].as_bytes(), Some(b"bar".as_slice()));
+    }
+
+    #[test]
+    fn borrowed_tape_reuses_input_buffer() {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let tape = BorrowedRespTape::parse_pipeline(input).unwrap();
+        let cmd = tape.iter().next().unwrap();
+        let name = cmd.command_name().unwrap();
+
+        assert_eq!(tape.frame_count(), 1);
+        assert_eq!(tape.consumed(), input.len());
+        assert!(std::ptr::eq(name.as_ptr(), input[8..].as_ptr()));
+        assert_eq!(tape.backing().as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn borrowed_tape_into_reuses_scratch_entries() {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let mut scratch = Vec::with_capacity(16);
+        let original_capacity = scratch.capacity();
+
+        {
+            let tape = BorrowedRespTape::parse_pipeline_into(input, &mut scratch).unwrap();
+            let cmd = tape.iter().next().unwrap();
+            let name = cmd.command_name().unwrap();
+
+            assert_eq!(tape.frame_count(), 1);
+            assert_eq!(tape.consumed(), input.len());
+            assert!(std::ptr::eq(name.as_ptr(), input[8..].as_ptr()));
+            assert_eq!(tape.backing().as_ptr(), input.as_ptr());
+            assert_eq!(tape.entries().len(), 4);
+        }
+
+        assert_eq!(scratch.capacity(), original_capacity);
     }
 
     #[test]

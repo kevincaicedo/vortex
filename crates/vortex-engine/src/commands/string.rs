@@ -16,8 +16,10 @@ use vortex_common::VortexValue;
 
 use super::{
     CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand, NS_PER_MS,
-    NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, arg_bytes, int_resp, key_from_bytes,
-    owned_value_to_resp, value_from_bytes, value_to_resp,
+    NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos, arg_bytes,
+    deadline_nanos_to_absolute_unix_nanos, encode_aof_persist, encode_aof_pexpireat,
+    encode_aof_set_pxat, int_resp, key_from_bytes, owned_value_to_resp, value_from_bytes,
+    value_to_resp,
 };
 use crate::ConcurrentKeyspace;
 use crate::commands::context::{MutationOutcome, SetOptions, SetResult};
@@ -45,6 +47,7 @@ pub fn cmd_get(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
     let guard = keyspace.read_shard_by_index(shard_index);
     match guard.get_with_ttl_prehashed(key_bytes, table_hash) {
         Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+            keyspace.record_access_prehashed(&guard, key_bytes, table_hash);
             // Hot path: format RESP from &VortexValue while read lock is held.
             value_to_resp(value)
         }
@@ -68,14 +71,25 @@ pub fn cmd_get(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
 /// SET key value [EX seconds | PX milliseconds | EXAT unix-time-seconds |
 ///   PXAT unix-time-milliseconds | KEEPTTL] [NX | XX] [GET]
 #[inline]
+#[allow(dead_code)]
 pub fn cmd_set(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
+    cmd_set_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_set_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
     // Fast path: plain `SET key value` (argc == 3, no options).
     // Avoids SmallVec allocation in CommandArgs::collect and skips
-    // option parsing entirely. Benchmark workloads hit this >99%.
+    // option parsing entirely.
     let argc = match frame.element_count() {
         Some(n) => n as usize,
         None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
@@ -92,10 +106,15 @@ pub fn cmd_set(
             Some(b) => b,
             None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
         };
-        let key = key_from_bytes(key_bytes);
-        let value = value_from_bytes(val_bytes);
-        let outcome = keyspace.set_value_plain(key, value);
-        return ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn);
+        let outcome = match keyspace.set_value_plain_bytes(key_bytes, val_bytes, now_nanos) {
+            Ok(outcome) => outcome,
+            Err(err) => return err.into_executed(),
+        };
+        return ExecutedCommand::with_aof_records(
+            CmdResult::Static(RESP_OK),
+            outcome.aof_records,
+            outcome.aof_lsn,
+        );
     }
 
     // Slow path: SET with options (EX, PX, NX, XX, GET, KEEPTTL, etc.).
@@ -121,6 +140,7 @@ pub fn cmd_set(
     let mut xx = false;
     let mut get = false;
     let mut keepttl = false;
+    let mut has_explicit_ttl = false;
 
     let mut i = 3;
     while i < argc {
@@ -136,6 +156,7 @@ pub fn cmd_set(
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 ttl_deadline = now_nanos + secs * NS_PER_SEC;
+                has_explicit_ttl = true;
             }
             OptToken::PX => {
                 i += 1;
@@ -144,6 +165,7 @@ pub fn cmd_set(
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 ttl_deadline = now_nanos + ms * NS_PER_MS;
+                has_explicit_ttl = true;
             }
             OptToken::EXAT => {
                 i += 1;
@@ -151,7 +173,12 @@ pub fn cmd_set(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                ttl_deadline = secs * NS_PER_SEC;
+                ttl_deadline = absolute_unix_nanos_to_deadline_nanos(
+                    secs * NS_PER_SEC,
+                    now_nanos,
+                    unix_now_nanos,
+                );
+                has_explicit_ttl = true;
             }
             OptToken::PXAT => {
                 i += 1;
@@ -159,7 +186,12 @@ pub fn cmd_set(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                ttl_deadline = ms * NS_PER_MS;
+                ttl_deadline = absolute_unix_nanos_to_deadline_nanos(
+                    ms * NS_PER_MS,
+                    now_nanos,
+                    unix_now_nanos,
+                );
+                has_explicit_ttl = true;
             }
             OptToken::NX => nx = true,
             OptToken::XX => xx = true,
@@ -183,7 +215,10 @@ pub fn cmd_set(
         keepttl,
     };
 
-    let outcome = keyspace.set_value_with_options(key, value, options, now_nanos);
+    let outcome = match keyspace.set_value_with_options(key, value, options, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = match outcome.value {
         SetResult::Ok => CmdResult::Static(RESP_OK),
         SetResult::NotSet => CmdResult::Static(RESP_NIL),
@@ -192,7 +227,25 @@ pub fn cmd_set(
         SetResult::NotSetGet(Some(old)) => owned_value_to_resp(old),
         SetResult::NotSetGet(None) => CmdResult::Static(RESP_NIL),
     };
-    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+    let aof_payload =
+        if outcome.aof_lsn.is_some() && has_explicit_ttl && !keepttl && unix_now_nanos != 0 {
+            let absolute_deadline_ms =
+                deadline_nanos_to_absolute_unix_nanos(ttl_deadline, now_nanos, unix_now_nanos)
+                    / NS_PER_MS;
+            Some(encode_aof_set_pxat(
+                key_bytes,
+                val_bytes,
+                absolute_deadline_ms,
+            ))
+        } else {
+            None
+        };
+    ExecutedCommand::with_optional_aof_payload_and_records(
+        response,
+        outcome.aof_records,
+        outcome.aof_lsn,
+        aof_payload,
+    )
 }
 
 // ── SETNX ───────────────────────────────────────────────────────────────────
@@ -220,7 +273,7 @@ pub fn cmd_setnx(
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
-    let outcome = keyspace.set_value_with_options(
+    let outcome = match keyspace.set_value_with_options(
         key,
         value,
         SetOptions {
@@ -228,23 +281,37 @@ pub fn cmd_setnx(
             ..SetOptions::default()
         },
         now_nanos,
-    );
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = match outcome.value {
         SetResult::Ok => CmdResult::Static(super::RESP_ONE),
         SetResult::NotSet => CmdResult::Static(RESP_ZERO),
         _ => CmdResult::Static(RESP_ZERO),
     };
-    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+    ExecutedCommand::with_aof_records(response, outcome.aof_records, outcome.aof_lsn)
 }
 
 // ── SETEX ───────────────────────────────────────────────────────────────────
 
 /// SETEX key seconds value — SET with EXpire.
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cmd_setex(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_setex_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_setex_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
 ) -> ExecutedCommand {
     let Some(args) = CommandArgs::collect(frame) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -265,18 +332,48 @@ pub fn cmd_setex(
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
     let deadline = now_nanos + secs * NS_PER_SEC;
-    let outcome = keyspace.set_value_with_ttl(key, value, deadline);
-    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn)
+    let outcome = match keyspace.set_value_with_ttl(key, value, deadline, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    let aof_payload = if outcome.aof_lsn.is_some() && unix_now_nanos != 0 {
+        let absolute_deadline_ms =
+            deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos) / NS_PER_MS;
+        Some(encode_aof_set_pxat(
+            key_bytes,
+            val_bytes,
+            absolute_deadline_ms,
+        ))
+    } else {
+        None
+    };
+    ExecutedCommand::with_optional_aof_payload_and_records(
+        CmdResult::Static(RESP_OK),
+        outcome.aof_records,
+        outcome.aof_lsn,
+        aof_payload,
+    )
 }
 
 // ── PSETEX ──────────────────────────────────────────────────────────────────
 
 /// PSETEX key milliseconds value — SET with PX expire.
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cmd_psetex(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_psetex_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_psetex_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
 ) -> ExecutedCommand {
     let Some(args) = CommandArgs::collect(frame) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -297,8 +394,27 @@ pub fn cmd_psetex(
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
     let deadline = now_nanos + ms * NS_PER_MS;
-    let outcome = keyspace.set_value_with_ttl(key, value, deadline);
-    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn)
+    let outcome = match keyspace.set_value_with_ttl(key, value, deadline, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    let aof_payload = if outcome.aof_lsn.is_some() && unix_now_nanos != 0 {
+        let absolute_deadline_ms =
+            deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos) / NS_PER_MS;
+        Some(encode_aof_set_pxat(
+            key_bytes,
+            val_bytes,
+            absolute_deadline_ms,
+        ))
+    } else {
+        None
+    };
+    ExecutedCommand::with_optional_aof_payload_and_records(
+        CmdResult::Static(RESP_OK),
+        outcome.aof_records,
+        outcome.aof_lsn,
+        aof_payload,
+    )
 }
 
 // ── MGET ────────────────────────────────────────────────────────────────────
@@ -351,8 +467,15 @@ pub fn cmd_mset(
         pairs.push((key_from_bytes(key_bytes), value_from_bytes(value_bytes)));
     }
 
-    let outcome = keyspace.mset_values(pairs);
-    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), outcome.aof_lsn)
+    let outcome = match keyspace.mset_values(pairs, _now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    ExecutedCommand::with_aof_records(
+        CmdResult::Static(RESP_OK),
+        outcome.aof_records,
+        outcome.aof_lsn,
+    )
 }
 
 // ── MSETNX ──────────────────────────────────────────────────────────────────
@@ -388,13 +511,16 @@ pub fn cmd_msetnx(
         pairs.push((key_from_bytes(key_bytes), value_from_bytes(value_bytes)));
     }
 
-    let outcome = keyspace.msetnx_values(pairs, now_nanos);
+    let outcome = match keyspace.msetnx_values(pairs, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = if outcome.value {
         CmdResult::Static(super::RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
     };
-    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+    ExecutedCommand::with_aof_records(response, outcome.aof_records, outcome.aof_lsn)
 }
 
 // ── GETSET ──────────────────────────────────────────────────────────────────
@@ -422,7 +548,7 @@ pub fn cmd_getset(
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
-    let outcome = keyspace.set_value_with_options(
+    let outcome = match keyspace.set_value_with_options(
         key,
         value,
         SetOptions {
@@ -430,13 +556,16 @@ pub fn cmd_getset(
             ..SetOptions::default()
         },
         now_nanos,
-    );
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = match outcome.value {
         SetResult::OkGet(Some(old)) => owned_value_to_resp(old),
         SetResult::OkGet(None) => CmdResult::Static(RESP_NIL),
         _ => CmdResult::Static(RESP_NIL),
     };
-    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+    ExecutedCommand::with_aof_records(response, outcome.aof_records, outcome.aof_lsn)
 }
 
 // ── GETDEL ──────────────────────────────────────────────────────────────────
@@ -470,10 +599,21 @@ pub fn cmd_getdel(
 ///
 /// Get value and optionally set/remove TTL.
 #[inline]
+#[allow(dead_code)]
 pub fn cmd_getex(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_getex_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_getex_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
 ) -> ExecutedCommand {
     let Some(args) = CommandArgs::collect(frame) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -493,6 +633,7 @@ pub fn cmd_getex(
 
     // Then apply TTL modification if specified.
     let mut aof_lsn = None;
+    let mut aof_payload = None;
     if argc >= 3 {
         let opt = match args.get(2) {
             Some(b) => b,
@@ -504,40 +645,67 @@ pub fn cmd_getex(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                aof_lsn = keyspace
-                    .expire_key(&key, now_nanos + secs * NS_PER_SEC, now_nanos)
-                    .aof_lsn;
+                let deadline = now_nanos + secs * NS_PER_SEC;
+                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
+                if aof_lsn.is_some() && unix_now_nanos != 0 {
+                    let absolute_deadline_ms =
+                        deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
+                            / NS_PER_MS;
+                    aof_payload = Some(encode_aof_pexpireat(key_bytes, absolute_deadline_ms));
+                }
             }
             OptToken::PX => {
                 let ms = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                aof_lsn = keyspace
-                    .expire_key(&key, now_nanos + ms * NS_PER_MS, now_nanos)
-                    .aof_lsn;
+                let deadline = now_nanos + ms * NS_PER_MS;
+                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
+                if aof_lsn.is_some() && unix_now_nanos != 0 {
+                    let absolute_deadline_ms =
+                        deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
+                            / NS_PER_MS;
+                    aof_payload = Some(encode_aof_pexpireat(key_bytes, absolute_deadline_ms));
+                }
             }
             OptToken::EXAT => {
                 let secs = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                aof_lsn = keyspace
-                    .expire_key(&key, secs * NS_PER_SEC, now_nanos)
-                    .aof_lsn;
+                let deadline = absolute_unix_nanos_to_deadline_nanos(
+                    secs * NS_PER_SEC,
+                    now_nanos,
+                    unix_now_nanos,
+                );
+                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
+                if aof_lsn.is_some() {
+                    aof_payload = Some(encode_aof_pexpireat(key_bytes, secs * 1_000));
+                }
             }
             OptToken::PXAT => {
                 let ms = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                aof_lsn = keyspace.expire_key(&key, ms * NS_PER_MS, now_nanos).aof_lsn;
+                let deadline = absolute_unix_nanos_to_deadline_nanos(
+                    ms * NS_PER_MS,
+                    now_nanos,
+                    unix_now_nanos,
+                );
+                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
+                if aof_lsn.is_some() {
+                    aof_payload = Some(encode_aof_pexpireat(key_bytes, ms));
+                }
             }
             OptToken::KEEPTTL => { /* PERSIST alias in GETEX context */ }
             _ => {
                 // Check for "PERSIST" keyword.
                 if eq_ci(opt, b"PERSIST") {
                     aof_lsn = keyspace.persist_key(&key).aof_lsn;
+                    if aof_lsn.is_some() {
+                        aof_payload = Some(encode_aof_persist(key_bytes));
+                    }
                 } else {
                     return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
                 }
@@ -545,7 +713,7 @@ pub fn cmd_getex(
         }
     }
 
-    ExecutedCommand::with_aof_lsn(owned_value_to_resp(val), aof_lsn)
+    ExecutedCommand::with_optional_aof_payload(owned_value_to_resp(val), aof_lsn, aof_payload)
 }
 
 // ── INCR / INCRBY / DECR / DECRBY ──────────────────────────────────────────
@@ -565,10 +733,12 @@ fn incr_by(
     let key = key_from_bytes(key_bytes);
 
     match keyspace.increment_by(key, delta, now_nanos) {
-        Ok(MutationOutcome { value, aof_lsn }) => {
-            ExecutedCommand::with_aof_lsn(int_resp(value), aof_lsn)
-        }
-        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => ExecutedCommand::with_aof_records(int_resp(value), aof_records, aof_lsn),
+        Err(err) => err.into_executed(),
     }
 }
 
@@ -677,10 +847,16 @@ pub fn cmd_incrbyfloat(
     let key = key_from_bytes(key_bytes);
 
     match keyspace.increment_by_float(key, incr, now_nanos) {
-        Ok(MutationOutcome { value, aof_lsn }) => {
-            ExecutedCommand::with_aof_lsn(CmdResult::Resp(RespFrame::bulk_string(value)), aof_lsn)
-        }
-        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => ExecutedCommand::with_aof_records(
+            CmdResult::Resp(RespFrame::bulk_string(value)),
+            aof_records,
+            aof_lsn,
+        ),
+        Err(err) => err.into_executed(),
     }
 }
 
@@ -698,10 +874,12 @@ pub fn cmd_append(
     if let (Some(key_bytes), Some(append_bytes)) = (arg_bytes(frame, 1), arg_bytes(frame, 2)) {
         let key = key_from_bytes(key_bytes);
         return match keyspace.append_value(key, append_bytes, now_nanos) {
-            Ok(MutationOutcome { value, aof_lsn }) => {
-                ExecutedCommand::with_aof_lsn(int_resp(value as i64), aof_lsn)
-            }
-            Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
+            Ok(MutationOutcome {
+                value,
+                aof_records,
+                aof_lsn,
+            }) => ExecutedCommand::with_aof_records(int_resp(value as i64), aof_records, aof_lsn),
+            Err(err) => err.into_executed(),
         };
     }
     ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX))
@@ -794,10 +972,12 @@ pub fn cmd_setrange(
 
     let key = key_from_bytes(key_bytes);
     match keyspace.setrange_value(key, offset, new_bytes, now_nanos) {
-        Ok(MutationOutcome { value, aof_lsn }) => {
-            ExecutedCommand::with_aof_lsn(int_resp(value as i64), aof_lsn)
-        }
-        Err(err) => ExecutedCommand::from(CmdResult::Static(err)),
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => ExecutedCommand::with_aof_records(int_resp(value as i64), aof_records, aof_lsn),
+        Err(err) => err.into_executed(),
     }
 }
 
@@ -861,8 +1041,6 @@ fn opt_upper(b: &[u8]) -> OptToken {
     }
 }
 
-/// Case-insensitive comparison (ASCII only).
-#[inline]
 fn eq_ci(a: &[u8], b: &[u8]) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -873,6 +1051,7 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::commands::test_harness::TestHarness;
+    use crate::eviction::EvictionPolicy;
     use vortex_proto::RespTape;
 
     trait ResultView {
@@ -895,6 +1074,17 @@ mod tests {
     /// Caller must do `tape.iter().next().unwrap()` to get the FrameRef.
     fn make_tape(input: &[u8]) -> RespTape {
         RespTape::parse_pipeline(input).expect("valid RESP input")
+    }
+
+    fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+        for part in parts {
+            buf.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            buf.extend_from_slice(part);
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf
     }
 
     /// Assert a CmdResult is a static byte slice.
@@ -941,6 +1131,22 @@ mod tests {
                 panic!("expected Resp, got Static({:?})", std::str::from_utf8(b))
             }
         }
+    }
+
+    fn same_shard_keys(keyspace: &ConcurrentKeyspace, count: usize) -> Vec<Vec<u8>> {
+        let mut found = Vec::with_capacity(count);
+        let target = keyspace.shard_index(b"evict:seed");
+        for index in 0..10_000usize {
+            let key = format!("evict:{index:04}").into_bytes();
+            if keyspace.shard_index(&key) != target {
+                continue;
+            }
+            found.push(key);
+            if found.len() == count {
+                return found;
+            }
+        }
+        panic!("failed to find {count} keys on shard {target}");
     }
 
     // ── Option parsing ──
@@ -1035,6 +1241,203 @@ mod tests {
         let key = VortexKey::from(b"foo" as &[u8]);
         let val = h.get(&key, 0).unwrap();
         assert_eq!(val.as_string_bytes().unwrap(), b"bar");
+    }
+
+    #[test]
+    fn set_noeviction_returns_oom_without_mutating() {
+        let h = TestHarness::new();
+        let keys = same_shard_keys(&h.keyspace, 2);
+        let first = VortexKey::from(keys[0].as_slice());
+        h.set(first.clone(), VortexValue::from_bytes(b"warm"));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::NoEviction);
+
+        let cmd = make_resp(&[b"SET", keys[1].as_slice(), b"new"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_set(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::ERR_OOM);
+        assert!(h.get(&first, 0).is_some());
+        assert!(h.get(&VortexKey::from(keys[1].as_slice()), 0).is_none());
+    }
+
+    #[test]
+    fn set_allkeys_lru_evicts_colder_same_shard_key() {
+        let h = TestHarness::new();
+        h.keyspace.enable_aof_recording();
+        let keys = same_shard_keys(&h.keyspace, 3);
+        let hot = VortexKey::from(keys[0].as_slice());
+        let cold = VortexKey::from(keys[1].as_slice());
+        let incoming = VortexKey::from(keys[2].as_slice());
+
+        h.set(hot.clone(), VortexValue::from_bytes(b"warm"));
+        h.set(cold.clone(), VortexValue::from_bytes(b"cool"));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::AllKeysLru);
+        for _ in 0..16 {
+            let _ = h.get(&hot, 0);
+        }
+
+        let cmd = make_resp(&[b"SET", keys[2].as_slice(), b"mild"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_set(&h.keyspace, &frame, 0);
+
+        assert_static(&result, RESP_OK);
+        let aof_records = result.aof_records.as_ref().expect("eviction records");
+        assert_eq!(aof_records.len(), 1);
+        assert_eq!(aof_records[0].key.as_bytes(), keys[1].as_slice());
+        assert!(
+            aof_records[0].lsn < result.aof_lsn().expect("SET allocates LSN"),
+            "eviction must be logged before the triggering SET"
+        );
+        assert!(h.get(&hot, 0).is_some());
+        assert!(h.get(&incoming, 0).is_some());
+        assert!(h.get(&cold, 0).is_none());
+    }
+
+    #[test]
+    fn set_logs_eviction_even_when_write_still_ooms() {
+        let h = TestHarness::new();
+        h.keyspace.enable_aof_recording();
+        let keys = same_shard_keys(&h.keyspace, 2);
+        let resident = VortexKey::from(keys[0].as_slice());
+        let incoming = VortexKey::from(keys[1].as_slice());
+
+        h.set(resident.clone(), VortexValue::from_bytes(b"warm"));
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::AllKeysLru);
+
+        let oversized = vec![b'x'; h.keyspace.memory_used().saturating_add(4096)];
+        let cmd = make_resp(&[b"SET", keys[1].as_slice(), oversized.as_slice()]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_set(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::ERR_OOM);
+        let aof_records = result.aof_records.as_ref().expect("eviction records");
+        assert_eq!(aof_records.len(), 1);
+        assert_eq!(aof_records[0].key.as_bytes(), keys[0].as_slice());
+        assert!(result.aof_lsn().is_none());
+        assert!(h.get(&resident, 0).is_none());
+        assert!(h.get(&incoming, 0).is_none());
+    }
+
+    #[test]
+    fn set_allkeys_lfu_evicts_lower_frequency_same_shard_key() {
+        let h = TestHarness::new();
+        let keys = same_shard_keys(&h.keyspace, 3);
+        let hot = VortexKey::from(keys[0].as_slice());
+        let cold = VortexKey::from(keys[1].as_slice());
+        let incoming = VortexKey::from(keys[2].as_slice());
+
+        h.set(hot.clone(), VortexValue::from_bytes(b"warm"));
+        h.set(cold.clone(), VortexValue::from_bytes(b"cool"));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::AllKeysLfu);
+        for _ in 0..32 {
+            let _ = h.get(&hot, 0);
+        }
+
+        let cmd = make_resp(&[b"SET", keys[2].as_slice(), b"mild"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_set(&h.keyspace, &frame, 0);
+
+        assert_static(&result, RESP_OK);
+        assert!(h.get(&hot, 0).is_some());
+        assert!(h.get(&incoming, 0).is_some());
+        assert!(h.get(&cold, 0).is_none());
+    }
+
+    #[test]
+    fn append_noeviction_returns_oom_without_mutating() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"grow" as &[u8]);
+        h.set(key.clone(), VortexValue::from_bytes(b"hi"));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::NoEviction);
+
+        let cmd = make_resp(&[b"APPEND", b"grow", b"-there"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_append(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::ERR_OOM);
+        assert_eq!(h.get(&key, 0).unwrap().as_string_bytes().unwrap(), b"hi");
+    }
+
+    #[test]
+    fn setrange_noeviction_returns_oom_without_mutating() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"range" as &[u8]);
+        h.set(key.clone(), VortexValue::from_bytes(b"hi"));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::NoEviction);
+
+        let cmd = make_resp(&[b"SETRANGE", b"range", b"5", b"x"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_setrange(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::ERR_OOM);
+        assert_eq!(h.get(&key, 0).unwrap().as_string_bytes().unwrap(), b"hi");
+    }
+
+    #[test]
+    fn incr_missing_noeviction_returns_oom_without_mutating() {
+        let h = TestHarness::new();
+        let anchor = VortexKey::from(b"anchor" as &[u8]);
+        h.set(anchor.clone(), VortexValue::from_bytes(b"stay"));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::NoEviction);
+
+        let cmd = make_resp(&[b"INCR", b"counter"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_incr(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::ERR_OOM);
+        assert!(h.get(&VortexKey::from(b"counter" as &[u8]), 0).is_none());
+        assert_eq!(
+            h.get(&anchor, 0).unwrap().as_string_bytes().unwrap(),
+            b"stay"
+        );
+    }
+
+    #[test]
+    fn incrbyfloat_noeviction_returns_oom_without_mutating() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"float" as &[u8]);
+        h.set(key.clone(), VortexValue::Integer(1));
+
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), EvictionPolicy::NoEviction);
+
+        let cmd = make_resp(&[b"INCRBYFLOAT", b"float", b"0.25"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_incrbyfloat(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::ERR_OOM);
+        assert_eq!(
+            resp_bytes(&cmd_get(
+                &h.keyspace,
+                &make_tape(b"*2\r\n$3\r\nGET\r\n$5\r\nfloat\r\n")
+                    .iter()
+                    .next()
+                    .unwrap(),
+                0
+            )),
+            b"1"
+        );
     }
 
     #[test]

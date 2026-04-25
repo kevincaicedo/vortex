@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use vortex_engine::EvictionPolicy;
 use vortex_io::{IoBackendMode, ReactorPool, ReactorPoolConfig};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
@@ -32,6 +33,8 @@ fn multi_reactor_ping_pong() {
         io_backend: IoBackendMode::Polling,
         ring_size: 4096,
         sqpoll_idle_ms: 1000,
+        max_memory: 0,
+        eviction_policy: EvictionPolicy::NoEviction,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

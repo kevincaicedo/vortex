@@ -102,6 +102,8 @@ fn graceful_shutdown_pool() {
         io_backend: IoBackendMode::Polling,
         ring_size: 4096,
         sqpoll_idle_ms: 1000,
+        max_memory: 0,
+        eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

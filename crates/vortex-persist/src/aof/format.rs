@@ -9,6 +9,8 @@
 
 use std::io::{self, Read, Write};
 
+use vortex_common::current_unix_time_nanos;
+
 /// Magic bytes identifying a VortexDB AOF file.
 pub const AOF_MAGIC: &[u8; 6] = b"VXAOF\x00";
 
@@ -65,10 +67,7 @@ pub struct AofHeader {
 impl AofHeader {
     /// Create a new header with current timestamp.
     pub fn new(reactor_id: u16) -> Self {
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let created_at = current_unix_time_nanos() / 1_000_000_000;
         Self {
             version: AOF_VERSION,
             reactor_id,

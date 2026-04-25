@@ -21,7 +21,9 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use vortex_common::{Timestamp, VortexValue};
+use vortex_common::{
+    Timestamp, VortexValue, current_unix_time_nanos, deadline_nanos_to_absolute_unix_nanos,
+};
 use vortex_engine::ConcurrentKeyspace;
 
 use super::format::AofHeader;
@@ -56,6 +58,7 @@ impl AofRewriter {
         header.write_to(&mut writer)?;
 
         let now_nanos = Timestamp::now().as_nanos();
+        let unix_now_nanos = current_unix_time_nanos();
         let mut keys_written = 0u64;
 
         // Iterate all shards, taking a read lock on each one at a time.
@@ -90,7 +93,11 @@ impl AofRewriter {
 
                     // If the key has a TTL, emit PEXPIREAT.
                     if ttl_nanos != 0 && ttl_nanos > now_nanos {
-                        let deadline_ms = ttl_nanos / 1_000_000;
+                        let deadline_ms = deadline_nanos_to_absolute_unix_nanos(
+                            ttl_nanos,
+                            now_nanos,
+                            unix_now_nanos,
+                        ) / 1_000_000;
                         Self::write_pexpireat_cmd(&mut writer, key_bytes.as_bytes(), deadline_ms)?;
                     }
 
@@ -155,7 +162,7 @@ impl AofRewriter {
 mod tests {
     use super::*;
     use crate::aof::reader::AofReader;
-    use vortex_engine::commands::execute_command;
+    use vortex_engine::commands::{CommandClock, execute_command};
     use vortex_proto::RespTape;
 
     fn temp_path(suffix: &str) -> PathBuf {
@@ -186,7 +193,8 @@ mod tests {
         let frame = tape.iter().next().unwrap();
         let name = frame.command_name().unwrap();
         let now = Timestamp::now().as_nanos();
-        let _ = execute_command(ks, name, &frame, now);
+        let unix_now = current_unix_time_nanos();
+        let _ = execute_command(ks, name, &frame, CommandClock::new(now, unix_now));
     }
 
     #[test]
@@ -216,7 +224,7 @@ mod tests {
 
         // SET ephemeral with TTL via PEXPIREAT.
         run_cmd(&ks, b"*3\r\n$3\r\nSET\r\n$9\r\nephemeral\r\n$4\r\ndata\r\n");
-        let future_ms = Timestamp::now().as_nanos() / 1_000_000 + 60_000;
+        let future_ms = current_unix_time_nanos() / 1_000_000 + 60_000;
         let pexpireat_cmd = format!(
             "*3\r\n$9\r\nPEXPIREAT\r\n$9\r\nephemeral\r\n${}\r\n{}\r\n",
             format!("{future_ms}").len(),

@@ -4,6 +4,8 @@
 //! `ConcurrentKeyspace` (defined here via `impl ConcurrentKeyspace`).
 //! No trait indirection, no dynamic dispatch.
 
+use core::mem::size_of;
+
 use bytes::Bytes;
 use smallvec::SmallVec;
 use vortex_common::value::InlineBytes;
@@ -11,10 +13,14 @@ use vortex_common::{VortexKey, VortexValue};
 use vortex_proto::RespFrame;
 
 use crate::SwissTable;
-use crate::keyspace::ConcurrentKeyspace;
+use crate::entry::Entry;
+use crate::keyspace::{ConcurrentKeyspace, EvictedKeys, EvictionAdmissionError};
 
 use super::pattern::glob_match;
-use super::{ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_OVERFLOW, ERR_WRONG_TYPE};
+use super::{
+    AofRecord, AofRecords, CmdResult, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_OVERFLOW, ERR_WRONG_TYPE,
+    ExecutedCommand,
+};
 
 const SCAN_CURSOR_SHARD_SHIFT: u32 = 32;
 const DEFAULT_RANDOM_SEED: u64 = 0xDEAD_BEEF_CAFE_BABE;
@@ -36,14 +42,112 @@ struct MultiWriteLookup {
 #[derive(Debug)]
 pub(crate) struct MutationOutcome<T> {
     pub(crate) value: T,
+    pub(crate) aof_records: AofRecords,
     pub(crate) aof_lsn: Option<u64>,
 }
 
 impl<T> MutationOutcome<T> {
     #[inline(always)]
     pub(crate) fn new(value: T, aof_lsn: Option<u64>) -> Self {
-        Self { value, aof_lsn }
+        Self {
+            value,
+            aof_records: None,
+            aof_lsn,
+        }
     }
+
+    #[inline(always)]
+    pub(crate) fn with_aof_records(
+        value: T,
+        aof_records: AofRecords,
+        aof_lsn: Option<u64>,
+    ) -> Self {
+        Self {
+            value,
+            aof_records,
+            aof_lsn,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn map_value<U>(self, value: U) -> MutationOutcome<U> {
+        MutationOutcome {
+            value,
+            aof_records: self.aof_records,
+            aof_lsn: self.aof_lsn,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MutationError {
+    pub(crate) response: &'static [u8],
+    pub(crate) aof_records: AofRecords,
+}
+
+impl MutationError {
+    #[inline(always)]
+    pub(crate) fn new(response: &'static [u8]) -> Self {
+        Self {
+            response,
+            aof_records: None,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn with_evictions(response: &'static [u8], evicted: EvictedKeys) -> Self {
+        Self {
+            response,
+            aof_records: evicted_keys_to_aof_records(evicted),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_executed(self) -> ExecutedCommand {
+        ExecutedCommand::with_aof_records(CmdResult::Static(self.response), self.aof_records, None)
+    }
+}
+
+impl From<&'static [u8]> for MutationError {
+    #[inline(always)]
+    fn from(response: &'static [u8]) -> Self {
+        Self::new(response)
+    }
+}
+
+impl From<EvictionAdmissionError> for MutationError {
+    #[inline(always)]
+    fn from(error: EvictionAdmissionError) -> Self {
+        Self {
+            response: error.response,
+            aof_records: evicted_keys_to_aof_records(error.evicted),
+        }
+    }
+}
+
+pub(crate) type MutationResult<T> = Result<MutationOutcome<T>, MutationError>;
+
+#[inline]
+fn evicted_keys_to_aof_records(evicted: EvictedKeys) -> AofRecords {
+    let evicted = evicted?;
+
+    let mut records = Vec::with_capacity(evicted.len());
+    for evicted in evicted {
+        records.push(AofRecord {
+            lsn: evicted.lsn,
+            key: evicted.key,
+        });
+    }
+    Some(records.into_boxed_slice())
+}
+
+#[inline]
+fn mutation_outcome_with_evictions<T>(
+    value: T,
+    aof_lsn: Option<u64>,
+    evicted: EvictedKeys,
+) -> MutationOutcome<T> {
+    MutationOutcome::with_aof_records(value, evicted_keys_to_aof_records(evicted), aof_lsn)
 }
 
 /// Result of a SET command with options (NX/XX/GET).
@@ -93,6 +197,252 @@ fn mget_value_to_frame(value: &VortexValue) -> RespFrame {
 #[inline]
 fn ttl_present(ttl_deadline: Option<u64>) -> bool {
     matches!(ttl_deadline, Some(deadline) if deadline != 0)
+}
+
+#[inline]
+fn positive_delta(delta: isize) -> usize {
+    delta.max(0) as usize
+}
+
+#[inline]
+fn entry_memory_usage(key: &VortexKey, value_memory_usage: usize) -> usize {
+    size_of::<Entry>() + key.memory_usage() + value_memory_usage
+}
+
+#[inline]
+fn string_value_memory_usage(len: usize) -> usize {
+    if len <= 23 {
+        size_of::<InlineBytes>() + len
+    } else {
+        size_of::<Bytes>() + len
+    }
+}
+
+#[inline]
+fn integer_value_memory_usage() -> usize {
+    size_of::<i64>()
+}
+
+#[inline]
+fn projected_rewrite_delta(
+    key: &VortexKey,
+    existing_value: Option<&VortexValue>,
+    new_value_memory_usage: usize,
+) -> usize {
+    match existing_value {
+        Some(value) => {
+            positive_delta(new_value_memory_usage as isize - value.memory_usage() as isize)
+        }
+        None => entry_memory_usage(key, new_value_memory_usage),
+    }
+}
+
+fn projected_increment_delta(
+    table: &SwissTable,
+    key: &VortexKey,
+    delta: i64,
+    now_nanos: u64,
+) -> Result<usize, &'static [u8]> {
+    match table.get_with_ttl(key) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+            let current = match value {
+                VortexValue::Integer(number) => *number,
+                VortexValue::InlineString(inline) => {
+                    crate::commands::parse_i64(inline.as_bytes()).ok_or(ERR_NOT_INTEGER)?
+                }
+                VortexValue::String(bytes) => {
+                    crate::commands::parse_i64(bytes.as_ref()).ok_or(ERR_NOT_INTEGER)?
+                }
+                _ => return Err(ERR_WRONG_TYPE),
+            };
+            let _ = current.checked_add(delta).ok_or(ERR_OVERFLOW)?;
+            Ok(projected_rewrite_delta(
+                key,
+                Some(value),
+                integer_value_memory_usage(),
+            ))
+        }
+        Some(_) | None => Ok(entry_memory_usage(key, integer_value_memory_usage())),
+    }
+}
+
+fn projected_increment_by_float_delta(
+    table: &SwissTable,
+    key: &VortexKey,
+    increment: f64,
+    now_nanos: u64,
+) -> Result<usize, &'static [u8]> {
+    let current = match table.get_with_ttl(key) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => match value {
+            VortexValue::Integer(number) => *number as f64,
+            VortexValue::InlineString(inline) => std::str::from_utf8(inline.as_bytes())
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .ok_or(ERR_NOT_FLOAT)?,
+            VortexValue::String(bytes) => std::str::from_utf8(bytes.as_ref())
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .ok_or(ERR_NOT_FLOAT)?,
+            _ => return Err(ERR_WRONG_TYPE),
+        },
+        Some(_) | None => 0.0,
+    };
+
+    let result = current + increment;
+    if result.is_nan() || result.is_infinite() {
+        return Err(ERR_NOT_FLOAT);
+    }
+
+    let mut buffer = ryu::Buffer::new();
+    let text = buffer.format(result);
+    let existing = match table.get_with_ttl(key) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+        _ => None,
+    };
+
+    Ok(projected_rewrite_delta(
+        key,
+        existing,
+        string_value_memory_usage(text.len()),
+    ))
+}
+
+fn projected_append_delta(
+    table: &SwissTable,
+    key: &VortexKey,
+    append_bytes: &[u8],
+    now_nanos: u64,
+) -> Result<usize, &'static [u8]> {
+    match table.get_with_ttl(key) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+            let current_len = match value {
+                VortexValue::InlineString(_) | VortexValue::String(_) | VortexValue::Integer(_) => {
+                    value.strlen()
+                }
+                _ => return Err(ERR_WRONG_TYPE),
+            };
+            Ok(projected_rewrite_delta(
+                key,
+                Some(value),
+                string_value_memory_usage(current_len + append_bytes.len()),
+            ))
+        }
+        Some(_) | None => Ok(entry_memory_usage(
+            key,
+            string_value_memory_usage(append_bytes.len()),
+        )),
+    }
+}
+
+fn projected_setrange_delta(
+    table: &SwissTable,
+    key: &VortexKey,
+    offset: usize,
+    new_bytes: &[u8],
+    now_nanos: u64,
+) -> Result<usize, &'static [u8]> {
+    let required_len = offset + new_bytes.len();
+    match table.get_with_ttl(key) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+            let current_len = match value {
+                VortexValue::InlineString(_) | VortexValue::String(_) | VortexValue::Integer(_) => {
+                    value.strlen()
+                }
+                _ => return Err(ERR_WRONG_TYPE),
+            };
+            Ok(projected_rewrite_delta(
+                key,
+                Some(value),
+                string_value_memory_usage(current_len.max(required_len)),
+            ))
+        }
+        Some(_) | None => Ok(entry_memory_usage(
+            key,
+            string_value_memory_usage(required_len),
+        )),
+    }
+}
+
+fn projected_copy_delta(
+    source_value: Option<&VortexValue>,
+    dst_table: &SwissTable,
+    dst: &VortexKey,
+    replace: bool,
+    now_nanos: u64,
+) -> usize {
+    let Some(source_value) = source_value else {
+        return 0;
+    };
+
+    let existing = match dst_table.get_with_ttl(dst) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+        _ => None,
+    };
+    if !replace && existing.is_some() {
+        return 0;
+    }
+
+    projected_rewrite_delta(dst, existing, source_value.memory_usage())
+}
+
+fn projected_rename_delta(
+    src_table: &SwissTable,
+    old_key: &VortexKey,
+    dst_table: &SwissTable,
+    new_key: &VortexKey,
+    now_nanos: u64,
+    nx: bool,
+) -> Result<usize, &'static [u8]> {
+    if old_key == new_key {
+        return Ok(0);
+    }
+
+    let Some((source_value, source_ttl)) = src_table.get_with_ttl(old_key) else {
+        return Err(b"-ERR no such key\r\n");
+    };
+    if source_ttl != 0 && source_ttl <= now_nanos {
+        return Err(b"-ERR no such key\r\n");
+    }
+
+    let existing_dst = match dst_table.get_with_ttl(new_key) {
+        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+        _ => None,
+    };
+    if nx && existing_dst.is_some() {
+        return Ok(0);
+    }
+
+    let moved_usage = entry_memory_usage(new_key, source_value.memory_usage());
+    let removed_source_usage = entry_memory_usage(old_key, source_value.memory_usage());
+    let removed_dst_usage = existing_dst
+        .map(|value| entry_memory_usage(new_key, value.memory_usage()))
+        .unwrap_or(0);
+
+    Ok(positive_delta(
+        moved_usage as isize - removed_source_usage as isize - removed_dst_usage as isize,
+    ))
+}
+
+fn projected_set_write_delta(
+    table: &SwissTable,
+    key: &VortexKey,
+    value: &VortexValue,
+    options: SetOptions,
+    now_nanos: u64,
+) -> usize {
+    let exists = matches!(
+        table.get_with_ttl(key),
+        Some((_, ttl)) if ttl == 0 || ttl > now_nanos
+    );
+
+    if options.nx && exists {
+        return 0;
+    }
+    if options.xx && !exists {
+        return 0;
+    }
+
+    positive_delta(table.projected_insert_delta(key, value))
 }
 
 fn build_multi_write_lookups<'a>(
@@ -188,7 +538,6 @@ fn set_with_options_on_table(
     let exists = match table.get_with_ttl(&key) {
         Some((current, ttl)) if ttl == 0 || ttl > now_nanos => {
             existing_ttl = ttl;
-            if options.keepttl {}
             if options.get && (options.nx || options.xx) {
                 existing_for_notset_get = Some(current.clone());
             }
@@ -370,11 +719,9 @@ fn append_to_table(
                     let mut combined = Vec::with_capacity(inline.len() + append_bytes.len());
                     combined.extend_from_slice(inline.as_bytes());
                     combined.extend_from_slice(append_bytes);
-                    let new_value = VortexValue::String(Bytes::from(combined));
-                    let length = match &new_value {
-                        VortexValue::String(bytes) => bytes.len(),
-                        _ => 0,
-                    };
+                    let bytes = Bytes::from(combined);
+                    let length = bytes.len();
+                    let new_value = VortexValue::String(bytes);
                     let delta_bytes = new_value.memory_usage() as isize - old_bytes as isize;
                     *existing = new_value;
                     (length, delta_bytes)
@@ -683,6 +1030,7 @@ impl ConcurrentKeyspace {
         let removed = remove_if_expired(table, key, now_nanos);
         if removed {
             self.update_expiry_count(shard_index, had_ttl, false);
+            self.bump_watch_key(key);
         }
         removed
     }
@@ -710,14 +1058,19 @@ impl ConcurrentKeyspace {
             Some((_, ttl)) if ttl != 0
         );
         self.update_expiry_count(shard_index, true, has_ttl);
+        self.bump_watch_key_bytes(key_bytes);
         true
     }
 
     pub(crate) fn get_value(&self, key: &VortexKey, now_nanos: u64) -> Option<VortexValue> {
         let shard_index = self.shard_index(key.as_bytes());
+        let table_hash = self.table_hash_key(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
         match guard.get_with_ttl(key) {
-            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value.clone()),
+            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+                self.record_access_prehashed(&guard, key.as_bytes(), table_hash);
+                Some(value.clone())
+            }
             Some(_) => {
                 // Expired — drop read lock, escalate to write lock, double-check.
                 drop(guard);
@@ -734,13 +1087,30 @@ impl ConcurrentKeyspace {
         key: VortexKey,
         value: VortexValue,
         ttl_deadline_nanos: u64,
-    ) -> MutationOutcome<Option<VortexValue>> {
-        let shard_index = self.shard_index(key.as_bytes());
+        now_nanos: u64,
+    ) -> MutationResult<Option<VortexValue>> {
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let projected_delta = self
+            .read_shard_by_index(shard_index)
+            .projected_insert_delta(&key, &value);
+        let evicted =
+            self.ensure_memory_for(shard_index, positive_delta(projected_delta), now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
+        let watched_key = self.watch_tracking_active().then(|| key.clone());
         let previous = guard.insert_with_ttl(key, value, ttl_deadline_nanos);
         self.update_expiry_count(shard_index, had_ttl, true);
-        MutationOutcome::new(previous, Some(self.next_lsn()))
+        self.record_frequency_hash(table_hash);
+        if let Some(key) = watched_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            previous,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     /// Fast path for plain `SET key value` (no options, no TTL).
@@ -756,36 +1126,113 @@ impl ConcurrentKeyspace {
     /// expired value is replaced regardless. The expiry count is still
     /// correctly maintained via the `old_had_ttl` return value.
     #[inline]
+    pub(crate) fn set_value_plain_bytes(
+        &self,
+        key_bytes: &[u8],
+        value_bytes: &[u8],
+        now_nanos: u64,
+    ) -> MutationResult<()> {
+        let features = self.mutation_features();
+        if features != 0 {
+            return self.set_value_plain(
+                VortexKey::from(key_bytes),
+                VortexValue::from_bytes(value_bytes),
+                now_nanos,
+            );
+        }
+
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let mut guard = self.write_shard_by_index(shard_index);
+        let old_had_ttl = if value_bytes.len() <= 23 {
+            let value = VortexValue::from_bytes(value_bytes);
+            let (_old, old_had_ttl) =
+                guard.insert_no_ttl_bytes_prehashed(key_bytes, value, table_hash);
+            old_had_ttl
+        } else {
+            guard.insert_no_ttl_raw_value_prehashed(key_bytes, value_bytes, table_hash)
+        };
+        self.update_expiry_count(shard_index, old_had_ttl, false);
+        Ok(MutationOutcome::new((), None))
+    }
+
+    #[inline]
     pub(crate) fn set_value_plain(
         &self,
         key: VortexKey,
         value: VortexValue,
-    ) -> MutationOutcome<()> {
+        now_nanos: u64,
+    ) -> MutationResult<()> {
         let key_bytes = key.as_bytes();
         let shard_index = self.shard_index(key_bytes);
         // Pre-hash for the table BEFORE acquiring the write lock.
         let table_hash = self.table_hash_key(key_bytes);
+        let features = self.mutation_features();
+        let evicted = if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
+            let eviction = self.eviction_config();
+            if eviction.max_memory == 0 || self.replay_mode_active() {
+                None
+            } else {
+                let projected_delta = self
+                    .read_shard_by_index(shard_index)
+                    .projected_insert_delta_prehashed(&key, &value, table_hash);
+                self.ensure_memory_for_snapshot(
+                    shard_index,
+                    positive_delta(projected_delta),
+                    now_nanos,
+                    eviction,
+                )?
+            }
+        } else {
+            None
+        };
         let mut guard = self.write_shard_by_index(shard_index);
+        let watched_key = ConcurrentKeyspace::mutation_feature_watch(features).then(|| key.clone());
         let (_old, old_had_ttl) = guard.insert_no_ttl_prehashed(key, value, table_hash);
         self.update_expiry_count(shard_index, old_had_ttl, false);
-        MutationOutcome::new((), Some(self.next_lsn()))
+        if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
+            self.record_frequency_hash(table_hash);
+        }
+        if let Some(key) = watched_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            (),
+            self.next_aof_lsn_with_features(features),
+            evicted,
+        ))
     }
-
     pub(crate) fn set_value_with_options(
         &self,
         key: VortexKey,
         value: VortexValue,
         options: SetOptions,
         now_nanos: u64,
-    ) -> MutationOutcome<SetResult> {
+    ) -> MutationResult<SetResult> {
         let shard_index = self.shard_index(key.as_bytes());
+        let projected_delta = projected_set_write_delta(
+            &self.read_shard_by_index(shard_index),
+            &key,
+            &value,
+            options,
+            now_nanos,
+        );
+        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
         let (result, has_ttl) =
-            set_with_options_on_table(&mut guard, key, value, options, now_nanos);
+            set_with_options_on_table(&mut guard, key.clone(), value, options, now_nanos);
         self.update_expiry_count(shard_index, had_ttl, has_ttl);
         let changed = matches!(&result, SetResult::Ok | SetResult::OkGet(_));
-        MutationOutcome::new(result, changed.then(|| self.next_lsn()))
+        if changed {
+            self.record_frequency_hash(self.table_hash_key(key.as_bytes()));
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            result,
+            changed.then(|| self.next_aof_lsn()).flatten(),
+            evicted,
+        ))
     }
 
     pub(crate) fn mget_frames(&self, keys: &[&[u8]], now_nanos: u64) -> Vec<RespFrame> {
@@ -833,6 +1280,7 @@ impl ConcurrentKeyspace {
                 let key_bytes = keys[lookup.output_idx];
                 match guard.get_with_ttl_prehashed(key_bytes, lookup.hash) {
                     Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+                        self.record_access_prehashed(&guard, key_bytes, lookup.hash);
                         frames[lookup.output_idx] = mget_value_to_frame(value);
                     }
                     Some(_) => {
@@ -865,10 +1313,29 @@ impl ConcurrentKeyspace {
         frames
     }
 
-    pub(crate) fn mset_values(&self, pairs: Vec<(VortexKey, VortexValue)>) -> MutationOutcome<()> {
+    pub(crate) fn mset_values(
+        &self,
+        pairs: Vec<(VortexKey, VortexValue)>,
+        now_nanos: u64,
+    ) -> MutationResult<()> {
         if pairs.is_empty() {
-            return MutationOutcome::new((), None);
+            return Ok(MutationOutcome::new((), None));
         }
+
+        let projected_delta: usize = pairs
+            .iter()
+            .map(|(key, value)| {
+                let shard_index = self.shard_index(key.as_bytes());
+                let guard = self.read_shard_by_index(shard_index);
+                positive_delta(guard.projected_insert_delta(key, value))
+            })
+            .sum();
+        let evicted = self.ensure_memory_for(
+            self.shard_index(pairs[0].0.as_bytes()),
+            projected_delta,
+            now_nanos,
+        )?;
+
         let (key_refs, lookups) = build_multi_write_lookups(self, &pairs);
         let (mut guards, sorted_shards, _) = self.multi_write(&key_refs);
         drop(key_refs);
@@ -883,21 +1350,52 @@ impl ConcurrentKeyspace {
             let (key, value) = pairs[lookup.pair_index]
                 .take()
                 .expect("mset pair must be available exactly once");
+            self.bump_watch_key(&key);
             let (_previous, old_had_ttl) =
                 table.insert_no_ttl_prehashed(key, value, lookup.table_hash);
             self.update_expiry_count(lookup.shard_idx, old_had_ttl, false);
+            self.record_frequency_hash(lookup.table_hash);
         }
-        MutationOutcome::new((), Some(self.next_lsn()))
+        Ok(mutation_outcome_with_evictions(
+            (),
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn msetnx_values(
         &self,
         pairs: Vec<(VortexKey, VortexValue)>,
         now_nanos: u64,
-    ) -> MutationOutcome<bool> {
+    ) -> MutationResult<bool> {
         if pairs.is_empty() {
-            return MutationOutcome::new(true, None);
+            return Ok(MutationOutcome::new(true, None));
         }
+
+        let all_absent = pairs.iter().all(|(key, _)| {
+            !matches!(
+                self.read_shard_by_index(self.shard_index(key.as_bytes()))
+                    .get_with_ttl(key),
+                Some((_, ttl)) if ttl == 0 || ttl > now_nanos
+            )
+        });
+        if !all_absent {
+            return Ok(MutationOutcome::new(false, None));
+        }
+
+        let projected_delta: usize = pairs
+            .iter()
+            .map(|(key, value)| {
+                let shard_index = self.shard_index(key.as_bytes());
+                let guard = self.read_shard_by_index(shard_index);
+                positive_delta(guard.projected_insert_delta(key, value))
+            })
+            .sum();
+        let evicted = self.ensure_memory_for(
+            self.shard_index(pairs[0].0.as_bytes()),
+            projected_delta,
+            now_nanos,
+        )?;
 
         let (key_refs, lookups) = build_multi_write_lookups(self, &pairs);
         let (mut guards, sorted_shards, _) = self.multi_write(&key_refs);
@@ -918,7 +1416,7 @@ impl ConcurrentKeyspace {
                 now_nanos,
             );
             if table.contains_key_prehashed(key_bytes, lookup.table_hash) {
-                return MutationOutcome::new(false, None);
+                return Ok(mutation_outcome_with_evictions(false, None, evicted));
             }
         }
 
@@ -932,10 +1430,16 @@ impl ConcurrentKeyspace {
             let (key, value) = pairs[lookup.pair_index]
                 .take()
                 .expect("msetnx pair must be available exactly once");
+            self.bump_watch_key(&key);
             table.insert_new_prehashed(key, value, lookup.table_hash);
+            self.record_frequency_hash(lookup.table_hash);
         }
 
-        MutationOutcome::new(true, Some(self.next_lsn()))
+        Ok(mutation_outcome_with_evictions(
+            true,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn remove_value(
@@ -948,7 +1452,10 @@ impl ConcurrentKeyspace {
         let (removed, had_ttl) = take_live_value(&mut guard, key, now_nanos);
         self.update_expiry_count(shard_index, had_ttl, false);
         let changed = removed.is_some();
-        MutationOutcome::new(removed, changed.then(|| self.next_lsn()))
+        if changed {
+            self.bump_watch_key(key);
+        }
+        MutationOutcome::new(removed, changed.then(|| self.next_aof_lsn()).flatten())
     }
 
     pub(crate) fn delete_key_bytes(
@@ -962,7 +1469,10 @@ impl ConcurrentKeyspace {
         let (deleted, had_ttl) =
             delete_live_key_bytes(&mut guard, key_bytes, table_hash, now_nanos);
         self.update_expiry_count(shard_index, had_ttl, false);
-        MutationOutcome::new(deleted, deleted.then(|| self.next_lsn()))
+        if deleted {
+            self.bump_watch_key_bytes(key_bytes);
+        }
+        MutationOutcome::new(deleted, deleted.then(|| self.next_aof_lsn()).flatten())
     }
 
     pub(crate) fn increment_by(
@@ -970,12 +1480,30 @@ impl ConcurrentKeyspace {
         key: VortexKey,
         delta: i64,
         now_nanos: u64,
-    ) -> Result<MutationOutcome<i64>, &'static [u8]> {
-        let shard_index = self.shard_index(key.as_bytes());
+    ) -> MutationResult<i64> {
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let read_guard = self.read_shard_by_index(shard_index);
+        let projected_delta = projected_increment_delta(&read_guard, &key, delta, now_nanos)?;
+        drop(read_guard);
+        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
-        let (result, transition) = increment_table_by(&mut guard, key, delta, now_nanos)?;
+        let watched_key = self.watch_tracking_active().then(|| key.clone());
+        let (result, transition) = match increment_table_by(&mut guard, key, delta, now_nanos) {
+            Ok(result) => result,
+            Err(err) => return Err(MutationError::with_evictions(err, evicted)),
+        };
         self.update_expiry_count(shard_index, transition.had_ttl, transition.has_ttl_after);
-        Ok(MutationOutcome::new(result, Some(self.next_lsn())))
+        self.record_frequency_hash(table_hash);
+        if let Some(key) = watched_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            result,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn increment_by_float(
@@ -983,17 +1511,36 @@ impl ConcurrentKeyspace {
         key: VortexKey,
         increment: f64,
         now_nanos: u64,
-    ) -> Result<MutationOutcome<Bytes>, &'static [u8]> {
-        let shard_index = self.shard_index(key.as_bytes());
+    ) -> MutationResult<Bytes> {
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let read_guard = self.read_shard_by_index(shard_index);
+        let projected_delta =
+            projected_increment_by_float_delta(&read_guard, &key, increment, now_nanos)?;
+        drop(read_guard);
+        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let ttl_deadline = guard.get_entry_ttl(&key);
-        let result = increment_table_by_float(&mut guard, key, increment, now_nanos)?;
+        let watched_key = self.watch_tracking_active().then(|| key.clone());
+        let result = match increment_table_by_float(&mut guard, key, increment, now_nanos) {
+            Ok(result) => result,
+            Err(err) => return Err(MutationError::with_evictions(err, evicted)),
+        };
         self.update_expiry_count(
             shard_index,
             ttl_present(ttl_deadline),
             matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
         );
-        Ok(MutationOutcome::new(result, Some(self.next_lsn())))
+        self.record_frequency_hash(table_hash);
+        if let Some(key) = watched_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            result,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn append_value(
@@ -1001,17 +1548,35 @@ impl ConcurrentKeyspace {
         key: VortexKey,
         append_bytes: &[u8],
         now_nanos: u64,
-    ) -> Result<MutationOutcome<usize>, &'static [u8]> {
-        let shard_index = self.shard_index(key.as_bytes());
+    ) -> MutationResult<usize> {
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let read_guard = self.read_shard_by_index(shard_index);
+        let projected_delta = projected_append_delta(&read_guard, &key, append_bytes, now_nanos)?;
+        drop(read_guard);
+        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let ttl_deadline = guard.get_entry_ttl(&key);
-        let length = append_to_table(&mut guard, key, append_bytes, now_nanos)?;
+        let watched_key = self.watch_tracking_active().then(|| key.clone());
+        let length = match append_to_table(&mut guard, key, append_bytes, now_nanos) {
+            Ok(length) => length,
+            Err(err) => return Err(MutationError::with_evictions(err, evicted)),
+        };
         self.update_expiry_count(
             shard_index,
             ttl_present(ttl_deadline),
             matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
         );
-        Ok(MutationOutcome::new(length, Some(self.next_lsn())))
+        self.record_frequency_hash(table_hash);
+        if let Some(key) = watched_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            length,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn strlen_value(
@@ -1020,9 +1585,11 @@ impl ConcurrentKeyspace {
         now_nanos: u64,
     ) -> Result<Option<usize>, &'static [u8]> {
         let shard_index = self.shard_index(key.as_bytes());
+        let table_hash = self.table_hash_key(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
         match guard.get_with_ttl(key) {
             Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+                self.record_access_prehashed(&guard, key.as_bytes(), table_hash);
                 if !value.is_string() {
                     Err(ERR_WRONG_TYPE)
                 } else {
@@ -1047,9 +1614,11 @@ impl ConcurrentKeyspace {
         now_nanos: u64,
     ) -> Result<Option<Bytes>, &'static [u8]> {
         let shard_index = self.shard_index(key.as_bytes());
+        let table_hash = self.table_hash_key(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
         match guard.get_with_ttl(key) {
             Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+                self.record_access_prehashed(&guard, key.as_bytes(), table_hash);
                 // Live key — compute range while read guard is held.
                 getrange_from_value(value, start, end)
             }
@@ -1069,13 +1638,32 @@ impl ConcurrentKeyspace {
         offset: usize,
         new_bytes: &[u8],
         now_nanos: u64,
-    ) -> Result<MutationOutcome<usize>, &'static [u8]> {
-        let shard_index = self.shard_index(key.as_bytes());
+    ) -> MutationResult<usize> {
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let read_guard = self.read_shard_by_index(shard_index);
+        let projected_delta =
+            projected_setrange_delta(&read_guard, &key, offset, new_bytes, now_nanos)?;
+        drop(read_guard);
+        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
-        let length = setrange_in_table(&mut guard, key, offset, new_bytes, now_nanos)?;
+        let watched_key = self.watch_tracking_active().then(|| key.clone());
+        let length = match setrange_in_table(&mut guard, key, offset, new_bytes, now_nanos) {
+            Ok(length) => length,
+            Err(err) => return Err(MutationError::with_evictions(err, evicted)),
+        };
         self.update_expiry_count(shard_index, had_ttl, false);
-        Ok(MutationOutcome::new(length, Some(self.next_lsn())))
+        self.record_frequency_hash(table_hash);
+        if let Some(key) = watched_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            length,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn delete_keys(&self, keys: &[VortexKey], now_nanos: u64) -> MutationOutcome<i64> {
@@ -1084,7 +1672,8 @@ impl ConcurrentKeyspace {
         }
         if keys.len() == 1 {
             let removed = self.remove_value(&keys[0], now_nanos);
-            return MutationOutcome::new(i64::from(removed.value.is_some()), removed.aof_lsn);
+            let deleted = removed.value.is_some();
+            return removed.map_value(i64::from(deleted));
         }
 
         let key_refs: Vec<&[u8]> = keys.iter().map(VortexKey::as_bytes).collect();
@@ -1097,11 +1686,15 @@ impl ConcurrentKeyspace {
             let (removed, had_ttl) = take_live_value(table, key, now_nanos);
             if removed.is_some() {
                 deleted += 1;
+                self.bump_watch_key(key);
             }
             self.update_expiry_count(shard_index, had_ttl, false);
         }
 
-        MutationOutcome::new(deleted, (deleted != 0).then(|| self.next_lsn()))
+        MutationOutcome::new(
+            deleted,
+            (deleted != 0).then(|| self.next_aof_lsn()).flatten(),
+        )
     }
 
     pub(crate) fn count_existing(&self, keys: &[VortexKey], now_nanos: u64) -> i64 {
@@ -1113,9 +1706,13 @@ impl ConcurrentKeyspace {
         if keys.len() == 1 {
             let key = &keys[0];
             let shard_index = self.shard_index(key.as_bytes());
+            let table_hash = self.table_hash_key(key.as_bytes());
             let guard = self.read_shard_by_index(shard_index);
             return match guard.get_with_ttl(key) {
-                Some((_, ttl)) if ttl == 0 || ttl > now_nanos => 1,
+                Some((_, ttl)) if ttl == 0 || ttl > now_nanos => {
+                    self.record_access_prehashed(&guard, key.as_bytes(), table_hash);
+                    1
+                }
                 Some(_) => {
                     drop(guard);
                     let mut wguard = self.write_shard_by_index(shard_index);
@@ -1135,7 +1732,14 @@ impl ConcurrentKeyspace {
         {
             let position = ConcurrentKeyspace::guard_position(&sorted_shards, shard_index);
             match guards[position].1.get_with_ttl(key) {
-                Some((_, ttl)) if ttl == 0 || ttl > now_nanos => count += 1,
+                Some((_, ttl)) if ttl == 0 || ttl > now_nanos => {
+                    self.record_access_prehashed(
+                        &guards[position].1,
+                        key.as_bytes(),
+                        self.table_hash_key(key.as_bytes()),
+                    );
+                    count += 1;
+                }
                 Some(_) => expired_indices.push(idx),
                 None => {}
             }
@@ -1167,7 +1771,10 @@ impl ConcurrentKeyspace {
         let had_ttl = ttl_present(guard.get_entry_ttl(key));
         let updated = guard.set_entry_ttl(key, deadline_nanos);
         self.update_expiry_count(shard_index, had_ttl, updated);
-        MutationOutcome::new(updated, updated.then(|| self.next_lsn()))
+        if updated {
+            self.bump_watch_key(key);
+        }
+        MutationOutcome::new(updated, updated.then(|| self.next_aof_lsn()).flatten())
     }
 
     pub(crate) fn persist_key(&self, key: &VortexKey) -> MutationOutcome<bool> {
@@ -1176,7 +1783,10 @@ impl ConcurrentKeyspace {
         let had_ttl = ttl_present(guard.get_entry_ttl(key));
         let updated = guard.clear_entry_ttl(key);
         self.update_expiry_count(shard_index, had_ttl, false);
-        MutationOutcome::new(updated, updated.then(|| self.next_lsn()))
+        if updated {
+            self.bump_watch_key(key);
+        }
+        MutationOutcome::new(updated, updated.then(|| self.next_aof_lsn()).flatten())
     }
 
     pub(crate) fn ttl_state(&self, key: &VortexKey, now_nanos: u64) -> TtlState {
@@ -1189,7 +1799,10 @@ impl ConcurrentKeyspace {
         let guard = self.read_shard_by_index(shard_index);
         match guard.get_with_ttl_prehashed(key_bytes, table_hash) {
             None => TtlState::Missing,
-            Some((_, 0)) => TtlState::Persistent,
+            Some((_, 0)) => {
+                self.record_access_prehashed(&guard, key_bytes, table_hash);
+                TtlState::Persistent
+            }
             Some((_, deadline)) if deadline <= now_nanos => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
@@ -1202,15 +1815,22 @@ impl ConcurrentKeyspace {
                 );
                 TtlState::Missing
             }
-            Some((_, deadline)) => TtlState::Deadline(deadline),
+            Some((_, deadline)) => {
+                self.record_access_prehashed(&guard, key_bytes, table_hash);
+                TtlState::Deadline(deadline)
+            }
         }
     }
 
     pub(crate) fn type_of_key(&self, key: &VortexKey, now_nanos: u64) -> Option<&'static str> {
         let shard_index = self.shard_index(key.as_bytes());
+        let table_hash = self.table_hash_key(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
         match guard.get_with_ttl(key) {
-            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value.type_name()),
+            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+                self.record_access_prehashed(&guard, key.as_bytes(), table_hash);
+                Some(value.type_name())
+            }
             Some(_) => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
@@ -1227,13 +1847,18 @@ impl ConcurrentKeyspace {
         new_key: VortexKey,
         now_nanos: u64,
         nx: bool,
-    ) -> Result<MutationOutcome<bool>, &'static [u8]> {
+    ) -> MutationResult<bool> {
         let source_shard = self.shard_index(old_key.as_bytes());
         let destination_shard = self.shard_index(new_key.as_bytes());
+        let new_hash = self.table_hash_key(new_key.as_bytes());
 
         if source_shard == destination_shard {
             let destination = new_key.clone();
             let mut guard = self.write_shard_by_index(source_shard);
+            let _ = self.cleanup_expired_key(source_shard, &mut guard, old_key, now_nanos);
+            if old_key != &destination {
+                let _ = self.cleanup_expired_key(source_shard, &mut guard, &destination, now_nanos);
+            }
             let old_had_ttl = ttl_present(guard.get_entry_ttl(old_key));
             let new_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
             let same_key = old_key == &destination;
@@ -1246,13 +1871,34 @@ impl ConcurrentKeyspace {
             }
             let renamed = renamed?;
             let changed = renamed && !same_key;
+            if changed {
+                self.record_frequency_hash(new_hash);
+                self.bump_watch_key(old_key);
+                self.bump_watch_key(&destination);
+            }
             return Ok(MutationOutcome::new(
                 renamed,
-                changed.then(|| self.next_lsn()),
+                changed.then(|| self.next_aof_lsn()).flatten(),
             ));
         }
 
         let key_refs = [old_key.as_bytes(), new_key.as_bytes()];
+        let (read_guards, read_sorted_shards, read_per_key_shards) = self.multi_read(&key_refs);
+        let read_src_position =
+            ConcurrentKeyspace::guard_position(&read_sorted_shards, read_per_key_shards[0]);
+        let read_dst_position =
+            ConcurrentKeyspace::guard_position(&read_sorted_shards, read_per_key_shards[1]);
+        let projected_delta = projected_rename_delta(
+            &read_guards[read_src_position].1,
+            old_key,
+            &read_guards[read_dst_position].1,
+            &new_key,
+            now_nanos,
+            nx,
+        )?;
+        drop(read_guards);
+        let evicted = self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
+
         let (mut guards, sorted_shards, per_key_shards) = self.multi_write(&key_refs);
         let src_position = ConcurrentKeyspace::guard_position(&sorted_shards, per_key_shards[0]);
         let dst_position = ConcurrentKeyspace::guard_position(&sorted_shards, per_key_shards[1]);
@@ -1270,16 +1916,20 @@ impl ConcurrentKeyspace {
         let old_had_ttl = ttl_present(src_table.get_entry_ttl(old_key));
         let new_had_ttl = ttl_present(dst_table.get_entry_ttl(&new_key));
         if !src_table.contains_key(old_key) {
-            return Err(b"-ERR no such key\r\n");
+            return Err(MutationError::with_evictions(
+                b"-ERR no such key\r\n",
+                evicted,
+            ));
         }
         if nx && dst_table.contains_key(&new_key) {
-            return Ok(MutationOutcome::new(false, None));
+            return Ok(mutation_outcome_with_evictions(false, None, evicted));
         }
 
         let (value, ttl) = src_table
             .remove_with_ttl(old_key)
             .expect("source key must exist after contains_key check");
         dst_table.remove(&new_key);
+        let watched_new_key = self.watch_tracking_active().then(|| new_key.clone());
         if ttl != 0 && ttl > now_nanos {
             dst_table.insert_with_ttl(new_key, value, ttl);
         } else {
@@ -1287,7 +1937,16 @@ impl ConcurrentKeyspace {
         }
         self.update_expiry_count(source_shard, old_had_ttl, false);
         self.update_expiry_count(destination_shard, new_had_ttl, ttl != 0 && ttl > now_nanos);
-        Ok(MutationOutcome::new(true, Some(self.next_lsn())))
+        self.record_frequency_hash(new_hash);
+        self.bump_watch_key(old_key);
+        if let Some(key) = watched_new_key {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            true,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn scan_keys(
@@ -1372,21 +2031,62 @@ impl ConcurrentKeyspace {
         dst: VortexKey,
         replace: bool,
         now_nanos: u64,
-    ) -> MutationOutcome<bool> {
+    ) -> MutationResult<bool> {
         let source_shard = self.shard_index(src.as_bytes());
         let destination_shard = self.shard_index(dst.as_bytes());
+        let dst_hash = self.table_hash_key(dst.as_bytes());
 
         if source_shard == destination_shard {
+            let read_guard = self.read_shard_by_index(source_shard);
+            let source_value = match read_guard.get_with_ttl(src) {
+                Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+                _ => None,
+            };
+            let projected_delta =
+                projected_copy_delta(source_value, &read_guard, &dst, replace, now_nanos);
+            drop(read_guard);
+            let evicted = self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
             let destination = dst.clone();
             let mut guard = self.write_shard_by_index(source_shard);
+            let _ = self.cleanup_expired_key(source_shard, &mut guard, src, now_nanos);
+            if src != &destination {
+                let _ = self.cleanup_expired_key(source_shard, &mut guard, &destination, now_nanos);
+            }
             let dst_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
             let copied = copy_within_table(&mut guard, src, dst, replace, now_nanos);
             let dst_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
             self.update_expiry_count(source_shard, dst_had_ttl, dst_has_ttl);
-            return MutationOutcome::new(copied, copied.then(|| self.next_lsn()));
+            if copied {
+                self.record_frequency_hash(dst_hash);
+                self.bump_watch_key(&destination);
+            }
+            return Ok(mutation_outcome_with_evictions(
+                copied,
+                copied.then(|| self.next_aof_lsn()).flatten(),
+                evicted,
+            ));
         }
 
         let key_refs = [src.as_bytes(), dst.as_bytes()];
+        let (read_guards, read_sorted_shards, read_per_key_shards) = self.multi_read(&key_refs);
+        let read_src_position =
+            ConcurrentKeyspace::guard_position(&read_sorted_shards, read_per_key_shards[0]);
+        let read_dst_position =
+            ConcurrentKeyspace::guard_position(&read_sorted_shards, read_per_key_shards[1]);
+        let source_value = match read_guards[read_src_position].1.get_with_ttl(src) {
+            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+            _ => None,
+        };
+        let projected_delta = projected_copy_delta(
+            source_value,
+            &read_guards[read_dst_position].1,
+            &dst,
+            replace,
+            now_nanos,
+        );
+        drop(read_guards);
+        let evicted = self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
+
         let (mut guards, sorted_shards, per_key_shards) = self.multi_write(&key_refs);
         let src_position = ConcurrentKeyspace::guard_position(&sorted_shards, per_key_shards[0]);
         let dst_position = ConcurrentKeyspace::guard_position(&sorted_shards, per_key_shards[1]);
@@ -1404,26 +2104,35 @@ impl ConcurrentKeyspace {
         let dst_had_ttl = ttl_present(dst_table.get_entry_ttl(&dst));
         let (value_clone, ttl) = {
             let Some((value, ttl)) = src_table.get_with_ttl(src) else {
-                return MutationOutcome::new(false, None);
+                return Ok(mutation_outcome_with_evictions(false, None, evicted));
             };
             if ttl != 0 && ttl <= now_nanos {
-                return MutationOutcome::new(false, None);
+                return Ok(mutation_outcome_with_evictions(false, None, evicted));
             }
             (value.clone(), ttl)
         };
 
         let _ = remove_if_expired(dst_table, &dst, now_nanos);
         if !replace && dst_table.contains_key(&dst) {
-            return MutationOutcome::new(false, None);
+            return Ok(mutation_outcome_with_evictions(false, None, evicted));
         }
 
+        let watched_dst = self.watch_tracking_active().then(|| dst.clone());
         if ttl != 0 && ttl > now_nanos {
             dst_table.insert_with_ttl(dst, value_clone, ttl);
         } else {
             dst_table.insert(dst, value_clone);
         }
         self.update_expiry_count(destination_shard, dst_had_ttl, ttl != 0 && ttl > now_nanos);
-        MutationOutcome::new(true, Some(self.next_lsn()))
+        self.record_frequency_hash(dst_hash);
+        if let Some(key) = watched_dst {
+            self.bump_watch_key(&key);
+        }
+        Ok(mutation_outcome_with_evictions(
+            true,
+            self.next_aof_lsn(),
+            evicted,
+        ))
     }
 
     pub(crate) fn cmd_dbsize(&self, now_nanos: u64) -> usize {

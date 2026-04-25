@@ -30,6 +30,9 @@ pub use encoding::Encoding;
 pub use error::{VortexError, VortexResult};
 pub use key::VortexKey;
 pub use shard::ShardId;
-pub use timestamp::Timestamp;
+pub use timestamp::{
+    Timestamp, absolute_unix_nanos_to_deadline_nanos, current_unix_time_nanos,
+    deadline_nanos_to_absolute_unix_nanos,
+};
 pub use ttl::TTL;
 pub use value::VortexValue;

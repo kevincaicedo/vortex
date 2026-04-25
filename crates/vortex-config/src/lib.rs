@@ -236,11 +236,13 @@ impl VortexConfig {
             "allkeys-random",
             "volatile-random",
             "volatile-ttl",
+            "allkeys-lfu",
+            "volatile-lfu",
         ]
         .contains(&self.eviction_policy.as_str())
         {
             return Err(format!(
-                "invalid eviction_policy '{}': must be noeviction, allkeys-lru, volatile-lru, allkeys-random, volatile-random, or volatile-ttl",
+                "invalid eviction_policy '{}': must be noeviction, allkeys-lru, volatile-lru, allkeys-random, volatile-random, volatile-ttl, allkeys-lfu, or volatile-lfu",
                 self.eviction_policy
             ));
         }
@@ -430,6 +432,23 @@ mod tests {
             ..VortexConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validation_accepts_lfu_eviction_policies() {
+        let allkeys = VortexConfig {
+            threads: 1,
+            eviction_policy: "allkeys-lfu".to_string(),
+            ..VortexConfig::default()
+        };
+        assert!(allkeys.validate().is_ok());
+
+        let volatile = VortexConfig {
+            threads: 1,
+            eviction_policy: "volatile-lfu".to_string(),
+            ..VortexConfig::default()
+        };
+        assert!(volatile.validate().is_ok());
     }
 
     #[test]

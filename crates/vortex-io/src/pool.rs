@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use vortex_engine::eviction::EvictionPolicy;
 use vortex_engine::keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 use vortex_persist::aof::reader::AofReader;
 
-use crate::reactor::{AofConfig, Reactor, ReactorConfig};
+use crate::reactor::{AofConfig, AofFatalState, Reactor, ReactorConfig};
 use crate::shutdown::ShutdownCoordinator;
 
 /// I/O backend selection for pool-managed reactors.
@@ -48,6 +49,10 @@ pub struct ReactorPoolConfig {
     pub aof_config: Option<AofConfig>,
     /// Number of ConcurrentKeyspace shards (must be power of 2, default 4096).
     pub shard_count: usize,
+    /// Max memory in bytes for eviction enforcement (0 = unlimited).
+    pub max_memory: usize,
+    /// Runtime eviction policy for the shared keyspace.
+    pub eviction_policy: EvictionPolicy,
     /// I/O backend selection.
     pub io_backend: IoBackendMode,
     /// io_uring submission queue size.
@@ -67,6 +72,8 @@ impl Default for ReactorPoolConfig {
             connection_timeout: 300,
             aof_config: None,
             shard_count: DEFAULT_SHARD_COUNT,
+            max_memory: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
             io_backend: IoBackendMode::Auto,
             ring_size: 4096,
             sqpoll_idle_ms: 1000,
@@ -108,11 +115,14 @@ impl ReactorPool {
         };
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
+        let aof_fatal_state = Arc::new(AofFatalState::default());
 
         // ── Create shared ConcurrentKeyspace ────────────────────────
         let keyspace = Arc::new(ConcurrentKeyspace::new(config.shard_count));
         tracing::info!(
             shard_count = config.shard_count,
+            max_memory = config.max_memory,
+            eviction_policy = config.eviction_policy.as_str(),
             "shared ConcurrentKeyspace created"
         );
 
@@ -147,25 +157,18 @@ impl ReactorPool {
                 num_files = aof_paths.len(),
                 "starting K-Way merge AOF replay into shared keyspace..."
             );
-            match AofReader::replay_merge(&aof_paths, &keyspace) {
-                Ok(stats) => {
-                    tracing::info!(
-                        files_merged = stats.files_merged,
-                        commands = stats.commands_replayed,
-                        bytes = stats.bytes_read,
-                        max_lsn = stats.max_lsn,
-                        duration_ms = stats.duration_ms,
-                        "AOF K-Way merge replay complete"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "AOF K-Way merge replay failed — data may be missing"
-                    );
-                }
-            }
+            let stats = AofReader::replay_merge(&aof_paths, &keyspace)?;
+            tracing::info!(
+                files_merged = stats.files_merged,
+                commands = stats.commands_replayed,
+                bytes = stats.bytes_read,
+                max_lsn = stats.max_lsn,
+                duration_ms = stats.duration_ms,
+                "AOF K-Way merge replay complete"
+            );
         }
+
+        keyspace.configure_eviction(config.max_memory, config.eviction_policy);
 
         // Distribute resources evenly across reactors.
         let per_reactor_conns = (config.max_connections / num_reactors).max(1);
@@ -177,6 +180,7 @@ impl ReactorPool {
             let core_id = core_ids.get(i).copied();
             let coord_clone = Arc::clone(&coordinator);
             let ks_clone = Arc::clone(&keyspace);
+            let aof_fatal_state_clone = Arc::clone(&aof_fatal_state);
 
             let reactor_config = ReactorConfig {
                 bind_addr: config.bind_addr,
@@ -205,11 +209,12 @@ impl ReactorPool {
                         }
                     }
 
-                    let mut reactor = match Reactor::with_shared_keyspace(
+                    let mut reactor = match Reactor::with_shared_keyspace_and_aof_state(
                         i,
                         reactor_config,
                         coord_clone,
                         ks_clone,
+                        aof_fatal_state_clone,
                         num_reactors,
                     ) {
                         Ok(r) => r,

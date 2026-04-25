@@ -3,8 +3,10 @@
 //! Each reactor is pinned to a CPU core and owns its own I/O backend,
 //! connection slab, buffer pool, timer wheel, and buffer state.
 
+use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::backend::{
     ACCEPT_CONN_ID, Completion, IoBackend, OpType, PollingBackend, decode_token, encode_token,
@@ -13,16 +15,19 @@ use crate::connection::{ConnectionFlags, ConnectionMeta, ConnectionSlab, Connect
 use crate::pool::IoBackendMode;
 use crate::shutdown::ShutdownCoordinator;
 use crate::timer::{ExpiredTimer, TimerWheel};
-use vortex_common::Timestamp;
-use vortex_engine::ConcurrentKeyspace;
-use vortex_engine::commands::{CmdResult, arg_bytes, arg_count, execute_command};
+use vortex_common::{Timestamp, current_unix_time_nanos};
+use vortex_engine::commands::{
+    CmdResult, CommandClock, arg_bytes, arg_count, execute_command, key_from_bytes,
+};
 use vortex_engine::keyspace::DEFAULT_SHARD_COUNT;
+use vortex_engine::keyspace::WatchKeyState;
+use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_memory::{ArenaAllocator, BufferPool};
 use vortex_persist::aof::rewrite::AofRewriter;
 use vortex_persist::aof::writer::AofFileWriter;
 use vortex_proto::{
-    CommandRouter, DispatchResult, FrameRef, IovecWriter, ParseError, RespFrame, RespSerializer,
-    RespTape,
+    BorrowedRespTape, CommandFlags, CommandRouter, DispatchResult, FrameRef, IovecWriter,
+    ParseError, RespFrame, RespSerializer, TapeEntry,
 };
 
 /// Default read buffer size per connection (16 KB).
@@ -30,19 +35,39 @@ const DEFAULT_BUF_SIZE: usize = 16_384;
 
 /// Maximum completions processed per iteration.
 const MAX_COMPLETIONS: usize = 256;
+/// Maximum extra sockets drained after one accept readiness notification.
+const ACCEPT_DRAIN_BUDGET: usize = 512;
 
 /// Pre-computed RESP error for unknown commands.
 static RESP_ERR_UNKNOWN: &[u8] = b"-ERR unknown command\r\n";
+static RESP_ERR_WRONG_ARGC: &[u8] = b"-ERR wrong number of arguments for command\r\n";
 /// Pre-computed RESP error for protocol failures.
 static RESP_ERR_PROTOCOL: &[u8] = b"-ERR protocol error\r\n";
+static RESP_ERR_AOF_MISCONF: &[u8] =
+    b"-MISCONF AOF persistence error; write commands are disabled until the issue is resolved\r\n";
+static RESP_ERR_CONFIG_SET_MAXMEMORY: &[u8] = b"-ERR invalid argument for CONFIG SET maxmemory\r\n";
+static RESP_ERR_CONFIG_SET_POLICY: &[u8] =
+    b"-ERR invalid argument for CONFIG SET maxmemory-policy\r\n";
 
 /// Responses smaller than this threshold are copied into the write buffer.
 /// Larger responses use scatter-gather `writev` to avoid contiguous copies.
 #[allow(dead_code)] // Infrastructure for Phase 2.5 engine command integration.
 const WRITEV_THRESHOLD: usize = 256;
+const MAX_TRANSACTION_COMMANDS: usize = 128;
+
+static RESP_QUEUED: &[u8] = b"+QUEUED\r\n";
+static RESP_NULL_ARRAY: &[u8] = b"*-1\r\n";
+static RESP_ERR_EXEC_WITHOUT_MULTI: &[u8] = b"-ERR EXEC without MULTI\r\n";
+static RESP_ERR_DISCARD_WITHOUT_MULTI: &[u8] = b"-ERR DISCARD without MULTI\r\n";
+static RESP_ERR_NESTED_MULTI: &[u8] = b"-ERR MULTI calls can not be nested\r\n";
+static RESP_ERR_WATCH_INSIDE_MULTI: &[u8] = b"-ERR WATCH inside MULTI is not allowed\r\n";
+static RESP_ERR_EXECABORT: &[u8] =
+    b"-EXECABORT Transaction discarded because of previous errors.\r\n";
+static RESP_ERR_TX_QUEUE_FULL: &[u8] = b"-ERR transaction queue limit exceeded\r\n";
 
 /// Command response type — determines serialization strategy.
 #[allow(dead_code)] // Frame variant is infrastructure for Phase 2.5 engine commands.
+#[derive(Debug)]
 enum CommandResponse {
     /// Pre-computed static response (PONG, OK, ERR).
     /// Copied directly into the connection write buffer.
@@ -53,6 +78,111 @@ enum CommandResponse {
     /// Uses `serialize_to_iovecs()` + `submit_writev()` for large responses,
     /// or `serialize_to_slice()` + memcpy for small ones.
     Frame(RespFrame),
+    /// Owned serialized RESP bytes.
+    Owned(Box<[u8]>),
+}
+
+#[derive(Default)]
+struct TransactionState {
+    queueing: bool,
+    dirty: bool,
+    queued: Vec<Box<[u8]>>,
+    watched: Vec<WatchKeyState>,
+    watch_epoch: u64,
+}
+
+impl TransactionState {
+    #[inline]
+    fn reset_multi(&mut self) {
+        self.queueing = false;
+        self.dirty = false;
+        self.queued.clear();
+    }
+
+    #[inline]
+    fn reset_all(&mut self) {
+        self.reset_multi();
+        self.watched.clear();
+        self.watch_epoch = 0;
+    }
+}
+
+fn config_pair_response(param: &'static [u8], value: Vec<u8>) -> (CommandResponse, bool) {
+    (
+        CommandResponse::Frame(RespFrame::Array(Some(vec![
+            RespFrame::BulkString(Some(bytes::Bytes::from_static(param))),
+            RespFrame::BulkString(Some(bytes::Bytes::from(value))),
+        ]))),
+        false,
+    )
+}
+
+#[inline]
+fn push_resp_array_len(buf: &mut Vec<u8>, len: usize) {
+    buf.push(b'*');
+    buf.extend_from_slice(len.to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
+#[inline]
+fn push_resp_bulk_string(buf: &mut Vec<u8>, value: &[u8]) {
+    buf.push(b'$');
+    buf.extend_from_slice(value.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(value);
+    buf.extend_from_slice(b"\r\n");
+}
+
+fn append_cmd_result(buf: &mut Vec<u8>, result: CmdResult) {
+    match result {
+        CmdResult::Static(bytes) => buf.extend_from_slice(bytes),
+        CmdResult::Inline(inline) => buf.extend_from_slice(inline.as_bytes()),
+        CmdResult::Resp(frame) => append_resp_frame(buf, &frame),
+    }
+}
+
+fn append_resp_frame(buf: &mut Vec<u8>, frame: &RespFrame) {
+    let start = buf.len();
+    let mut len = 128usize;
+    loop {
+        buf.resize(start + len, 0);
+        if let Some(written) = RespSerializer::serialize_to_slice(frame, &mut buf[start..]) {
+            buf.truncate(start + written);
+            return;
+        }
+        len = len.saturating_mul(2);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AofFatalState {
+    failed: AtomicBool,
+}
+
+impl AofFatalState {
+    #[inline]
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    fn mark_failed(&self, reactor_id: usize, context: &'static str, error: &io::Error) {
+        let was_failed = self.failed.swap(true, Ordering::Relaxed);
+        if was_failed {
+            tracing::debug!(
+                reactor_id,
+                context,
+                error = %error,
+                "AOF fatal state already set"
+            );
+        } else {
+            tracing::error!(
+                reactor_id,
+                context,
+                error = %error,
+                "AOF persistence failed; rejecting future writes"
+            );
+        }
+    }
 }
 
 struct PendingWritev {
@@ -131,6 +261,43 @@ impl PendingWritev {
             self.total_len -= consumed;
             self.iov_start += 1;
         }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InflightOps {
+    read: bool,
+    write: bool,
+    writev: bool,
+    close: bool,
+}
+
+impl InflightOps {
+    #[inline]
+    fn mark_submitted(&mut self, op: OpType) {
+        match op {
+            OpType::Read => self.read = true,
+            OpType::Write => self.write = true,
+            OpType::Writev => self.writev = true,
+            OpType::Close => self.close = true,
+            OpType::Accept => {}
+        }
+    }
+
+    #[inline]
+    fn mark_completed(&mut self, op: OpType) {
+        match op {
+            OpType::Read => self.read = false,
+            OpType::Write => self.write = false,
+            OpType::Writev => self.writev = false,
+            OpType::Close => self.close = false,
+            OpType::Accept => {}
+        }
+    }
+
+    #[inline]
+    fn has_any(&self) -> bool {
+        self.read || self.write || self.writev || self.close
     }
 }
 
@@ -265,6 +432,12 @@ pub struct Reactor {
     /// frames, serializer scratch, and raw iovec array for any in-flight
     /// WRITEV operation so io_uring can safely complete asynchronously.
     writev_states: Vec<PendingWritev>,
+    /// Per-connection in-flight I/O ownership. Buffers must not be released
+    /// until all tracked ops have completed or been canceled.
+    inflight_ops: Vec<InflightOps>,
+    /// Per-connection MULTI/WATCH state. Kept outside `ConnectionMeta` so the
+    /// hot connection cache line stays fixed at 64 bytes.
+    transaction_states: Vec<TransactionState>,
     /// Command dispatch router with PHF lookup.
     command_router: CommandRouter,
     /// Shared concurrent keyspace — all reactors operate on the same data.
@@ -272,6 +445,8 @@ pub struct Reactor {
     /// Cached monotonic timestamp (nanoseconds) for the current event-loop iteration.
     /// Avoids re-reading the clock for every command in a batch.
     cached_nanos: u64,
+    /// Cached Unix wall-clock timestamp (nanoseconds) paired with `cached_nanos`.
+    cached_unix_nanos: u64,
     /// Next time at which the background active-expiry sweep should run.
     /// Active expiry is opportunistic cleanup; lazy expiry on key access
     /// remains the correctness path for expired reads.
@@ -285,12 +460,18 @@ pub struct Reactor {
     /// Reusable scratch buffer for serializing RESP frames to AOF.
     /// 4 KB is enough for any single command (max key 512 bytes + value + overhead).
     aof_scratch: Vec<u8>,
+    /// Shared durable-write health state. Once persistence fails, reactors
+    /// reject future write commands before mutating the keyspace.
+    aof_fatal_state: Arc<AofFatalState>,
     /// Active expiry: current shard index being swept by this reactor.
     /// Each reactor sweeps different shards in round-robin fashion to
     /// distribute expiry load across the pool.
     expiry_shard_cursor: usize,
     /// Active expiry: current slot offset within the current shard.
     expiry_slot_cursor: usize,
+    /// Reusable RESP parser tape entries. Kept reactor-local so command
+    /// parsing does not allocate on every read batch.
+    parse_entries: Vec<TapeEntry>,
 }
 
 impl Reactor {
@@ -306,7 +487,16 @@ impl Reactor {
     ) -> std::io::Result<Self> {
         let backend = make_backend(&config)?;
         let keyspace = Arc::new(ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT));
-        Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, 1)
+        let aof_fatal_state = Arc::new(AofFatalState::default());
+        Self::with_keyspace_and_backend(
+            id,
+            config,
+            coordinator,
+            keyspace,
+            backend,
+            aof_fatal_state,
+            1,
+        )
     }
 
     /// Creates a new reactor with a specific backend and a fresh keyspace.
@@ -317,7 +507,16 @@ impl Reactor {
         backend: Box<dyn IoBackend>,
     ) -> std::io::Result<Self> {
         let keyspace = Arc::new(ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT));
-        Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, 1)
+        let aof_fatal_state = Arc::new(AofFatalState::default());
+        Self::with_keyspace_and_backend(
+            id,
+            config,
+            coordinator,
+            keyspace,
+            backend,
+            aof_fatal_state,
+            1,
+        )
     }
 
     /// Creates a new reactor with a shared keyspace (used by `ReactorPool`).
@@ -338,8 +537,35 @@ impl Reactor {
         keyspace: Arc<ConcurrentKeyspace>,
         num_reactors: usize,
     ) -> std::io::Result<Self> {
+        let aof_fatal_state = Arc::new(AofFatalState::default());
+        Self::with_shared_keyspace_and_aof_state(
+            id,
+            config,
+            coordinator,
+            keyspace,
+            aof_fatal_state,
+            num_reactors,
+        )
+    }
+
+    pub(crate) fn with_shared_keyspace_and_aof_state(
+        id: usize,
+        config: ReactorConfig,
+        coordinator: Arc<ShutdownCoordinator>,
+        keyspace: Arc<ConcurrentKeyspace>,
+        aof_fatal_state: Arc<AofFatalState>,
+        num_reactors: usize,
+    ) -> std::io::Result<Self> {
         let backend = make_backend(&config)?;
-        Self::with_keyspace_and_backend(id, config, coordinator, keyspace, backend, num_reactors)
+        Self::with_keyspace_and_backend(
+            id,
+            config,
+            coordinator,
+            keyspace,
+            backend,
+            aof_fatal_state,
+            num_reactors,
+        )
     }
 
     /// Internal constructor — all public constructors delegate here.
@@ -349,6 +575,7 @@ impl Reactor {
         coordinator: Arc<ShutdownCoordinator>,
         keyspace: Arc<ConcurrentKeyspace>,
         backend: Box<dyn IoBackend>,
+        aof_fatal_state: Arc<AofFatalState>,
         num_reactors: usize,
     ) -> std::io::Result<Self> {
         // Create the listener socket with SO_REUSEPORT + SO_REUSEADDR + SO_INCOMING_CPU.
@@ -412,6 +639,9 @@ impl Reactor {
         } else {
             None
         };
+        if aof_writer.is_some() {
+            keyspace.enable_aof_recording();
+        }
 
         // Stagger the starting shard cursor by reactor ID so each reactor
         // sweeps a distinct region, distributing expiry work evenly.
@@ -419,6 +649,7 @@ impl Reactor {
         let expiry_shard_cursor = id * (keyspace.num_shards() / num_reactors.max(1)).max(1);
 
         let cached_nanos = Timestamp::now().as_nanos();
+        let cached_unix_nanos = current_unix_time_nanos();
 
         Ok(Self {
             id,
@@ -441,14 +672,21 @@ impl Reactor {
             writev_states: std::iter::repeat_with(PendingWritev::new)
                 .take(max_conn)
                 .collect(),
+            inflight_ops: vec![InflightOps::default(); max_conn],
+            transaction_states: std::iter::repeat_with(TransactionState::default)
+                .take(max_conn)
+                .collect(),
             command_router: CommandRouter::new(),
             keyspace,
             cached_nanos,
+            cached_unix_nanos,
             next_active_expiry_nanos: cached_nanos,
             aof_writer,
             aof_scratch: vec![0u8; 4096],
+            aof_fatal_state,
             expiry_shard_cursor,
             expiry_slot_cursor: 0,
+            parse_entries: Vec::with_capacity(64),
         })
     }
 
@@ -468,6 +706,7 @@ impl Reactor {
         loop {
             // Cache monotonic time once per iteration and derive the seconds view from it.
             self.cached_nanos = Timestamp::now().as_nanos();
+            self.cached_unix_nanos = current_unix_time_nanos();
             self.now_secs = ((self.cached_nanos - self.start_nanos) / 1_000_000_000) as u32;
 
             // 1. Flush pending submissions.
@@ -562,25 +801,28 @@ impl Reactor {
             {
                 let now = self.cached_nanos;
                 if now >= self.next_active_expiry_nanos {
-                    let num_shards = self.keyspace.num_shards();
                     const ACTIVE_EXPIRY_INTERVAL_NANOS: u64 = 1_000_000;
                     const MAX_EXPIRY_ITERS: usize = 3;
                     const MAX_EFFORT: usize = 20;
                     self.next_active_expiry_nanos =
                         now.saturating_add(ACTIVE_EXPIRY_INTERVAL_NANOS);
-                    for _ in 0..MAX_EXPIRY_ITERS {
-                        let shard_idx = self.expiry_shard_cursor % num_shards;
-                        let (expired, sampled) = self.keyspace.run_active_expiry_on_shard(
-                            shard_idx,
-                            self.expiry_slot_cursor,
-                            MAX_EFFORT,
-                            now,
-                        );
-                        // Advance cursors for next sweep.
-                        self.expiry_slot_cursor = self.expiry_slot_cursor.wrapping_add(MAX_EFFORT);
-                        self.expiry_shard_cursor = self.expiry_shard_cursor.wrapping_add(1);
-                        if sampled == 0 || expired * 4 <= sampled {
-                            break;
+                    if self.keyspace.has_expiring_keys() {
+                        let num_shards = self.keyspace.num_shards();
+                        for _ in 0..MAX_EXPIRY_ITERS {
+                            let shard_idx = self.expiry_shard_cursor % num_shards;
+                            let (expired, sampled) = self.keyspace.run_active_expiry_on_shard(
+                                shard_idx,
+                                self.expiry_slot_cursor,
+                                MAX_EFFORT,
+                                now,
+                            );
+                            // Advance cursors for next sweep.
+                            self.expiry_slot_cursor =
+                                self.expiry_slot_cursor.wrapping_add(MAX_EFFORT);
+                            self.expiry_shard_cursor = self.expiry_shard_cursor.wrapping_add(1);
+                            if sampled == 0 || expired * 4 <= sampled {
+                                break;
+                            }
                         }
                     }
                 }
@@ -590,7 +832,10 @@ impl Reactor {
             // at most once per second. No-op for `always` (synced inline)
             // or `no` (OS-managed). Cheap: just checks a timestamp.
             if let Some(ref mut w) = self.aof_writer {
-                let _ = w.maybe_fsync();
+                if let Err(error) = w.maybe_fsync() {
+                    self.aof_fatal_state
+                        .mark_failed(self.id, "maybe_fsync", &error);
+                }
             }
 
             // 6. Check for force-kill (immediate exit, no flushing).
@@ -673,10 +918,43 @@ impl Reactor {
             return;
         }
 
-        let new_fd = cqe.result;
+        self.handle_accepted_fd(cqe.result);
+        self.drain_ready_accepts();
 
-        // Set TCP_NODELAY on the new connection.
-        // SAFETY: new_fd is a valid socket fd just returned by accept.
+        // Re-arm accept (unless draining).
+        if !self.draining {
+            let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
+            let _ = self.backend.submit_accept(self.listener_fd, token);
+        }
+    }
+
+    fn drain_ready_accepts(&mut self) {
+        for _ in 0..ACCEPT_DRAIN_BUDGET {
+            let result = unsafe {
+                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+                let mut addr_len: libc::socklen_t =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                libc::accept(
+                    self.listener_fd,
+                    &mut addr as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+                    &mut addr_len,
+                )
+            };
+
+            if result >= 0 {
+                self.handle_accepted_fd(result);
+                continue;
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                tracing::warn!(errno = err.raw_os_error().unwrap_or(1), "accept failed");
+            }
+            break;
+        }
+    }
+
+    fn handle_accepted_fd(&mut self, new_fd: RawFd) {
         unsafe {
             let nodelay: libc::c_int = 1;
             libc::setsockopt(
@@ -686,102 +964,86 @@ impl Reactor {
                 &nodelay as *const libc::c_int as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
-            // Set non-blocking.
             let flags = libc::fcntl(new_fd, libc::F_GETFL);
             libc::fcntl(new_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
 
-        // Check if we have capacity.
         if self.connections.len() >= self.config.max_connections {
             tracing::warn!("max connections reached, rejecting");
-            // SAFETY: new_fd is a valid fd.
             unsafe {
                 libc::close(new_fd);
             }
-        } else {
-            // Lease read and write buffers from the mmap pool.
-            let read_idx = match self.buffer_pool.lease_index() {
-                Some(idx) => idx,
-                None => {
-                    tracing::warn!("buffer pool exhausted (read), rejecting connection");
-                    unsafe {
-                        libc::close(new_fd);
-                    }
-                    if !self.draining {
-                        let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-                        let _ = self.backend.submit_accept(self.listener_fd, token);
-                    }
-                    return;
-                }
-            };
-            let write_idx = match self.buffer_pool.lease_index() {
-                Some(idx) => idx,
-                None => {
-                    tracing::warn!("buffer pool exhausted (write), rejecting connection");
-                    self.buffer_pool.release_index(read_idx);
-                    unsafe {
-                        libc::close(new_fd);
-                    }
-                    if !self.draining {
-                        let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-                        let _ = self.backend.submit_accept(self.listener_fd, token);
-                    }
-                    return;
-                }
-            };
-
-            // Allocate slab slot.
-            let mut meta = ConnectionMeta::new(new_fd, 0);
-            meta.last_active = self.now_secs;
-            meta.read_buf_offset = read_idx as u32;
-            meta.write_buf_offset = write_idx as u32;
-            meta.read_buf_len = 0;
-            meta.write_buf_len = 0;
-            let conn_id = self.connections.insert(meta);
-
-            // Bump generation for this slot (wraps at 24-bit boundary).
-            if conn_id < self.generations.len() {
-                self.generations[conn_id] = self.generations[conn_id].wrapping_add(1) & 0xFF_FFFF;
-            }
-            let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
-            self.writev_states[conn_id].clear();
-
-            tracing::debug!(
-                reactor_id = self.id,
-                conn_id,
-                fd = new_fd,
-                cgen,
-                read_idx,
-                write_idx,
-                "connection accepted"
-            );
-
-            // Schedule idle timeout.
-            if self.connection_timeout > 0 {
-                let deadline = self.now_secs + self.connection_timeout;
-                let entry = self.timer_wheel.schedule(conn_id, cgen, deadline);
-                if let Some(c) = self.connections.get_mut(conn_id) {
-                    c.timer_slot = entry;
-                }
-            }
-
-            // Submit read for this connection.
-            self.submit_read_for(conn_id, new_fd);
+            return;
         }
 
-        // Re-arm accept (unless draining).
-        if !self.draining {
-            let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-            let _ = self.backend.submit_accept(self.listener_fd, token);
+        let read_idx = match self.buffer_pool.lease_index() {
+            Some(idx) => idx,
+            None => {
+                tracing::warn!("buffer pool exhausted (read), rejecting connection");
+                unsafe {
+                    libc::close(new_fd);
+                }
+                return;
+            }
+        };
+        let write_idx = match self.buffer_pool.lease_index() {
+            Some(idx) => idx,
+            None => {
+                tracing::warn!("buffer pool exhausted (write), rejecting connection");
+                self.buffer_pool.release_index(read_idx);
+                unsafe {
+                    libc::close(new_fd);
+                }
+                return;
+            }
+        };
+
+        let mut meta = ConnectionMeta::new(new_fd, 0);
+        meta.last_active = self.now_secs;
+        meta.read_buf_offset = read_idx as u32;
+        meta.write_buf_offset = write_idx as u32;
+        meta.read_buf_len = 0;
+        meta.write_buf_len = 0;
+        let conn_id = self.connections.insert(meta);
+
+        if conn_id < self.generations.len() {
+            self.generations[conn_id] = self.generations[conn_id].wrapping_add(1) & 0xFF_FFFF;
         }
+        let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
+        self.writev_states[conn_id].clear();
+        self.inflight_ops[conn_id] = InflightOps::default();
+        self.transaction_states[conn_id].reset_all();
+
+        tracing::debug!(
+            reactor_id = self.id,
+            conn_id,
+            fd = new_fd,
+            cgen,
+            read_idx,
+            write_idx,
+            "connection accepted"
+        );
+
+        if self.connection_timeout > 0 {
+            let deadline = self.now_secs + self.connection_timeout;
+            let entry = self.timer_wheel.schedule(conn_id, cgen, deadline);
+            if let Some(c) = self.connections.get_mut(conn_id) {
+                c.timer_slot = entry;
+            }
+        }
+
+        self.submit_read_for(conn_id, new_fd);
     }
 
     // ── Read handler ───────────────────────────────────────────────
 
     fn handle_read(&mut self, conn_id: usize, cqe: &Completion) {
+        self.mark_inflight_completed(conn_id, OpType::Read);
+
         // Ignore late completions for connections being torn down.
         if let Some(c) = self.connections.get(conn_id) {
             if c.is_closing() {
+                self.maybe_finalize_close(conn_id);
                 return;
             }
         }
@@ -861,13 +1123,17 @@ impl Reactor {
         // Tracks whether we've switched to scatter-gather mode for this batch.
         // Once true, all subsequent responses go through the IovecWriter.
         let mut scatter_gather = false;
+        let mut parse_entries = std::mem::take(&mut self.parse_entries);
 
         while offset < cursor {
-            match RespTape::parse_pipeline(&read_slice[offset..cursor]) {
+            match BorrowedRespTape::parse_pipeline_into(
+                &read_slice[offset..cursor],
+                &mut parse_entries,
+            ) {
                 Ok(tape) => {
                     let batch_end = offset + tape.consumed();
                     for frame in tape.iter() {
-                        let (response, should_close) = self.dispatch_command(&frame);
+                        let (response, should_close) = self.dispatch_command(conn_id, &frame);
                         if should_close {
                             close_after_write = true;
                         }
@@ -908,6 +1174,26 @@ impl Reactor {
                                                 .push_bytes(&write_buf[..write_cursor]);
                                         }
                                         self.writev_states[conn_id].push_inline(buf);
+                                    }
+                                }
+                            }
+                            CommandResponse::Owned(bytes) => {
+                                let buf = bytes.as_ref();
+                                if scatter_gather {
+                                    self.writev_states[conn_id].push_bytes(buf);
+                                } else {
+                                    let end = write_cursor + buf.len();
+                                    if end <= buf_size {
+                                        write_buf[write_cursor..end].copy_from_slice(buf);
+                                        write_cursor = end;
+                                    } else {
+                                        scatter_gather = true;
+                                        self.writev_states[conn_id].clear();
+                                        if write_cursor > 0 {
+                                            self.writev_states[conn_id]
+                                                .push_bytes(&write_buf[..write_cursor]);
+                                        }
+                                        self.writev_states[conn_id].push_bytes(buf);
                                     }
                                 }
                             }
@@ -957,6 +1243,8 @@ impl Reactor {
                                 "protocol error response does not fit, closing"
                             );
                             self.close_connection(conn_id);
+                            parse_entries.clear();
+                            self.parse_entries = parse_entries;
                             return;
                         }
                         write_buf[write_cursor..end].copy_from_slice(RESP_ERR_PROTOCOL);
@@ -988,6 +1276,9 @@ impl Reactor {
             }
         }
 
+        parse_entries.clear();
+        self.parse_entries = parse_entries;
+
         // Write all responses, or re-arm read if no complete command was parsed.
         if scatter_gather {
             // Scatter-gather path: submit writev with the assembled iovecs.
@@ -1007,6 +1298,8 @@ impl Reactor {
                 {
                     self.writev_states[conn_id].clear();
                     self.close_connection(conn_id);
+                } else {
+                    self.mark_inflight_submitted(conn_id, OpType::Writev);
                 }
             } else if close_after_write {
                 self.close_connection(conn_id);
@@ -1021,13 +1314,21 @@ impl Reactor {
             }
             let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
             let token = encode_token(conn_id, cgen, OpType::Write);
-            let _ = self.backend.submit_write_fixed(
-                fd,
-                write_ptr as *const u8,
-                write_cursor,
-                write_idx as u16,
-                token,
-            );
+            if self
+                .backend
+                .submit_write_fixed(
+                    fd,
+                    write_ptr as *const u8,
+                    write_cursor,
+                    write_idx as u16,
+                    token,
+                )
+                .is_ok()
+            {
+                self.mark_inflight_submitted(conn_id, OpType::Write);
+            } else {
+                self.close_connection(conn_id);
+            }
         } else if close_after_write {
             self.close_connection(conn_id);
         } else if self.draining {
@@ -1039,69 +1340,377 @@ impl Reactor {
         }
     }
 
+    #[inline]
+    fn clear_watches(&mut self, conn_id: usize) {
+        if conn_id >= self.transaction_states.len() {
+            return;
+        }
+        let watched = std::mem::take(&mut self.transaction_states[conn_id].watched);
+        self.transaction_states[conn_id].watch_epoch = 0;
+        if !watched.is_empty() {
+            self.keyspace.unwatch_keys(&watched);
+        }
+    }
+
+    #[inline]
+    fn clear_transaction_state(&mut self, conn_id: usize) {
+        if conn_id >= self.transaction_states.len() {
+            return;
+        }
+        self.clear_watches(conn_id);
+        self.transaction_states[conn_id].reset_all();
+    }
+
+    fn normalized_command_name(frame: &FrameRef<'_>) -> Option<([u8; 32], usize)> {
+        let cmd_name = frame.command_name()?;
+        let len = cmd_name.len();
+        if len == 0 || len > 32 {
+            return None;
+        }
+        let mut upper = [0u8; 32];
+        upper[..len].copy_from_slice(cmd_name);
+        upper[..len].make_ascii_uppercase();
+        Some((upper, len))
+    }
+
+    fn frame_to_owned_resp(&mut self, frame: &FrameRef<'_>) -> io::Result<Box<[u8]>> {
+        let written = loop {
+            if let Some(written) = frame.write_resp_to(&mut self.aof_scratch) {
+                break written;
+            }
+
+            let next_len = self
+                .aof_scratch
+                .len()
+                .max(1)
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "RESP frame exceeded scratch buffer growth limit",
+                    )
+                })?;
+            self.aof_scratch.resize(next_len, 0);
+        };
+        Ok(self.aof_scratch[..written].to_vec().into_boxed_slice())
+    }
+
+    fn queue_transaction_command(
+        &mut self,
+        conn_id: usize,
+        frame: &FrameRef<'_>,
+    ) -> CommandResponse {
+        if self.transaction_states[conn_id].queued.len() >= MAX_TRANSACTION_COMMANDS {
+            self.transaction_states[conn_id].dirty = true;
+            return CommandResponse::Static(RESP_ERR_TX_QUEUE_FULL);
+        }
+
+        match self.command_router.dispatch(frame) {
+            DispatchResult::Dispatch { meta, .. } => {
+                if self.aof_writer.is_some()
+                    && self.aof_fatal_state.is_failed()
+                    && meta.flags.contains(CommandFlags::WRITE)
+                {
+                    self.transaction_states[conn_id].dirty = true;
+                    return CommandResponse::Static(RESP_ERR_AOF_MISCONF);
+                }
+            }
+            DispatchResult::WrongArity { .. } => {
+                self.transaction_states[conn_id].dirty = true;
+                return CommandResponse::Static(RESP_ERR_WRONG_ARGC);
+            }
+            DispatchResult::UnknownCommand => {
+                self.transaction_states[conn_id].dirty = true;
+                return CommandResponse::Static(RESP_ERR_UNKNOWN);
+            }
+        }
+
+        match self.frame_to_owned_resp(frame) {
+            Ok(payload) => {
+                self.transaction_states[conn_id].queued.push(payload);
+                CommandResponse::Static(RESP_QUEUED)
+            }
+            Err(_) => {
+                self.transaction_states[conn_id].dirty = true;
+                CommandResponse::Static(RESP_ERR_PROTOCOL)
+            }
+        }
+    }
+
+    fn handle_watch(&mut self, conn_id: usize, frame: &FrameRef<'_>) -> CommandResponse {
+        let argc = match frame.element_count() {
+            Some(argc) if argc >= 2 => argc as usize,
+            _ => return CommandResponse::Static(RESP_ERR_WRONG_ARGC),
+        };
+
+        let mut keys = Vec::with_capacity(argc - 1);
+        let Some(mut children) = frame.children() else {
+            return CommandResponse::Static(RESP_ERR_WRONG_ARGC);
+        };
+        let _ = children.next();
+        for child in children {
+            let Some(key_bytes) = child.as_bytes() else {
+                return CommandResponse::Static(RESP_ERR_WRONG_ARGC);
+            };
+            keys.push(key_from_bytes(key_bytes));
+        }
+
+        if self.transaction_states[conn_id].watched.is_empty() {
+            self.transaction_states[conn_id].watch_epoch = self.keyspace.current_watch_epoch();
+        }
+
+        for key in keys {
+            if self.transaction_states[conn_id]
+                .watched
+                .iter()
+                .any(|watched| watched.key == key)
+            {
+                continue;
+            }
+            let watched = self.keyspace.watch_key(key);
+            self.transaction_states[conn_id].watched.push(watched);
+        }
+
+        CommandResponse::Static(vortex_engine::commands::RESP_OK)
+    }
+
+    fn queued_payload_has_write(&mut self, payload: &[u8]) -> bool {
+        let Ok(tape) = BorrowedRespTape::parse_pipeline(payload) else {
+            return false;
+        };
+        let Some(frame) = tape.iter().next() else {
+            return false;
+        };
+        match self.command_router.dispatch(&frame) {
+            DispatchResult::Dispatch { meta, .. } => meta.flags.contains(CommandFlags::WRITE),
+            _ => false,
+        }
+    }
+
+    fn queued_transaction_has_write(&mut self, queued: &[Box<[u8]>]) -> bool {
+        queued
+            .iter()
+            .any(|payload| self.queued_payload_has_write(payload.as_ref()))
+    }
+
+    fn execute_transaction(&mut self, conn_id: usize) -> (CommandResponse, bool) {
+        if conn_id >= self.transaction_states.len() || !self.transaction_states[conn_id].queueing {
+            return (CommandResponse::Static(RESP_ERR_EXEC_WITHOUT_MULTI), false);
+        }
+
+        if self.transaction_states[conn_id].dirty {
+            self.clear_transaction_state(conn_id);
+            return (CommandResponse::Static(RESP_ERR_EXECABORT), false);
+        }
+
+        let queued = std::mem::take(&mut self.transaction_states[conn_id].queued);
+        self.transaction_states[conn_id].queueing = false;
+        self.transaction_states[conn_id].dirty = false;
+
+        if self.aof_writer.is_some()
+            && self.aof_fatal_state.is_failed()
+            && self.queued_transaction_has_write(&queued)
+        {
+            self.clear_watches(conn_id);
+            return (CommandResponse::Static(RESP_ERR_AOF_MISCONF), false);
+        }
+
+        let keyspace = Arc::clone(&self.keyspace);
+        let _transaction_gate = keyspace.enter_transaction_gate();
+
+        let watched_changed = {
+            let tx = &self.transaction_states[conn_id];
+            !tx.watched.is_empty()
+                && keyspace.watched_keys_changed(tx.watch_epoch, tx.watched.as_slice())
+        };
+        if watched_changed {
+            self.clear_watches(conn_id);
+            return (CommandResponse::Static(RESP_NULL_ARRAY), false);
+        }
+
+        self.clear_watches(conn_id);
+
+        let mut response = Vec::with_capacity(32 + queued.len() * 8);
+        push_resp_array_len(&mut response, queued.len());
+
+        for payload in queued {
+            if let Err(error) = self.execute_queued_payload(payload.as_ref(), &mut response) {
+                self.aof_fatal_state
+                    .mark_failed(self.id, "append_transaction", &error);
+                return (CommandResponse::Static(RESP_ERR_AOF_MISCONF), false);
+            }
+        }
+
+        (CommandResponse::Owned(response.into_boxed_slice()), false)
+    }
+
+    fn execute_queued_payload(&mut self, payload: &[u8], response: &mut Vec<u8>) -> io::Result<()> {
+        let tape = BorrowedRespTape::parse_pipeline(payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "queued RESP parse failed"))?;
+        let frame = tape
+            .iter()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty queued command"))?;
+
+        let dispatch = self.command_router.dispatch(&frame);
+        match dispatch {
+            DispatchResult::Dispatch { name, .. } => {
+                let clock = CommandClock::new(self.cached_nanos, self.cached_unix_nanos);
+                match execute_command(&self.keyspace, name, &frame, clock) {
+                    Some(executed) => {
+                        let vortex_engine::commands::ExecutedCommand {
+                            response: command_response,
+                            aof_records,
+                            aof_lsn,
+                            aof_payload,
+                        } = executed;
+                        if let Some(records) = aof_records {
+                            for record in records {
+                                self.append_eviction_aof_record(record.lsn, record.key.as_bytes())?;
+                            }
+                        }
+                        if aof_lsn != vortex_engine::commands::NO_AOF_LSN {
+                            let payload = aof_payload.as_deref().unwrap_or(payload);
+                            self.append_aof_payload(aof_lsn, payload)?;
+                        }
+                        append_cmd_result(response, command_response);
+                    }
+                    None => response.extend_from_slice(b"-ERR command not yet implemented\r\n"),
+                }
+            }
+            DispatchResult::WrongArity { .. } => response.extend_from_slice(RESP_ERR_WRONG_ARGC),
+            DispatchResult::UnknownCommand => response.extend_from_slice(RESP_ERR_UNKNOWN),
+        }
+
+        Ok(())
+    }
+
     /// Dispatch a parsed tape frame through the engine.
     ///
     /// Uses O(1) perfect-hash lookup with SWAR uppercase normalization,
     /// then routes to `vortex_engine::commands::execute_command()` against
     /// the shared `ConcurrentKeyspace`.
     /// Returns `(CommandResponse, should_close)` — the bool signals QUIT.
-    fn dispatch_command(&mut self, frame: &FrameRef<'_>) -> (CommandResponse, bool) {
-        static RESP_ERR_WRONG_ARGC_PREFIX: &[u8] =
-            b"-ERR wrong number of arguments for command\r\n";
+    fn dispatch_command(
+        &mut self,
+        conn_id: usize,
+        frame: &FrameRef<'_>,
+    ) -> (CommandResponse, bool) {
+        let Some((upper, len)) = Self::normalized_command_name(frame) else {
+            return (CommandResponse::Static(RESP_ERR_UNKNOWN), false);
+        };
+        let command_name = &upper[..len];
 
-        // Intercept reactor-level commands before PHF dispatch to avoid
-        // borrow conflicts (dispatch borrows self.command_router mutably).
-        if let Some(cmd_name) = frame.command_name() {
-            // Quick uppercase check — command names are short (≤16 bytes).
-            let mut upper = [0u8; 16];
-            let len = cmd_name.len().min(16);
-            upper[..len].copy_from_slice(&cmd_name[..len]);
-            upper[..len].make_ascii_uppercase();
-
-            match &upper[..len] {
-                b"BGREWRITEAOF" => return self.handle_bgrewriteaof(),
-                b"CONFIG" => {
-                    if let Some(resp) = self.handle_config(frame) {
-                        return resp;
-                    }
-                    // Fall through to engine/PHF for unhandled CONFIG subcommands.
+        if conn_id < self.transaction_states.len() && self.transaction_states[conn_id].queueing {
+            match command_name {
+                b"MULTI" => return (CommandResponse::Static(RESP_ERR_NESTED_MULTI), false),
+                b"EXEC" => return self.execute_transaction(conn_id),
+                b"DISCARD" => {
+                    self.clear_transaction_state(conn_id);
+                    return (
+                        CommandResponse::Static(vortex_engine::commands::RESP_OK),
+                        false,
+                    );
                 }
-                _ => {}
+                b"WATCH" => return (CommandResponse::Static(RESP_ERR_WATCH_INSIDE_MULTI), false),
+                _ => return (self.queue_transaction_command(conn_id, frame), false),
             }
+        }
+
+        match command_name {
+            b"MULTI" => {
+                if conn_id < self.transaction_states.len() {
+                    let tx = &mut self.transaction_states[conn_id];
+                    tx.queueing = true;
+                    tx.dirty = false;
+                    tx.queued.clear();
+                }
+                return (
+                    CommandResponse::Static(vortex_engine::commands::RESP_OK),
+                    false,
+                );
+            }
+            b"EXEC" => return (CommandResponse::Static(RESP_ERR_EXEC_WITHOUT_MULTI), false),
+            b"DISCARD" => {
+                return (
+                    CommandResponse::Static(RESP_ERR_DISCARD_WITHOUT_MULTI),
+                    false,
+                );
+            }
+            b"WATCH" => return (self.handle_watch(conn_id, frame), false),
+            b"UNWATCH" => {
+                self.clear_watches(conn_id);
+                return (
+                    CommandResponse::Static(vortex_engine::commands::RESP_OK),
+                    false,
+                );
+            }
+            b"BGREWRITEAOF" => return self.handle_bgrewriteaof(),
+            b"CONFIG" => {
+                if let Some(resp) = self.handle_config(frame) {
+                    return resp;
+                }
+            }
+            _ => {}
         }
 
         match self.command_router.dispatch(frame) {
             DispatchResult::Dispatch { meta, name, .. } => {
-                // Route through the engine against the shared ConcurrentKeyspace.
-                let now = self.cached_nanos;
-                match execute_command(&self.keyspace, name, frame, now) {
-                    Some(executed) => match executed.response {
-                        CmdResult::Static(buf) => {
-                            let close = meta.name == "QUIT";
-                            if !close && self.aof_writer.is_some() {
-                                if let Some(lsn) = executed.aof_lsn {
-                                    self.append_to_aof(lsn, frame);
+                if self.aof_writer.is_some()
+                    && self.aof_fatal_state.is_failed()
+                    && meta.flags.contains(CommandFlags::WRITE)
+                {
+                    return (CommandResponse::Static(RESP_ERR_AOF_MISCONF), false);
+                }
+
+                let clock = CommandClock::new(self.cached_nanos, self.cached_unix_nanos);
+                let executed = {
+                    let _command_gate = self.keyspace.enter_command_gate_slot(self.id);
+                    execute_command(&self.keyspace, name, frame, clock)
+                };
+                match executed {
+                    Some(executed) => {
+                        let vortex_engine::commands::ExecutedCommand {
+                            response,
+                            aof_records,
+                            aof_lsn,
+                            aof_payload,
+                        } = executed;
+                        if let Some(records) = aof_records {
+                            for record in records {
+                                if let Err(error) = self
+                                    .append_eviction_aof_record(record.lsn, record.key.as_bytes())
+                                {
+                                    self.aof_fatal_state.mark_failed(
+                                        self.id,
+                                        "append_eviction_record",
+                                        &error,
+                                    );
+                                    return (CommandResponse::Static(RESP_ERR_AOF_MISCONF), false);
                                 }
                             }
-                            (CommandResponse::Static(buf), close)
                         }
-                        CmdResult::Inline(inline) => {
-                            if self.aof_writer.is_some() {
-                                if let Some(lsn) = executed.aof_lsn {
-                                    self.append_to_aof(lsn, frame);
-                                }
+                        if aof_lsn != vortex_engine::commands::NO_AOF_LSN {
+                            if let Err(error) =
+                                self.append_to_aof(aof_lsn, frame, aof_payload.as_deref())
+                            {
+                                self.aof_fatal_state.mark_failed(
+                                    self.id,
+                                    "append_with_lsn",
+                                    &error,
+                                );
+                                return (CommandResponse::Static(RESP_ERR_AOF_MISCONF), false);
                             }
-                            (CommandResponse::Inline(inline), false)
                         }
-                        CmdResult::Resp(f) => {
-                            if self.aof_writer.is_some() {
-                                if let Some(lsn) = executed.aof_lsn {
-                                    self.append_to_aof(lsn, frame);
-                                }
+                        match response {
+                            CmdResult::Static(buf) => {
+                                let close = meta.name == "QUIT";
+                                (CommandResponse::Static(buf), close)
                             }
-                            (CommandResponse::Frame(f), false)
+                            CmdResult::Inline(inline) => (CommandResponse::Inline(inline), false),
+                            CmdResult::Resp(f) => (CommandResponse::Frame(f), false),
                         }
-                    },
+                    }
                     None => {
                         // Engine doesn't handle this command — shouldn't happen
                         // since all PHF commands are wired, but handle gracefully.
@@ -1113,7 +1722,7 @@ impl Reactor {
                 }
             }
             DispatchResult::WrongArity { .. } => {
-                (CommandResponse::Static(RESP_ERR_WRONG_ARGC_PREFIX), false)
+                (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false)
             }
             DispatchResult::UnknownCommand => (CommandResponse::Static(RESP_ERR_UNKNOWN), false),
         }
@@ -1125,28 +1734,64 @@ impl Reactor {
     /// writes it with the LSN prefix to the AOF. This is the only AOF
     /// hot-path code.
     #[inline]
-    fn append_to_aof(&mut self, lsn: u64, frame: &FrameRef<'_>) {
-        // Serialize frame RESP into scratch buffer.
-        let written = match frame.write_resp_to(&mut self.aof_scratch) {
-            Some(n) => n,
-            None => {
-                // Scratch buffer too small — grow it and retry.
-                self.aof_scratch.resize(self.aof_scratch.len() * 2, 0);
-                match frame.write_resp_to(&mut self.aof_scratch) {
-                    Some(n) => n,
-                    None => {
-                        tracing::warn!("AOF: frame too large for scratch buffer, skipping");
-                        return;
-                    }
-                }
-            }
-        };
-
+    fn append_eviction_aof_record(&mut self, lsn: u64, key: &[u8]) -> io::Result<()> {
         if let Some(ref mut writer) = self.aof_writer {
-            if let Err(e) = writer.append_with_lsn(lsn, &self.aof_scratch[..written]) {
-                tracing::error!(error = %e, "AOF write failed");
+            self.aof_scratch.clear();
+            push_resp_array_len(&mut self.aof_scratch, 2);
+            push_resp_bulk_string(&mut self.aof_scratch, b"DEL");
+            push_resp_bulk_string(&mut self.aof_scratch, key);
+            writer.append_with_lsn(lsn, &self.aof_scratch)?;
+            if self.aof_scratch.len() < 4096 {
+                self.aof_scratch.resize(4096, 0);
             }
         }
+        Ok(())
+    }
+
+    #[inline]
+    fn append_aof_payload(&mut self, lsn: u64, payload: &[u8]) -> io::Result<()> {
+        if let Some(ref mut writer) = self.aof_writer {
+            writer.append_with_lsn(lsn, payload)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn append_to_aof(
+        &mut self,
+        lsn: u64,
+        frame: &FrameRef<'_>,
+        aof_payload: Option<&[u8]>,
+    ) -> io::Result<()> {
+        if let Some(ref mut writer) = self.aof_writer {
+            let payload = if let Some(payload) = aof_payload {
+                payload
+            } else {
+                let written = loop {
+                    if let Some(written) = frame.write_resp_to(&mut self.aof_scratch) {
+                        break written;
+                    }
+
+                    let next_len =
+                        self.aof_scratch
+                            .len()
+                            .max(1)
+                            .checked_mul(2)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "AOF frame exceeded scratch buffer growth limit",
+                                )
+                            })?;
+                    self.aof_scratch.resize(next_len, 0);
+                };
+                &self.aof_scratch[..written]
+            };
+
+            writer.append_with_lsn(lsn, payload)?;
+        }
+
+        Ok(())
     }
 
     /// Handle BGREWRITEAOF command.
@@ -1236,45 +1881,35 @@ impl Reactor {
             b"GET" => {
                 let param_lower: Vec<u8> = param.iter().map(|b| b.to_ascii_lowercase()).collect();
                 match param_lower.as_slice() {
-                    b"appendonly" => {
-                        let val = if self.aof_writer.is_some() {
-                            "yes"
+                    b"appendonly" => Some(config_pair_response(
+                        b"appendonly",
+                        if self.aof_writer.is_some() {
+                            b"yes".to_vec()
                         } else {
-                            "no"
-                        };
-                        Some((
-                            CommandResponse::Frame(RespFrame::Array(Some(vec![
-                                RespFrame::BulkString(Some(bytes::Bytes::from_static(
-                                    b"appendonly",
-                                ))),
-                                RespFrame::BulkString(Some(bytes::Bytes::from(
-                                    val.as_bytes().to_vec(),
-                                ))),
-                            ]))),
-                            false,
-                        ))
-                    }
-                    b"appendfsync" => {
-                        let val = match &self.config.aof_config {
+                            b"no".to_vec()
+                        },
+                    )),
+                    b"appendfsync" => Some(config_pair_response(
+                        b"appendfsync",
+                        match &self.config.aof_config {
                             Some(cfg) => match cfg.fsync_policy {
-                                vortex_persist::aof::AofFsyncPolicy::Always => "always",
-                                vortex_persist::aof::AofFsyncPolicy::Everysec => "everysec",
-                                vortex_persist::aof::AofFsyncPolicy::No => "no",
+                                vortex_persist::aof::AofFsyncPolicy::Always => b"always".to_vec(),
+                                vortex_persist::aof::AofFsyncPolicy::Everysec => {
+                                    b"everysec".to_vec()
+                                }
+                                vortex_persist::aof::AofFsyncPolicy::No => b"no".to_vec(),
                             },
-                            None => "everysec",
-                        };
-                        Some((
-                            CommandResponse::Frame(RespFrame::Array(Some(vec![
-                                RespFrame::BulkString(Some(bytes::Bytes::from_static(
-                                    b"appendfsync",
-                                ))),
-                                RespFrame::BulkString(Some(bytes::Bytes::from(
-                                    val.as_bytes().to_vec(),
-                                ))),
-                            ]))),
-                            false,
-                        ))
-                    }
+                            None => b"everysec".to_vec(),
+                        },
+                    )),
+                    b"maxmemory" => Some(config_pair_response(
+                        b"maxmemory",
+                        self.keyspace.max_memory().to_string().into_bytes(),
+                    )),
+                    b"maxmemory-policy" => Some(config_pair_response(
+                        b"maxmemory-policy",
+                        self.keyspace.eviction_policy().as_str().as_bytes().to_vec(),
+                    )),
                     _ => None, // Fall through to engine.
                 }
             }
@@ -1329,6 +1964,7 @@ impl Reactor {
                                 ) {
                                     Ok(w) => {
                                         self.aof_writer = Some(w);
+                                        self.keyspace.enable_aof_recording();
                                         self.config.aof_config = Some(aof_cfg);
                                         tracing::info!(
                                             reactor_id = self.id,
@@ -1347,6 +1983,7 @@ impl Reactor {
                             b"no" => {
                                 if let Some(ref mut w) = self.aof_writer {
                                     let _ = w.flush_and_sync();
+                                    self.keyspace.disable_aof_recording();
                                 }
                                 self.aof_writer = None;
                                 tracing::info!(reactor_id = self.id, "AOF disabled via CONFIG SET");
@@ -1360,6 +1997,32 @@ impl Reactor {
                             )),
                         }
                     }
+                    b"maxmemory" => {
+                        let Ok(raw_value) = std::str::from_utf8(value) else {
+                            return Some((
+                                CommandResponse::Static(RESP_ERR_CONFIG_SET_MAXMEMORY),
+                                false,
+                            ));
+                        };
+                        let Ok(max_memory) = raw_value.parse::<usize>() else {
+                            return Some((
+                                CommandResponse::Static(RESP_ERR_CONFIG_SET_MAXMEMORY),
+                                false,
+                            ));
+                        };
+                        self.keyspace.set_max_memory(max_memory);
+                        Some((CommandResponse::Static(b"+OK\r\n"), false))
+                    }
+                    b"maxmemory-policy" => {
+                        let Some(policy) = EvictionPolicy::parse_bytes(value) else {
+                            return Some((
+                                CommandResponse::Static(RESP_ERR_CONFIG_SET_POLICY),
+                                false,
+                            ));
+                        };
+                        self.keyspace.set_eviction_policy(policy);
+                        Some((CommandResponse::Static(b"+OK\r\n"), false))
+                    }
                     _ => None, // Fall through to engine.
                 }
             }
@@ -1370,9 +2033,18 @@ impl Reactor {
     // ── Write handler ──────────────────────────────────────────────
 
     fn handle_write(&mut self, conn_id: usize, op: OpType, cqe: &Completion) {
+        self.mark_inflight_completed(conn_id, op);
+
         // Ignore late completions for connections being torn down.
         if let Some(c) = self.connections.get(conn_id) {
             if c.is_closing() {
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.write_buf_len = 0;
+                }
+                if matches!(op, OpType::Writev) {
+                    self.writev_states[conn_id].clear();
+                }
+                self.maybe_finalize_close(conn_id);
                 return;
             }
         }
@@ -1405,13 +2077,21 @@ impl Reactor {
                     }
                     let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
                     let token = encode_token(conn_id, cgen, OpType::Write);
-                    let _ = self.backend.submit_write_fixed(
-                        fd,
-                        write_ptr as *const u8,
-                        remaining,
-                        write_idx as u16,
-                        token,
-                    );
+                    if self
+                        .backend
+                        .submit_write_fixed(
+                            fd,
+                            write_ptr as *const u8,
+                            remaining,
+                            write_idx as u16,
+                            token,
+                        )
+                        .is_ok()
+                    {
+                        self.mark_inflight_submitted(conn_id, OpType::Write);
+                    } else {
+                        self.close_connection(conn_id);
+                    }
                 }
                 OpType::Writev => {
                     self.writev_states[conn_id].advance(bytes_written);
@@ -1428,6 +2108,8 @@ impl Reactor {
                     {
                         self.writev_states[conn_id].clear();
                         self.close_connection(conn_id);
+                    } else {
+                        self.mark_inflight_submitted(conn_id, OpType::Writev);
                     }
                 }
                 _ => unreachable!(),
@@ -1458,19 +2140,8 @@ impl Reactor {
     // ── Close handler ──────────────────────────────────────────────
 
     fn handle_close(&mut self, conn_id: usize) {
-        if let Some(c) = self.connections.get(conn_id) {
-            // Release leased buffers back to the mmap pool.
-            let read_idx = c.read_buf_offset as usize;
-            let write_idx = c.write_buf_offset as usize;
-            self.buffer_pool.release_index(read_idx);
-            self.buffer_pool.release_index(write_idx);
-            if conn_id < self.writev_states.len() {
-                self.writev_states[conn_id].clear();
-            }
-
-            self.connections.remove(conn_id);
-            tracing::debug!(reactor_id = self.id, conn_id, "connection closed");
-        }
+        self.mark_inflight_completed(conn_id, OpType::Close);
+        self.maybe_finalize_close(conn_id);
     }
 
     // ── Helpers ────────────────────────────────────────────────────
@@ -1504,9 +2175,15 @@ impl Reactor {
         let buf_ptr = unsafe { self.buffer_pool.ptr(read_idx).add(cursor) };
         let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
         let token = encode_token(conn_id, cgen, OpType::Read);
-        let _ = self
+        if self
             .backend
-            .submit_read_fixed(fd, buf_ptr, remaining, read_idx as u16, token);
+            .submit_read_fixed(fd, buf_ptr, remaining, read_idx as u16, token)
+            .is_ok()
+        {
+            self.mark_inflight_submitted(conn_id, OpType::Read);
+        } else {
+            self.close_connection(conn_id);
+        }
     }
 
     /// Initiate a connection close.
@@ -1524,9 +2201,81 @@ impl Reactor {
             let _ = c.transition(ConnectionState::Closing);
         }
 
+        let inflight = self.inflight_ops.get(conn_id).copied().unwrap_or_default();
+
         let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
+        if inflight.read {
+            let _ = self
+                .backend
+                .submit_cancel(encode_token(conn_id, cgen, OpType::Read));
+        }
+        if inflight.write {
+            let _ = self
+                .backend
+                .submit_cancel(encode_token(conn_id, cgen, OpType::Write));
+        }
+        if inflight.writev {
+            let _ = self
+                .backend
+                .submit_cancel(encode_token(conn_id, cgen, OpType::Writev));
+        }
+
         let token = encode_token(conn_id, cgen, OpType::Close);
-        let _ = self.backend.submit_close(fd, token);
+        if self.backend.submit_close(fd, token).is_ok() {
+            self.mark_inflight_submitted(conn_id, OpType::Close);
+        } else {
+            tracing::warn!(conn_id, "submit_close failed, falling back to direct close");
+            // SAFETY: fd is owned by this connection and must be closed exactly once.
+            unsafe {
+                libc::close(fd);
+            }
+            self.maybe_finalize_close(conn_id);
+        }
+    }
+
+    #[inline]
+    fn mark_inflight_submitted(&mut self, conn_id: usize, op: OpType) {
+        if let Some(inflight) = self.inflight_ops.get_mut(conn_id) {
+            inflight.mark_submitted(op);
+        }
+    }
+
+    #[inline]
+    fn mark_inflight_completed(&mut self, conn_id: usize, op: OpType) {
+        if let Some(inflight) = self.inflight_ops.get_mut(conn_id) {
+            inflight.mark_completed(op);
+        }
+    }
+
+    fn maybe_finalize_close(&mut self, conn_id: usize) {
+        let Some(connection) = self.connections.get(conn_id) else {
+            return;
+        };
+        if !connection.is_closing() {
+            return;
+        }
+        if self
+            .inflight_ops
+            .get(conn_id)
+            .is_some_and(InflightOps::has_any)
+        {
+            return;
+        }
+
+        let read_idx = connection.read_buf_offset as usize;
+        let write_idx = connection.write_buf_offset as usize;
+        self.buffer_pool.release_index(read_idx);
+        self.buffer_pool.release_index(write_idx);
+        if conn_id < self.writev_states.len() {
+            self.writev_states[conn_id].clear();
+        }
+        if conn_id < self.inflight_ops.len() {
+            self.inflight_ops[conn_id] = InflightOps::default();
+        }
+        self.clear_transaction_state(conn_id);
+
+        self.connections.remove(conn_id);
+        tracing::debug!(reactor_id = self.id, conn_id, "connection closed");
     }
 
     // ── Timer management ───────────────────────────────────────────
@@ -1666,11 +2415,192 @@ impl Reactor {
     }
 }
 
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        if self.aof_writer.is_some() {
+            self.keyspace.disable_aof_recording();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shutdown::ShutdownCoordinator;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use vortex_persist::aof::{AofFsyncPolicy, reader::AofReader, writer::AofFileWriter};
+    use vortex_proto::RespTape;
 
     static RESP_PONG: &[u8] = b"+PONG\r\n";
+
+    fn test_reactor() -> Reactor {
+        let config = ReactorConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        };
+        Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))).unwrap()
+    }
+
+    #[derive(Default)]
+    struct MockBackendState {
+        cancels: Vec<u64>,
+        closes: Vec<u64>,
+        completions: VecDeque<Completion>,
+    }
+
+    struct MockBackend {
+        state: Arc<Mutex<MockBackendState>>,
+    }
+
+    impl IoBackend for MockBackend {
+        fn submit_accept(&mut self, _listener_fd: RawFd, _token: u64) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn submit_read(
+            &mut self,
+            _fd: RawFd,
+            _buf_ptr: *mut u8,
+            _buf_len: usize,
+            _token: u64,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn submit_write(
+            &mut self,
+            _fd: RawFd,
+            _buf_ptr: *const u8,
+            _buf_len: usize,
+            _token: u64,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn submit_writev(
+            &mut self,
+            _fd: RawFd,
+            _iovecs: *const libc::iovec,
+            _iov_count: usize,
+            _token: u64,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn submit_cancel(&mut self, token: u64) -> std::io::Result<()> {
+            self.state.lock().unwrap().cancels.push(token);
+            Ok(())
+        }
+
+        fn submit_close(&mut self, _fd: RawFd, token: u64) -> std::io::Result<()> {
+            self.state.lock().unwrap().closes.push(token);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
+        fn completions(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize> {
+            let mut state = self.state.lock().unwrap();
+            let start = out.len();
+            while let Some(cqe) = state.completions.pop_front() {
+                out.push(cqe);
+            }
+            Ok(out.len() - start)
+        }
+
+        fn drain_cq(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize> {
+            self.completions(out)
+        }
+    }
+
+    fn test_reactor_with_backend(state: Arc<Mutex<MockBackendState>>) -> Reactor {
+        let config = ReactorConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        };
+        Reactor::with_keyspace_and_backend(
+            0,
+            config,
+            Arc::new(ShutdownCoordinator::new(1)),
+            Arc::new(ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT)),
+            Box::new(MockBackend { state }),
+            Arc::new(AofFatalState::default()),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn temp_aof_path(suffix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vortex-reactor-test-{}-{}-{suffix}.aof",
+            std::process::id(),
+            COUNTER.fetch_add(1, AtomicOrdering::Relaxed),
+        ));
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn handle_config_wire(reactor: &mut Reactor, wire: &[u8]) -> (CommandResponse, bool) {
+        let tape = RespTape::parse_pipeline(wire).expect("valid RESP");
+        let frame = tape.iter().next().expect("at least one frame");
+        reactor.handle_config(&frame).expect("handled config")
+    }
+
+    fn dispatch_reactor_wire_on(
+        reactor: &mut Reactor,
+        conn_id: usize,
+        wire: &[u8],
+    ) -> (CommandResponse, bool) {
+        let tape = RespTape::parse_pipeline(wire).expect("valid RESP");
+        let frame = tape.iter().next().expect("at least one frame");
+        reactor.dispatch_command(conn_id, &frame)
+    }
+
+    fn dispatch_reactor_wire(reactor: &mut Reactor, wire: &[u8]) -> (CommandResponse, bool) {
+        dispatch_reactor_wire_on(reactor, 0, wire)
+    }
+
+    fn response_bytes(resp: CommandResponse) -> Vec<u8> {
+        match resp {
+            CommandResponse::Static(bytes) => bytes.to_vec(),
+            CommandResponse::Inline(inline) => inline.as_bytes().to_vec(),
+            CommandResponse::Owned(bytes) => bytes.into_vec(),
+            CommandResponse::Frame(frame) => {
+                let mut out = Vec::new();
+                append_resp_frame(&mut out, &frame);
+                out
+            }
+        }
+    }
+
+    fn expect_config_pair(resp: CommandResponse, expected_name: &[u8], expected_value: &[u8]) {
+        match resp {
+            CommandResponse::Frame(RespFrame::Array(Some(items))) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(bulk_bytes(&items[0]), expected_name);
+                assert_eq!(bulk_bytes(&items[1]), expected_value);
+            }
+            other => panic!("expected config pair response, got {other:?}"),
+        }
+    }
+
+    fn bulk_bytes(frame: &RespFrame) -> &[u8] {
+        match frame {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
 
     /// Helper: parse a single RESP wire command, route through engine dispatch.
     fn dispatch_wire(wire: &[u8]) -> (CommandResponse, bool) {
@@ -1696,10 +2626,9 @@ mod tests {
                     ),
                 }
             }
-            DispatchResult::WrongArity { .. } => (
-                CommandResponse::Static(b"-ERR wrong number of arguments for command\r\n"),
-                false,
-            ),
+            DispatchResult::WrongArity { .. } => {
+                (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false)
+            }
             DispatchResult::UnknownCommand => (CommandResponse::Static(RESP_ERR_UNKNOWN), false),
         }
     }
@@ -1726,6 +2655,149 @@ mod tests {
     }
 
     #[test]
+    fn multi_exec_queues_and_returns_array() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*2\r\n+OK\r\n$3\r\nbar\r\n");
+    }
+
+    #[test]
+    fn watch_aborts_when_other_connection_modifies_key() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            1,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$5\r\nother\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$6\r\nqueued\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
+        assert_eq!(response_bytes(resp), b"$-1\r\n");
+    }
+
+    #[test]
+    fn exec_appends_queued_writes_to_aof() {
+        let path = temp_aof_path("transaction-aof");
+        let mut reactor = test_reactor();
+        reactor.aof_writer = Some(AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap());
+        reactor.keyspace.enable_aof_recording();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$5\r\ntxkey\r\n$5\r\nvalue\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*1\r\n+OK\r\n");
+        reactor
+            .aof_writer
+            .as_mut()
+            .expect("AOF writer")
+            .flush_buffer()
+            .unwrap();
+
+        let replayed = ConcurrentKeyspace::new(DEFAULT_SHARD_COUNT);
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&replayed)
+            .unwrap();
+        assert_eq!(stats.commands_replayed, 1);
+
+        let tape =
+            RespTape::parse_pipeline(b"*2\r\n$3\r\nGET\r\n$5\r\ntxkey\r\n").expect("valid RESP");
+        let frame = tape.iter().next().unwrap();
+        let result = execute_command(
+            &replayed,
+            b"GET",
+            &frame,
+            CommandClock::new(Timestamp::now().as_nanos(), current_unix_time_nanos()),
+        )
+        .unwrap();
+        assert!(
+            matches!(result.response, CmdResult::Inline(inline) if inline.payload() == b"value")
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn discard_clears_transaction_and_watches() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$7\r\nDISCARD\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"$-1\r\n");
+    }
+
+    #[test]
+    fn fatal_aof_state_rejects_writes_before_mutation() {
+        let path = temp_aof_path("fatal-write-reject");
+        let mut reactor = test_reactor();
+        reactor.aof_writer = Some(AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap());
+        reactor.keyspace.enable_aof_recording();
+        reactor.aof_fatal_state.mark_failed(
+            reactor.id,
+            "test",
+            &std::io::Error::other("forced AOF failure"),
+        );
+
+        let (resp, close) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+        );
+        assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_ERR_AOF_MISCONF));
+        assert!(!close);
+
+        let (read_resp, _) =
+            dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        assert!(matches!(read_resp, CommandResponse::Static(b) if b == b"$-1\r\n"));
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn dispatch_ping_lowercase() {
         let (resp, _) = dispatch_wire(b"*1\r\n$4\r\nping\r\n");
         assert!(matches!(resp, CommandResponse::Static(b) if b == RESP_PONG));
@@ -1744,7 +2816,7 @@ mod tests {
         // Acceptable outcomes: static PONG or a bulk-string echo of the attribute child.
         match resp {
             CommandResponse::Static(b) => assert_eq!(b, RESP_PONG),
-            CommandResponse::Inline(_) | CommandResponse::Frame(_) => {
+            CommandResponse::Inline(_) | CommandResponse::Frame(_) | CommandResponse::Owned(_) => {
                 /* bulk string from attribute child — acceptable */
             }
         }
@@ -1765,6 +2837,107 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_uses_monotonic_clock_for_relative_expiry() {
+        let mut reactor = test_reactor();
+        let monotonic_now = 5 * 1_000_000_000;
+        let unix_now = 4_102_444_800 * 1_000_000_000;
+        reactor.cached_nanos = monotonic_now;
+        reactor.cached_unix_nanos = unix_now;
+
+        let (resp, close) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$7\r\nsession\r\n$5\r\ntoken\r\n",
+        );
+        assert!(matches!(resp, CommandResponse::Static(b) if b == b"+OK\r\n"));
+        assert!(!close);
+
+        let (resp, close) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$7\r\nPEXPIRE\r\n$7\r\nsession\r\n$1\r\n1\r\n",
+        );
+        assert!(matches!(resp, CommandResponse::Static(b) if b == b":1\r\n"));
+        assert!(!close);
+
+        let tape =
+            RespTape::parse_pipeline(b"*2\r\n$3\r\nGET\r\n$7\r\nsession\r\n").expect("valid RESP");
+        let frame = tape.iter().next().expect("at least one frame");
+        let expired = execute_command(
+            &reactor.keyspace,
+            b"GET",
+            &frame,
+            CommandClock::new(monotonic_now + 2_000_000, unix_now + 2_000_000),
+        )
+        .expect("GET is implemented");
+        assert!(matches!(expired.response, CmdResult::Static(b) if b == b"$-1\r\n"));
+    }
+
+    #[test]
+    fn config_get_reads_runtime_eviction_state() {
+        let mut reactor = test_reactor();
+        reactor.keyspace.set_max_memory(4096);
+        reactor
+            .keyspace
+            .set_eviction_policy(EvictionPolicy::VolatileTtl);
+
+        let (resp, close) = handle_config_wire(
+            &mut reactor,
+            b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n",
+        );
+        assert!(!close);
+        expect_config_pair(resp, b"maxmemory", b"4096");
+
+        let (resp, close) = handle_config_wire(
+            &mut reactor,
+            b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$16\r\nmaxmemory-policy\r\n",
+        );
+        assert!(!close);
+        expect_config_pair(resp, b"maxmemory-policy", b"volatile-ttl");
+    }
+
+    #[test]
+    fn config_set_updates_runtime_eviction_state() {
+        let mut reactor = test_reactor();
+
+        let (resp, close) = handle_config_wire(
+            &mut reactor,
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$9\r\nmaxmemory\r\n$4\r\n8192\r\n",
+        );
+        assert!(matches!(resp, CommandResponse::Static(b) if b == b"+OK\r\n"));
+        assert!(!close);
+        assert_eq!(reactor.keyspace.max_memory(), 8192);
+
+        let (resp, close) = handle_config_wire(
+            &mut reactor,
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$16\r\nmaxmemory-policy\r\n$15\r\nvolatile-random\r\n",
+        );
+        assert!(matches!(resp, CommandResponse::Static(b) if b == b"+OK\r\n"));
+        assert!(!close);
+        assert_eq!(
+            reactor.keyspace.eviction_policy(),
+            EvictionPolicy::VolatileRandom
+        );
+    }
+
+    #[test]
+    fn config_set_accepts_lfu_policy() {
+        let mut reactor = test_reactor();
+        reactor
+            .keyspace
+            .set_eviction_policy(EvictionPolicy::NoEviction);
+
+        let (resp, close) = handle_config_wire(
+            &mut reactor,
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lfu\r\n",
+        );
+        assert!(matches!(resp, CommandResponse::Static(b) if b == b"+OK\r\n"));
+        assert!(!close);
+        assert_eq!(
+            reactor.keyspace.eviction_policy(),
+            EvictionPolicy::AllKeysLfu
+        );
+    }
+
+    #[test]
     fn pending_writev_advances_across_segments() {
         let mut pending = PendingWritev::new();
         pending.push_static(b"abc");
@@ -1781,5 +2954,67 @@ mod tests {
             std::slice::from_raw_parts(remaining[0].iov_base.cast::<u8>(), remaining[0].iov_len)
         };
         assert_eq!(bytes, b"efg");
+    }
+
+    #[test]
+    fn close_waits_for_inflight_io_before_releasing_buffers() {
+        let state = Arc::new(Mutex::new(MockBackendState::default()));
+        let mut reactor = test_reactor_with_backend(state.clone());
+
+        let read_idx = reactor.buffer_pool.lease_index().unwrap();
+        let write_idx = reactor.buffer_pool.lease_index().unwrap();
+        let mut meta = ConnectionMeta::new(123, 0);
+        meta.read_buf_offset = read_idx as u32;
+        meta.write_buf_offset = write_idx as u32;
+        let conn_id = reactor.connections.insert(meta);
+        reactor.generations[conn_id] = 7;
+        reactor.writev_states[conn_id].push_static(b"pending");
+        reactor.writev_states[conn_id].finalize();
+        reactor.inflight_ops[conn_id].read = true;
+        reactor.inflight_ops[conn_id].writev = true;
+
+        reactor.close_connection(conn_id);
+
+        let cgen = reactor.generations[conn_id];
+        let read_token = encode_token(conn_id, cgen, OpType::Read);
+        let writev_token = encode_token(conn_id, cgen, OpType::Writev);
+        let close_token = encode_token(conn_id, cgen, OpType::Close);
+
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.cancels, vec![read_token, writev_token]);
+            assert_eq!(state.closes, vec![close_token]);
+        }
+        assert!(reactor.connections.get(conn_id).unwrap().is_closing());
+        assert_eq!(reactor.buffer_pool.outstanding(), 2);
+
+        reactor.handle_close(conn_id);
+        assert!(reactor.connections.get(conn_id).is_some());
+        assert_eq!(reactor.buffer_pool.outstanding(), 2);
+
+        reactor.handle_read(
+            conn_id,
+            &Completion {
+                token: read_token,
+                result: -libc::ECANCELED,
+                flags: 0,
+            },
+        );
+        assert!(reactor.connections.get(conn_id).is_some());
+        assert_eq!(reactor.buffer_pool.outstanding(), 2);
+
+        reactor.handle_write(
+            conn_id,
+            OpType::Writev,
+            &Completion {
+                token: writev_token,
+                result: -libc::ECANCELED,
+                flags: 0,
+            },
+        );
+
+        assert!(reactor.connections.get(conn_id).is_none());
+        assert_eq!(reactor.buffer_pool.outstanding(), 0);
+        assert_eq!(reactor.writev_states[conn_id].remaining_len(), 0);
     }
 }

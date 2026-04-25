@@ -16,12 +16,14 @@
 
 pub mod commands;
 pub mod entry;
+pub mod eviction;
 pub mod keyspace;
 pub mod morph;
 pub mod prefetch;
 pub mod table;
 
 pub use entry::{Entry, EntryValue};
+pub use eviction::{EvictionConfig, EvictionPolicy};
 pub use keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 pub use morph::{AccessProfile, DefaultMorphMonitor, DisabledMorphMonitor, MorphMonitor};
 pub use table::SwissTable;

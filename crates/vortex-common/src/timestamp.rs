@@ -3,8 +3,43 @@
 /// Wraps a `u64` representing nanoseconds since the Unix epoch.
 /// Uses `CLOCK_MONOTONIC_COARSE` on Linux for fast (~4ns) timestamping
 /// which is sufficient for TTL resolution (millisecond granularity).
+const NS_PER_SEC: u64 = 1_000_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(u64);
+
+#[inline]
+pub fn current_unix_time_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    // SAFETY: `clock_gettime` writes into a valid `timespec` we own.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+
+    debug_assert_eq!(ret, 0, "clock_gettime failed");
+
+    ts.tv_sec as u64 * NS_PER_SEC + ts.tv_nsec as u64
+}
+
+#[inline]
+pub fn absolute_unix_nanos_to_deadline_nanos(
+    absolute_unix_nanos: u64,
+    monotonic_now_nanos: u64,
+    unix_now_nanos: u64,
+) -> u64 {
+    monotonic_now_nanos.saturating_add(absolute_unix_nanos.saturating_sub(unix_now_nanos))
+}
+
+#[inline]
+pub fn deadline_nanos_to_absolute_unix_nanos(
+    deadline_nanos: u64,
+    monotonic_now_nanos: u64,
+    unix_now_nanos: u64,
+) -> u64 {
+    unix_now_nanos.saturating_add(deadline_nanos.saturating_sub(monotonic_now_nanos))
+}
 
 impl Timestamp {
     /// Returns the current timestamp using the fastest available monotonic clock.
@@ -118,5 +153,23 @@ mod tests {
             t2 >= t1,
             "Timestamp::now() must be monotonically non-decreasing"
         );
+    }
+
+    #[test]
+    fn unix_now_is_nonzero() {
+        assert!(current_unix_time_nanos() > 0);
+    }
+
+    #[test]
+    fn clock_domain_conversion_round_trip() {
+        let unix_now = 1_750_000_000 * NS_PER_SEC;
+        let mono_now = 9_000 * NS_PER_SEC;
+        let absolute = unix_now + 60 * NS_PER_SEC;
+
+        let deadline = absolute_unix_nanos_to_deadline_nanos(absolute, mono_now, unix_now);
+        assert_eq!(deadline, mono_now + 60 * NS_PER_SEC);
+
+        let round_trip = deadline_nanos_to_absolute_unix_nanos(deadline, mono_now, unix_now);
+        assert_eq!(round_trip, absolute);
     }
 }

@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use vortex_common::{VortexKey, VortexValue};
-use vortex_engine::ConcurrentKeyspace;
 use vortex_engine::commands::execute_command;
+use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_proto::RespTape;
 
 const BENCH_CONCURRENT_SHARDS: usize = 64;
@@ -35,6 +35,22 @@ fn prefill_keyspace(n: usize) -> ConcurrentKeyspace {
     keyspace
 }
 
+fn same_shard_keys(keyspace: &ConcurrentKeyspace, count: usize) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(count);
+    let target = keyspace.shard_index(b"bench-evict-seed");
+    for index in 0..10_000usize {
+        let key = format!("bench-evict:{index:04}").into_bytes();
+        if keyspace.shard_index(&key) != target {
+            continue;
+        }
+        keys.push(key);
+        if keys.len() == count {
+            return keys;
+        }
+    }
+    panic!("failed to find {count} same-shard benchmark keys");
+}
+
 fn bench_cmd_get_inline(c: &mut Criterion) {
     let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let key = VortexKey::from(b"mykey" as &[u8]);
@@ -66,6 +82,120 @@ fn bench_cmd_set_inline(c: &mut Criterion) {
             let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
             black_box(r);
         });
+    });
+}
+
+fn bench_cmd_set_inline_allkeys_lru_headroom(c: &mut Criterion) {
+    let cmd = make_resp(&[b"SET", b"mykey", b"myvalue"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_set_inline_allkeys_lru_headroom", |b| {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        let key = VortexKey::from(b"mykey" as &[u8]);
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"oldval"));
+        keyspace.configure_eviction(1 << 20, EvictionPolicy::AllKeysLru);
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_set_inline_allkeys_lru_evict_same_shard(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let keys = same_shard_keys(&keyspace, 3);
+    let get_cmd = make_resp(&[b"GET", keys[0].as_slice()]);
+    let get_tape = RespTape::parse_pipeline(&get_cmd).unwrap();
+    let set_cmd = make_resp(&[b"SET", keys[2].as_slice(), b"mild"]);
+    let set_tape = RespTape::parse_pipeline(&set_cmd).unwrap();
+
+    c.bench_function("cmd_set_inline_allkeys_lru_evict_same_shard", |b| {
+        b.iter_batched(
+            || {
+                let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+                insert_keyspace_value(
+                    &keyspace,
+                    VortexKey::from(keys[0].as_slice()),
+                    VortexValue::from_bytes(b"warm"),
+                );
+                insert_keyspace_value(
+                    &keyspace,
+                    VortexKey::from(keys[1].as_slice()),
+                    VortexValue::from_bytes(b"cool"),
+                );
+                keyspace.configure_eviction(keyspace.memory_used(), EvictionPolicy::AllKeysLru);
+                for _ in 0..16 {
+                    let frame = get_tape.iter().next().unwrap();
+                    let _ = execute_command(&keyspace, b"GET", &frame, 0);
+                }
+                keyspace
+            },
+            |keyspace| {
+                let frame = set_tape.iter().next().unwrap();
+                let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+                black_box(r);
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_cmd_set_inline_allkeys_lfu_headroom(c: &mut Criterion) {
+    let cmd = make_resp(&[b"SET", b"mykey", b"myvalue"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_set_inline_allkeys_lfu_headroom", |b| {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        let key = VortexKey::from(b"mykey" as &[u8]);
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"oldval"));
+        keyspace.configure_eviction(1 << 20, EvictionPolicy::AllKeysLfu);
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_set_inline_allkeys_lfu_evict_same_shard(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let keys = same_shard_keys(&keyspace, 3);
+    let get_cmd = make_resp(&[b"GET", keys[0].as_slice()]);
+    let get_tape = RespTape::parse_pipeline(&get_cmd).unwrap();
+    let set_cmd = make_resp(&[b"SET", keys[2].as_slice(), b"mild"]);
+    let set_tape = RespTape::parse_pipeline(&set_cmd).unwrap();
+
+    c.bench_function("cmd_set_inline_allkeys_lfu_evict_same_shard", |b| {
+        b.iter_batched(
+            || {
+                let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+                insert_keyspace_value(
+                    &keyspace,
+                    VortexKey::from(keys[0].as_slice()),
+                    VortexValue::from_bytes(b"warm"),
+                );
+                insert_keyspace_value(
+                    &keyspace,
+                    VortexKey::from(keys[1].as_slice()),
+                    VortexValue::from_bytes(b"cool"),
+                );
+                keyspace.configure_eviction(keyspace.memory_used(), EvictionPolicy::AllKeysLfu);
+                for _ in 0..32 {
+                    let frame = get_tape.iter().next().unwrap();
+                    let _ = execute_command(&keyspace, b"GET", &frame, 0);
+                }
+                keyspace
+            },
+            |keyspace| {
+                let frame = set_tape.iter().next().unwrap();
+                let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+                black_box(r);
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 }
 
@@ -598,6 +728,10 @@ criterion_group!(
     benches,
     bench_cmd_get_inline,
     bench_cmd_set_inline,
+    bench_cmd_set_inline_allkeys_lru_headroom,
+    bench_cmd_set_inline_allkeys_lru_evict_same_shard,
+    bench_cmd_set_inline_allkeys_lfu_headroom,
+    bench_cmd_set_inline_allkeys_lfu_evict_same_shard,
     bench_cmd_get_miss,
     bench_cmd_incr,
     bench_cmd_mget_100,

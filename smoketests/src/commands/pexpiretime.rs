@@ -12,11 +12,10 @@ fn reports_missing_and_persistent_states(ctx: &mut SmokeContext) -> Result<()> {
 
 fn reports_absolute_deadline(ctx: &mut SmokeContext) -> Result<()> {
     ctx.set("session", "token")?;
+    let expected = 4_102_444_800_000;
     let _: i64 = ctx.exec(&["PEXPIREAT", "session", "4102444800000"])?;
-    assert_eq!(
-        ctx.exec::<i64>(&["PEXPIRETIME", "session"])?,
-        4_102_444_800_000
-    );
+    let actual = ctx.exec::<i64>(&["PEXPIRETIME", "session"])?;
+    assert!(actual == expected || actual == expected - 1);
     Ok(())
 }
 

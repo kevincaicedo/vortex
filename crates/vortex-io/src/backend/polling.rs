@@ -80,13 +80,37 @@ struct ArmedRead {
 // by the single-threaded polling backend.
 unsafe impl Send for ArmedRead {}
 
+enum ArmedWrite {
+    Write {
+        fd: RawFd,
+        buf_ptr: *const u8,
+        buf_len: usize,
+        token: u64,
+    },
+    Writev {
+        fd: RawFd,
+        iovecs: *const libc::iovec,
+        iov_count: usize,
+        token: u64,
+    },
+}
+
+// SAFETY: ArmedWrite stores reactor-owned raw buffer pointers and is only used
+// by the single-threaded polling backend.
+unsafe impl Send for ArmedWrite {}
+
 /// Cross-platform I/O backend using the `polling` crate.
 pub struct PollingBackend {
     poller: Poller,
     events: Events,
     pending: VecDeque<PendingOp>,
+    armed_accept: Option<(RawFd, u64)>,
     armed_reads: Vec<Option<ArmedRead>>,
+    armed_writes: Vec<Option<ArmedWrite>>,
+    ready: VecDeque<Completion>,
+    ready_accept_tokens: Vec<u64>,
     ready_read_tokens: Vec<u64>,
+    ready_write_tokens: Vec<u64>,
     /// Per-fd interest flags indexed by `RawFd`. 0 = not registered.
     /// Bit 0 (`INTEREST_READABLE`): registered for read-readiness.
     /// Bit 1 (`INTEREST_WRITABLE`): registered for write-readiness.
@@ -100,8 +124,13 @@ impl PollingBackend {
             poller: Poller::new()?,
             events: Events::new(),
             pending: VecDeque::with_capacity(256),
+            armed_accept: None,
             armed_reads: Vec::new(),
+            armed_writes: Vec::new(),
+            ready: VecDeque::with_capacity(64),
+            ready_accept_tokens: Vec::with_capacity(4),
             ready_read_tokens: Vec::with_capacity(64),
+            ready_write_tokens: Vec::with_capacity(64),
             registered: vec![0u8; 64],
         })
     }
@@ -119,6 +148,13 @@ impl PollingBackend {
     fn ensure_read_capacity(&mut self, conn_id: usize) {
         if conn_id >= self.armed_reads.len() {
             self.armed_reads.resize_with(conn_id + 1, || None);
+        }
+    }
+
+    #[inline]
+    fn ensure_write_capacity(&mut self, conn_id: usize) {
+        if conn_id >= self.armed_writes.len() {
+            self.armed_writes.resize_with(conn_id + 1, || None);
         }
     }
 
@@ -195,16 +231,38 @@ impl PollingBackend {
         }
     }
 
-    fn rearm_ready_reads(&mut self) {
+    fn rearm_ready_ops(&mut self) {
+        self.ready_accept_tokens.clear();
         self.ready_read_tokens.clear();
+        self.ready_write_tokens.clear();
         for event in self.events.iter() {
-            if !event.readable {
-                continue;
-            }
             let token = event.key as u64;
             let (conn_id, _, op) = decode_token(token);
-            if matches!(op, OpType::Read) && conn_id < self.armed_reads.len() {
+            if event.readable && matches!(op, OpType::Accept) {
+                self.ready_accept_tokens.push(token);
+            }
+            if event.readable && matches!(op, OpType::Read) && conn_id < self.armed_reads.len() {
                 self.ready_read_tokens.push(token);
+            }
+            if event.writable
+                && matches!(op, OpType::Write | OpType::Writev)
+                && conn_id < self.armed_writes.len()
+            {
+                self.ready_write_tokens.push(token);
+            }
+        }
+
+        for token in self.ready_accept_tokens.drain(..) {
+            let Some((listener_fd, accept_token)) = self.armed_accept.take() else {
+                continue;
+            };
+            if accept_token == token {
+                self.pending.push_back(PendingOp::Accept {
+                    listener_fd,
+                    token: accept_token,
+                });
+            } else {
+                self.armed_accept = Some((listener_fd, accept_token));
             }
         }
 
@@ -222,6 +280,138 @@ impl PollingBackend {
                 buf_len: read.buf_len,
                 token: read.token,
             });
+        }
+
+        for token in self.ready_write_tokens.drain(..) {
+            let (conn_id, _, _) = decode_token(token);
+            let Some(write) = self.armed_writes.get_mut(conn_id).and_then(Option::take) else {
+                continue;
+            };
+            match write {
+                ArmedWrite::Write {
+                    fd,
+                    buf_ptr,
+                    buf_len,
+                    token: write_token,
+                } if write_token == token => {
+                    self.pending.push_back(PendingOp::Write {
+                        fd,
+                        buf_ptr,
+                        buf_len,
+                        token: write_token,
+                    });
+                }
+                ArmedWrite::Writev {
+                    fd,
+                    iovecs,
+                    iov_count,
+                    token: write_token,
+                } if write_token == token => {
+                    self.pending.push_back(PendingOp::Writev {
+                        fd,
+                        iovecs,
+                        iov_count,
+                        token: write_token,
+                    });
+                }
+                stale => {
+                    self.armed_writes[conn_id] = Some(stale);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn push_canceled_completion(&mut self, token: u64) {
+        self.ready.push_back(Completion {
+            token,
+            result: -libc::ECANCELED,
+            flags: 0,
+        });
+    }
+
+    fn drain_ready(&mut self, out: &mut Vec<Completion>) -> usize {
+        let start = out.len();
+        while let Some(completion) = self.ready.pop_front() {
+            out.push(completion);
+        }
+        out.len() - start
+    }
+
+    fn cancel_pending_token(&mut self, token: u64) -> bool {
+        let mut canceled = false;
+        let pending_len = self.pending.len();
+        for _ in 0..pending_len {
+            let Some(op) = self.pending.pop_front() else {
+                break;
+            };
+            if pending_op_token(&op) == token {
+                canceled = true;
+                self.push_canceled_completion(token);
+            } else {
+                self.pending.push_back(op);
+            }
+        }
+
+        let (conn_id, _, op) = decode_token(token);
+        if matches!(op, OpType::Read)
+            && conn_id < self.armed_reads.len()
+            && self.armed_reads[conn_id]
+                .as_ref()
+                .is_some_and(|read| read.token == token)
+        {
+            self.armed_reads[conn_id] = None;
+            canceled = true;
+            self.push_canceled_completion(token);
+        }
+
+        if matches!(op, OpType::Write | OpType::Writev)
+            && conn_id < self.armed_writes.len()
+            && self.armed_writes[conn_id]
+                .as_ref()
+                .is_some_and(|write| armed_write_token(write) == token)
+        {
+            self.armed_writes[conn_id] = None;
+            canceled = true;
+            self.push_canceled_completion(token);
+        }
+
+        canceled
+    }
+
+    fn cancel_pending_fd(&mut self, fd: RawFd) {
+        let mut canceled_tokens = Vec::new();
+        let pending_len = self.pending.len();
+        for _ in 0..pending_len {
+            let Some(op) = self.pending.pop_front() else {
+                break;
+            };
+            if pending_op_fd(&op) == Some(fd) {
+                canceled_tokens.push(pending_op_token(&op));
+            } else {
+                self.pending.push_back(op);
+            }
+        }
+
+        for armed in &mut self.armed_reads {
+            if armed.as_ref().is_some_and(|read| read.fd == fd) {
+                canceled_tokens.push(armed.as_ref().map(|read| read.token).unwrap_or(0));
+                *armed = None;
+            }
+        }
+
+        for armed in &mut self.armed_writes {
+            if armed
+                .as_ref()
+                .is_some_and(|write| armed_write_fd(write) == fd)
+            {
+                canceled_tokens.push(armed.as_ref().map(armed_write_token).unwrap_or(0));
+                *armed = None;
+            }
+        }
+
+        for token in canceled_tokens {
+            self.push_canceled_completion(token);
         }
     }
 }
@@ -286,6 +476,11 @@ impl IoBackend for PollingBackend {
         Ok(())
     }
 
+    fn submit_cancel(&mut self, token: u64) -> io::Result<()> {
+        let _ = self.cancel_pending_token(token);
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<usize> {
         // The polling backend doesn't batch — ops are processed in completions().
         Ok(0)
@@ -294,8 +489,13 @@ impl IoBackend for PollingBackend {
     fn completions(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         let start = out.len();
 
+        if self.drain_ready(out) > 0 {
+            return Ok(out.len() - start);
+        }
+
         // First pass: attempt all pending operations.
         self.drain_pending(out);
+        self.drain_ready(out);
 
         // Hot path: if we produced completions, return immediately.
         if out.len() > start {
@@ -311,8 +511,24 @@ impl IoBackend for PollingBackend {
         // Immediately retry pending ops now that readiness has been signalled.
         // This avoids deferring to the next reactor iteration.
         if !self.events.is_empty() {
-            self.rearm_ready_reads();
+            self.rearm_ready_ops();
             self.drain_pending(out);
+            self.drain_ready(out);
+        }
+
+        Ok(out.len() - start)
+    }
+
+    fn drain_cq(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
+        let start = out.len();
+
+        self.drain_ready(out);
+        if out.len() == start {
+            // Non-blocking progress pass for operations submitted while the
+            // reactor was processing completions. This makes polling mode
+            // match the reactor fast-path contract without entering poll().
+            self.drain_pending(out);
+            self.drain_ready(out);
         }
 
         Ok(out.len() - start)
@@ -354,8 +570,7 @@ impl PollingBackend {
                 if (self.registered[listener_fd as usize] & INTEREST_READABLE) == 0 {
                     self.register_interest(listener_fd, Event::readable(token as usize));
                 }
-                self.pending
-                    .push_back(PendingOp::Accept { listener_fd, token });
+                self.armed_accept = Some((listener_fd, token));
             } else {
                 let errno = err.raw_os_error().unwrap_or(1);
                 out.push(Completion {
@@ -482,7 +697,9 @@ impl PollingBackend {
                 // modify semantics; the readable flag is cleared so the next
                 // read EAGAIN will re-register it.
                 self.register_interest(fd, Event::writable(token as usize));
-                self.pending.push_back(PendingOp::Write {
+                let (conn_id, _, _) = decode_token(token);
+                self.ensure_write_capacity(conn_id);
+                self.armed_writes[conn_id] = Some(ArmedWrite::Write {
                     fd,
                     buf_ptr,
                     buf_len,
@@ -522,7 +739,9 @@ impl PollingBackend {
             if err.kind() == io::ErrorKind::WouldBlock {
                 // Register for write-readiness instead of busy-polling.
                 self.register_interest(fd, Event::writable(token as usize));
-                self.pending.push_back(PendingOp::Writev {
+                let (conn_id, _, _) = decode_token(token);
+                self.ensure_write_capacity(conn_id);
+                self.armed_writes[conn_id] = Some(ArmedWrite::Writev {
                     fd,
                     iovecs,
                     iov_count,
@@ -542,8 +761,11 @@ impl PollingBackend {
     fn do_close(&mut self, fd: RawFd, token: u64, out: &mut Vec<Completion>) {
         let (conn_id, _, _) = decode_token(token);
         if conn_id < self.armed_reads.len() {
-            self.armed_reads[conn_id] = None;
+            if let Some(read) = self.armed_reads[conn_id].take() {
+                self.push_canceled_completion(read.token);
+            }
         }
+        self.cancel_pending_fd(fd);
 
         // Remove from poller if registered.
         let fd_idx = fd as usize;
@@ -562,5 +784,194 @@ impl PollingBackend {
             result,
             flags: 0,
         });
+    }
+}
+
+#[inline]
+fn pending_op_token(op: &PendingOp) -> u64 {
+    match op {
+        PendingOp::Accept { token, .. }
+        | PendingOp::Read { token, .. }
+        | PendingOp::Write { token, .. }
+        | PendingOp::Writev { token, .. }
+        | PendingOp::Close { token, .. } => *token,
+    }
+}
+
+#[inline]
+fn pending_op_fd(op: &PendingOp) -> Option<RawFd> {
+    match op {
+        PendingOp::Read { fd, .. }
+        | PendingOp::Write { fd, .. }
+        | PendingOp::Writev { fd, .. }
+        | PendingOp::Close { fd, .. } => Some(*fd),
+        PendingOp::Accept { .. } => None,
+    }
+}
+
+#[inline]
+fn armed_write_token(write: &ArmedWrite) -> u64 {
+    match write {
+        ArmedWrite::Write { token, .. } | ArmedWrite::Writev { token, .. } => *token,
+    }
+}
+
+#[inline]
+fn armed_write_fd(write: &ArmedWrite) -> RawFd {
+    match write {
+        ArmedWrite::Write { fd, .. } | ArmedWrite::Writev { fd, .. } => *fd,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::encode_token;
+
+    #[test]
+    fn cancel_pending_writev_yields_ecanceled_completion() {
+        let mut backend = PollingBackend::new().unwrap();
+        let token = encode_token(3, 9, OpType::Writev);
+        let bytes = b"hello";
+        let iovecs = [libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        }];
+
+        backend
+            .submit_writev(99, iovecs.as_ptr(), iovecs.len(), token)
+            .unwrap();
+        backend.submit_cancel(token).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(backend.drain_cq(&mut out).unwrap(), 1);
+        assert_eq!(out[0].token, token);
+        assert_eq!(out[0].result, -libc::ECANCELED);
+        assert!(backend.pending.is_empty());
+    }
+
+    #[test]
+    fn cancel_armed_write_yields_ecanceled_completion() {
+        let mut backend = PollingBackend::new().unwrap();
+        let token = encode_token(3, 9, OpType::Write);
+        let bytes = b"hello";
+
+        backend.ensure_write_capacity(3);
+        backend.armed_writes[3] = Some(ArmedWrite::Write {
+            fd: 99,
+            buf_ptr: bytes.as_ptr(),
+            buf_len: bytes.len(),
+            token,
+        });
+
+        let mut out = Vec::new();
+        assert_eq!(backend.drain_cq(&mut out).unwrap(), 0);
+        assert!(backend.armed_writes[3].is_some());
+
+        backend.submit_cancel(token).unwrap();
+        assert_eq!(backend.drain_cq(&mut out).unwrap(), 1);
+        assert_eq!(out[0].token, token);
+        assert_eq!(out[0].result, -libc::ECANCELED);
+        assert!(backend.armed_writes[3].is_none());
+    }
+
+    #[test]
+    fn accept_eagain_arms_listener_without_busy_pending_retry() {
+        use std::os::fd::IntoRawFd;
+
+        let mut backend = PollingBackend::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let fd = listener.into_raw_fd();
+        let token = encode_token(crate::backend::ACCEPT_CONN_ID, 0, OpType::Accept);
+
+        let mut out = Vec::new();
+        backend.do_accept(fd, token, &mut out);
+
+        assert!(out.is_empty());
+        assert!(backend.pending.is_empty());
+        assert_eq!(backend.armed_accept, Some((fd, token)));
+
+        if fd as usize >= backend.registered.len() || backend.registered[fd as usize] != 0 {
+            // SAFETY: fd was registered by this test's backend.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let _ = backend.poller.delete(borrowed);
+        }
+        // SAFETY: fd was obtained from into_raw_fd above and is still open.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn close_purges_pending_fd_ops_and_armed_reads() {
+        let mut backend = PollingBackend::new().unwrap();
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` initialises both fds on success.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let fd = fds[0];
+        let peer_fd = fds[1];
+
+        let read_token = encode_token(1, 5, OpType::Read);
+        let write_token = encode_token(1, 5, OpType::Write);
+        let writev_token = encode_token(1, 5, OpType::Writev);
+        let armed_write_token = encode_token(2, 5, OpType::Write);
+        let close_token = encode_token(1, 5, OpType::Close);
+
+        let write_bytes = [0u8; 8];
+        let writev_bytes = [1u8; 8];
+        let iovecs = [libc::iovec {
+            iov_base: writev_bytes.as_ptr() as *mut libc::c_void,
+            iov_len: writev_bytes.len(),
+        }];
+
+        backend.pending.push_back(PendingOp::Write {
+            fd,
+            buf_ptr: write_bytes.as_ptr(),
+            buf_len: write_bytes.len(),
+            token: write_token,
+        });
+        backend.pending.push_back(PendingOp::Writev {
+            fd,
+            iovecs: iovecs.as_ptr(),
+            iov_count: iovecs.len(),
+            token: writev_token,
+        });
+        backend.ensure_read_capacity(1);
+        backend.armed_reads[1] = Some(ArmedRead {
+            fd,
+            buf_ptr: std::ptr::null_mut(),
+            buf_len: 0,
+            token: read_token,
+        });
+        backend.ensure_write_capacity(2);
+        backend.armed_writes[2] = Some(ArmedWrite::Write {
+            fd,
+            buf_ptr: write_bytes.as_ptr(),
+            buf_len: write_bytes.len(),
+            token: armed_write_token,
+        });
+
+        let mut close_out = Vec::new();
+        backend.do_close(fd, close_token, &mut close_out);
+        assert_eq!(close_out.len(), 1);
+        assert_eq!(close_out[0].token, close_token);
+
+        let mut canceled = Vec::new();
+        assert_eq!(backend.drain_cq(&mut canceled).unwrap(), 4);
+        let canceled_tokens: Vec<u64> = canceled.into_iter().map(|c| c.token).collect();
+        assert_eq!(
+            canceled_tokens,
+            vec![read_token, write_token, writev_token, armed_write_token]
+        );
+        assert!(backend.pending.is_empty());
+        assert!(backend.armed_reads[1].is_none());
+        assert!(backend.armed_writes[2].is_none());
+
+        // SAFETY: `peer_fd` is the other end of the pipe opened by this test.
+        unsafe {
+            libc::close(peer_fd);
+        }
     }
 }

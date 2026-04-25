@@ -10,14 +10,14 @@ fn unwatch_is_currently_noop_ok(ctx: &mut SmokeContext) -> Result<()> {
 }
 
 pub fn spec() -> CommandSpec {
-    CommandSpec::new("UNWATCH", CommandGroup::Server, SupportLevel::Partial)
-        .summary("Currently returns OK even though WATCH state is not implemented yet.")
+    CommandSpec::new("UNWATCH", CommandGroup::Server, SupportLevel::Supported)
+        .summary("Clears watched keys for the current connection.")
         .syntax(&["UNWATCH"])
-        .tested(&["Current no-op OK behavior"])
-        .not_tested(&["Actual watched-key state clearing until WATCH support ships"])
+        .tested(&["OK without active watches"])
+        .not_tested(&["Watch clearing is covered by reactor unit tests"])
         .case(CaseDef::new(
-            "returns ok as no op",
-            "UNWATCH should currently behave as a successful no-op.",
+            "returns ok",
+            "UNWATCH should return OK even when no keys are watched.",
             unwatch_is_currently_noop_ok,
         ))
 }

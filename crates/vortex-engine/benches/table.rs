@@ -34,6 +34,25 @@ fn bench_swiss_table_insert(c: &mut Criterion) {
     group.finish();
 }
 
+// rust HashMap lookup hit is very fast, so we want to see how SwissTable compares.
+fn bench_hashmap_lookup_hit(c: &mut Criterion) {
+    use std::collections::HashMap;
+
+    let mut group = c.benchmark_group("hashmap_lookup_hit");
+    for &size in &[100, 10_000, 1_000_000] {
+        let mut map = HashMap::with_capacity(size);
+        for i in 0..size {
+            let key = VortexKey::from(format!("key:{i:08}").as_str());
+            map.insert(key, VortexValue::Integer(i as i64));
+        }
+        let key = VortexKey::from(format!("key:{:08}", size / 2).as_str());
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter(|| map.get(&key));
+        });
+    }
+    group.finish();
+}
+
 fn bench_swiss_table_lookup_hit(c: &mut Criterion) {
     let mut group = c.benchmark_group("swiss_table_lookup_hit");
     for &size in &[100, 10_000, 1_000_000] {
@@ -41,6 +60,25 @@ fn bench_swiss_table_lookup_hit(c: &mut Criterion) {
         let key = VortexKey::from(format!("key:{:08}", size / 2).as_str());
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter(|| table.get(&key));
+        });
+    }
+    group.finish();
+}
+
+// rust HashMap lookup miss is very fast, so we want to see how SwissTable compares.
+fn bench_hashmap_lookup_miss(c: &mut Criterion) {
+    use std::collections::HashMap;
+
+    let mut group = c.benchmark_group("hashmap_lookup_miss");
+    for &size in &[100, 10_000, 1_000_000] {
+        let mut map = HashMap::with_capacity(size);
+        for i in 0..size {
+            let key = VortexKey::from(format!("key:{i:08}").as_str());
+            map.insert(key, VortexValue::Integer(i as i64));
+        }
+        let key = VortexKey::from("nonexistent_key");
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter(|| map.get(&key));
         });
     }
     group.finish();
@@ -98,6 +136,31 @@ fn bench_swiss_table_insert_single(c: &mut Criterion) {
                 |(mut table, keys, values)| {
                     for (k, v) in keys.into_iter().zip(values) {
                         table.insert(k, v);
+                    }
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Compare with rust HashMap insert single
+fn bench_hashmap_insert_single(c: &mut Criterion) {
+    use std::collections::HashMap;
+
+    let mut group = c.benchmark_group("hashmap_insert_single");
+    for &size in &[100, 10_000, 1_000_000] {
+        let keys: Vec<VortexKey> = (0..size)
+            .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
+            .collect();
+        let values: Vec<VortexValue> = (0..size).map(|i| VortexValue::Integer(i as i64)).collect();
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || (HashMap::with_capacity(size), keys.clone(), values.clone()),
+                |(mut map, keys, values)| {
+                    for (k, v) in keys.into_iter().zip(values) {
+                        map.insert(k, v);
                     }
                 },
                 criterion::BatchSize::SmallInput,
@@ -371,6 +434,9 @@ criterion_group!(
     benches,
     bench_swiss_table_insert,
     bench_swiss_table_insert_single,
+    bench_hashmap_insert_single,
+    bench_hashmap_lookup_miss,
+    bench_hashmap_lookup_hit,
     bench_swiss_table_lookup_hit,
     bench_swiss_table_lookup_miss,
     bench_swiss_table_delete,

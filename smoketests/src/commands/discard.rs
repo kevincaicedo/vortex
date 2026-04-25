@@ -10,14 +10,14 @@ fn discard_errors_without_multi(ctx: &mut SmokeContext) -> Result<()> {
 }
 
 pub fn spec() -> CommandSpec {
-    CommandSpec::new("DISCARD", CommandGroup::Server, SupportLevel::Stubbed)
-        .summary("Currently behaves as a transaction stub and errors without MULTI.")
+    CommandSpec::new("DISCARD", CommandGroup::Server, SupportLevel::Supported)
+        .summary("Discards a queued transaction and errors when no transaction is active.")
         .syntax(&["DISCARD"])
-        .tested(&["Current stub error semantics"])
-        .not_tested(&["Real queued transaction semantics until MULTI/EXEC ships"])
+        .tested(&["Error without MULTI"])
+        .not_tested(&["Queue clearing is covered by reactor unit tests"])
         .case(CaseDef::new(
             "discard errors without multi",
-            "DISCARD should currently return the documented stub error.",
+            "DISCARD should return an error when no transaction is active.",
             discard_errors_without_multi,
         ))
 }

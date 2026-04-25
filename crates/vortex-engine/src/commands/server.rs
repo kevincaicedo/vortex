@@ -5,7 +5,10 @@
 
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
-use super::{CmdResult, CommandArgs, ExecutedCommand, RESP_EMPTY_ARRAY, RESP_OK};
+use super::{
+    CmdResult, CommandArgs, ExecutedCommand, NS_PER_SEC, RESP_EMPTY_ARRAY, RESP_OK,
+    resolve_unix_time_now_nanos,
+};
 use crate::ConcurrentKeyspace;
 
 // ── Pre-computed static responses ───────────────────────────────────
@@ -591,26 +594,25 @@ pub fn cmd_select(
 ///
 /// Returns [unix_seconds_string, microseconds_string] as a two-element array.
 #[inline]
+#[allow(dead_code)]
 pub fn cmd_time(
     _keyspace: &ConcurrentKeyspace,
     _frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    // Convert nanoseconds to seconds + microseconds remainder.
-    // If now_nanos is 0 (testing), use system clock.
-    let (secs, usecs) = if now_nanos == 0 {
-        let dur = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        (dur.as_secs(), dur.subsec_micros() as u64)
-    } else {
-        // now_nanos is monotonic; for TIME we need wall clock.
-        // In Phase 3, fall back to system clock.
-        let dur = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        (dur.as_secs(), dur.subsec_micros() as u64)
-    };
+    cmd_time_with_clock(_keyspace, _frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_time_with_clock(
+    _keyspace: &ConcurrentKeyspace,
+    _frame: &FrameRef<'_>,
+    _now_nanos: u64,
+    unix_now_nanos: u64,
+) -> CmdResult {
+    let unix_now_nanos = resolve_unix_time_now_nanos(unix_now_nanos);
+    let secs = unix_now_nanos / NS_PER_SEC;
+    let usecs = (unix_now_nanos % NS_PER_SEC) / 1_000;
 
     let mut sec_buf = itoa::Buffer::new();
     let sec_str = sec_buf.format(secs);

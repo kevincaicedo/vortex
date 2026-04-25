@@ -11,7 +11,12 @@ pub(crate) mod server;
 pub(crate) mod string;
 
 use smallvec::SmallVec;
-use vortex_common::{VortexKey, VortexValue};
+use vortex_common::{
+    VortexKey, VortexValue,
+    absolute_unix_nanos_to_deadline_nanos as common_absolute_unix_nanos_to_deadline_nanos,
+    current_unix_time_nanos,
+    deadline_nanos_to_absolute_unix_nanos as common_deadline_nanos_to_absolute_unix_nanos,
+};
 use vortex_proto::{FrameRef, RespFrame};
 
 use crate::ConcurrentKeyspace;
@@ -20,6 +25,73 @@ use crate::ConcurrentKeyspace;
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 /// Nanoseconds per millisecond.
 pub const NS_PER_MS: u64 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommandClock {
+    pub monotonic_nanos: u64,
+    pub unix_nanos: u64,
+}
+
+impl CommandClock {
+    #[inline]
+    pub const fn new(monotonic_nanos: u64, unix_nanos: u64) -> Self {
+        Self {
+            monotonic_nanos,
+            unix_nanos,
+        }
+    }
+}
+
+impl From<u64> for CommandClock {
+    #[inline]
+    fn from(now_nanos: u64) -> Self {
+        Self::new(now_nanos, now_nanos)
+    }
+}
+
+#[inline]
+pub(crate) fn resolve_unix_time_now_nanos(unix_now_nanos: u64) -> u64 {
+    if unix_now_nanos == 0 {
+        current_unix_time_nanos()
+    } else {
+        unix_now_nanos
+    }
+}
+
+#[inline]
+fn resolve_deadline_clock_now_nanos(now_nanos: u64, unix_now_nanos: u64) -> u64 {
+    if unix_now_nanos == 0 {
+        now_nanos
+    } else {
+        unix_now_nanos
+    }
+}
+
+#[inline]
+pub(crate) fn absolute_unix_nanos_to_deadline_nanos(
+    absolute_unix_nanos: u64,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> u64 {
+    common_absolute_unix_nanos_to_deadline_nanos(
+        absolute_unix_nanos,
+        now_nanos,
+        resolve_deadline_clock_now_nanos(now_nanos, unix_now_nanos),
+    )
+}
+
+#[inline]
+pub(crate) fn deadline_nanos_to_absolute_unix_nanos(
+    deadline_nanos: u64,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> u64 {
+    common_deadline_nanos_to_absolute_unix_nanos(
+        deadline_nanos,
+        now_nanos,
+        resolve_deadline_clock_now_nanos(now_nanos, unix_now_nanos),
+    )
+}
 
 /// The result of executing a command.
 ///
@@ -33,6 +105,17 @@ pub enum CmdResult {
     Inline(InlineResp),
     /// Dynamic RESP frame requiring serialization.
     Resp(RespFrame),
+}
+
+impl CmdResult {
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        match self {
+            Self::Static(buf) => buf.first() == Some(&b'-'),
+            Self::Inline(inline) => inline.as_bytes().first() == Some(&b'-'),
+            Self::Resp(frame) => matches!(frame, RespFrame::Error(_)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,15 +182,74 @@ impl InlineResp {
 }
 
 #[derive(Debug)]
+pub struct AofRecord {
+    pub lsn: u64,
+    pub key: VortexKey,
+}
+
+pub type AofRecords = Option<Box<[AofRecord]>>;
+pub const NO_AOF_LSN: u64 = u64::MAX;
+
+#[inline]
+fn encode_aof_lsn(aof_lsn: Option<u64>) -> u64 {
+    aof_lsn.unwrap_or(NO_AOF_LSN)
+}
+
+#[derive(Debug)]
 pub struct ExecutedCommand {
     pub response: CmdResult,
-    pub aof_lsn: Option<u64>,
+    pub aof_records: AofRecords,
+    pub aof_lsn: u64,
+    pub aof_payload: Option<Box<[u8]>>,
 }
 
 impl ExecutedCommand {
     #[inline]
-    pub const fn with_aof_lsn(response: CmdResult, aof_lsn: Option<u64>) -> Self {
-        Self { response, aof_lsn }
+    pub fn with_aof_lsn(response: CmdResult, aof_lsn: Option<u64>) -> Self {
+        Self {
+            response,
+            aof_records: None,
+            aof_lsn: encode_aof_lsn(aof_lsn),
+            aof_payload: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_optional_aof_payload(
+        response: CmdResult,
+        aof_lsn: Option<u64>,
+        aof_payload: Option<Box<[u8]>>,
+    ) -> Self {
+        Self::with_optional_aof_payload_and_records(response, None, aof_lsn, aof_payload)
+    }
+
+    #[inline]
+    pub fn with_aof_records(
+        response: CmdResult,
+        aof_records: AofRecords,
+        aof_lsn: Option<u64>,
+    ) -> Self {
+        Self::with_optional_aof_payload_and_records(response, aof_records, aof_lsn, None)
+    }
+
+    #[inline]
+    pub fn with_optional_aof_payload_and_records(
+        response: CmdResult,
+        aof_records: AofRecords,
+        aof_lsn: Option<u64>,
+        aof_payload: Option<Box<[u8]>>,
+    ) -> Self {
+        Self {
+            response,
+            aof_records,
+            aof_lsn: encode_aof_lsn(aof_lsn),
+            aof_payload,
+        }
+    }
+
+    #[inline]
+    pub fn aof_lsn(&self) -> Option<u64> {
+        (self.aof_lsn != NO_AOF_LSN).then_some(self.aof_lsn)
     }
 }
 
@@ -116,9 +258,76 @@ impl From<CmdResult> for ExecutedCommand {
     fn from(response: CmdResult) -> Self {
         Self {
             response,
-            aof_lsn: None,
+            aof_records: None,
+            aof_lsn: NO_AOF_LSN,
+            aof_payload: None,
         }
     }
+}
+
+#[inline]
+fn encode_resp_bulk_command(parts: &[&[u8]]) -> Box<[u8]> {
+    let mut buf = Vec::with_capacity(16 + parts.iter().map(|part| part.len() + 16).sum::<usize>());
+
+    push_resp_array_len(&mut buf, parts.len());
+    for part in parts {
+        push_resp_bulk_string(&mut buf, part);
+    }
+
+    buf.into_boxed_slice()
+}
+
+#[inline]
+fn push_resp_array_len(buf: &mut Vec<u8>, len: usize) {
+    buf.push(b'*');
+    push_decimal(buf, len);
+    buf.extend_from_slice(b"\r\n");
+}
+
+#[inline]
+fn push_resp_bulk_string(buf: &mut Vec<u8>, value: &[u8]) {
+    buf.push(b'$');
+    push_decimal(buf, value.len());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(value);
+    buf.extend_from_slice(b"\r\n");
+}
+
+#[inline]
+fn push_decimal<T: itoa::Integer>(buf: &mut Vec<u8>, value: T) {
+    let mut digits = itoa::Buffer::new();
+    buf.extend_from_slice(digits.format(value).as_bytes());
+}
+
+#[inline]
+pub(crate) fn encode_aof_set_pxat(
+    key_bytes: &[u8],
+    value_bytes: &[u8],
+    absolute_deadline_ms: u64,
+) -> Box<[u8]> {
+    let mut deadline = itoa::Buffer::new();
+    encode_resp_bulk_command(&[
+        b"SET",
+        key_bytes,
+        value_bytes,
+        b"PXAT",
+        deadline.format(absolute_deadline_ms).as_bytes(),
+    ])
+}
+
+#[inline]
+pub(crate) fn encode_aof_pexpireat(key_bytes: &[u8], absolute_deadline_ms: u64) -> Box<[u8]> {
+    let mut deadline = itoa::Buffer::new();
+    encode_resp_bulk_command(&[
+        b"PEXPIREAT",
+        key_bytes,
+        deadline.format(absolute_deadline_ms).as_bytes(),
+    ])
+}
+
+#[inline]
+pub(crate) fn encode_aof_persist(key_bytes: &[u8]) -> Box<[u8]> {
+    encode_resp_bulk_command(&[b"PERSIST", key_bytes])
 }
 
 // Pre-computed RESP constants for zero-allocation hot paths.
@@ -139,6 +348,7 @@ pub static ERR_NOT_INTEGER: &[u8] = b"-ERR value is not an integer or out of ran
 pub static ERR_NOT_FLOAT: &[u8] = b"-ERR value is not a valid float\r\n";
 pub static ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
 pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of range\r\n";
+pub static ERR_OOM: &[u8] = b"-OOM command not allowed when used memory > 'maxmemory'.\r\n";
 
 /// Execute a command against the shared concurrent keyspace.
 ///
@@ -151,59 +361,109 @@ pub fn execute_command(
     keyspace: &ConcurrentKeyspace,
     name: &[u8],
     frame: &FrameRef<'_>,
-    now_nanos: u64,
+    clock: impl Into<CommandClock>,
 ) -> Option<ExecutedCommand> {
+    let clock = clock.into();
+    let now_nanos = clock.monotonic_nanos;
+    let unix_now_nanos = clock.unix_nanos;
+
     match name {
         b"GET" => Some(string::cmd_get(keyspace, frame, now_nanos).into()),
-        b"SET" => Some(string::cmd_set(keyspace, frame, now_nanos).into()),
-        b"INCR" => Some(string::cmd_incr(keyspace, frame, now_nanos).into()),
-        b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos).into()),
-        b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos).into()),
-        b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos).into()),
-        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(keyspace, frame, now_nanos).into()),
+        b"SET" => Some(string::cmd_set_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"INCR" => Some(string::cmd_incr(keyspace, frame, now_nanos)),
+        b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos)),
+        b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos)),
+        b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos)),
+        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(keyspace, frame, now_nanos)),
         b"MGET" => Some(string::cmd_mget(keyspace, frame, now_nanos).into()),
-        b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos).into()),
-        b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos).into()),
-        b"SETNX" => Some(string::cmd_setnx(keyspace, frame, now_nanos).into()),
-        b"SETEX" => Some(string::cmd_setex(keyspace, frame, now_nanos).into()),
-        b"PSETEX" => Some(string::cmd_psetex(keyspace, frame, now_nanos).into()),
-        b"GETSET" => Some(string::cmd_getset(keyspace, frame, now_nanos).into()),
-        b"GETDEL" => Some(string::cmd_getdel(keyspace, frame, now_nanos).into()),
-        b"GETEX" => Some(string::cmd_getex(keyspace, frame, now_nanos).into()),
-        b"APPEND" => Some(string::cmd_append(keyspace, frame, now_nanos).into()),
+        b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos)),
+        b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos)),
+        b"SETNX" => Some(string::cmd_setnx(keyspace, frame, now_nanos)),
+        b"SETEX" => Some(string::cmd_setex_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PSETEX" => Some(string::cmd_psetex_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"GETSET" => Some(string::cmd_getset(keyspace, frame, now_nanos)),
+        b"GETDEL" => Some(string::cmd_getdel(keyspace, frame, now_nanos)),
+        b"GETEX" => Some(string::cmd_getex_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"APPEND" => Some(string::cmd_append(keyspace, frame, now_nanos)),
         b"STRLEN" => Some(string::cmd_strlen(keyspace, frame, now_nanos).into()),
         b"GETRANGE" => Some(string::cmd_getrange(keyspace, frame, now_nanos).into()),
-        b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos).into()),
-        b"DEL" => Some(key::cmd_del(keyspace, frame, now_nanos).into()),
-        b"UNLINK" => Some(key::cmd_unlink(keyspace, frame, now_nanos).into()),
+        b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos)),
+        b"DEL" => Some(key::cmd_del(keyspace, frame, now_nanos)),
+        b"UNLINK" => Some(key::cmd_unlink(keyspace, frame, now_nanos)),
         b"EXISTS" => Some(key::cmd_exists(keyspace, frame, now_nanos).into()),
-        b"EXPIRE" => Some(key::cmd_expire(keyspace, frame, now_nanos).into()),
-        b"PEXPIRE" => Some(key::cmd_pexpire(keyspace, frame, now_nanos).into()),
-        b"EXPIREAT" => Some(key::cmd_expireat(keyspace, frame, now_nanos).into()),
-        b"PEXPIREAT" => Some(key::cmd_pexpireat(keyspace, frame, now_nanos).into()),
-        b"PERSIST" => Some(key::cmd_persist(keyspace, frame, now_nanos).into()),
+        b"EXPIRE" => Some(key::cmd_expire_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PEXPIRE" => Some(key::cmd_pexpire_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"EXPIREAT" => Some(key::cmd_expireat_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PEXPIREAT" => Some(key::cmd_pexpireat_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PERSIST" => Some(key::cmd_persist(keyspace, frame, now_nanos)),
         b"TTL" => Some(key::cmd_ttl(keyspace, frame, now_nanos).into()),
         b"PTTL" => Some(key::cmd_pttl(keyspace, frame, now_nanos).into()),
-        b"EXPIRETIME" => Some(key::cmd_expiretime(keyspace, frame, now_nanos).into()),
-        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(keyspace, frame, now_nanos).into()),
+        b"EXPIRETIME" => {
+            Some(key::cmd_expiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
+        }
+        b"PEXPIRETIME" => {
+            Some(key::cmd_pexpiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
+        }
         b"TYPE" => Some(key::cmd_type(keyspace, frame, now_nanos).into()),
-        b"RENAME" => Some(key::cmd_rename(keyspace, frame, now_nanos).into()),
-        b"RENAMENX" => Some(key::cmd_renamenx(keyspace, frame, now_nanos).into()),
+        b"RENAME" => Some(key::cmd_rename(keyspace, frame, now_nanos)),
+        b"RENAMENX" => Some(key::cmd_renamenx(keyspace, frame, now_nanos)),
         b"KEYS" => Some(key::cmd_keys(keyspace, frame, now_nanos).into()),
         b"SCAN" => Some(key::cmd_scan(keyspace, frame, now_nanos).into()),
         b"RANDOMKEY" => Some(key::cmd_randomkey(keyspace, frame, now_nanos).into()),
         b"TOUCH" => Some(key::cmd_touch(keyspace, frame, now_nanos).into()),
-        b"COPY" => Some(key::cmd_copy(keyspace, frame, now_nanos).into()),
+        b"COPY" => Some(key::cmd_copy(keyspace, frame, now_nanos)),
         b"PING" => Some(server::cmd_ping(keyspace, frame, now_nanos).into()),
         b"ECHO" => Some(server::cmd_echo(keyspace, frame, now_nanos).into()),
         b"QUIT" => Some(server::cmd_quit(keyspace, frame, now_nanos).into()),
         b"DBSIZE" => Some(server::cmd_dbsize(keyspace, frame, now_nanos).into()),
-        b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos).into()),
-        b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos).into()),
+        b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos)),
+        b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos)),
         b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos).into()),
         b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos).into()),
         b"SELECT" => Some(server::cmd_select(keyspace, frame, now_nanos).into()),
-        b"TIME" => Some(server::cmd_time(keyspace, frame, now_nanos).into()),
+        b"TIME" => {
+            Some(server::cmd_time_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
+        }
         b"MULTI" => Some(server::cmd_multi(keyspace, frame, now_nanos).into()),
         b"EXEC" => Some(server::cmd_exec(keyspace, frame, now_nanos).into()),
         b"DISCARD" => Some(server::cmd_discard(keyspace, frame, now_nanos).into()),
@@ -225,7 +485,7 @@ impl<'a> CommandArgs<'a> {
     pub fn collect(frame: &FrameRef<'a>) -> Option<Self> {
         let mut children = frame.children()?;
         let mut args = SmallVec::with_capacity(frame.element_count()? as usize);
-        while let Some(child) = children.next() {
+        for child in &mut children {
             args.push(child.as_bytes()?);
         }
         Some(Self { args })
@@ -234,6 +494,11 @@ impl<'a> CommandArgs<'a> {
     #[inline]
     pub fn len(&self) -> usize {
         self.args.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty()
     }
 
     #[inline]
@@ -455,5 +720,18 @@ mod tests {
     fn value_from_bytes_string() {
         let val = value_from_bytes(b"hello");
         assert!(matches!(val, VortexValue::InlineString(_)));
+    }
+
+    #[test]
+    fn absolute_deadline_round_trips_between_unix_and_monotonic_domains() {
+        let unix_now = 1_750_000_000 * NS_PER_SEC;
+        let mono_now = 9_000 * NS_PER_SEC;
+        let absolute = unix_now + 60 * NS_PER_SEC;
+
+        let deadline = common_absolute_unix_nanos_to_deadline_nanos(absolute, mono_now, unix_now);
+        assert_eq!(deadline, mono_now + 60 * NS_PER_SEC);
+
+        let round_trip = common_deadline_nanos_to_absolute_unix_nanos(deadline, mono_now, unix_now);
+        assert_eq!(round_trip, absolute);
     }
 }

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vortex_engine::eviction::EvictionPolicy;
 use vortex_io::{AofConfig, IoBackendMode, ReactorPool, ReactorPoolConfig};
 
 #[global_allocator]
@@ -71,6 +72,9 @@ fn main() {
         connection_timeout: config.connection_timeout_secs as u32,
         aof_config,
         shard_count: vortex_engine::DEFAULT_SHARD_COUNT,
+        max_memory: config.max_memory as usize,
+        eviction_policy: EvictionPolicy::parse_bytes(config.eviction_policy.as_bytes())
+            .unwrap_or(EvictionPolicy::NoEviction),
         io_backend: match config.io_backend {
             vortex_config::IoBackendKind::Auto => IoBackendMode::Auto,
             vortex_config::IoBackendKind::Uring => IoBackendMode::Uring,

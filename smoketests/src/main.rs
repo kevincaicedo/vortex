@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use vortex_smoketests::commands;
-use vortex_smoketests::runner::{Selection, run, selected_specs};
-use vortex_smoketests::server::{SpawnOptions, spawn_vortex};
+use vortex_smoketests::runner::{RunOptions, Selection, run, selected_specs};
+use vortex_smoketests::server::{SpawnOptions, spawn_redis, spawn_vortex};
 
 #[derive(Parser, Debug)]
 #[command(name = "vortex-smoketests")]
@@ -49,7 +49,11 @@ struct RunArgs {
     #[arg(long, default_value = "redis://127.0.0.1:6379/")]
     server_url: String,
     #[arg(long)]
+    baseline_url: Option<String>,
+    #[arg(long)]
     spawn_vortex: bool,
+    #[arg(long)]
+    spawn_redis_baseline: bool,
     #[arg(long)]
     bind: Option<String>,
     #[arg(long)]
@@ -57,7 +61,13 @@ struct RunArgs {
     #[arg(long = "vortex-arg")]
     vortex_args: Vec<String>,
     #[arg(long)]
+    redis_bin: Option<PathBuf>,
+    #[arg(long = "redis-arg")]
+    redis_args: Vec<String>,
+    #[arg(long)]
     fail_fast: bool,
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
     #[arg(long)]
     report: Option<PathBuf>,
 }
@@ -104,6 +114,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         .unwrap_or_else(|| PathBuf::from("smoketests/.artifacts/last-run.md"));
 
     let mut spawned = None;
+    let mut baseline_spawned = None;
     let server_url = if args.spawn_vortex {
         let server = spawn_vortex(&SpawnOptions {
             bind: args.bind.clone(),
@@ -123,7 +134,34 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         args.server_url.clone()
     };
 
-    let summary = run(&server_url, &selection, args.fail_fast)?;
+    let baseline_url = if args.spawn_redis_baseline {
+        let baseline = spawn_redis(&SpawnOptions {
+            bind: None,
+            vortex_bin: args.redis_bin.clone(),
+            vortex_args: args.redis_args.clone(),
+            ready_timeout: Duration::from_secs(20),
+        })?;
+        println!(
+            "spawned redis baseline at {} (log: {})",
+            baseline.url(),
+            baseline.log_path().display()
+        );
+        let url = baseline.url().to_string();
+        baseline_spawned = Some(baseline);
+        Some(url)
+    } else {
+        args.baseline_url.clone()
+    };
+
+    let summary = run(
+        &server_url,
+        &selection,
+        &RunOptions {
+            fail_fast: args.fail_fast,
+            repeat: args.repeat,
+            baseline_url,
+        },
+    )?;
     summary.write_markdown(&report_path)?;
     println!(
         "summary: {} commands, {} cases, {} failures",
@@ -131,6 +169,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
     );
     println!("report: {}", report_path.display());
 
+    drop(baseline_spawned);
     drop(spawned);
 
     if summary.failed_cases > 0 {

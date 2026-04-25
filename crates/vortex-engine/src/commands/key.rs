@@ -13,7 +13,8 @@ use vortex_proto::{FrameRef, RespFrame};
 use super::context::TtlState;
 use super::{
     CmdResult, CommandArgs, ExecutedCommand, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO,
-    RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, arg_bytes, int_resp, key_from_bytes,
+    RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos, arg_bytes,
+    deadline_nanos_to_absolute_unix_nanos, encode_aof_pexpireat, int_resp, key_from_bytes,
 };
 use crate::ConcurrentKeyspace;
 use crate::commands::context::MutationOutcome;
@@ -112,42 +113,110 @@ pub fn cmd_exists(
 
 /// EXPIRE key seconds [NX|XX|GT|LT]
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cmd_expire(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    expire_generic(keyspace, frame, now_nanos, ExpireMode::RelativeSeconds)
+    cmd_expire_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_expire_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::RelativeSeconds,
+    )
 }
 
 /// PEXPIRE key milliseconds [NX|XX|GT|LT]
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cmd_pexpire(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    expire_generic(keyspace, frame, now_nanos, ExpireMode::RelativeMillis)
+    cmd_pexpire_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_pexpire_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::RelativeMillis,
+    )
 }
 
 /// EXPIREAT key timestamp [NX|XX|GT|LT]
 #[inline]
+#[allow(dead_code)]
 pub fn cmd_expireat(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    expire_generic(keyspace, frame, now_nanos, ExpireMode::AbsoluteSeconds)
+    cmd_expireat_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_expireat_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::AbsoluteSeconds,
+    )
 }
 
 /// PEXPIREAT key ms-timestamp [NX|XX|GT|LT]
 #[inline]
+#[allow(dead_code)]
 pub fn cmd_pexpireat(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> ExecutedCommand {
-    expire_generic(keyspace, frame, now_nanos, ExpireMode::AbsoluteMillis)
+    cmd_pexpireat_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_pexpireat_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::AbsoluteMillis,
+    )
 }
 
 /// PERSIST key
@@ -186,6 +255,7 @@ fn expire_generic(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
+    unix_now_nanos: u64,
     mode: ExpireMode,
 ) -> ExecutedCommand {
     let Some(args) = CommandArgs::collect(frame) else {
@@ -254,7 +324,11 @@ fn expire_generic(
             now_nanos + (time_val as u64) * NS_PER_MS
         }
         ExpireMode::AbsoluteSeconds => {
-            let deadline = (time_val as u64) * NS_PER_SEC;
+            let deadline = absolute_unix_nanos_to_deadline_nanos(
+                (time_val as u64) * NS_PER_SEC,
+                now_nanos,
+                unix_now_nanos,
+            );
             if deadline <= now_nanos {
                 let key = key_from_bytes(kb);
                 let outcome = keyspace.remove_value(&key, now_nanos);
@@ -268,7 +342,11 @@ fn expire_generic(
             deadline
         }
         ExpireMode::AbsoluteMillis => {
-            let deadline = (time_val as u64) * NS_PER_MS;
+            let deadline = absolute_unix_nanos_to_deadline_nanos(
+                (time_val as u64) * NS_PER_MS,
+                now_nanos,
+                unix_now_nanos,
+            );
             if deadline <= now_nanos {
                 let key = key_from_bytes(kb);
                 let outcome = keyspace.remove_value(&key, now_nanos);
@@ -310,7 +388,15 @@ fn expire_generic(
     } else {
         CmdResult::Static(RESP_ZERO)
     };
-    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+    let aof_payload = if outcome.aof_lsn.is_some() && unix_now_nanos != 0 {
+        let absolute_deadline_ms =
+            deadline_nanos_to_absolute_unix_nanos(deadline_nanos, now_nanos, unix_now_nanos)
+                / NS_PER_MS;
+        Some(encode_aof_pexpireat(kb, absolute_deadline_ms))
+    } else {
+        None
+    };
+    ExecutedCommand::with_optional_aof_payload(response, outcome.aof_lsn, aof_payload)
 }
 
 // ── TTL / PTTL / EXPIRETIME / PEXPIRETIME ───────────────────────────
@@ -343,27 +429,21 @@ pub fn cmd_pttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
 
 /// EXPIRETIME key
 #[inline]
+#[allow(dead_code)]
 pub fn cmd_expiretime(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
 ) -> CmdResult {
-    let Some(key_bytes) = arg_bytes(frame, 1) else {
-        return CmdResult::Static(ERR_WRONG_ARGS);
-    };
-    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
-        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
-        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
-        TtlState::Deadline(deadline) => int_resp((deadline / NS_PER_SEC) as i64),
-    }
+    cmd_expiretime_with_clock(keyspace, frame, now_nanos, now_nanos)
 }
 
-/// PEXPIRETIME key
 #[inline]
-pub fn cmd_pexpiretime(
+pub(crate) fn cmd_expiretime_with_clock(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
+    unix_now_nanos: u64,
 ) -> CmdResult {
     let Some(key_bytes) = arg_bytes(frame, 1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
@@ -371,7 +451,41 @@ pub fn cmd_pexpiretime(
     match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
         TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
         TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
-        TtlState::Deadline(deadline) => int_resp((deadline / NS_PER_MS) as i64),
+        TtlState::Deadline(deadline) => int_resp(
+            (deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
+                / NS_PER_SEC) as i64,
+        ),
+    }
+}
+
+/// PEXPIRETIME key
+#[inline]
+#[allow(dead_code)]
+pub fn cmd_pexpiretime(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    cmd_pexpiretime_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_pexpiretime_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> CmdResult {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(
+            (deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos) / NS_PER_MS)
+                as i64,
+        ),
     }
 }
 
@@ -418,15 +532,19 @@ pub fn cmd_rename(
     let old_key = key_from_bytes(old_kb);
     let new_key = key_from_bytes(new_kb);
     match keyspace.rename_key(&old_key, new_key, now_nanos, false) {
-        Ok(MutationOutcome { value, aof_lsn }) => {
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => {
             let response = if value {
                 CmdResult::Static(RESP_OK)
             } else {
                 CmdResult::Static(RESP_ZERO)
             };
-            ExecutedCommand::with_aof_lsn(response, aof_lsn)
+            ExecutedCommand::with_aof_records(response, aof_records, aof_lsn)
         }
-        Err(msg) => ExecutedCommand::from(CmdResult::Static(msg)),
+        Err(err) => err.into_executed(),
     }
 }
 
@@ -454,15 +572,19 @@ pub fn cmd_renamenx(
     let new_key = key_from_bytes(new_kb);
 
     match keyspace.rename_key(&old_key, new_key, now_nanos, true) {
-        Ok(MutationOutcome { value, aof_lsn }) => {
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => {
             let response = if value {
                 CmdResult::Static(RESP_ONE)
             } else {
                 CmdResult::Static(RESP_ZERO)
             };
-            ExecutedCommand::with_aof_lsn(response, aof_lsn)
+            ExecutedCommand::with_aof_records(response, aof_records, aof_lsn)
         }
-        Err(msg) => ExecutedCommand::from(CmdResult::Static(msg)),
+        Err(err) => err.into_executed(),
     }
 }
 
@@ -615,13 +737,16 @@ pub fn cmd_copy(
     let src_key = key_from_bytes(src_kb);
     let dst_key = key_from_bytes(dst_kb);
 
-    let outcome = keyspace.copy_key(&src_key, dst_key, replace, now_nanos);
+    let outcome = match keyspace.copy_key(&src_key, dst_key, replace, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
         CmdResult::Static(RESP_ZERO)
     };
-    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+    ExecutedCommand::with_aof_records(response, outcome.aof_records, outcome.aof_lsn)
 }
 
 // ── Glob pattern matcher ────────────────────────────────────────────
@@ -844,18 +969,30 @@ mod tests {
         let h = new_harness();
         h.set(VortexKey::from("ea"), VortexValue::from("v"));
 
-        // EXPIREAT ea 2000 (unix timestamp in seconds)
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let deadline = unix_now + 60;
+
+        // EXPIREAT ea unix_now + 60 seconds
         let r = exec(
             &h.keyspace,
             cmd_expireat,
-            &[b"EXPIREAT", b"ea", b"2000"],
+            &[b"EXPIREAT", b"ea", deadline.to_string().as_bytes()],
             NOW,
         );
         assert_static(r, RESP_ONE);
 
-        // EXPIRETIME ea => 2000
+        // EXPIRETIME ea should report the original absolute deadline.
         let r = exec(&h.keyspace, cmd_expiretime, &[b"EXPIRETIME", b"ea"], NOW);
-        assert_integer(r, 2000);
+        match r {
+            CmdResult::Resp(RespFrame::Integer(actual)) => {
+                assert!(actual == deadline as i64 || actual == deadline as i64 - 1);
+            }
+            CmdResult::Static(bytes) => panic!("expected integer response, got {bytes:?}"),
+            other => panic!("expected integer response, got {other:?}"),
+        }
     }
 
     // ── TYPE ────────────────────────────────────────────────────────
@@ -946,6 +1083,25 @@ mod tests {
         h.set(VortexKey::from("b"), VortexValue::from("2"));
         let r = exec(&h.keyspace, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
         assert_static(r, RESP_ZERO);
+    }
+
+    #[test]
+    fn rename_noeviction_returns_oom_without_mutating() {
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("value"));
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), crate::EvictionPolicy::NoEviction);
+
+        let r = exec(
+            &h.keyspace,
+            cmd_rename,
+            &[b"RENAME", b"a", b"destination-key-that-grows-memory"],
+            NOW,
+        );
+
+        assert_static(r, crate::commands::ERR_OOM);
+        assert!(h.exists(&VortexKey::from("a"), NOW));
+        assert!(!h.exists(&VortexKey::from("destination-key-that-grows-memory"), NOW));
     }
 
     // ── SCAN ────────────────────────────────────────────────────────
@@ -1147,6 +1303,20 @@ mod tests {
             NOW,
         );
         assert_static(r, RESP_ONE);
+    }
+
+    #[test]
+    fn copy_noeviction_returns_oom_without_mutating() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("value"));
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), crate::EvictionPolicy::NoEviction);
+
+        let r = exec(&h.keyspace, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
+
+        assert_static(r, crate::commands::ERR_OOM);
+        assert!(h.exists(&VortexKey::from("src"), NOW));
+        assert!(!h.exists(&VortexKey::from("dst"), NOW));
     }
 
     // ── RANDOMKEY ───────────────────────────────────────────────────

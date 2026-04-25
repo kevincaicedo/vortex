@@ -22,6 +22,7 @@
 use core::{
     mem::{align_of, size_of},
     slice,
+    sync::atomic::{AtomicU16, Ordering},
 };
 
 use vortex_common::{VortexKey, VortexValue};
@@ -41,6 +42,9 @@ pub const FLAG_INLINE_KEY: u16 = 0x0001;
 pub const FLAG_INLINE_VALUE: u16 = 0x0002;
 pub const FLAG_INTEGER_VALUE: u16 = 0x0004;
 pub const FLAG_HAS_TTL: u16 = 0x0008;
+pub const EVICTION_COUNTER_SHIFT: u32 = 4;
+pub const EVICTION_COUNTER_MASK: u16 = 0x00F0;
+pub const EVICTION_COUNTER_MAX: u8 = 15;
 
 /// Value-type nibble stored in the high 4 bits of `flags`.
 pub const VTYPE_SHIFT: u32 = 12;
@@ -74,7 +78,7 @@ pub struct Entry {
     /// Inline key length. Heap keys encode their length in `key_data`.
     pub key_len: u8,
     /// Entry flags (type tag, heap indicators, TTL).
-    pub flags: u16,
+    pub flags: AtomicU16,
     /// Alignment padding (reserved for Phase 6 WATCH version counter).
     pub _pad0: u32,
     /// TTL deadline in nanoseconds (0 = no expiry).
@@ -99,7 +103,7 @@ impl Entry {
         Self {
             control: CTRL_EMPTY,
             key_len: 0,
-            flags: 0,
+            flags: AtomicU16::new(0),
             _pad0: 0,
             ttl_deadline: 0,
             key_data: [0; 23],
@@ -130,13 +134,72 @@ impl Entry {
     }
 
     #[inline]
-    pub const fn has_flag(&self, flag: u16) -> bool {
-        self.flags & flag != 0
+    pub fn has_flag(&self, flag: u16) -> bool {
+        self.flags() & flag != 0
     }
 
     #[inline]
-    pub const fn value_type(&self) -> u16 {
-        (self.flags & VTYPE_MASK) >> VTYPE_SHIFT
+    pub fn value_type(&self) -> u16 {
+        (self.flags() & VTYPE_MASK) >> VTYPE_SHIFT
+    }
+
+    #[inline]
+    pub fn eviction_counter(&self) -> u8 {
+        ((self.flags() & EVICTION_COUNTER_MASK) >> EVICTION_COUNTER_SHIFT) as u8
+    }
+
+    #[inline]
+    pub fn clear_eviction_counter(&self) {
+        self.set_eviction_counter(0);
+    }
+
+    #[inline]
+    pub fn set_eviction_counter(&self, counter: u8) {
+        let counter = counter.min(EVICTION_COUNTER_MAX);
+        let flags = self.flags();
+        self.store_flags(
+            (flags & !EVICTION_COUNTER_MASK) | ((counter as u16) << EVICTION_COUNTER_SHIFT),
+        );
+    }
+
+    #[inline]
+    pub fn decrement_eviction_counter(&self) -> bool {
+        self.flags
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |flags| {
+                let counter = ((flags & EVICTION_COUNTER_MASK) >> EVICTION_COUNTER_SHIFT) as u8;
+                (counter > 0).then_some(
+                    (flags & !EVICTION_COUNTER_MASK)
+                        | (((counter.saturating_sub(1)) as u16) << EVICTION_COUNTER_SHIFT),
+                )
+            })
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn record_access(&self, random: u64) {
+        let counter = self.eviction_counter();
+        if counter >= EVICTION_COUNTER_MAX {
+            return;
+        }
+
+        let mask = if counter == 0 {
+            0
+        } else {
+            (1u64 << counter) - 1
+        };
+        if random & mask != 0 {
+            return;
+        }
+
+        let _ = self
+            .flags
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |flags| {
+                let current = ((flags & EVICTION_COUNTER_MASK) >> EVICTION_COUNTER_SHIFT) as u8;
+                (current < EVICTION_COUNTER_MAX).then_some(
+                    (flags & !EVICTION_COUNTER_MASK)
+                        | (((current + 1) as u16) << EVICTION_COUNTER_SHIFT),
+                )
+            });
     }
 
     #[inline]
@@ -273,9 +336,9 @@ impl Entry {
     pub fn set_ttl(&mut self, deadline_nanos: u64) {
         self.ttl_deadline = deadline_nanos;
         if deadline_nanos != 0 {
-            self.flags |= FLAG_HAS_TTL;
+            self.store_flags(self.flags() | FLAG_HAS_TTL);
         } else {
-            self.flags &= !FLAG_HAS_TTL;
+            self.store_flags(self.flags() & !FLAG_HAS_TTL);
         }
     }
 
@@ -303,7 +366,7 @@ impl Entry {
     pub fn mark_deleted(&mut self) {
         self.control = CTRL_DELETED;
         self.key_len = 0;
-        self.flags = 0;
+        self.store_flags(0);
         self._pad0 = 0;
         self.ttl_deadline = 0;
         self.key_data = [0; 23];
@@ -316,7 +379,7 @@ impl Entry {
     fn reset(&mut self, h2: u8, ttl_deadline: u64) {
         self.control = h2;
         self.key_len = 0;
-        self.flags = 0;
+        self.store_flags(0);
         self._pad0 = 0;
         self.ttl_deadline = ttl_deadline;
         self.key_data = [0; 23];
@@ -325,19 +388,20 @@ impl Entry {
         self._pad1 = [0; 3];
 
         if ttl_deadline != 0 {
-            self.flags |= FLAG_HAS_TTL;
+            self.store_flags(self.flags() | FLAG_HAS_TTL);
         }
     }
 
     #[inline]
     fn set_value_type(&mut self, value_type: u16) {
-        self.flags = (self.flags & !VTYPE_MASK) | (value_type << VTYPE_SHIFT);
+        let flags = self.flags();
+        self.store_flags((flags & !VTYPE_MASK) | (value_type << VTYPE_SHIFT));
     }
 
     #[inline]
     fn store_inline_key(&mut self, key: &[u8]) {
         debug_assert!(key.len() <= 23);
-        self.flags |= FLAG_INLINE_KEY;
+        self.store_flags(self.flags() | FLAG_INLINE_KEY);
         self.key_len = key.len() as u8;
         self.key_data[..key.len()].copy_from_slice(key);
     }
@@ -356,7 +420,7 @@ impl Entry {
     #[inline]
     fn store_inline_value(&mut self, value: &[u8]) {
         debug_assert!(value.len() <= 21);
-        self.flags |= FLAG_INLINE_VALUE;
+        self.store_flags(self.flags() | FLAG_INLINE_VALUE);
         self.value_tag = value.len() as u8;
         self.value_data[..value.len()].copy_from_slice(value);
     }
@@ -370,9 +434,19 @@ impl Entry {
 
     #[inline]
     fn store_integer_value(&mut self, value: i64) {
-        self.flags |= FLAG_INTEGER_VALUE;
+        self.store_flags(self.flags() | FLAG_INTEGER_VALUE);
         self.value_tag = INTEGER_VALUE_TAG;
         self.value_data[..8].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    #[inline]
+    fn flags(&self) -> u16 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn store_flags(&self, flags: u16) {
+        self.flags.store(flags, Ordering::Relaxed);
     }
 
     #[inline]

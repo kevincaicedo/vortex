@@ -74,6 +74,19 @@ impl MmapRegion {
 
         let ptr = ptr.cast::<u8>();
 
+        // Fault pages during pool creation so the first client read/write does
+        // not pay anonymous mmap first-touch latency in the benchmark window.
+        // One byte per page is enough to commit the page while keeping startup
+        // work linear in pages, not bytes.
+        #[cfg(not(miri))]
+        unsafe {
+            let mut offset = 0usize;
+            while offset < total_bytes {
+                ptr.add(offset).write_volatile(0);
+                offset += PAGE_SIZE;
+            }
+        }
+
         // On Linux, pin pages in physical memory for io_uring.
         #[cfg(all(target_os = "linux", not(miri)))]
         {

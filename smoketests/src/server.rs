@@ -102,6 +102,67 @@ pub fn spawn_vortex(options: &SpawnOptions) -> Result<SpawnedServer> {
     })
 }
 
+pub fn spawn_redis(options: &SpawnOptions) -> Result<SpawnedServer> {
+    let workspace_root = workspace_root();
+    let bind = match &options.bind {
+        Some(bind) => bind.clone(),
+        None => free_bind_addr()?,
+    };
+    let (host, port) = bind
+        .split_once(':')
+        .with_context(|| format!("invalid bind address for redis baseline: {bind}"))?;
+    let server_url = format!("redis://{bind}/");
+    let bin_path = options
+        .vortex_bin
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("redis-server"));
+
+    let artifacts_dir = workspace_root.join("smoketests/.artifacts");
+    fs::create_dir_all(&artifacts_dir)
+        .with_context(|| format!("failed to create artifacts dir {}", artifacts_dir.display()))?;
+    let log_path = artifacts_dir.join("redis-server.log");
+    let stdout = File::create(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+    let mut command = Command::new(&bin_path);
+    command
+        .arg("--bind")
+        .arg(host)
+        .arg("--port")
+        .arg(port)
+        .arg("--save")
+        .arg("")
+        .arg("--appendonly")
+        .arg("no")
+        .args(&options.vortex_args)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .current_dir(&workspace_root);
+
+    let child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn redis-server baseline from {}",
+            bin_path.display()
+        )
+    })?;
+
+    wait_until_ready(&server_url, options.ready_timeout).with_context(|| {
+        format!(
+            "redis-server baseline did not become ready on {server_url}; see {}",
+            log_path.display()
+        )
+    })?;
+
+    Ok(SpawnedServer {
+        child,
+        url: server_url,
+        log_path,
+    })
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -120,10 +181,6 @@ fn free_bind_addr() -> Result<String> {
 }
 
 fn ensure_vortex_binary(workspace_root: &Path, binary: &Path) -> Result<()> {
-    if binary.exists() {
-        return Ok(());
-    }
-
     let status = Command::new("cargo")
         .arg("build")
         .arg("-p")
@@ -136,6 +193,13 @@ fn ensure_vortex_binary(workspace_root: &Path, binary: &Path) -> Result<()> {
 
     if !status.success() {
         bail!("cargo build -p vortex-server failed");
+    }
+
+    if !binary.exists() {
+        bail!(
+            "expected vortex-server binary at {} after build",
+            binary.display()
+        );
     }
 
     Ok(())
