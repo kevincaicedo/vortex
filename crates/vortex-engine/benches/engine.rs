@@ -68,6 +68,24 @@ fn bench_cmd_get_inline(c: &mut Criterion) {
     });
 }
 
+fn bench_cmd_get_inline_allkeys_lfu_hot(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let key = VortexKey::from(b"mykey" as &[u8]);
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"myvalue"));
+    keyspace.configure_eviction(1 << 20, EvictionPolicy::AllKeysLfu);
+
+    let cmd = make_resp(&[b"GET", b"mykey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_get_inline_allkeys_lfu_hot", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
 fn bench_cmd_set_inline(c: &mut Criterion) {
     let cmd = make_resp(&[b"SET", b"mykey", b"myvalue"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -191,6 +209,32 @@ fn bench_cmd_set_inline_allkeys_lfu_evict_same_shard(c: &mut Criterion) {
             },
             |keyspace| {
                 let frame = set_tape.iter().next().unwrap();
+                let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+                black_box(r);
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_cmd_set_inline_volatile_lru_no_ttl_oom(c: &mut Criterion) {
+    let cmd = make_resp(&[b"SET", b"probe", b"value"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_set_inline_volatile_lru_no_ttl_oom", |b| {
+        b.iter_batched(
+            || {
+                let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+                insert_keyspace_value(
+                    &keyspace,
+                    VortexKey::from(b"resident" as &[u8]),
+                    VortexValue::from_bytes(b"resident"),
+                );
+                keyspace.configure_eviction(keyspace.memory_used(), EvictionPolicy::VolatileLru);
+                keyspace
+            },
+            |keyspace| {
+                let frame = tape.iter().next().unwrap();
                 let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
                 black_box(r);
             },
@@ -433,6 +477,17 @@ fn bench_cmd_ttl(c: &mut Criterion) {
             let frame = tape.iter().next().unwrap();
             let r = execute_command(black_box(&keyspace), b"TTL", &frame, now);
             black_box(r);
+        });
+    });
+}
+
+fn bench_active_expiry_empty_shard(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+
+    c.bench_function("active_expiry_empty_shard", |b| {
+        b.iter(|| {
+            let result = keyspace.run_active_expiry_on_shard(0, 0, 64, 0);
+            black_box(result);
         });
     });
 }
@@ -727,11 +782,13 @@ fn bench_latency_distribution_set(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_cmd_get_inline,
+    bench_cmd_get_inline_allkeys_lfu_hot,
     bench_cmd_set_inline,
     bench_cmd_set_inline_allkeys_lru_headroom,
     bench_cmd_set_inline_allkeys_lru_evict_same_shard,
     bench_cmd_set_inline_allkeys_lfu_headroom,
     bench_cmd_set_inline_allkeys_lfu_evict_same_shard,
+    bench_cmd_set_inline_volatile_lru_no_ttl_oom,
     bench_cmd_get_miss,
     bench_cmd_incr,
     bench_cmd_mget_100,
@@ -742,6 +799,7 @@ criterion_group!(
     bench_cmd_exists,
     bench_cmd_expire,
     bench_cmd_ttl,
+    bench_active_expiry_empty_shard,
     bench_cmd_type,
     bench_cmd_scan_10k,
     bench_cmd_keys_star_10k,

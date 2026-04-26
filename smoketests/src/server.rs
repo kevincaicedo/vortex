@@ -68,7 +68,7 @@ pub fn spawn_vortex(options: &SpawnOptions) -> Result<SpawnedServer> {
     let artifacts_dir = workspace_root.join("smoketests/.artifacts");
     fs::create_dir_all(&artifacts_dir)
         .with_context(|| format!("failed to create artifacts dir {}", artifacts_dir.display()))?;
-    let log_path = artifacts_dir.join("vortex-server.log");
+    let log_path = log_path_for(&artifacts_dir, "vortex-server", &bind);
     let stdout = File::create(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
     let stderr = stdout
@@ -84,11 +84,11 @@ pub fn spawn_vortex(options: &SpawnOptions) -> Result<SpawnedServer> {
         .stderr(Stdio::from(stderr))
         .current_dir(&workspace_root);
 
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn vortex-server from {}", bin_path.display()))?;
 
-    wait_until_ready(&server_url, options.ready_timeout).with_context(|| {
+    wait_until_ready(&mut child, &server_url, options.ready_timeout).with_context(|| {
         format!(
             "vortex-server did not become ready on {server_url}; see {}",
             log_path.display()
@@ -120,7 +120,7 @@ pub fn spawn_redis(options: &SpawnOptions) -> Result<SpawnedServer> {
     let artifacts_dir = workspace_root.join("smoketests/.artifacts");
     fs::create_dir_all(&artifacts_dir)
         .with_context(|| format!("failed to create artifacts dir {}", artifacts_dir.display()))?;
-    let log_path = artifacts_dir.join("redis-server.log");
+    let log_path = log_path_for(&artifacts_dir, "redis-server", &bind);
     let stdout = File::create(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
     let stderr = stdout
@@ -142,14 +142,14 @@ pub fn spawn_redis(options: &SpawnOptions) -> Result<SpawnedServer> {
         .stderr(Stdio::from(stderr))
         .current_dir(&workspace_root);
 
-    let child = command.spawn().with_context(|| {
+    let mut child = command.spawn().with_context(|| {
         format!(
             "failed to spawn redis-server baseline from {}",
             bin_path.display()
         )
     })?;
 
-    wait_until_ready(&server_url, options.ready_timeout).with_context(|| {
+    wait_until_ready(&mut child, &server_url, options.ready_timeout).with_context(|| {
         format!(
             "redis-server baseline did not become ready on {server_url}; see {}",
             log_path.display()
@@ -168,6 +168,14 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("smoketests lives under workspace root")
         .to_path_buf()
+}
+
+fn log_path_for(artifacts_dir: &Path, label: &str, bind: &str) -> PathBuf {
+    let sanitized_bind: String = bind
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    artifacts_dir.join(format!("{label}-{sanitized_bind}.log"))
 }
 
 fn free_bind_addr() -> Result<String> {
@@ -205,9 +213,16 @@ fn ensure_vortex_binary(workspace_root: &Path, binary: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_until_ready(server_url: &str, timeout: Duration) -> Result<()> {
+fn wait_until_ready(child: &mut Child, server_url: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll smoke target process state")?
+        {
+            bail!("smoke target exited before becoming ready with status {status}");
+        }
+
         if Instant::now() >= deadline {
             bail!("timed out waiting for smoke target {server_url}");
         }

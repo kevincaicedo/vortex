@@ -39,7 +39,7 @@ Configuration is loaded from multiple sources with the following precedence (hig
 |--------|-----|---------|---------|-------------|
 | I/O backend | `--io-backend` | `VORTEX_IO_BACKEND` | `auto` | I/O multiplexing backend. Values: `auto`, `uring`, `polling`. |
 | Ring size | `--ring-size` | `VORTEX_RING_SIZE` | `4096` | io_uring submission queue size. Must be a power of two. Larger values allow more inflight I/O operations. Only applies to `uring` backend. |
-| Fixed buffers | `--fixed-buffers` | `VORTEX_FIXED_BUFFERS` | `1024` | Number of fixed I/O buffers pre-registered with io_uring for zero-copy I/O. Each connection uses 2 buffers (read + write). |
+| Fixed buffers | `--fixed-buffers` | `VORTEX_FIXED_BUFFERS` | `20000` | Number of fixed I/O buffers pre-registered with io_uring for zero-copy I/O. Must be at least `max_clients * 2` because each live connection uses one read buffer and one write buffer. |
 | Buffer size | `--buffer-size` | `VORTEX_BUFFER_SIZE` | `16384` | Size of each I/O buffer in bytes. Minimum: `4096`. Larger buffers reduce syscalls for big values but increase memory usage. |
 | SQPOLL idle | `--sqpoll-idle-ms` | `VORTEX_SQPOLL_IDLE_MS` | `1000` | io_uring SQPOLL kernel thread idle timeout in milliseconds. The kernel thread polls SQEs without syscalls; it sleeps after this idle period. |
 

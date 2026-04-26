@@ -158,6 +158,12 @@ fn execute_replay_record(
     Ok(())
 }
 
+fn truncate_partial_tail(path: &Path, valid_len: u64) -> io::Result<()> {
+    let file = File::options().write(true).open(path)?;
+    file.set_len(valid_len)?;
+    file.sync_all()
+}
+
 impl AofReader {
     /// Create a reader for the given AOF file path.
     pub fn new(path: &Path) -> Self {
@@ -276,9 +282,7 @@ impl AofReader {
         if bytes_truncated > 0 {
             let valid_len = AOF_HEADER_SIZE as u64 + offset as u64;
             drop(file);
-            let f = File::options().write(true).open(&self.path)?;
-            f.set_len(valid_len)?;
-            f.sync_all()?;
+            truncate_partial_tail(&self.path, valid_len)?;
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -330,6 +334,7 @@ impl AofReader {
             file.read_exact(&mut data)?;
 
             cursors.push(AofFileCursor {
+                path: path.clone(),
                 data,
                 offset: 0,
                 reactor_idx: idx,
@@ -337,6 +342,7 @@ impl AofReader {
                 synthetic_lsn_base: (idx as u64) << 48,
                 record_count: 0,
                 truncated_bytes: 0,
+                truncated_record_offset: None,
             });
             files_loaded += 1;
         }
@@ -370,7 +376,7 @@ impl AofReader {
                 Ok(None) => {}
                 Err(failure) => {
                     return Err(replay_parse_error(
-                        &paths[ci],
+                        &cursor.path,
                         failure.record_offset,
                         failure.lsn,
                         &failure.error,
@@ -392,11 +398,11 @@ impl AofReader {
             // Parse and execute the RESP record.
             let resp_data = &cursors[ci].data[resp_start..resp_start + resp_len];
             let tape = RespTape::parse_pipeline(resp_data).map_err(|error| {
-                replay_parse_error(&paths[ci], record_offset, Some(lsn), &error)
+                replay_parse_error(&cursors[ci].path, record_offset, Some(lsn), &error)
             })?;
             let frame = tape.iter().next().ok_or_else(|| {
                 replay_error(
-                    &paths[ci],
+                    &cursors[ci].path,
                     record_offset,
                     Some(lsn),
                     None,
@@ -404,7 +410,7 @@ impl AofReader {
                 )
             })?;
             execute_replay_record(
-                &paths[ci],
+                &cursors[ci].path,
                 keyspace,
                 record_offset,
                 Some(lsn),
@@ -428,7 +434,7 @@ impl AofReader {
                 Ok(None) => {}
                 Err(failure) => {
                     return Err(replay_parse_error(
-                        &paths[ci],
+                        &cursors[ci].path,
                         failure.record_offset,
                         failure.lsn,
                         &failure.error,
@@ -440,6 +446,15 @@ impl AofReader {
         // Restore global LSN counter to the next value after the highest replayed.
         if max_lsn > 0 {
             keyspace.set_lsn(max_lsn + 1);
+        }
+
+        for cursor in &cursors {
+            if let Some(valid_data_len) = cursor.valid_data_len() {
+                truncate_partial_tail(
+                    &cursor.path,
+                    AOF_HEADER_SIZE as u64 + valid_data_len as u64,
+                )?;
+            }
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -463,6 +478,8 @@ impl AofReader {
 
 /// Internal cursor for reading records from a single AOF file during K-Way merge.
 struct AofFileCursor {
+    /// Source file path used for diagnostics and truncation.
+    path: PathBuf,
     /// File data (excluding header).
     data: Vec<u8>,
     /// Current read offset.
@@ -479,9 +496,15 @@ struct AofFileCursor {
     record_count: u64,
     /// Number of trailing bytes that were discarded as an incomplete record.
     truncated_bytes: usize,
+    /// Start offset of the trailing partial record, if one was observed.
+    truncated_record_offset: Option<usize>,
 }
 
 impl AofFileCursor {
+    fn valid_data_len(&self) -> Option<usize> {
+        self.truncated_record_offset
+    }
+
     /// Read the next record, returning `(lsn, record_offset, resp_data_start, resp_data_len)`.
     ///
     /// For v2 files: reads the 8-byte LSN prefix, then parses to find the
@@ -497,6 +520,7 @@ impl AofFileCursor {
         let lsn = if self.is_v2 {
             if self.offset + LSN_SIZE > self.data.len() {
                 self.truncated_bytes = self.data.len() - record_offset;
+                self.truncated_record_offset = Some(record_offset);
                 self.offset = self.data.len();
                 return Ok(None);
             }
@@ -523,6 +547,7 @@ impl AofFileCursor {
             Ok((_, consumed)) => {
                 if consumed == 0 {
                     self.truncated_bytes = self.data.len() - record_offset;
+                    self.truncated_record_offset = Some(record_offset);
                     self.offset = self.data.len();
                     return Ok(None);
                 }
@@ -531,6 +556,7 @@ impl AofFileCursor {
             }
             Err(ParseError::NeedMoreData) => {
                 self.truncated_bytes = self.data.len() - record_offset;
+                self.truncated_record_offset = Some(record_offset);
                 self.offset = self.data.len();
                 Ok(None)
             }
@@ -1182,6 +1208,91 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("lsn=2"));
         assert!(message.contains("command=SET"));
+        assert!(message.contains(path1.file_name().unwrap().to_string_lossy().as_ref()));
+
+        cleanup(&path0);
+        cleanup(&path1);
+    }
+
+    #[test]
+    fn kway_merge_truncates_trailing_partial_record() {
+        let path0 = temp_path("merge-truncated-r0");
+        let path1 = temp_path("merge-truncated-r1");
+
+        {
+            let mut w = AofFileWriter::open(&path0, 0, AofFsyncPolicy::No).unwrap();
+            w.append_with_lsn(1, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+                .unwrap();
+            w.flush_buffer().unwrap();
+        }
+
+        let valid_len = {
+            let mut w = AofFileWriter::open(&path1, 1, AofFsyncPolicy::No).unwrap();
+            w.append_with_lsn(2, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+                .unwrap();
+            w.flush_buffer().unwrap();
+            std::fs::metadata(&path1).unwrap().len()
+        };
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path1)
+                .unwrap();
+            file.write_all(b"\x03\x00\x00\x00\x00\x00\x00\x00*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\n")
+                .unwrap();
+        }
+
+        let ks = make_keyspace();
+        let stats = AofReader::replay_merge(&[path0.clone(), path1.clone()], &ks).unwrap();
+
+        assert_eq!(stats.commands_replayed, 2);
+        assert!(stats.bytes_truncated > 0);
+        assert_eq!(std::fs::metadata(&path1).unwrap().len(), valid_len);
+
+        cleanup(&path0);
+        cleanup(&path1);
+    }
+
+    #[test]
+    fn kway_merge_fails_on_mid_file_resp_corruption() {
+        let path0 = temp_path("merge-corrupt-r0");
+        let path1 = temp_path("merge-corrupt-r1");
+
+        {
+            let mut w = AofFileWriter::open(&path0, 0, AofFsyncPolicy::No).unwrap();
+            w.append_with_lsn(1, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+                .unwrap();
+            w.flush_buffer().unwrap();
+        }
+
+        {
+            let mut w = AofFileWriter::open(&path1, 1, AofFsyncPolicy::No).unwrap();
+            w.append_with_lsn(2, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+                .unwrap();
+            w.flush_buffer().unwrap();
+        }
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path1)
+                .unwrap();
+            file.write_all(&3u64.to_le_bytes()).unwrap();
+            file.write_all(b"!broken\r\n").unwrap();
+            file.write_all(&4u64.to_le_bytes()).unwrap();
+            file.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$1\r\n3\r\n")
+                .unwrap();
+        }
+
+        let ks = make_keyspace();
+        let error = AofReader::replay_merge(&[path0.clone(), path1.clone()], &ks).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("lsn=3"));
         assert!(message.contains(path1.file_name().unwrap().to_string_lossy().as_ref()));
 
         cleanup(&path0);

@@ -1,7 +1,6 @@
-//! Server & connection command handlers.
+//! Server command handlers.
 //!
-//! PING, ECHO, QUIT, DBSIZE, FLUSHDB, FLUSHALL, INFO, COMMAND,
-//! SELECT, TIME, and transaction stubs (MULTI/EXEC/DISCARD/WATCH/UNWATCH).
+//! DBSIZE, FLUSHDB, FLUSHALL, INFO, COMMAND, and TIME.
 
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
@@ -11,67 +10,79 @@ use super::{
 };
 use crate::ConcurrentKeyspace;
 
-// ── Pre-computed static responses ───────────────────────────────────
+/// Alpha-visible command set. This excludes commands that are still stubs,
+/// unsupported, or intentionally disabled for the alpha release.
+const SUPPORTED_COMMANDS: &[&str] = &[
+    // Connection
+    "PING",
+    "ECHO",
+    "QUIT",
+    "SELECT",
+    // Server
+    "COMMAND",
+    "INFO",
+    "DBSIZE",
+    "FLUSHDB",
+    "FLUSHALL",
+    "CONFIG",
+    "TIME",
+    "MULTI",
+    "EXEC",
+    "DISCARD",
+    "WATCH",
+    "UNWATCH",
+    // String
+    "SET",
+    "GET",
+    "SETNX",
+    "SETEX",
+    "PSETEX",
+    "MSET",
+    "MSETNX",
+    "MGET",
+    "GETSET",
+    "GETDEL",
+    "GETEX",
+    "INCR",
+    "DECR",
+    "INCRBY",
+    "DECRBY",
+    "INCRBYFLOAT",
+    "APPEND",
+    "STRLEN",
+    "GETRANGE",
+    "SETRANGE",
+    // Key
+    "DEL",
+    "UNLINK",
+    "EXISTS",
+    "EXPIRE",
+    "PEXPIRE",
+    "EXPIREAT",
+    "PEXPIREAT",
+    "PERSIST",
+    "TTL",
+    "PTTL",
+    "EXPIRETIME",
+    "PEXPIRETIME",
+    "RENAME",
+    "RENAMENX",
+    "KEYS",
+    "SCAN",
+    "RANDOMKEY",
+    "TOUCH",
+    "COPY",
+    "TYPE",
+];
 
-static RESP_PONG: &[u8] = b"+PONG\r\n";
-static ERR_DB_INDEX: &[u8] = b"-ERR DB index is out of range\r\n";
-static ERR_MULTI_NOT_IMPL: &[u8] = b"-ERR MULTI/EXEC is not yet implemented\r\n";
-
-// ── 3.6.1 — PING / ECHO / QUIT ─────────────────────────────────────
-
-/// PING [message]
-///
-/// If no argument: +PONG\r\n.
-/// If argument: return it as bulk string.
 #[inline]
-pub fn cmd_ping(
-    _keyspace: &ConcurrentKeyspace,
-    frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    let Some(args) = CommandArgs::collect(frame) else {
-        return CmdResult::Static(RESP_PONG);
-    };
-    if args.len() <= 1 {
-        return CmdResult::Static(RESP_PONG);
-    }
-    // PING message — return message as bulk string.
-    if let Some(msg) = args.get(1) {
-        CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(msg)))
-    } else {
-        CmdResult::Static(RESP_PONG)
-    }
+fn lookup_supported_command(name: &str) -> Option<&'static CommandMeta> {
+    SUPPORTED_COMMANDS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == name)
+        .and_then(vortex_proto::command::lookup_command)
 }
-
-/// ECHO message
-///
-/// Returns the message as a bulk string.
-#[inline]
-pub fn cmd_echo(
-    _keyspace: &ConcurrentKeyspace,
-    frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    if let Some(msg) = CommandArgs::collect(frame).and_then(|args| args.get(1)) {
-        CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(msg)))
-    } else {
-        CmdResult::Static(b"$-1\r\n")
-    }
-}
-
-/// QUIT
-///
-/// Returns +OK. Connection close is handled by the reactor layer.
-#[inline]
-pub fn cmd_quit(
-    _keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    CmdResult::Static(RESP_OK)
-}
-
-// ── 3.6.2 — DBSIZE / FLUSHDB / FLUSHALL ────────────────────────────
 
 /// DBSIZE
 ///
@@ -87,8 +98,8 @@ pub fn cmd_dbsize(
 
 /// FLUSHDB [ASYNC|SYNC]
 ///
-/// Removes all keys from the shard. Also clears the expiry wheel.
-/// Phase 3: ASYNC is accepted but executes synchronously.
+/// Removes all keys from the shard. Phase 3: ASYNC is accepted but executes
+/// synchronously.
 #[inline]
 pub fn cmd_flushdb(
     keyspace: &ConcurrentKeyspace,
@@ -100,7 +111,7 @@ pub fn cmd_flushdb(
 
 /// FLUSHALL [ASYNC|SYNC]
 ///
-/// Same as FLUSHDB in single-shard Phase 3.
+/// Same as FLUSHDB for the shared-keyspace alpha.
 #[inline]
 pub fn cmd_flushall(
     keyspace: &ConcurrentKeyspace,
@@ -109,8 +120,6 @@ pub fn cmd_flushall(
 ) -> ExecutedCommand {
     ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), keyspace.cmd_flush_all())
 }
-
-// ── 3.6.3 — INFO ───────────────────────────────────────────────────
 
 /// INFO [section]
 ///
@@ -159,14 +168,11 @@ fn write_info_server(buf: &mut Vec<u8>) {
 
 fn write_info_clients(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"# Clients\r\n");
-    // Phase 3: client count not tracked in engine; reactor owns that.
-    // Return 0 as placeholder — reactor integration (Task 3.7) will inject real value.
     buf.extend_from_slice(b"connected_clients:0\r\n\r\n");
 }
 
 fn write_info_memory(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"# Memory\r\n");
-    // Approximate process memory from the OS.
     buf.extend_from_slice(b"used_memory:0\r\n");
     buf.extend_from_slice(b"used_memory_human:0B\r\n\r\n");
 }
@@ -183,14 +189,11 @@ fn write_info_keyspace(buf: &mut Vec<u8>, keys: usize, expires: usize) {
     buf.extend_from_slice(b"\r\n");
 }
 
-/// Fast itoa into a Vec (avoids pulling in itoa for a Vec target).
 #[inline]
 fn itoa_append(buf: &mut Vec<u8>, n: i64) {
     let mut tmp = itoa::Buffer::new();
     buf.extend_from_slice(tmp.format(n).as_bytes());
 }
-
-// ── 3.6.4 — COMMAND ────────────────────────────────────────────────
 
 /// COMMAND [subcommand [args...]]
 ///
@@ -208,7 +211,6 @@ pub fn cmd_command(
     let argc = args.len();
 
     if argc <= 1 {
-        // COMMAND (no subcommand) — return all command metadata.
         return cmd_command_all();
     }
 
@@ -219,22 +221,13 @@ pub fn cmd_command(
     if eq_ci(sub, b"info") {
         return cmd_command_info(&args);
     }
-    if eq_ci(sub, b"docs") {
-        // COMMAND DOCS — not implemented, return empty array.
+    if eq_ci(sub, b"docs") || eq_ci(sub, b"list") || eq_ci(sub, b"getkeys") {
         return CmdResult::Static(RESP_EMPTY_ARRAY);
     }
-    if eq_ci(sub, b"list") {
-        // COMMAND LIST — not implemented, return empty array.
-        return CmdResult::Static(RESP_EMPTY_ARRAY);
-    }
-    if eq_ci(sub, b"getkeys") {
-        return CmdResult::Static(RESP_EMPTY_ARRAY);
-    }
-    // Unknown subcommand.
+
     CmdResult::Static(b"-ERR unknown subcommand or wrong number of arguments\r\n")
 }
 
-/// COMMAND (no args) — returns metadata array for all commands.
 fn cmd_command_all() -> CmdResult {
     let entries = collect_all_command_metas();
     let mut frames = Vec::with_capacity(entries.len());
@@ -244,26 +237,21 @@ fn cmd_command_all() -> CmdResult {
     CmdResult::Resp(RespFrame::Array(Some(frames)))
 }
 
-/// COMMAND COUNT — returns the number of registered commands.
 fn cmd_command_count() -> CmdResult {
-    let count = collect_all_command_metas().len();
-    super::int_resp(count as i64)
+    super::int_resp(collect_all_command_metas().len() as i64)
 }
 
-/// COMMAND INFO cmd [cmd ...]
 fn cmd_command_info(args: &CommandArgs<'_>) -> CmdResult {
     let argc = args.len();
     let mut frames = Vec::with_capacity(argc.saturating_sub(2));
     for i in 2..argc {
         if let Some(name_bytes) = args.get(i) {
-            // Uppercase for lookup.
             let mut buf = [0u8; 32];
             let len = name_bytes.len().min(32);
             buf[..len].copy_from_slice(&name_bytes[..len]);
             vortex_proto::uppercase_inplace(&mut buf[..len]);
-            // SAFETY: uppercase ASCII is valid UTF-8.
             let name_str = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
-            match vortex_proto::command::lookup_command(name_str) {
+            match lookup_supported_command(name_str) {
                 Some(meta) => frames.push(command_meta_to_frame(meta)),
                 None => frames.push(RespFrame::Null),
             }
@@ -274,13 +262,10 @@ fn cmd_command_info(args: &CommandArgs<'_>) -> CmdResult {
     CmdResult::Resp(RespFrame::Array(Some(frames)))
 }
 
-/// Serialize a single CommandMeta to a RESP array:
-/// [name, arity, [flags...], first_key, last_key, step]
 fn command_meta_to_frame(meta: &CommandMeta) -> RespFrame {
     let name = RespFrame::bulk_string(bytes::Bytes::from_static(meta.name.as_bytes()));
     let arity = RespFrame::integer(i64::from(meta.arity));
 
-    // Build flags array.
     let mut flags = Vec::with_capacity(4);
     if meta.flags.contains(CommandFlags::READ) {
         flags.push(RespFrame::simple_string("readonly"));
@@ -317,278 +302,17 @@ fn command_meta_to_frame(meta: &CommandMeta) -> RespFrame {
     ]))
 }
 
-/// Collect all command metadata from the PHF table.
-///
-/// The PHF table is compile-time generated; we must iterate it via
-/// the known command set. We use `lookup_command` against the known list.
 fn collect_all_command_metas() -> Vec<&'static CommandMeta> {
-    // The known command names. We include all registered names from build.rs.
-    // This is the canonical list for COMMAND output.
-    static KNOWN_COMMANDS: &[&str] = &[
-        // Connection
-        "PING",
-        "ECHO",
-        "QUIT",
-        "AUTH",
-        "SELECT",
-        "HELLO",
-        "RESET",
-        "CLIENT",
-        // Server
-        "COMMAND",
-        "INFO",
-        "DBSIZE",
-        "FLUSHDB",
-        "FLUSHALL",
-        "CONFIG",
-        "DEBUG",
-        "SAVE",
-        "BGSAVE",
-        "BGREWRITEAOF",
-        "LASTSAVE",
-        "TIME",
-        "SLOWLOG",
-        "MULTI",
-        "EXEC",
-        "DISCARD",
-        "WATCH",
-        "UNWATCH",
-        "WAIT",
-        "SHUTDOWN",
-        "SWAPDB",
-        "OBJECT",
-        "TYPE",
-        "DUMP",
-        "RESTORE",
-        // String
-        "SET",
-        "GET",
-        "SETNX",
-        "SETEX",
-        "PSETEX",
-        "MSET",
-        "MSETNX",
-        "MGET",
-        "GETSET",
-        "GETDEL",
-        "GETEX",
-        "INCR",
-        "DECR",
-        "INCRBY",
-        "DECRBY",
-        "INCRBYFLOAT",
-        "APPEND",
-        "STRLEN",
-        "GETRANGE",
-        "SETRANGE",
-        "SUBSTR",
-        "LCS",
-        // Key
-        "DEL",
-        "UNLINK",
-        "EXISTS",
-        "EXPIRE",
-        "PEXPIRE",
-        "EXPIREAT",
-        "PEXPIREAT",
-        "PERSIST",
-        "TTL",
-        "PTTL",
-        "EXPIRETIME",
-        "PEXPIRETIME",
-        "RENAME",
-        "RENAMENX",
-        "KEYS",
-        "SCAN",
-        "RANDOMKEY",
-        "TOUCH",
-        "COPY",
-        "SORT",
-        "SORT_RO",
-        "MOVE",
-        "WAIT",
-        // Hash
-        "HSET",
-        "HGET",
-        "HMSET",
-        "HMGET",
-        "HDEL",
-        "HEXISTS",
-        "HLEN",
-        "HKEYS",
-        "HVALS",
-        "HGETALL",
-        "HINCRBY",
-        "HINCRBYFLOAT",
-        "HSETNX",
-        "HRANDFIELD",
-        "HSCAN",
-        // Set
-        "SADD",
-        "SREM",
-        "SISMEMBER",
-        "SMISMEMBER",
-        "SMEMBERS",
-        "SCARD",
-        "SPOP",
-        "SRANDMEMBER",
-        "SINTER",
-        "SINTERSTORE",
-        "SINTERCARD",
-        "SUNION",
-        "SUNIONSTORE",
-        "SDIFF",
-        "SDIFFSTORE",
-        "SSCAN",
-        // Sorted Set
-        "ZADD",
-        "ZREM",
-        "ZSCORE",
-        "ZRANK",
-        "ZREVRANK",
-        "ZCARD",
-        "ZCOUNT",
-        "ZLEXCOUNT",
-        "ZRANGE",
-        "ZRANGEBYLEX",
-        "ZRANGEBYSCORE",
-        "ZREVRANGE",
-        "ZREVRANGEBYLEX",
-        "ZREVRANGEBYSCORE",
-        "ZRANGESTORE",
-        "ZINCRBY",
-        "ZPOPMIN",
-        "ZPOPMAX",
-        "ZRANDMEMBER",
-        "ZMSCORE",
-        "ZUNIONSTORE",
-        "ZINTERSTORE",
-        "ZUNION",
-        "ZINTER",
-        "ZDIFF",
-        "ZDIFFSTORE",
-        "ZSCAN",
-        "BZPOPMIN",
-        "BZPOPMAX",
-        "ZINTERCARD",
-        // List
-        "LPUSH",
-        "RPUSH",
-        "LPOP",
-        "RPOP",
-        "LLEN",
-        "LINDEX",
-        "LSET",
-        "LRANGE",
-        "LTRIM",
-        "LREM",
-        "LINSERT",
-        "LPOS",
-        "LMPOP",
-        "RPOPLPUSH",
-        "LMOVE",
-        "LPUSHX",
-        "RPUSHX",
-        "BLPOP",
-        "BRPOP",
-        "BRPOPLPUSH",
-        "BLMOVE",
-        "BLMPOP",
-        // Stream
-        "XADD",
-        "XLEN",
-        "XRANGE",
-        "XREVRANGE",
-        "XREAD",
-        "XINFO",
-        "XACK",
-        "XCLAIM",
-        "XAUTOCLAIM",
-        "XDEL",
-        "XTRIM",
-        "XGROUP",
-        "XREADGROUP",
-        "XPENDING",
-        "XSETID",
-        // Pub/Sub
-        "SUBSCRIBE",
-        "UNSUBSCRIBE",
-        "PUBLISH",
-        "PSUBSCRIBE",
-        "PUNSUBSCRIBE",
-        "PUBSUB",
-        "SSUBSCRIBE",
-        "SUNSUBSCRIBE",
-        // Scripting
-        "EVAL",
-        "EVALSHA",
-        "EVALRO",
-        "EVALSHA_RO",
-        "SCRIPT",
-        "FUNCTION",
-        // HyperLogLog
-        "PFADD",
-        "PFCOUNT",
-        "PFMERGE",
-        // Bitmap
-        "SETBIT",
-        "GETBIT",
-        "BITCOUNT",
-        "BITOP",
-        "BITPOS",
-        "BITFIELD",
-        "BITFIELD_RO",
-        // Geo
-        "GEOADD",
-        "GEODIST",
-        "GEOHASH",
-        "GEOPOS",
-        "GEORADIUS",
-        "GEORADIUSBYMEMBER",
-        "GEOSEARCH",
-        "GEOSEARCHSTORE",
-        "GEORADIUS_RO",
-        "GEORADIUSBYMEMBER_RO",
-        // Cluster
-        "CLUSTER",
-        "READONLY",
-        "READWRITE",
-        "ASKING",
-        // ACL
-        "ACL",
-        // Module
-        "MODULE",
-        // Memory
-        "MEMORY",
-    ];
-
-    let mut metas = Vec::with_capacity(KNOWN_COMMANDS.len());
-    for &name in KNOWN_COMMANDS {
-        if let Some(meta) = vortex_proto::command::lookup_command(name) {
+    let mut metas = Vec::with_capacity(SUPPORTED_COMMANDS.len());
+    for &name in SUPPORTED_COMMANDS {
+        if let Some(meta) = lookup_supported_command(name) {
             metas.push(meta);
         }
     }
     metas
 }
 
-// ── 3.6.5 — SELECT / TIME / transaction stubs ──────────────────────
-
-/// SELECT index
-///
-/// Accept 0 (single DB in Phase 3), reject N>0.
-#[inline]
-pub fn cmd_select(
-    _keyspace: &ConcurrentKeyspace,
-    frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    if let Some(idx_bytes) = CommandArgs::collect(frame).and_then(|args| args.get(1)) {
-        if idx_bytes == b"0" {
-            return CmdResult::Static(RESP_OK);
-        }
-    }
-    CmdResult::Static(ERR_DB_INDEX)
-}
+// ── 3.6.4 — TIME ───────────────────────────────────────────────────
 
 /// TIME
 ///
@@ -623,56 +347,6 @@ pub(crate) fn cmd_time_with_clock(
         RespFrame::bulk_string(bytes::Bytes::copy_from_slice(sec_str.as_bytes())),
         RespFrame::bulk_string(bytes::Bytes::copy_from_slice(usec_str.as_bytes())),
     ])))
-}
-
-/// MULTI — stub.
-#[inline]
-pub fn cmd_multi(
-    _keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    CmdResult::Static(ERR_MULTI_NOT_IMPL)
-}
-
-/// EXEC — stub.
-#[inline]
-pub fn cmd_exec(
-    _keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    CmdResult::Static(b"-ERR EXEC without MULTI\r\n")
-}
-
-/// DISCARD — stub.
-#[inline]
-pub fn cmd_discard(
-    _keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    CmdResult::Static(b"-ERR DISCARD without MULTI\r\n")
-}
-
-/// WATCH key [key ...] — stub.
-#[inline]
-pub fn cmd_watch(
-    _keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    CmdResult::Static(ERR_MULTI_NOT_IMPL)
-}
-
-/// UNWATCH — stub.
-#[inline]
-pub fn cmd_unwatch(
-    _keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
-    _now_nanos: u64,
-) -> CmdResult {
-    CmdResult::Static(RESP_OK)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -771,48 +445,17 @@ mod tests {
         }
     }
 
-    // ── PING ──
-
-    #[test]
-    fn ping_no_args() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"PING"]);
-        assert_static(&r, RESP_PONG);
-    }
-
-    #[test]
-    fn ping_with_message() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"PING", b"hello"]);
-        match &r {
-            CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
-                assert_eq!(b.as_ref(), b"hello" as &[u8]);
-            }
-            other => panic!("expected BulkString, got {other:?}"),
+    fn array_contains_command_name(r: &CmdResult, needle: &[u8]) -> bool {
+        match r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => arr.iter().any(|frame| match frame {
+                RespFrame::Array(Some(meta)) => match meta.first() {
+                    Some(RespFrame::BulkString(Some(name))) => name.as_ref() == needle,
+                    _ => false,
+                },
+                _ => false,
+            }),
+            other => panic!("expected Array, got {other:?}"),
         }
-    }
-
-    // ── ECHO ──
-
-    #[test]
-    fn echo_returns_message() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"ECHO", b"world"]);
-        match &r {
-            CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
-                assert_eq!(b.as_ref(), b"world" as &[u8]);
-            }
-            other => panic!("expected BulkString, got {other:?}"),
-        }
-    }
-
-    // ── QUIT ──
-
-    #[test]
-    fn quit_returns_ok() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"QUIT"]);
-        assert_static(&r, RESP_OK);
     }
 
     // ── DBSIZE ──
@@ -898,10 +541,21 @@ mod tests {
         let r = exec(&h, &[b"COMMAND", b"COUNT"]);
         match &r {
             CmdResult::Resp(RespFrame::Integer(n)) => {
-                assert!(*n > 100, "expected > 100 commands, got {n}");
+                assert_eq!(*n, SUPPORTED_COMMANDS.len() as i64);
             }
             other => panic!("expected Integer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn command_all_omits_unsupported_alpha_commands() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"COMMAND"]);
+
+        assert!(array_contains_command_name(&r, b"GET"));
+        assert!(array_contains_command_name(&r, b"CONFIG"));
+        assert!(!array_contains_command_name(&r, b"HSET"));
+        assert!(!array_contains_command_name(&r, b"BGREWRITEAOF"));
     }
 
     #[test]
@@ -920,20 +574,17 @@ mod tests {
         assert_array_len(&r, 1);
     }
 
-    // ── SELECT ──
-
     #[test]
-    fn select_zero_ok() {
+    fn command_info_unsupported_returns_null() {
         let h = TestHarness::new();
-        let r = exec(&h, &[b"SELECT", b"0"]);
-        assert_static(&r, RESP_OK);
-    }
-
-    #[test]
-    fn select_nonzero_error() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"SELECT", b"1"]);
-        assert_static(&r, ERR_DB_INDEX);
+        let r = exec(&h, &[b"COMMAND", b"INFO", b"HSET", b"BGREWRITEAOF"]);
+        match &r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert!(matches!(arr.first(), Some(RespFrame::Null)));
+                assert!(matches!(arr.get(1), Some(RespFrame::Null)));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
     }
 
     // ── TIME ──
@@ -964,42 +615,5 @@ mod tests {
             }
             other => panic!("expected Array, got {other:?}"),
         }
-    }
-
-    // ── Transaction stubs ──
-
-    #[test]
-    fn multi_returns_error() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"MULTI"]);
-        assert_static(&r, ERR_MULTI_NOT_IMPL);
-    }
-
-    #[test]
-    fn exec_without_multi() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"EXEC"]);
-        assert_static(&r, b"-ERR EXEC without MULTI\r\n");
-    }
-
-    #[test]
-    fn discard_without_multi() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"DISCARD"]);
-        assert_static(&r, b"-ERR DISCARD without MULTI\r\n");
-    }
-
-    #[test]
-    fn watch_returns_error() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"WATCH", b"mykey"]);
-        assert_static(&r, ERR_MULTI_NOT_IMPL);
-    }
-
-    #[test]
-    fn unwatch_returns_ok() {
-        let h = TestHarness::new();
-        let r = exec(&h, &[b"UNWATCH"]);
-        assert_static(&r, RESP_OK);
     }
 }

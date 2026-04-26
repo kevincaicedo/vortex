@@ -26,7 +26,7 @@ fn multi_reactor_ping_pong() {
         threads: 2,
         max_connections: 128,
         buffer_size: 4096,
-        buffer_count: 128,
+        buffer_count: 256,
         connection_timeout: 0,
         aof_config: None,
         shard_count: 64,

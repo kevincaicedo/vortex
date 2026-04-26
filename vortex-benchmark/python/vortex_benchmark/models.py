@@ -20,6 +20,8 @@ SUPPORTED_EVICTION_POLICIES = (
     "allkeys-random",
     "volatile-random",
     "volatile-ttl",
+    "allkeys-lfu",
+    "volatile-lfu",
 )
 
 

@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "reactor_clock"
 harness = false
+
+[[bench]]
+name = "transaction_roundtrip"
+harness = false

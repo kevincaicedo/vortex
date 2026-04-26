@@ -1,8 +1,10 @@
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 pub const EVICTION_SWEEP_WINDOW: usize = 64;
+pub const EVICTION_MAX_SHARDS_PER_ADMISSION: usize = 64;
 pub const LFU_SKETCH_DEPTH: usize = 4;
 pub const LFU_SKETCH_WIDTH: usize = 2048;
+pub const LFU_READ_SAMPLE_MASK: u64 = 0x0F;
 
 const LFU_SKETCH_MASK: usize = LFU_SKETCH_WIDTH - 1;
 const LFU_SKETCH_DECAY_INTERVAL: u64 = 1 << 16;
@@ -208,6 +210,11 @@ impl FrequencySketch {
     }
 }
 
+#[inline]
+pub const fn should_sample_lfu_read(random: u64) -> bool {
+    random & LFU_READ_SAMPLE_MASK == 0
+}
+
 impl EvictionConfigState {
     #[inline]
     pub const fn new() -> Self {
@@ -307,7 +314,9 @@ pub fn next_random_u64() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvictionConfigState, EvictionPolicy, FrequencySketch, xorshift64};
+    use super::{
+        EvictionConfigState, EvictionPolicy, FrequencySketch, should_sample_lfu_read, xorshift64,
+    };
 
     #[test]
     fn parses_known_policy_names() {
@@ -365,5 +374,13 @@ mod tests {
         sketch.record(cold);
 
         assert!(sketch.estimate(hot) > sketch.estimate(cold));
+    }
+
+    #[test]
+    fn lfu_read_sampling_uses_one_in_sixteen_mask() {
+        let sampled: Vec<u64> = (0..16)
+            .filter(|value| should_sample_lfu_read(*value))
+            .collect();
+        assert_eq!(sampled, vec![0]);
     }
 }

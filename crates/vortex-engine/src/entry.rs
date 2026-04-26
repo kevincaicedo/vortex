@@ -9,7 +9,7 @@
 //!  0       1    control      — H₂ fingerprint (7 bits, MSB=1) or EMPTY/DELETED
 //!  1       1    key_len      — inline key length (0..=23) or 0 for heap keys
 //!  2       2    flags        — inline/heap markers, integer flag, TTL flag, value type nibble
-//!  4       4    _pad0        — alignment padding / (reserved for Phase 6 WATCH version counter)
+//!  4       4    _pad0        — AccessProfile payload (current owner of the 4-byte slack field)
 //!  8       8    ttl_deadline — absolute nanos, 0 = no expiry
 //! 16      23    key_data     — inline key bytes, or heap key ptr+len metadata
 //! 39       1    value_tag    — inline value len, HEAP tag, or INTEGER tag
@@ -79,7 +79,7 @@ pub struct Entry {
     pub key_len: u8,
     /// Entry flags (type tag, heap indicators, TTL).
     pub flags: AtomicU16,
-    /// Alignment padding (reserved for Phase 6 WATCH version counter).
+    /// Access-profile payload. Alpha WATCH/version tracking stays in cold side tables.
     pub _pad0: u32,
     /// TTL deadline in nanoseconds (0 = no expiry).
     pub ttl_deadline: u64,

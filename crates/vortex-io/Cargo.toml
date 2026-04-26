@@ -26,6 +26,7 @@ core_affinity = { workspace = true }
 crossbeam-utils = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
+itoa = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

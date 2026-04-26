@@ -37,8 +37,8 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use vortex_common::VortexKey;
 
 use crate::eviction::{
-    EVICTION_SWEEP_WINDOW, EvictionConfig, EvictionConfigState, EvictionPolicy, FrequencySketch,
-    next_random_u64,
+    EVICTION_MAX_SHARDS_PER_ADMISSION, EVICTION_SWEEP_WINDOW, EvictionConfig, EvictionConfigState,
+    EvictionPolicy, FrequencySketch, next_random_u64, should_sample_lfu_read,
 };
 use crate::table::SwissTable;
 
@@ -92,6 +92,7 @@ pub(crate) struct EvictedKey {
 pub(crate) type EvictedKeys = Option<Box<[EvictedKey]>>;
 
 #[derive(Debug)]
+/// Cold WATCH metadata kept outside the 64-byte Entry hot path.
 struct WatchSlot {
     version: u64,
     refs: usize,
@@ -141,6 +142,75 @@ impl EvictionAdmissionError {
     #[inline]
     fn new(response: &'static [u8], evicted: EvictedKeys) -> Self {
         Self { response, evicted }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EvictionMetricsSnapshot {
+    pub admissions: u64,
+    pub shards_scanned: u64,
+    pub slots_sampled: u64,
+    pub bytes_freed: u64,
+    pub oom_after_scan: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EvictionScanReport {
+    shards_scanned: usize,
+    slots_sampled: usize,
+    bytes_freed: usize,
+    oom_after_scan: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EvictionSweepResult {
+    next_slot: usize,
+    freed_bytes: usize,
+    slots_sampled: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvictionSweepContext {
+    shard_idx: usize,
+    start_slot: usize,
+    bytes_needed: usize,
+    now_nanos: u64,
+    volatile_only: bool,
+}
+
+#[derive(Debug, Default)]
+struct EvictionMetrics {
+    admissions: AtomicU64,
+    shards_scanned: AtomicU64,
+    slots_sampled: AtomicU64,
+    bytes_freed: AtomicU64,
+    oom_after_scan: AtomicU64,
+}
+
+impl EvictionMetrics {
+    #[inline]
+    fn record(&self, report: EvictionScanReport) {
+        self.admissions.fetch_add(1, Ordering::Relaxed);
+        self.shards_scanned
+            .fetch_add(report.shards_scanned as u64, Ordering::Relaxed);
+        self.slots_sampled
+            .fetch_add(report.slots_sampled as u64, Ordering::Relaxed);
+        self.bytes_freed
+            .fetch_add(report.bytes_freed as u64, Ordering::Relaxed);
+        if report.oom_after_scan {
+            self.oom_after_scan.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn snapshot(&self) -> EvictionMetricsSnapshot {
+        EvictionMetricsSnapshot {
+            admissions: self.admissions.load(Ordering::Relaxed),
+            shards_scanned: self.shards_scanned.load(Ordering::Relaxed),
+            slots_sampled: self.slots_sampled.load(Ordering::Relaxed),
+            bytes_freed: self.bytes_freed.load(Ordering::Relaxed),
+            oom_after_scan: self.oom_after_scan.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -261,6 +331,8 @@ pub struct ConcurrentKeyspace {
     eviction: EvictionConfigState,
     /// Global LFU frequency sketch shared across all shards.
     frequency_sketch: FrequencySketch,
+    /// Slow-path observability for bounded eviction work.
+    eviction_metrics: EvictionMetrics,
     /// Optimistic WATCH side table. It is cold unless clients are actively
     /// watching keys; normal mutations avoid it behind `watch_active`.
     watch_shards: Box<[WatchShard]>,
@@ -364,6 +436,7 @@ impl ConcurrentKeyspace {
             aof_recording_refs: AtomicUsize::new(0),
             eviction: EvictionConfigState::new(),
             frequency_sketch: FrequencySketch::new(),
+            eviction_metrics: EvictionMetrics::default(),
             watch_shards,
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
@@ -439,6 +512,7 @@ impl ConcurrentKeyspace {
     pub fn watch_key(&self, key: VortexKey) -> WatchKeyState {
         self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
         let shard_idx = self.watch_shard_index(key.as_bytes());
+        // TODO: Check Deadlock-free guarantees for WATCH operations.
         let mut guard = self.watch_shards[shard_idx].write();
         let slot = guard.entry(key.clone()).or_insert(WatchSlot {
             version: 0,
@@ -457,6 +531,7 @@ impl ConcurrentKeyspace {
     pub fn unwatch_keys(&self, keys: &[WatchKeyState]) {
         for watched in keys {
             let shard_idx = self.watch_shard_index(watched.key.as_bytes());
+            // TODO: Check Deadlock-free guarantees for WATCH operations.
             let mut guard = self.watch_shards[shard_idx].write();
             if let Some(slot) = guard.get_mut(&watched.key) {
                 if slot.refs > 1 {
@@ -478,6 +553,7 @@ impl ConcurrentKeyspace {
 
         for watched in keys {
             let shard_idx = self.watch_shard_index(watched.key.as_bytes());
+            // TODO: Check Deadlock-free guarantees for WATCH operations.
             let guard = self.watch_shards[shard_idx].read();
             let Some(slot) = guard.get(&watched.key) else {
                 return true;
@@ -540,6 +616,7 @@ impl ConcurrentKeyspace {
             aof_recording_refs: AtomicUsize::new(0),
             eviction: EvictionConfigState::new(),
             frequency_sketch: FrequencySketch::new(),
+            eviction_metrics: EvictionMetrics::default(),
             watch_shards,
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
@@ -653,8 +730,11 @@ impl ConcurrentKeyspace {
 
         match snapshot.policy {
             EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
-                self.frequency_sketch.record(hash);
-                let _ = table.record_access_prehashed(key_bytes, hash, next_random_u64());
+                let access_random = next_random_u64();
+                if should_sample_lfu_read(access_random) {
+                    self.frequency_sketch.record(hash);
+                }
+                let _ = table.record_access_prehashed(key_bytes, hash, access_random);
             }
             EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => {
                 let _ = table.record_access_prehashed(key_bytes, hash, next_random_u64());
@@ -743,6 +823,9 @@ impl ConcurrentKeyspace {
         now_nanos: u64,
         snapshot: EvictionConfig,
     ) -> Result<EvictedKeys, EvictionAdmissionError> {
+        // Alpha note: this is a concurrent preflight against the published
+        // global counter, not a linearizable reservation. Racing writers can
+        // still overshoot until a future reservation protocol lands.
         if additional_bytes == 0 {
             return Ok(None);
         }
@@ -763,21 +846,31 @@ impl ConcurrentKeyspace {
             return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
         }
 
+        let mut report = EvictionScanReport::default();
+        if snapshot.policy.is_volatile_only() && !self.has_expiring_keys() {
+            report.oom_after_scan = true;
+            self.eviction_metrics.record(report);
+            return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
+        }
+
         let mut evicted = Vec::new();
         let target_used = snapshot.max_memory.saturating_sub(additional_bytes);
-        let _ = self.evict_until_target(
+        report.bytes_freed = self.evict_until_target(
             preferred_shard,
             target_used,
             snapshot.policy,
             now_nanos,
+            &mut report,
             &mut evicted,
         );
 
-        if self
+        report.oom_after_scan = self
             .published_memory_used()
             .saturating_add(additional_bytes)
-            <= snapshot.max_memory
-        {
+            > snapshot.max_memory;
+        self.eviction_metrics.record(report);
+
+        if !report.oom_after_scan {
             Ok(evicted_keys_to_box(evicted))
         } else {
             Err(EvictionAdmissionError::new(
@@ -793,6 +886,7 @@ impl ConcurrentKeyspace {
         target_used: usize,
         policy: EvictionPolicy,
         now_nanos: u64,
+        report: &mut EvictionScanReport,
         evicted: &mut Vec<EvictedKey>,
     ) -> usize {
         let shard_count = self.shards.len();
@@ -801,17 +895,30 @@ impl ConcurrentKeyspace {
         }
 
         let start_shard = preferred_shard & (shard_count - 1);
+        let shard_budget = shard_count.min(EVICTION_MAX_SHARDS_PER_ADMISSION);
         let initial_used = self.published_memory_used();
         let mut current_used = initial_used;
         let mut passes_without_progress = 0usize;
 
-        while current_used > target_used && passes_without_progress < shard_count {
+        while current_used > target_used
+            && passes_without_progress < shard_count
+            && report.shards_scanned < shard_budget
+        {
             let mut progress = false;
 
             for offset in 0..shard_count {
+                if report.shards_scanned >= shard_budget {
+                    break;
+                }
                 let shard_idx = (start_shard + offset) & (shard_count - 1);
+                if policy.is_volatile_only() && !self.shard_has_expiring_keys(shard_idx) {
+                    continue;
+                }
+
+                report.shards_scanned += 1;
                 let remaining = current_used.saturating_sub(target_used);
-                let freed = self.evict_from_shard(shard_idx, policy, remaining, now_nanos, evicted);
+                let freed =
+                    self.evict_from_shard(shard_idx, policy, remaining, now_nanos, report, evicted);
                 if freed == 0 {
                     continue;
                 }
@@ -839,6 +946,7 @@ impl ConcurrentKeyspace {
         policy: EvictionPolicy,
         bytes_needed: usize,
         now_nanos: u64,
+        report: &mut EvictionScanReport,
         evicted: &mut Vec<EvictedKey>,
     ) -> usize {
         let mut guard = self.write_shard_by_index(shard_idx);
@@ -848,67 +956,49 @@ impl ConcurrentKeyspace {
         }
 
         let start_slot = self.clock_hand(shard_idx) % total_slots;
-        let (next_slot, freed_bytes) = match policy {
-            EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => self.evict_random(
-                shard_idx,
-                &mut guard,
-                start_slot,
-                bytes_needed,
-                now_nanos,
-                policy.is_volatile_only(),
-                evicted,
-            ),
-            EvictionPolicy::VolatileTtl => {
-                self.evict_volatile_ttl(shard_idx, &mut guard, start_slot, now_nanos, evicted)
-            }
-            policy if policy.is_lfu() => self.evict_lfu_clock_sweep(
-                shard_idx,
-                &mut guard,
-                start_slot,
-                bytes_needed,
-                now_nanos,
-                policy.is_volatile_only(),
-                evicted,
-            ),
-            _ => self.evict_clock_sweep(
-                shard_idx,
-                &mut guard,
-                start_slot,
-                bytes_needed,
-                now_nanos,
-                policy.is_volatile_only(),
-                evicted,
-            ),
+        let context = EvictionSweepContext {
+            shard_idx,
+            start_slot,
+            bytes_needed,
+            now_nanos,
+            volatile_only: policy.is_volatile_only(),
         };
-        self.set_clock_hand(shard_idx, next_slot);
-        freed_bytes
+        let sweep = match policy {
+            EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => {
+                self.evict_random(&mut guard, context, evicted)
+            }
+            EvictionPolicy::VolatileTtl => self.evict_volatile_ttl(&mut guard, context, evicted),
+            policy if policy.is_lfu() => self.evict_lfu_clock_sweep(&mut guard, context, evicted),
+            _ => self.evict_clock_sweep(&mut guard, context, evicted),
+        };
+        report.slots_sampled += sweep.slots_sampled;
+        self.set_clock_hand(shard_idx, sweep.next_slot);
+        sweep.freed_bytes
     }
 
     fn evict_clock_sweep(
         &self,
-        shard_idx: usize,
         table: &mut SwissTable,
-        start_slot: usize,
-        bytes_needed: usize,
-        now_nanos: u64,
-        volatile_only: bool,
+        context: EvictionSweepContext,
         evicted: &mut Vec<EvictedKey>,
-    ) -> (usize, usize) {
+    ) -> EvictionSweepResult {
         let total_slots = table.total_slots();
         if total_slots == 0 {
-            return (0, 0);
+            return EvictionSweepResult::default();
         }
 
-        let mut slot = start_slot % total_slots;
+        let mut slot = context.start_slot % total_slots;
         let mut freed_bytes = 0usize;
+        let mut slots_sampled = 0usize;
         let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
 
         for _ in 0..sweep_len {
             let current_slot = slot;
             slot = (slot + 1) % total_slots;
+            slots_sampled += 1;
 
             let ttl = table.slot_entry_ttl(current_slot);
-            if ttl == 0 && volatile_only {
+            if ttl == 0 && context.volatile_only {
                 continue;
             }
 
@@ -916,9 +1006,10 @@ impl ConcurrentKeyspace {
                 continue;
             };
 
-            if ttl != 0 && ttl <= now_nanos {
-                freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
-                if freed_bytes >= bytes_needed {
+            if ttl != 0 && ttl <= context.now_nanos {
+                freed_bytes +=
+                    self.delete_evictable_slot(context.shard_idx, table, current_slot, evicted);
+                if freed_bytes >= context.bytes_needed {
                     break;
                 }
                 continue;
@@ -928,42 +1019,45 @@ impl ConcurrentKeyspace {
                 continue;
             }
 
-            freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
-            if freed_bytes >= bytes_needed {
+            freed_bytes +=
+                self.delete_evictable_slot(context.shard_idx, table, current_slot, evicted);
+            if freed_bytes >= context.bytes_needed {
                 break;
             }
         }
 
-        (slot, freed_bytes)
+        EvictionSweepResult {
+            next_slot: slot,
+            freed_bytes,
+            slots_sampled,
+        }
     }
 
     fn evict_lfu_clock_sweep(
         &self,
-        shard_idx: usize,
         table: &mut SwissTable,
-        start_slot: usize,
-        bytes_needed: usize,
-        now_nanos: u64,
-        volatile_only: bool,
+        context: EvictionSweepContext,
         evicted: &mut Vec<EvictedKey>,
-    ) -> (usize, usize) {
+    ) -> EvictionSweepResult {
         let total_slots = table.total_slots();
         if total_slots == 0 {
-            return (0, 0);
+            return EvictionSweepResult::default();
         }
 
-        let mut slot = start_slot % total_slots;
+        let mut slot = context.start_slot % total_slots;
         let mut freed_bytes = 0usize;
         let mut best_candidate = None;
         let mut best_frequency = u8::MAX;
+        let mut slots_sampled = 0usize;
         let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
 
         for _ in 0..sweep_len {
             let current_slot = slot;
             slot = (slot + 1) % total_slots;
+            slots_sampled += 1;
 
             let ttl = table.slot_entry_ttl(current_slot);
-            if ttl == 0 && volatile_only {
+            if ttl == 0 && context.volatile_only {
                 continue;
             }
 
@@ -971,10 +1065,15 @@ impl ConcurrentKeyspace {
                 continue;
             };
 
-            if ttl != 0 && ttl <= now_nanos {
-                freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
-                if freed_bytes >= bytes_needed {
-                    return (slot, freed_bytes);
+            if ttl != 0 && ttl <= context.now_nanos {
+                freed_bytes +=
+                    self.delete_evictable_slot(context.shard_idx, table, current_slot, evicted);
+                if freed_bytes >= context.bytes_needed {
+                    return EvictionSweepResult {
+                        next_slot: slot,
+                        freed_bytes,
+                        slots_sampled,
+                    };
                 }
                 continue;
             }
@@ -995,77 +1094,85 @@ impl ConcurrentKeyspace {
             }
         }
 
-        if freed_bytes < bytes_needed {
+        if freed_bytes < context.bytes_needed {
             if let Some(candidate) = best_candidate {
-                freed_bytes += self.delete_evictable_slot(shard_idx, table, candidate, evicted);
+                freed_bytes +=
+                    self.delete_evictable_slot(context.shard_idx, table, candidate, evicted);
             }
         }
 
-        (slot, freed_bytes)
+        EvictionSweepResult {
+            next_slot: slot,
+            freed_bytes,
+            slots_sampled,
+        }
     }
 
     fn evict_random(
         &self,
-        shard_idx: usize,
         table: &mut SwissTable,
-        start_slot: usize,
-        bytes_needed: usize,
-        now_nanos: u64,
-        volatile_only: bool,
+        context: EvictionSweepContext,
         evicted: &mut Vec<EvictedKey>,
-    ) -> (usize, usize) {
+    ) -> EvictionSweepResult {
         let total_slots = table.total_slots();
         if total_slots == 0 {
-            return (0, 0);
+            return EvictionSweepResult::default();
         }
 
         let random_start = (next_random_u64() as usize) & (total_slots - 1);
-        let mut slot = (start_slot + random_start) % total_slots;
+        let mut slot = (context.start_slot + random_start) % total_slots;
         let mut freed_bytes = 0usize;
+        let mut slots_sampled = 0usize;
         let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
 
         for _ in 0..sweep_len {
             let current_slot = slot;
             slot = (slot + 1) % total_slots;
+            slots_sampled += 1;
 
             let ttl = table.slot_entry_ttl(current_slot);
-            if ttl == 0 && volatile_only {
+            if ttl == 0 && context.volatile_only {
                 continue;
             }
             if table.slot_entry(current_slot).is_none() {
                 continue;
             }
-            let _ = now_nanos;
-            freed_bytes += self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
-            if freed_bytes >= bytes_needed {
+            let _ = context.now_nanos;
+            freed_bytes +=
+                self.delete_evictable_slot(context.shard_idx, table, current_slot, evicted);
+            if freed_bytes >= context.bytes_needed {
                 break;
             }
         }
 
-        (slot, freed_bytes)
+        EvictionSweepResult {
+            next_slot: slot,
+            freed_bytes,
+            slots_sampled,
+        }
     }
 
     fn evict_volatile_ttl(
         &self,
-        shard_idx: usize,
         table: &mut SwissTable,
-        start_slot: usize,
-        now_nanos: u64,
+        context: EvictionSweepContext,
         evicted: &mut Vec<EvictedKey>,
-    ) -> (usize, usize) {
+    ) -> EvictionSweepResult {
         let total_slots = table.total_slots();
         if total_slots == 0 {
-            return (0, 0);
+            return EvictionSweepResult::default();
         }
 
-        let mut slot = start_slot % total_slots;
+        let mut slot = context.start_slot % total_slots;
         let mut best_slot = None;
         let mut best_deadline = u64::MAX;
+        let mut slots_sampled = 0usize;
         let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
 
         for _ in 0..sweep_len {
             let current_slot = slot;
             slot = (slot + 1) % total_slots;
+            slots_sampled += 1;
             let ttl = table.slot_entry_ttl(current_slot);
             if ttl == 0 {
                 continue;
@@ -1073,9 +1180,14 @@ impl ConcurrentKeyspace {
             if table.slot_entry(current_slot).is_none() {
                 continue;
             }
-            if ttl <= now_nanos {
-                let freed = self.delete_evictable_slot(shard_idx, table, current_slot, evicted);
-                return (slot, freed);
+            if ttl <= context.now_nanos {
+                let freed =
+                    self.delete_evictable_slot(context.shard_idx, table, current_slot, evicted);
+                return EvictionSweepResult {
+                    next_slot: slot,
+                    freed_bytes: freed,
+                    slots_sampled,
+                };
             }
             if ttl < best_deadline {
                 best_deadline = ttl;
@@ -1084,9 +1196,15 @@ impl ConcurrentKeyspace {
         }
 
         let freed = best_slot
-            .map(|candidate| self.delete_evictable_slot(shard_idx, table, candidate, evicted))
+            .map(|candidate| {
+                self.delete_evictable_slot(context.shard_idx, table, candidate, evicted)
+            })
             .unwrap_or(0);
-        (slot, freed)
+        EvictionSweepResult {
+            next_slot: slot,
+            freed_bytes: freed,
+            slots_sampled,
+        }
     }
 
     fn delete_evictable_slot(
@@ -1170,11 +1288,27 @@ impl ConcurrentKeyspace {
         self.expiry_key_total.load(Ordering::Relaxed)
     }
 
+    #[inline]
+    pub fn approx_expiring_keys(&self) -> usize {
+        self.expiry_key_total.load(Ordering::Relaxed)
+    }
+
     /// Cheap global check used by event loops to skip active-expiry work for
     /// pure no-TTL workloads.
     #[inline]
     pub fn has_expiring_keys(&self) -> bool {
-        self.expiry_key_total.load(Ordering::Relaxed) != 0
+        self.approx_expiring_keys() != 0
+    }
+
+    #[inline]
+    fn shard_has_expiring_keys(&self, shard_idx: usize) -> bool {
+        debug_assert!(shard_idx < self.expiry_key_count.len());
+        self.expiry_key_count[shard_idx].load(Ordering::Relaxed) != 0
+    }
+
+    #[inline]
+    pub fn eviction_metrics(&self) -> EvictionMetricsSnapshot {
+        self.eviction_metrics.snapshot()
     }
 
     #[inline]
@@ -1535,6 +1669,9 @@ impl ConcurrentKeyspace {
         now_nanos: u64,
     ) -> (usize, usize) {
         debug_assert!(shard_idx < self.shards.len());
+        if !self.shard_has_expiring_keys(shard_idx) {
+            return (0, 0);
+        }
         let mut guard = self.write_shard_by_index(shard_idx);
         let total_slots = guard.total_slots();
         if total_slots == 0 {
@@ -1589,7 +1726,8 @@ impl ConcurrentKeyspace {
     ///
     /// Acquires a write lock on each shard sequentially. Not atomic across
     /// shards — concurrent reads may see partial results during flush.
-    pub fn flush_all(&self) {
+    #[allow(dead_code)]
+    pub(crate) fn flush_all(&self) {
         for shard in self.shards.iter() {
             let mut guard = shard.write();
             // Replace with a fresh empty table to release all memory.
@@ -1635,7 +1773,8 @@ impl ConcurrentKeyspace {
             .sum()
     }
 
-    /// Returns the approximate global memory counter used by OOM/eviction checks.
+    /// Returns the approximate published memory counter used by OOM/eviction checks.
+    /// It is intentionally cheap and may lag exact shard-local memory briefly.
     #[inline]
     pub fn approx_memory_used(&self) -> usize {
         self.global_memory_used.load(Ordering::Relaxed)
@@ -1649,13 +1788,36 @@ impl ConcurrentKeyspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     use vortex_common::{VortexKey, VortexValue};
 
     /// Helper: smallest valid shard count for tests.
     const TEST_SHARDS: usize = 64;
+
+    fn keys_for_shards(keyspace: &ConcurrentKeyspace, shards: &[usize]) -> Vec<Vec<u8>> {
+        let mut keys = vec![Vec::new(); shards.len()];
+        let mut found = vec![false; shards.len()];
+
+        for candidate in 0..200_000usize {
+            let key = format!("evict:{candidate:06}").into_bytes();
+            let shard_idx = keyspace.shard_index(&key);
+            for (position, target) in shards.iter().enumerate() {
+                if !found[position] && *target == shard_idx {
+                    keys[position] = key.clone();
+                    found[position] = true;
+                }
+            }
+            if found.iter().all(|flag| *flag) {
+                return keys;
+            }
+        }
+
+        panic!("failed to find keys for requested shards");
+    }
 
     #[test]
     fn single_thread_set_get_del() {
@@ -1930,11 +2092,13 @@ mod tests {
         let key = VortexKey::from_bytes(b"ttl_key");
         let val = VortexValue::from("ephemeral");
         let deadline = 1_000_000_000u64; // 1 second from epoch
+        let shard_idx = ks.shard_index(b"ttl_key");
 
         // SET with TTL
         ks.write(b"ttl_key", |t| {
             t.insert_with_ttl(key.clone(), val, deadline);
         });
+        ks.update_expiry_count(shard_idx, false, true);
 
         // GET before expiry (now=0)
         let got = ks.read(b"ttl_key", |t| {
@@ -2128,9 +2292,11 @@ mod tests {
         for i in 0..10u64 {
             let key_bytes = format!("exp:{i}");
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
+            let shard_idx = ks.shard_index(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
                 t.insert_with_ttl(key, VortexValue::from(i as i64), 1_000);
             });
+            ks.update_expiry_count(shard_idx, false, true);
         }
 
         assert_eq!(ks.dbsize(), 10);
@@ -2168,9 +2334,11 @@ mod tests {
         for i in 0..5u64 {
             let key_bytes = format!("future:{i}");
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
+            let shard_idx = ks.shard_index(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
                 t.insert_with_ttl(key, VortexValue::from("later"), 10_000);
             });
+            ks.update_expiry_count(shard_idx, false, true);
         }
 
         assert_eq!(ks.dbsize(), 10);
@@ -2184,5 +2352,105 @@ mod tests {
 
         assert_eq!(total_expired, 0);
         assert_eq!(ks.dbsize(), 10);
+    }
+
+    #[test]
+    fn lfu_read_sampling_reduces_global_sketch_updates() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        ks.configure_eviction(1 << 20, EvictionPolicy::AllKeysLfu);
+
+        let key = VortexKey::from_bytes(b"hot-key");
+        ks.write(b"hot-key", |table| {
+            table.insert(key.clone(), VortexValue::from("value"));
+        });
+
+        let shard_idx = ks.shard_index(key.as_bytes());
+        let hash = ks.table_hash_key(key.as_bytes());
+        let guard = ks.read_shard_by_index(shard_idx);
+        for _ in 0..128 {
+            ks.record_access_prehashed(&guard, key.as_bytes(), hash);
+        }
+        drop(guard);
+
+        let sampled_reads = ks.frequency_sketch.estimate(hash);
+        assert!(sampled_reads > 0);
+        assert!(sampled_reads < 64);
+
+        let writes = ConcurrentKeyspace::new(TEST_SHARDS);
+        writes.configure_eviction(1 << 20, EvictionPolicy::AllKeysLfu);
+        for _ in 0..128 {
+            writes.record_frequency_hash(hash);
+        }
+        let write_updates = writes.frequency_sketch.estimate(hash);
+        assert_eq!(write_updates, 128);
+        assert!(sampled_reads < write_updates);
+    }
+
+    #[test]
+    fn volatile_eviction_without_ttls_fails_fast_without_scanning() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        ks.write(b"resident", |table| {
+            table.insert(
+                VortexKey::from_bytes(b"resident"),
+                VortexValue::from("value"),
+            );
+        });
+        ks.configure_eviction(ks.memory_used(), EvictionPolicy::VolatileLru);
+
+        let error = ks.ensure_memory_for(0, 1, 0).unwrap_err();
+        assert_eq!(error.response, crate::commands::ERR_OOM);
+
+        let metrics = ks.eviction_metrics();
+        assert_eq!(metrics.admissions, 1);
+        assert_eq!(metrics.shards_scanned, 0);
+        assert_eq!(metrics.slots_sampled, 0);
+        assert_eq!(metrics.bytes_freed, 0);
+        assert_eq!(metrics.oom_after_scan, 1);
+    }
+
+    #[test]
+    fn eviction_budget_caps_shards_scanned_per_admission() {
+        let ks = ConcurrentKeyspace::new(256);
+        let shard_budget = crate::eviction::EVICTION_MAX_SHARDS_PER_ADMISSION;
+        let target_shards: Vec<usize> = (0..(shard_budget + 8)).collect();
+        let keys = keys_for_shards(&ks, &target_shards);
+
+        for key in &keys {
+            ks.write(key, |table| {
+                table.insert(VortexKey::from_bytes(key), VortexValue::from("value"));
+            });
+        }
+        ks.configure_eviction(ks.memory_used(), EvictionPolicy::AllKeysRandom);
+
+        let additional_bytes = ks.max_memory() + 1;
+        let error = ks.ensure_memory_for(0, additional_bytes, 0).unwrap_err();
+        assert_eq!(error.response, crate::commands::ERR_OOM);
+
+        let metrics = ks.eviction_metrics();
+        assert_eq!(metrics.admissions, 1);
+        assert!(metrics.shards_scanned <= shard_budget as u64);
+        assert!(metrics.slots_sampled >= metrics.shards_scanned);
+        assert!(metrics.bytes_freed > 0);
+        assert_eq!(metrics.oom_after_scan, 1);
+    }
+
+    #[test]
+    fn active_expiry_on_ttl_free_shard_skips_lock_acquisition() {
+        let ks = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+        let shard_idx = 0usize;
+        let write_guard = ks.write_shard_by_index(shard_idx);
+        let (tx, rx) = mpsc::channel();
+        let worker_ks = Arc::clone(&ks);
+
+        let handle = thread::spawn(move || {
+            tx.send(worker_ks.run_active_expiry_on_shard(shard_idx, 0, 32, 0))
+                .unwrap();
+        });
+
+        let result = rx.recv_timeout(Duration::from_millis(100));
+        drop(write_guard);
+        handle.join().unwrap();
+
+        assert_eq!(result.unwrap(), (0, 0));
     }
 }

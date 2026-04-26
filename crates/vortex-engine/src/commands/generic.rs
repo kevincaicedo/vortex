@@ -1,4 +1,4 @@
-//! Key management command handlers.
+//! Generic key command handlers.
 //!
 //! Implements DEL, UNLINK, EXISTS, EXPIRE, EXPIREAT, PEXPIRE, PEXPIREAT,
 //! PERSIST, TTL, PTTL, EXPIRETIME, PEXPIRETIME, TYPE, RENAME, RENAMENX,

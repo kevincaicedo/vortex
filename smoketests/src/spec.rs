@@ -6,6 +6,7 @@ pub type CaseFn = fn(&mut SmokeContext) -> anyhow::Result<()>;
 pub enum CommandGroup {
     String,
     Key,
+    Transaction,
     Server,
 }
 
@@ -14,6 +15,7 @@ impl CommandGroup {
         match self {
             Self::String => "string",
             Self::Key => "key",
+            Self::Transaction => "transaction",
             Self::Server => "server",
         }
     }

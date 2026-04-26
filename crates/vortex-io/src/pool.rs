@@ -68,7 +68,7 @@ impl Default for ReactorPoolConfig {
             threads: 0,
             max_connections: 10_000,
             buffer_size: 16_384,
-            buffer_count: 1024,
+            buffer_count: 20_000,
             connection_timeout: 300,
             aof_config: None,
             shard_count: DEFAULT_SHARD_COUNT,
@@ -100,6 +100,33 @@ pub struct ReactorPool {
     keyspace: Arc<ConcurrentKeyspace>,
 }
 
+fn bounded_reactor_count(requested: usize, max_connections: usize) -> usize {
+    requested.min(max_connections.max(1))
+}
+
+fn share_evenly(total: usize, buckets: usize, index: usize) -> usize {
+    debug_assert!(buckets > 0);
+    debug_assert!(index < buckets);
+
+    let base = total / buckets;
+    let remainder = total % buckets;
+    base + usize::from(index < remainder)
+}
+
+fn reactor_resource_share(
+    total_connections: usize,
+    total_buffers: usize,
+    num_reactors: usize,
+    reactor_idx: usize,
+) -> (usize, usize) {
+    let reactor_connections = share_evenly(total_connections, num_reactors, reactor_idx);
+    let required_buffers = total_connections.saturating_mul(2);
+    let spare_buffers = total_buffers - required_buffers;
+    let reactor_buffers = reactor_connections.saturating_mul(2)
+        + share_evenly(spare_buffers, num_reactors, reactor_idx);
+    (reactor_connections, reactor_buffers)
+}
+
 impl ReactorPool {
     /// Spawn `N` reactor threads (one per CPU core by default).
     ///
@@ -108,11 +135,29 @@ impl ReactorPool {
     /// SO_REUSEPORT listener.
     pub fn spawn(config: ReactorPoolConfig) -> std::io::Result<Self> {
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let num_reactors = if config.threads == 0 {
+        let requested_reactors = if config.threads == 0 {
             core_ids.len().max(1)
         } else {
             config.threads
         };
+        let num_reactors = bounded_reactor_count(requested_reactors, config.max_connections);
+
+        let min_buffer_count = Reactor::min_buffer_count_for_connections(config.max_connections)?;
+        if config.buffer_count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer_count must be greater than zero",
+            ));
+        }
+        if config.buffer_count < min_buffer_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "buffer_count ({}) must be at least max_connections * 2 ({min_buffer_count})",
+                    config.buffer_count
+                ),
+            ));
+        }
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
         let aof_fatal_state = Arc::new(AofFatalState::default());
@@ -170,13 +215,15 @@ impl ReactorPool {
 
         keyspace.configure_eviction(config.max_memory, config.eviction_policy);
 
-        // Distribute resources evenly across reactors.
-        let per_reactor_conns = (config.max_connections / num_reactors).max(1);
-        let per_reactor_bufs = (config.buffer_count / num_reactors).max(1);
-
         let mut handles = Vec::with_capacity(num_reactors);
 
         for i in 0..num_reactors {
+            let (reactor_max_connections, reactor_buffer_count) = reactor_resource_share(
+                config.max_connections,
+                config.buffer_count,
+                num_reactors,
+                i,
+            );
             let core_id = core_ids.get(i).copied();
             let coord_clone = Arc::clone(&coordinator);
             let ks_clone = Arc::clone(&keyspace);
@@ -184,9 +231,9 @@ impl ReactorPool {
 
             let reactor_config = ReactorConfig {
                 bind_addr: config.bind_addr,
-                max_connections: per_reactor_conns,
+                max_connections: reactor_max_connections,
                 buffer_size: config.buffer_size,
-                buffer_count: per_reactor_bufs,
+                buffer_count: reactor_buffer_count,
                 connection_timeout: config.connection_timeout,
                 aof_config: config.aof_config.clone(),
                 io_backend: config.io_backend,
@@ -296,5 +343,39 @@ impl Drop for ReactorPool {
         // Ensure all reactor threads are stopped and joined on drop.
         self.coordinator.initiate();
         self.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reactor_count_respects_connection_budget() {
+        assert_eq!(bounded_reactor_count(8, 3), 3);
+        assert_eq!(bounded_reactor_count(4, 0), 1);
+        assert_eq!(bounded_reactor_count(2, 10), 2);
+    }
+
+    #[test]
+    fn reactor_resource_share_preserves_totals_and_invariant() {
+        let shares: Vec<_> = (0..2)
+            .map(|index| reactor_resource_share(5, 12, 2, index))
+            .collect();
+
+        assert_eq!(shares, vec![(3, 7), (2, 5)]);
+        assert_eq!(
+            shares
+                .iter()
+                .map(|(connections, _)| connections)
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(shares.iter().map(|(_, buffers)| buffers).sum::<usize>(), 12);
+        assert!(
+            shares
+                .iter()
+                .all(|(connections, buffers)| *buffers >= (*connections * 2))
+        );
     }
 }

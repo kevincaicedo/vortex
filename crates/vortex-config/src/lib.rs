@@ -75,7 +75,7 @@ pub struct VortexConfig {
     pub ring_size: u32,
 
     /// Number of fixed I/O buffers pre-registered with io_uring.
-    #[arg(long, default_value = "1024", env = "VORTEX_FIXED_BUFFERS")]
+    #[arg(long, default_value = "20000", env = "VORTEX_FIXED_BUFFERS")]
     pub fixed_buffers: usize,
 
     /// Size of each I/O buffer in bytes (minimum 4096).
@@ -146,7 +146,7 @@ impl Default for VortexConfig {
             eviction_policy: "noeviction".to_string(),
             io_backend: IoBackendKind::Auto,
             ring_size: 4096,
-            fixed_buffers: 1024,
+            fixed_buffers: 20_000,
             buffer_size: 16_384,
             connection_timeout_secs: 300,
             sqpoll_idle_ms: 1000,
@@ -221,6 +221,18 @@ impl VortexConfig {
             return Err(format!(
                 "buffer_size must be >= 4096, got {}",
                 self.buffer_size
+            ));
+        }
+        let min_fixed_buffers = self.max_clients.checked_mul(2).ok_or_else(|| {
+            format!(
+                "max_clients is too large to derive the minimum fixed_buffers: {}",
+                self.max_clients
+            )
+        })?;
+        if self.fixed_buffers < min_fixed_buffers {
+            return Err(format!(
+                "fixed_buffers must be at least max_clients * 2 ({}), got {}",
+                min_fixed_buffers, self.fixed_buffers
             ));
         }
         if !["always", "everysec", "no"].contains(&self.aof_fsync.as_str()) {
@@ -349,6 +361,7 @@ mod tests {
         let config = VortexConfig::default();
         assert_eq!(config.bind.port(), 6379);
         assert_eq!(config.max_clients, 10_000);
+        assert_eq!(config.fixed_buffers, 20_000);
         assert!(!config.aof_enabled);
         assert_eq!(config.io_backend, IoBackendKind::Auto);
         assert_eq!(config.ring_size, 4096);
@@ -386,6 +399,22 @@ mod tests {
 
         assert_eq!(config.io_backend, IoBackendKind::Uring);
         assert_eq!(config.ring_size, 2048);
+    }
+
+    #[test]
+    fn rejects_fixed_buffers_below_two_per_client() {
+        let error = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--max-clients".to_string(),
+            "1024".to_string(),
+            "--fixed-buffers".to_string(),
+            "1024".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("fixed_buffers must be at least max_clients * 2"));
     }
 
     #[test]

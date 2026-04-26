@@ -10,3 +10,6 @@ rust-version.workspace = true
 anyhow = "1"
 clap.workspace = true
 redis = "0.32"
+
+[dev-dependencies]
+vortex-persist.workspace = true

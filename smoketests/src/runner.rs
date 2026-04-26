@@ -35,6 +35,7 @@ impl Selection {
                     || match spec.group {
                         CommandGroup::String => candidate.eq_ignore_ascii_case("strings"),
                         CommandGroup::Key => candidate.eq_ignore_ascii_case("keys"),
+                        CommandGroup::Transaction => candidate.eq_ignore_ascii_case("transactions"),
                         CommandGroup::Server => {
                             candidate.eq_ignore_ascii_case("server")
                                 || candidate.eq_ignore_ascii_case("connection")

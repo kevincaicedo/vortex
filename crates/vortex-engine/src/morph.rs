@@ -18,8 +18,10 @@
 //! 26-31   6    (reserved)    — future use
 //! ```
 //!
-//! Stored in `Entry::_pad0` (the existing 4-byte padding field) for **zero
-//! additional memory overhead** per key.
+//! Stored in `Entry::_pad0` (the existing 4-byte slack field) for **zero
+//! additional memory overhead** per key. Alpha WATCH/version tracking stays in
+//! `ConcurrentKeyspace` side tables, so do not repurpose `_pad0` without a
+//! fresh layout and benchmark review.
 
 use vortex_common::Encoding;
 

@@ -1,0 +1,28 @@
+schema_version: 1
+name: zipfian-mixed-lfu
+description: Zipfian mixed workload with 64mb maxmemory and allkeys-lfu eviction.
+databases:
+  - vortex
+  - redis
+backends:
+  - memtier_benchmark
+workloads:
+  - zipfian-mixed
+duration: 30s
+environment:
+  mode: native
+  port_base: 18479
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  maxmemory: 64mb
+  eviction_policy: allkeys-lfu
+settings:
+  memtier_benchmark:
+    clients: 16
+    pipeline: 4
+    keyspace_size: 200000
+    data_size: 512

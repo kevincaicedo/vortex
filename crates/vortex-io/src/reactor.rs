@@ -23,7 +23,6 @@ use vortex_engine::keyspace::DEFAULT_SHARD_COUNT;
 use vortex_engine::keyspace::WatchKeyState;
 use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_memory::{ArenaAllocator, BufferPool};
-use vortex_persist::aof::rewrite::AofRewriter;
 use vortex_persist::aof::writer::AofFileWriter;
 use vortex_proto::{
     BorrowedRespTape, CommandFlags, CommandRouter, DispatchResult, FrameRef, IovecWriter,
@@ -45,6 +44,8 @@ static RESP_ERR_WRONG_ARGC: &[u8] = b"-ERR wrong number of arguments for command
 static RESP_ERR_PROTOCOL: &[u8] = b"-ERR protocol error\r\n";
 static RESP_ERR_AOF_MISCONF: &[u8] =
     b"-MISCONF AOF persistence error; write commands are disabled until the issue is resolved\r\n";
+static RESP_ERR_BGREWRITEAOF_DISABLED: &[u8] =
+    b"-ERR BGREWRITEAOF is disabled for the alpha release\r\n";
 static RESP_ERR_CONFIG_SET_MAXMEMORY: &[u8] = b"-ERR invalid argument for CONFIG SET maxmemory\r\n";
 static RESP_ERR_CONFIG_SET_POLICY: &[u8] =
     b"-ERR invalid argument for CONFIG SET maxmemory-policy\r\n";
@@ -120,17 +121,23 @@ fn config_pair_response(param: &'static [u8], value: Vec<u8>) -> (CommandRespons
 #[inline]
 fn push_resp_array_len(buf: &mut Vec<u8>, len: usize) {
     buf.push(b'*');
-    buf.extend_from_slice(len.to_string().as_bytes());
+    push_decimal(buf, len);
     buf.extend_from_slice(b"\r\n");
 }
 
 #[inline]
 fn push_resp_bulk_string(buf: &mut Vec<u8>, value: &[u8]) {
     buf.push(b'$');
-    buf.extend_from_slice(value.len().to_string().as_bytes());
+    push_decimal(buf, value.len());
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(value);
     buf.extend_from_slice(b"\r\n");
+}
+
+#[inline]
+fn push_decimal<T: itoa::Integer>(buf: &mut Vec<u8>, value: T) {
+    let mut digits = itoa::Buffer::new();
+    buf.extend_from_slice(digits.format(value).as_bytes());
 }
 
 fn append_cmd_result(buf: &mut Vec<u8>, result: CmdResult) {
@@ -338,7 +345,7 @@ impl Default for ReactorConfig {
             bind_addr: "127.0.0.1:6379".parse().expect("valid default addr"),
             max_connections: 1024,
             buffer_size: DEFAULT_BUF_SIZE,
-            buffer_count: 1024,
+            buffer_count: 2048,
             connection_timeout: 300,
             aof_config: None,
             io_backend: IoBackendMode::Auto,
@@ -475,6 +482,60 @@ pub struct Reactor {
 }
 
 impl Reactor {
+    #[inline]
+    fn has_exact_arity(frame: &FrameRef<'_>, expected: usize) -> bool {
+        frame
+            .element_count()
+            .is_some_and(|argc| argc as usize == expected)
+    }
+
+    #[inline]
+    fn has_min_arity(frame: &FrameRef<'_>, minimum: usize) -> bool {
+        frame
+            .element_count()
+            .is_some_and(|argc| argc as usize >= minimum)
+    }
+
+    #[inline]
+    fn mark_transaction_dirty(&mut self, conn_id: usize) {
+        if conn_id < self.transaction_states.len() {
+            self.transaction_states[conn_id].dirty = true;
+        }
+    }
+
+    pub(crate) fn min_buffer_count_for_connections(max_connections: usize) -> io::Result<usize> {
+        max_connections.checked_mul(2).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_connections is too large to derive the minimum buffer_count",
+            )
+        })
+    }
+
+    fn validate_buffer_configuration(
+        max_connections: usize,
+        buffer_count: usize,
+    ) -> io::Result<()> {
+        if buffer_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer_count must be greater than zero",
+            ));
+        }
+
+        let min_buffer_count = Self::min_buffer_count_for_connections(max_connections)?;
+        if buffer_count < min_buffer_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "buffer_count ({buffer_count}) must be at least max_connections * 2 ({min_buffer_count})"
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Creates a new reactor with the polling backend and a fresh keyspace.
     ///
     /// This constructor creates its own `ConcurrentKeyspace`. For production
@@ -578,15 +639,16 @@ impl Reactor {
         aof_fatal_state: Arc<AofFatalState>,
         num_reactors: usize,
     ) -> std::io::Result<Self> {
+        Self::validate_buffer_configuration(config.max_connections, config.buffer_count)?;
+
         // Create the listener socket with SO_REUSEPORT + SO_REUSEADDR + SO_INCOMING_CPU.
         let listener_fd = crate::accept::create_listener(config.bind_addr, Some(id))?;
 
         let max_conn = config.max_connections;
         let connection_timeout = config.connection_timeout;
 
-        // Allocate 2 buffers per connection (read + write) from the mmap pool.
-        let buffer_count = max_conn * 2;
-        let buffer_pool = BufferPool::new(buffer_count, config.buffer_size);
+        // `buffer_count` is validated up-front and remains authoritative here.
+        let buffer_pool = BufferPool::new(config.buffer_count, config.buffer_size);
 
         // Register the fixed buffers with the io_uring kernel if applicable.
         // For polling backends this is a no-op.
@@ -1340,6 +1402,17 @@ impl Reactor {
         }
     }
 
+    /// UNWATCH
+    ///
+    /// Clears every key watched by the connection.
+    ///
+    /// Big-O: `O(W)`, where `W` is watched keys for this connection.
+    ///
+    /// Compatibility: Returns `OK` even when no keys are watched. `EXEC`,
+    /// `DISCARD`, and connection close also call this path.
+    ///
+    /// Notes: Watch removals touch only the watch side table and do not take
+    /// keyspace shard write locks.
     #[inline]
     fn clear_watches(&mut self, conn_id: usize) {
         if conn_id >= self.transaction_states.len() {
@@ -1359,6 +1432,53 @@ impl Reactor {
         }
         self.clear_watches(conn_id);
         self.transaction_states[conn_id].reset_all();
+    }
+
+    /// MULTI
+    ///
+    /// Starts transaction queueing for one connection.
+    ///
+    /// Big-O: `O(Q)` only when stale queued commands must be cleared from a
+    /// previous dirty state; the normal path is `O(1)`.
+    ///
+    /// Compatibility: Returns `OK` and queues later commands until `EXEC` or
+    /// `DISCARD`. Nested `MULTI` is rejected and dirties the transaction in
+    /// `dispatch_command`.
+    ///
+    /// Notes: The state is reactor-local to avoid adding transaction branches
+    /// or connection lookups to the keyspace hot path.
+    #[inline]
+    fn begin_transaction(&mut self, conn_id: usize) -> (CommandResponse, bool) {
+        if conn_id < self.transaction_states.len() {
+            let tx = &mut self.transaction_states[conn_id];
+            tx.queueing = true;
+            tx.dirty = false;
+            tx.queued.clear();
+        }
+        (
+            CommandResponse::Static(vortex_engine::commands::RESP_OK),
+            false,
+        )
+    }
+
+    /// DISCARD
+    ///
+    /// Drops queued commands, exits transaction mode, and clears WATCH state.
+    ///
+    /// Big-O: `O(Q + W)`, where `Q` is queued commands and `W` is watched keys.
+    ///
+    /// Compatibility: Returns `OK` inside MULTI and `ERR DISCARD without MULTI`
+    /// outside MULTI.
+    ///
+    /// Notes: Because queued commands were not executed, DISCARD never appends
+    /// their payloads to AOF.
+    #[inline]
+    fn discard_transaction(&mut self, conn_id: usize) -> (CommandResponse, bool) {
+        self.clear_transaction_state(conn_id);
+        (
+            CommandResponse::Static(vortex_engine::commands::RESP_OK),
+            false,
+        )
     }
 
     fn normalized_command_name(frame: &FrameRef<'_>) -> Option<([u8; 32], usize)> {
@@ -1437,6 +1557,20 @@ impl Reactor {
         }
     }
 
+    /// WATCH key [key ...]
+    ///
+    /// Registers optimistic CAS watches for the current connection. `EXEC`
+    /// aborts with a nil array if any watched key changes before execution.
+    ///
+    /// Big-O: `O(K + D)`, where `K` is the number of requested keys and `D` is
+    /// the current watched-key count for duplicate suppression.
+    ///
+    /// Compatibility: Requires at least one key; `WATCH` inside MULTI is
+    /// rejected in `dispatch_command` and dirties the transaction.
+    ///
+    /// Notes: The first WATCH snapshots the global watch epoch. Writes stay on
+    /// the fast path when no watches exist because keyspace mutation only
+    /// consults the watch side table while the watch feature bit is active.
     fn handle_watch(&mut self, conn_id: usize, frame: &FrameRef<'_>) -> CommandResponse {
         let argc = match frame.element_count() {
             Some(argc) if argc >= 2 => argc as usize,
@@ -1493,6 +1627,22 @@ impl Reactor {
             .any(|payload| self.queued_payload_has_write(payload.as_ref()))
     }
 
+    /// EXEC
+    ///
+    /// Atomically validates WATCH state and executes queued commands for one
+    /// connection, returning one RESP array with each command reply.
+    ///
+    /// Big-O: `O(W + Q * C)`, where `W` is watched keys, `Q` is queued commands,
+    /// and `C` is the cost of each command. Response construction is linear in
+    /// the serialized replies.
+    ///
+    /// Compatibility: Queue-time errors cause `EXECABORT`; runtime command
+    /// errors are returned inside the EXEC array and do not stop later queued
+    /// commands. A watched-key conflict returns a nil array.
+    ///
+    /// Notes: The transaction gate excludes concurrent keyspace mutations
+    /// between watch validation and queued command execution. AOF records are
+    /// appended per executed write only after the command mutates successfully.
     fn execute_transaction(&mut self, conn_id: usize) -> (CommandResponse, bool) {
         if conn_id >= self.transaction_states.len() || !self.transaction_states[conn_id].queueing {
             return (CommandResponse::Static(RESP_ERR_EXEC_WITHOUT_MULTI), false);
@@ -1603,42 +1753,70 @@ impl Reactor {
 
         if conn_id < self.transaction_states.len() && self.transaction_states[conn_id].queueing {
             match command_name {
-                b"MULTI" => return (CommandResponse::Static(RESP_ERR_NESTED_MULTI), false),
-                b"EXEC" => return self.execute_transaction(conn_id),
-                b"DISCARD" => {
-                    self.clear_transaction_state(conn_id);
-                    return (
-                        CommandResponse::Static(vortex_engine::commands::RESP_OK),
-                        false,
-                    );
+                b"MULTI" => {
+                    self.mark_transaction_dirty(conn_id);
+                    if !Self::has_exact_arity(frame, 1) {
+                        return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                    }
+                    return (CommandResponse::Static(RESP_ERR_NESTED_MULTI), false);
                 }
-                b"WATCH" => return (CommandResponse::Static(RESP_ERR_WATCH_INSIDE_MULTI), false),
+                b"EXEC" => {
+                    if !Self::has_exact_arity(frame, 1) {
+                        self.mark_transaction_dirty(conn_id);
+                        return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                    }
+                    return self.execute_transaction(conn_id);
+                }
+                b"DISCARD" => {
+                    if !Self::has_exact_arity(frame, 1) {
+                        self.mark_transaction_dirty(conn_id);
+                        return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                    }
+                    return self.discard_transaction(conn_id);
+                }
+                b"WATCH" => {
+                    self.mark_transaction_dirty(conn_id);
+                    if !Self::has_min_arity(frame, 2) {
+                        return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                    }
+                    return (CommandResponse::Static(RESP_ERR_WATCH_INSIDE_MULTI), false);
+                }
                 _ => return (self.queue_transaction_command(conn_id, frame), false),
             }
         }
 
         match command_name {
             b"MULTI" => {
-                if conn_id < self.transaction_states.len() {
-                    let tx = &mut self.transaction_states[conn_id];
-                    tx.queueing = true;
-                    tx.dirty = false;
-                    tx.queued.clear();
+                if !Self::has_exact_arity(frame, 1) {
+                    return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
                 }
-                return (
-                    CommandResponse::Static(vortex_engine::commands::RESP_OK),
-                    false,
-                );
+                return self.begin_transaction(conn_id);
             }
-            b"EXEC" => return (CommandResponse::Static(RESP_ERR_EXEC_WITHOUT_MULTI), false),
+            b"EXEC" => {
+                if !Self::has_exact_arity(frame, 1) {
+                    return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                }
+                return (CommandResponse::Static(RESP_ERR_EXEC_WITHOUT_MULTI), false);
+            }
             b"DISCARD" => {
+                if !Self::has_exact_arity(frame, 1) {
+                    return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                }
                 return (
                     CommandResponse::Static(RESP_ERR_DISCARD_WITHOUT_MULTI),
                     false,
                 );
             }
-            b"WATCH" => return (self.handle_watch(conn_id, frame), false),
+            b"WATCH" => {
+                if !Self::has_min_arity(frame, 2) {
+                    return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                }
+                return (self.handle_watch(conn_id, frame), false);
+            }
             b"UNWATCH" => {
+                if !Self::has_exact_arity(frame, 1) {
+                    return (CommandResponse::Static(RESP_ERR_WRONG_ARGC), false);
+                }
                 self.clear_watches(conn_id);
                 return (
                     CommandResponse::Static(vortex_engine::commands::RESP_OK),
@@ -1794,70 +1972,11 @@ impl Reactor {
         Ok(())
     }
 
-    /// Handle BGREWRITEAOF command.
-    ///
-    /// Rewrites the AOF by dumping the current keyspace state as a minimal
-    /// set of SET commands. The rewrite runs synchronously on the reactor
-    /// thread (blocking — acceptable for alpha) and swaps the file atomically.
     fn handle_bgrewriteaof(&mut self) -> (CommandResponse, bool) {
-        let aof_cfg = match &self.config.aof_config {
-            Some(cfg) => cfg.clone(),
-            None => {
-                return (
-                    CommandResponse::Static(b"-ERR AOF is not enabled\r\n"),
-                    false,
-                );
-            }
-        };
-
-        let aof_path = if self.id == 0 {
-            aof_cfg.path.clone()
-        } else {
-            let stem = aof_cfg
-                .path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let ext = aof_cfg
-                .path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy();
-            aof_cfg
-                .path
-                .with_file_name(format!("{stem}-shard{}.{ext}", self.id))
-        };
-
-        match AofRewriter::rewrite(&self.keyspace, &aof_path, self.id as u16) {
-            Ok((new_path, keys_written)) => {
-                // Swap the writer to the new file.
-                if let Some(ref mut writer) = self.aof_writer {
-                    if let Err(e) = writer.swap_file(&new_path) {
-                        tracing::error!(error = %e, "AOF rewrite swap failed");
-                        return (
-                            CommandResponse::Frame(RespFrame::Error(
-                                format!("ERR AOF rewrite swap failed: {e}").into(),
-                            )),
-                            false,
-                        );
-                    }
-                }
-                tracing::info!(reactor_id = self.id, keys_written, "BGREWRITEAOF completed");
-                (
-                    CommandResponse::Static(b"+Background AOF rewrite started\r\n"),
-                    false,
-                )
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "BGREWRITEAOF failed");
-                (
-                    CommandResponse::Frame(RespFrame::Error(
-                        format!("ERR BGREWRITEAOF failed: {e}").into(),
-                    )),
-                    false,
-                )
-            }
-        }
+        (
+            CommandResponse::Static(RESP_ERR_BGREWRITEAOF_DISABLED),
+            false,
+        )
     }
 
     /// Handle CONFIG subcommands relevant to AOF.
@@ -2772,6 +2891,185 @@ mod tests {
     }
 
     #[test]
+    fn multi_wrong_arity_does_not_enter_transaction() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) =
+            dispatch_reactor_wire(&mut reactor, b"*2\r\n$5\r\nMULTI\r\n$5\r\nextra\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_WRONG_ARGC);
+
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_EXEC_WITHOUT_MULTI);
+    }
+
+    #[test]
+    fn queue_time_wrong_arity_aborts_exec_without_mutating() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$4\r\nINCR\r\n$3\r\nfoo\r\n$5\r\nextra\r\n",
+        );
+        assert_eq!(response_bytes(resp), RESP_ERR_WRONG_ARGC);
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_EXECABORT);
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"$-1\r\n");
+    }
+
+    #[test]
+    fn nested_multi_marks_transaction_dirty() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_NESTED_MULTI);
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_EXECABORT);
+    }
+
+    #[test]
+    fn watch_inside_multi_marks_transaction_dirty() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_WATCH_INSIDE_MULTI);
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_EXECABORT);
+    }
+
+    #[test]
+    fn exec_wrong_arity_inside_multi_marks_transaction_dirty() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$4\r\nEXEC\r\n$5\r\nextra\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_WRONG_ARGC);
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_EXECABORT);
+    }
+
+    #[test]
+    fn exec_empty_transaction_returns_empty_array() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*0\r\n");
+    }
+
+    #[test]
+    fn exec_runtime_error_does_not_abort_later_commands() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nnum\r\n$5\r\nnoint\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$4\r\nINCR\r\n$3\r\nnum\r\n");
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+        let (resp, _) = dispatch_reactor_wire(
+            &mut reactor,
+            b"*3\r\n$3\r\nSET\r\n$5\r\nafter\r\n$2\r\nok\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(
+            response_bytes(resp),
+            b"*3\r\n+OK\r\n-ERR value is not an integer or out of range\r\n+OK\r\n"
+        );
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$5\r\nafter\r\n");
+        assert_eq!(response_bytes(resp), b"$2\r\nok\r\n");
+    }
+
+    #[test]
+    fn watch_aborts_on_same_connection_pre_multi_write() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$4\r\nself\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
+    }
+
+    #[test]
+    fn unwatch_clears_watches_before_conflicting_write() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$7\r\nUNWATCH\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            1,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$5\r\nother\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$2\r\nok\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*1\r\n+OK\r\n");
+    }
+
+    #[test]
+    fn watch_and_unwatch_wrong_arity_are_rejected() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$5\r\nWATCH\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_WRONG_ARGC);
+
+        let (resp, _) =
+            dispatch_reactor_wire(&mut reactor, b"*2\r\n$7\r\nUNWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), RESP_ERR_WRONG_ARGC);
+    }
+
+    #[test]
     fn fatal_aof_state_rejects_writes_before_mutation() {
         let path = temp_aof_path("fatal-write-reject");
         let mut reactor = test_reactor();
@@ -2935,6 +3233,33 @@ mod tests {
             reactor.keyspace.eviction_policy(),
             EvictionPolicy::AllKeysLfu
         );
+    }
+
+    #[test]
+    fn reactor_rejects_buffer_count_below_connection_minimum() {
+        let config = ReactorConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 4,
+            buffer_count: 7,
+            ..Default::default()
+        };
+
+        let error = match Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))) {
+            Ok(_) => panic!("reactor creation should fail when buffer_count < max_connections * 2"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("buffer_count"));
+    }
+
+    #[test]
+    fn bgrewriteaof_is_disabled_for_alpha() {
+        let mut reactor = test_reactor();
+
+        let (resp, close) = dispatch_reactor_wire(&mut reactor, b"*1\r\n$12\r\nBGREWRITEAOF\r\n");
+
+        assert!(!close);
+        assert_eq!(response_bytes(resp), RESP_ERR_BGREWRITEAOF_DISABLED);
     }
 
     #[test]

@@ -4,11 +4,13 @@
 //! dispatched via a static match on the command name. No trait objects, no
 //! dynamic dispatch — the compiler inlines the entire chain.
 
+pub(crate) mod connection;
 pub(crate) mod context;
-pub(crate) mod key;
+pub(crate) mod generic;
 pub(crate) mod pattern;
 pub(crate) mod server;
 pub(crate) mod string;
+pub(crate) mod transaction;
 
 use smallvec::SmallVec;
 use vortex_common::{
@@ -354,8 +356,8 @@ pub static ERR_OOM: &[u8] = b"-OOM command not allowed when used memory > 'maxme
 ///
 /// `name` must be an uppercase ASCII command name (already normalized by
 /// the CommandRouter). Returns `None` if the command is unknown to the
-/// engine (connection-level commands like PING/QUIT are handled by the
-/// reactor directly).
+/// engine. Connection-state commands such as MULTI and WATCH are handled by
+/// the reactor directly because their correctness depends on per-client state.
 #[inline]
 pub fn execute_command(
     keyspace: &ConcurrentKeyspace,
@@ -408,67 +410,65 @@ pub fn execute_command(
         b"STRLEN" => Some(string::cmd_strlen(keyspace, frame, now_nanos).into()),
         b"GETRANGE" => Some(string::cmd_getrange(keyspace, frame, now_nanos).into()),
         b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos)),
-        b"DEL" => Some(key::cmd_del(keyspace, frame, now_nanos)),
-        b"UNLINK" => Some(key::cmd_unlink(keyspace, frame, now_nanos)),
-        b"EXISTS" => Some(key::cmd_exists(keyspace, frame, now_nanos).into()),
-        b"EXPIRE" => Some(key::cmd_expire_with_clock(
+        b"DEL" => Some(generic::cmd_del(keyspace, frame, now_nanos)),
+        b"UNLINK" => Some(generic::cmd_unlink(keyspace, frame, now_nanos)),
+        b"EXISTS" => Some(generic::cmd_exists(keyspace, frame, now_nanos).into()),
+        b"EXPIRE" => Some(generic::cmd_expire_with_clock(
             keyspace,
             frame,
             now_nanos,
             unix_now_nanos,
         )),
-        b"PEXPIRE" => Some(key::cmd_pexpire_with_clock(
+        b"PEXPIRE" => Some(generic::cmd_pexpire_with_clock(
             keyspace,
             frame,
             now_nanos,
             unix_now_nanos,
         )),
-        b"EXPIREAT" => Some(key::cmd_expireat_with_clock(
+        b"EXPIREAT" => Some(generic::cmd_expireat_with_clock(
             keyspace,
             frame,
             now_nanos,
             unix_now_nanos,
         )),
-        b"PEXPIREAT" => Some(key::cmd_pexpireat_with_clock(
+        b"PEXPIREAT" => Some(generic::cmd_pexpireat_with_clock(
             keyspace,
             frame,
             now_nanos,
             unix_now_nanos,
         )),
-        b"PERSIST" => Some(key::cmd_persist(keyspace, frame, now_nanos)),
-        b"TTL" => Some(key::cmd_ttl(keyspace, frame, now_nanos).into()),
-        b"PTTL" => Some(key::cmd_pttl(keyspace, frame, now_nanos).into()),
-        b"EXPIRETIME" => {
-            Some(key::cmd_expiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
-        }
-        b"PEXPIRETIME" => {
-            Some(key::cmd_pexpiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
-        }
-        b"TYPE" => Some(key::cmd_type(keyspace, frame, now_nanos).into()),
-        b"RENAME" => Some(key::cmd_rename(keyspace, frame, now_nanos)),
-        b"RENAMENX" => Some(key::cmd_renamenx(keyspace, frame, now_nanos)),
-        b"KEYS" => Some(key::cmd_keys(keyspace, frame, now_nanos).into()),
-        b"SCAN" => Some(key::cmd_scan(keyspace, frame, now_nanos).into()),
-        b"RANDOMKEY" => Some(key::cmd_randomkey(keyspace, frame, now_nanos).into()),
-        b"TOUCH" => Some(key::cmd_touch(keyspace, frame, now_nanos).into()),
-        b"COPY" => Some(key::cmd_copy(keyspace, frame, now_nanos)),
-        b"PING" => Some(server::cmd_ping(keyspace, frame, now_nanos).into()),
-        b"ECHO" => Some(server::cmd_echo(keyspace, frame, now_nanos).into()),
-        b"QUIT" => Some(server::cmd_quit(keyspace, frame, now_nanos).into()),
+        b"PERSIST" => Some(generic::cmd_persist(keyspace, frame, now_nanos)),
+        b"TTL" => Some(generic::cmd_ttl(keyspace, frame, now_nanos).into()),
+        b"PTTL" => Some(generic::cmd_pttl(keyspace, frame, now_nanos).into()),
+        b"EXPIRETIME" => Some(
+            generic::cmd_expiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into(),
+        ),
+        b"PEXPIRETIME" => Some(
+            generic::cmd_pexpiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into(),
+        ),
+        b"TYPE" => Some(generic::cmd_type(keyspace, frame, now_nanos).into()),
+        b"RENAME" => Some(generic::cmd_rename(keyspace, frame, now_nanos)),
+        b"RENAMENX" => Some(generic::cmd_renamenx(keyspace, frame, now_nanos)),
+        b"KEYS" => Some(generic::cmd_keys(keyspace, frame, now_nanos).into()),
+        b"SCAN" => Some(generic::cmd_scan(keyspace, frame, now_nanos).into()),
+        b"RANDOMKEY" => Some(generic::cmd_randomkey(keyspace, frame, now_nanos).into()),
+        b"TOUCH" => Some(generic::cmd_touch(keyspace, frame, now_nanos).into()),
+        b"COPY" => Some(generic::cmd_copy(keyspace, frame, now_nanos)),
+        b"PING" => Some(connection::cmd_ping(keyspace, frame, now_nanos).into()),
+        b"ECHO" => Some(connection::cmd_echo(keyspace, frame, now_nanos).into()),
+        b"QUIT" => Some(connection::cmd_quit(keyspace, frame, now_nanos).into()),
         b"DBSIZE" => Some(server::cmd_dbsize(keyspace, frame, now_nanos).into()),
         b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos)),
         b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos)),
         b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos).into()),
         b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos).into()),
-        b"SELECT" => Some(server::cmd_select(keyspace, frame, now_nanos).into()),
+        b"SELECT" => Some(connection::cmd_select(keyspace, frame, now_nanos).into()),
         b"TIME" => {
             Some(server::cmd_time_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
         }
-        b"MULTI" => Some(server::cmd_multi(keyspace, frame, now_nanos).into()),
-        b"EXEC" => Some(server::cmd_exec(keyspace, frame, now_nanos).into()),
-        b"DISCARD" => Some(server::cmd_discard(keyspace, frame, now_nanos).into()),
-        b"WATCH" => Some(server::cmd_watch(keyspace, frame, now_nanos).into()),
-        b"UNWATCH" => Some(server::cmd_unwatch(keyspace, frame, now_nanos).into()),
+        b"EXEC" => Some(transaction::cmd_exec(keyspace, frame, now_nanos).into()),
+        b"DISCARD" => Some(transaction::cmd_discard(keyspace, frame, now_nanos).into()),
+        b"UNWATCH" => Some(transaction::cmd_unwatch(keyspace, frame, now_nanos).into()),
         _ => None,
     }
 }
