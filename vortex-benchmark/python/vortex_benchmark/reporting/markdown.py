@@ -80,9 +80,12 @@ def render_markdown_report(
 
     _section_header(lines, report_payload, source_runs, rows)
     _section_environment(lines, host, source_runs, validity)
+    _section_validity_warnings(lines, host, validity)
     _section_database_targets(lines, databases)
     _section_workloads(lines, workloads)
     _section_cross_db_comparison(lines, analysis, databases)
+    _section_workload_rankings(lines, analysis, databases)
+    _section_database_scorecard(lines, analysis)
     _section_performance_analysis(lines, analysis)
     _section_diagnostics(
         lines,
@@ -92,6 +95,8 @@ def render_markdown_report(
         aof_overhead,
         eviction_rows,
     )
+    timeseries_summaries = diagnostics.get("timeseries_summaries") or []
+    _section_host_telemetry_timeseries(lines, timeseries_summaries)
     _section_detailed_results(lines, rows)
     _section_key_insights(lines, analysis)
     _section_visualizations(lines, markdown_path, chart_paths)
@@ -171,6 +176,53 @@ def _section_environment(
     lines.append("")
 
 
+def _section_validity_warnings(
+    lines: list[str],
+    host: dict[str, Any],
+    validity: dict[str, Any],
+) -> None:
+    """Emit visible warnings for conditions that may invalidate results."""
+    host_validity = validity.get("host") or {}
+    warnings: list[str] = []
+
+    if host_validity.get("thermal_degraded") is True:
+        warnings.append(
+            "⚠️ **Thermal degraded** — Host is thermally throttled. "
+            "Results may understate peak performance."
+        )
+    governor = host_validity.get("cpu_governor")
+    if governor and governor not in {"performance", None}:
+        warnings.append(
+            f"⚠️ **CPU governor is '{governor}'** — Frequency scaling may "
+            f"add variance. Set to 'performance' for citation-grade runs."
+        )
+    if host_validity.get("pmu_available") is False:
+        warnings.append(
+            "⚠️ **PMU unavailable** — perf_event_paranoid blocks hardware "
+            "counters. IPC and cache-miss data will not be available."
+        )
+    if validity.get("requested_repeat_count") in {1, None}:
+        warnings.append(
+            "ℹ️ **Single replicate** — No repeated runs. Spread and outlier "
+            "statistics are unavailable. Use `repeat: N` for engineering-grade evidence."
+        )
+    git = validity.get("git") or {}
+    if git.get("dirty") is True:
+        warnings.append(
+            "ℹ️ **Git tree is dirty** — Results may not be reproducible "
+            "from committed source."
+        )
+
+    if not warnings:
+        return
+
+    lines.append("## Run Validity Warnings")
+    lines.append("")
+    for warning in warnings:
+        lines.append(f"- {warning}")
+    lines.append("")
+
+
 def _section_database_targets(
     lines: list[str], databases: list[dict[str, Any]]
 ) -> None:
@@ -240,6 +292,11 @@ def _section_cross_db_comparison(
     databases: list[dict[str, Any]],
 ) -> None:
     comparisons = analysis.get("backend_comparisons") or {}
+    advisory = analysis.get("advisory_backend_comparisons") or {}
+    is_advisory = False
+    if not comparisons and advisory:
+        comparisons = advisory
+        is_advisory = True
     if not comparisons:
         return
 
@@ -249,6 +306,13 @@ def _section_cross_db_comparison(
     lines.append("")
     lines.append("## Cross-Database Performance Comparison")
     lines.append("")
+    if is_advisory:
+        lines.append(
+            "> ⚠️ **Advisory comparison** — Runtime configurations differ between "
+            "databases (see Invalid Comparisons below). Use these tables for "
+            "directional guidance only, not citation-grade claims."
+        )
+        lines.append("")
 
     for backend, comp in sorted(comparisons.items()):
         if comp.get("type") == "command":
@@ -383,6 +447,191 @@ def _render_thread_workload_comparison(
 
 
 # ---------------------------------------------------------------------------
+# Workload Rankings (databases as columns)
+# ---------------------------------------------------------------------------
+
+
+def _section_workload_rankings(
+    lines: list[str],
+    analysis: dict[str, Any],
+    databases: list[dict[str, Any]],
+) -> None:
+    rankings = analysis.get("workload_rankings") or {}
+    if not rankings:
+        return
+
+    db_names = [d.get("database", "unknown") for d in databases]
+    has_advisory = not analysis.get("backend_comparisons")
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## Workload Ranking Matrix")
+    lines.append("")
+    if has_advisory:
+        lines.append(
+            "> ⚠️ **Advisory rankings** — Runtime configurations differ "
+            "between databases. Rankings are for directional guidance only."
+        )
+        lines.append("")
+
+    for backend, ranking_data in sorted(rankings.items()):
+        if ranking_data.get("type") == "command":
+            _render_command_ranking_table(lines, backend, ranking_data, db_names)
+        elif ranking_data.get("type") == "thread_workload":
+            _render_thread_ranking_tables(lines, backend, ranking_data, db_names)
+
+
+def _render_command_ranking_table(
+    lines: list[str],
+    backend: str,
+    ranking_data: dict[str, Any],
+    db_names: list[str],
+) -> None:
+    rows = ranking_data.get("rows") or []
+    if not rows:
+        return
+
+    lines.append(f"### {backend}: Throughput Ranking")
+    lines.append("")
+
+    header = ["Command"]
+    for db in db_names:
+        header.extend([f"{db} ops/s", f"{db} Rank"])
+    header.extend(["Δ%", "Winner"])
+    lines.append("| " + " | ".join(header) + " |")
+
+    sep = ["---------"]
+    for _ in db_names:
+        sep.extend(["----------:", "-----:"])
+    sep.extend(["----:", "--------"])
+    lines.append("|" + "|".join(sep) + "|")
+
+    for row in rows:
+        cells = [f"**{row.get('series', 'n/a')}**"]
+        ranks = row.get("ranks") or {}
+        deltas = row.get("delta_pct") or {}
+        for db in db_names:
+            metrics = row.get(db, {})
+            ops = metrics.get("throughput_ops_sec")
+            cells.append(_fmt_ops(ops))
+            rank = ranks.get(db)
+            cells.append(f"#{rank}" if rank is not None else "n/a")
+        # Show delta for the non-leader (the biggest gap)
+        non_leader_deltas = [
+            v for db, v in deltas.items()
+            if v is not None and v != 0.0
+        ]
+        if non_leader_deltas:
+            delta_val = max(non_leader_deltas, key=abs)
+            cells.append(f"{delta_val:+.1f}%")
+        else:
+            cells.append("—")
+        winner = row.get("winner")
+        cells.append(f"**{winner}**" if winner else "—")
+        lines.append("| " + " | ".join(cells) + " |")
+    lines.append("")
+
+
+def _render_thread_ranking_tables(
+    lines: list[str],
+    backend: str,
+    ranking_data: dict[str, Any],
+    db_names: list[str],
+) -> None:
+    workloads = ranking_data.get("workloads") or {}
+    for workload, wk_data in sorted(workloads.items()):
+        wk_rows = wk_data.get("rows") or []
+        if not wk_rows:
+            continue
+
+        lines.append(f"### {backend}: {workload}")
+        lines.append("")
+
+        header = ["Threads"]
+        for db in db_names:
+            header.extend([f"{db} ops/s", f"{db} Rank"])
+        header.extend(["Δ%", "Winner"])
+        lines.append("| " + " | ".join(header) + " |")
+
+        sep = ["--------:"]
+        for _ in db_names:
+            sep.extend(["----------:", "-----:"])
+        sep.extend(["----:", "--------"])
+        lines.append("|" + "|".join(sep) + "|")
+
+        for row in wk_rows:
+            threads = row.get("threads")
+            cells = [f"**{threads}**" if threads is not None else "n/a"]
+            ranks = row.get("ranks") or {}
+            deltas = row.get("delta_pct") or {}
+            for db in db_names:
+                metrics = row.get(db, {})
+                ops = metrics.get("throughput_ops_sec")
+                cells.append(_fmt_ops(ops))
+                rank = ranks.get(db)
+                cells.append(f"#{rank}" if rank is not None else "n/a")
+            non_leader_deltas = [
+                v for db, v in deltas.items()
+                if v is not None and v != 0.0
+            ]
+            if non_leader_deltas:
+                delta_val = max(non_leader_deltas, key=abs)
+                cells.append(f"{delta_val:+.1f}%")
+            else:
+                cells.append("—")
+            winner = row.get("winner")
+            cells.append(f"**{winner}**" if winner else "—")
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+
+# ---------------------------------------------------------------------------
+# Database Scorecard
+# ---------------------------------------------------------------------------
+
+
+def _section_database_scorecard(
+    lines: list[str], analysis: dict[str, Any]
+) -> None:
+    scorecard = analysis.get("database_scorecard") or []
+    if not scorecard:
+        return
+
+    has_advisory = not analysis.get("backend_comparisons")
+
+    lines.append("### Overall Database Scorecard")
+    lines.append("")
+    if has_advisory:
+        lines.append(
+            "> ⚠️ **Advisory scorecard** — Computed from advisory comparisons. "
+            "Use for directional guidance only."
+        )
+        lines.append("")
+
+    lines.append(
+        "| Database | Workload Wins | Losses | Avg Rank | "
+        "Best Throughput | Best P99 ms | Scenarios |"
+    )
+    lines.append(
+        "|----------|-------------:|-------:|---------:|"
+        "---------------:|-----------:|----------:|"
+    )
+    for row in scorecard:
+        best_tp = row.get("best_throughput")
+        best_p99 = row.get("best_p99")
+        lines.append(
+            f"| **{row.get('database', 'n/a')}** "
+            f"| {row.get('wins', 0)} "
+            f"| {row.get('losses', 0)} "
+            f"| {_fmt_float(row.get('avg_rank'), 2)} "
+            f"| {_fmt_ops(best_tp)} "
+            f"| {_fmt_float(best_p99, 2)} "
+            f"| {row.get('scenario_count', 0)} |"
+        )
+    lines.append("")
+
+
+# ---------------------------------------------------------------------------
 # Performance Analysis Summary
 # ---------------------------------------------------------------------------
 
@@ -467,10 +716,10 @@ def _section_performance_analysis(
         lines.append("### Replicate Variance")
         lines.append("")
         lines.append(
-            "| Database | Backend | Series | Threads | Reps | Throughput Median | Throughput Spread % | Throughput Outliers | P99 Median ms | P99 Spread % | P99 Outliers |"
+            "| Database | Backend | Series | Threads | Reps | Throughput Median | Tp Spread % | Tp CV % | Throughput Outliers | P99 Median ms | P99 Spread % | P99 CV % | P99 Outliers |"
         )
         lines.append(
-            "|----------|---------|--------|--------:|-----:|------------------:|--------------------:|-------------------:|--------------:|-------------:|-------------:|"
+            "|----------|---------|--------|--------:|-----:|------------------:|------------:|--------:|-------------------:|--------------:|-------------:|---------:|-------------:|"
         )
         for row in series_statistics:
             lines.append(
@@ -481,9 +730,11 @@ def _section_performance_analysis(
                 f"| {row.get('replicate_count') or 0} "
                 f"| {_fmt_ops(row.get('throughput_median'))} "
                 f"| {_fmt_float(row.get('throughput_spread_pct'), 2)} "
+                f"| {_fmt_float(row.get('throughput_cv_pct'), 2)} "
                 f"| {row.get('throughput_outlier_replicates') or 0} "
                 f"| {_fmt_float(row.get('p99_latency_median'), 2)} "
                 f"| {_fmt_float(row.get('p99_latency_spread_pct'), 2)} "
+                f"| {_fmt_float(row.get('p99_latency_cv_pct'), 2)} "
                 f"| {row.get('p99_latency_outlier_replicates') or 0} |"
             )
         lines.append("")
@@ -566,6 +817,136 @@ def _render_winners(
 
         lines.append(f"- **{label}:** {db} — {val_str} ({context})")
     lines.append("")
+
+
+# ---------------------------------------------------------------------------
+# Host Telemetry Time-Series
+# ---------------------------------------------------------------------------
+
+
+def _section_host_telemetry_timeseries(
+    lines: list[str],
+    timeseries_summaries: list[dict[str, Any]],
+) -> None:
+    if not timeseries_summaries:
+        return
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## Host Telemetry Time-Series")
+    lines.append("")
+
+    # CPU & load table
+    lines.append("### CPU & Load")
+    lines.append("")
+    lines.append(
+        "| Database | Backend | Series | Threads | Samples | "
+        "Sys CPU min | Sys CPU avg | Sys CPU p95 | Sys CPU max | "
+        "Proc CPU min | Proc CPU avg | Proc CPU p95 | Proc CPU max | "
+        "Load1 avg |"
+    )
+    lines.append(
+        "|----------|---------|--------|--------:|--------:|"
+        "-----------:|-----------:|-----------:|-----------:|"
+        "------------:|------------:|------------:|------------:|"
+        "----------:|"
+    )
+    for ts in timeseries_summaries:
+        sys_cpu = ts.get("system_cpu_pct") or {}
+        proc_cpu = ts.get("process_cpu_pct") or {}
+        load1 = ts.get("loadavg_1") or {}
+        lines.append(
+            f"| {ts.get('database') or 'n/a'} "
+            f"| {ts.get('backend') or 'n/a'} "
+            f"| {ts.get('series_label') or 'n/a'} "
+            f"| {ts.get('thread_count') or 'n/a'} "
+            f"| {ts.get('sample_count') or 0} "
+            f"| {_fmt_float(sys_cpu.get('min'), 1)} "
+            f"| {_fmt_float(sys_cpu.get('avg'), 1)} "
+            f"| {_fmt_float(sys_cpu.get('p95'), 1)} "
+            f"| {_fmt_float(sys_cpu.get('max'), 1)} "
+            f"| {_fmt_float(proc_cpu.get('min'), 1)} "
+            f"| {_fmt_float(proc_cpu.get('avg'), 1)} "
+            f"| {_fmt_float(proc_cpu.get('p95'), 1)} "
+            f"| {_fmt_float(proc_cpu.get('max'), 1)} "
+            f"| {_fmt_float(load1.get('avg'), 2)} |"
+        )
+    lines.append("")
+
+    # Memory table
+    lines.append("### Memory")
+    lines.append("")
+    lines.append(
+        "| Database | Backend | Series | Threads | "
+        "RSS min | RSS avg | RSS p95 | RSS max | "
+        "Dirty avg | Dirty max |"
+    )
+    lines.append(
+        "|----------|---------|--------|--------:|"
+        "--------:|--------:|--------:|--------:|"
+        "----------:|----------:|"
+    )
+    for ts in timeseries_summaries:
+        rss = ts.get("process_rss_bytes") or {}
+        dirty = ts.get("mem_dirty_bytes") or {}
+        lines.append(
+            f"| {ts.get('database') or 'n/a'} "
+            f"| {ts.get('backend') or 'n/a'} "
+            f"| {ts.get('series_label') or 'n/a'} "
+            f"| {ts.get('thread_count') or 'n/a'} "
+            f"| {_fmt_bytes(rss.get('min'))} "
+            f"| {_fmt_bytes(rss.get('avg'))} "
+            f"| {_fmt_bytes(rss.get('p95'))} "
+            f"| {_fmt_bytes(rss.get('max'))} "
+            f"| {_fmt_bytes(dirty.get('avg'))} "
+            f"| {_fmt_bytes(dirty.get('max'))} |"
+        )
+    lines.append("")
+
+    # Network & Disk I/O rates table
+    lines.append("### Network & Disk I/O Rates")
+    lines.append("")
+    lines.append(
+        "| Database | Backend | Series | Threads | "
+        "Net RX avg/s | Net TX avg/s | "
+        "Disk Read avg/s | Disk Write avg/s | "
+        "CtxSw avg/s |"
+    )
+    lines.append(
+        "|----------|---------|--------|--------:|"
+        "-------------:|-------------:|"
+        "----------------:|-----------------:|"
+        "------------:|"
+    )
+    for ts in timeseries_summaries:
+        net_rx = ts.get("net_lo_rx_bytes_per_sec") or {}
+        net_tx = ts.get("net_lo_tx_bytes_per_sec") or {}
+        disk_r = ts.get("disk_read_bytes_per_sec") or {}
+        disk_w = ts.get("disk_write_bytes_per_sec") or {}
+        ctx = ts.get("ctx_switches_per_sec") or {}
+        lines.append(
+            f"| {ts.get('database') or 'n/a'} "
+            f"| {ts.get('backend') or 'n/a'} "
+            f"| {ts.get('series_label') or 'n/a'} "
+            f"| {ts.get('thread_count') or 'n/a'} "
+            f"| {_fmt_bytes(net_rx.get('avg'))}/s "
+            f"| {_fmt_bytes(net_tx.get('avg'))}/s "
+            f"| {_fmt_bytes(disk_r.get('avg'))}/s "
+            f"| {_fmt_bytes(disk_w.get('avg'))}/s "
+            f"| {_fmt_rate(ctx.get('avg'))} |"
+        )
+    lines.append("")
+
+
+def _fmt_rate(value: Optional[float]) -> str:
+    """Format a per-second rate value."""
+    if value is None:
+        return "n/a"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:.0f}"
 
 
 # ---------------------------------------------------------------------------

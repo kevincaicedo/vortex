@@ -209,6 +209,17 @@ ensure_macos_debuggable_binary() {
 # ── Timestamp ────────────────────────────────────────────────────────────────
 timestamp() { date -u "+%Y%m%d-%H%M%S"; }
 
+probe_server_ready() {
+    local host="$1" port="$2"
+
+    if has_cmd redis-cli; then
+        redis-cli -h "$host" -p "$port" PING 2>/dev/null | grep -q '^PONG$'
+        return $?
+    fi
+
+    echo -ne "*1\r\n\$4\r\nPING\r\n" | nc -w 1 "$host" "$port" 2>/dev/null | grep -q "PONG"
+}
+
 # ── Server readiness probe (pure bash + nc) ──────────────────────────────────
 wait_for_server_ready() {
     local host="$1" port="$2" timeout="${3:-20}"
@@ -217,7 +228,7 @@ wait_for_server_ready() {
     info "Waiting for server at ${host}:${port}..."
     while [[ $(date +%s) -lt $deadline ]]; do
         # Try sending PING and check for PONG
-        if echo -ne "*1\r\n\$4\r\nPING\r\n" | nc -w 1 "$host" "$port" 2>/dev/null | grep -q "PONG"; then
+        if probe_server_ready "$host" "$port"; then
             local discovered_pid
             discovered_pid="$(discover_pid_by_port "$port")"
             record_session_pid "$discovered_pid"

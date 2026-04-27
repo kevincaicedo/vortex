@@ -42,7 +42,8 @@ impl fmt::Display for IoBackendKind {
 #[derive(Debug, Clone, Parser, Deserialize)]
 #[command(
     name = "vortex-server",
-    about = "VortexDB — Next-generation in-memory data engine"
+    about = "VortexDB — Next-generation in-memory data engine",
+    version = env!("CARGO_PKG_VERSION"),
 )]
 #[serde(default)]
 pub struct VortexConfig {

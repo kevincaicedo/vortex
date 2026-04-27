@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from statistics import mean, median, quantiles, stdev
+import math
 from typing import Any, Optional
 
 
@@ -64,8 +65,19 @@ def _comparison_group_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _normalize_maxmemory(value: Any) -> Any:
+    """Normalize maxmemory for comparison: None, '0', and 0 are all 'unlimited'."""
+    if value is None or value == 0 or value == "0":
+        return "unlimited"
+    return value
+
+
 def _comparison_signature(row: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(row.get(field) for field in _COMPARISON_SIGNATURE_FIELDS)
+    return tuple(
+        _normalize_maxmemory(row.get(field)) if field == "configured_maxmemory"
+        else row.get(field)
+        for field in _COMPARISON_SIGNATURE_FIELDS
+    )
 
 
 def _metric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
@@ -85,6 +97,16 @@ def _spread_pct(values: list[float]) -> Optional[float]:
     if med <= 0:
         return None
     return ((max(values) - min(values)) / med) * 100.0
+
+
+def _cv_pct(values: list[float]) -> Optional[float]:
+    """Coefficient of Variation (stdev/mean * 100). Standard benchmarking metric."""
+    if len(values) < 2:
+        return None
+    m = mean(values)
+    if m <= 0:
+        return None
+    return (stdev(values) / m) * 100.0
 
 
 def _outlier_count(values: list[float]) -> int:
@@ -151,10 +173,12 @@ def _build_series_statistics(
             base[f"{metric}_mean"] = mean(values)
             base[f"{metric}_stdev"] = stdev(values) if len(values) > 1 else None
             base[f"{metric}_spread_pct"] = _spread_pct(values)
+            base[f"{metric}_cv_pct"] = _cv_pct(values)
 
             stats_key = metric.removesuffix("_ops_sec").removesuffix("_ms")
             stats_entry[f"{stats_key}_median"] = med
             stats_entry[f"{stats_key}_spread_pct"] = _spread_pct(values)
+            stats_entry[f"{stats_key}_cv_pct"] = _cv_pct(values)
 
         throughput_values = _metric_values(group, "throughput_ops_sec")
         p99_values = _metric_values(group, "p99_latency_ms")
@@ -265,6 +289,26 @@ def build_analysis(
             f"**Invalid comparisons excluded**: {len(comparison_validity)} scenario group(s) had mismatched runtime settings or duplicate rows across databases.",
         )
 
+    # Advisory comparisons use ALL aggregated rows (including invalid ones)
+    # so the report can show side-by-side even with mismatched configs
+    advisory_comparisons = (
+        _build_backend_comparisons(aggregated_rows, db_names)
+        if len(db_names) >= 2
+        else {}
+    )
+
+    # Workload rankings and scorecard also use all rows for advisory visibility
+    workload_rankings = (
+        _build_workload_rankings(aggregated_rows, db_names)
+        if len(db_names) >= 2
+        else {}
+    )
+    database_scorecard = (
+        _build_database_scorecard(aggregated_rows, db_names)
+        if len(db_names) >= 2
+        else []
+    )
+
     return {
         "aggregated_rows": aggregated_rows,
         "series_statistics": series_statistics,
@@ -272,6 +316,9 @@ def build_analysis(
         "backend_comparisons": _build_backend_comparisons(analysis_rows, db_names)
         if analysis_rows
         else {},
+        "advisory_backend_comparisons": advisory_comparisons,
+        "workload_rankings": workload_rankings,
+        "database_scorecard": database_scorecard,
         "scalability": _build_scalability(analysis_rows, db_names)
         if analysis_rows
         else [],
@@ -538,6 +585,206 @@ def _build_winners(
             }
 
     return winners
+
+
+# ---- workload rankings ----
+
+
+def _build_workload_rankings(
+    rows: list[dict[str, Any]], databases: list[str]
+) -> dict[str, Any]:
+    """Build per-workload comparison matrix with databases as columns and ranks."""
+    if len(databases) < 2:
+        return {}
+
+    by_backend: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_backend[row.get("backend", "unknown")].append(row)
+
+    rankings: dict[str, Any] = {}
+    for backend in sorted(by_backend):
+        backend_rows = by_backend[backend]
+        if backend == "redis-benchmark":
+            rankings[backend] = _build_command_rankings(backend_rows, databases)
+        else:
+            rankings[backend] = _build_thread_workload_rankings(backend_rows, databases)
+    return rankings
+
+
+def _build_command_rankings(
+    rows: list[dict[str, Any]], databases: list[str]
+) -> dict[str, Any]:
+    by_command: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for row in rows:
+        cmd = row.get("series_label", "unknown")
+        db = row.get("database", "unknown")
+        by_command[cmd][db] = {
+            "throughput_ops_sec": row.get("throughput_ops_sec"),
+            "average_latency_ms": row.get("average_latency_ms"),
+            "p50_latency_ms": row.get("p50_latency_ms"),
+            "p99_latency_ms": row.get("p99_latency_ms"),
+            "p99_9_latency_ms": row.get("p99_9_latency_ms"),
+        }
+
+    table_rows = []
+    for cmd in sorted(by_command):
+        entry: dict[str, Any] = {"series": cmd}
+        ops_by_db: dict[str, float] = {}
+        for db in databases:
+            metrics = by_command[cmd].get(db, {})
+            entry[db] = metrics
+            ops = metrics.get("throughput_ops_sec")
+            if ops is not None:
+                ops_by_db[db] = float(ops)
+        # Compute ranks and delta
+        if ops_by_db:
+            ranked = sorted(ops_by_db.items(), key=lambda x: x[1], reverse=True)
+            leader_ops = ranked[0][1] if ranked else 0
+            ranks: dict[str, int] = {}
+            for rank_idx, (db_name, _) in enumerate(ranked, 1):
+                ranks[db_name] = rank_idx
+            entry["ranks"] = ranks
+            entry["winner"] = ranked[0][0] if ranked else None
+            # Delta% for each db relative to leader
+            deltas: dict[str, Optional[float]] = {}
+            for db in databases:
+                if db in ops_by_db and leader_ops > 0:
+                    deltas[db] = ((ops_by_db[db] - leader_ops) / leader_ops) * 100.0
+                else:
+                    deltas[db] = None
+            entry["delta_pct"] = deltas
+        else:
+            entry["ranks"] = {}
+            entry["winner"] = None
+            entry["delta_pct"] = {}
+        table_rows.append(entry)
+    return {"type": "command", "rows": table_rows}
+
+
+def _build_thread_workload_rankings(
+    rows: list[dict[str, Any]], databases: list[str]
+) -> dict[str, Any]:
+    by_workload: dict[
+        str, dict[Any, dict[str, dict[str, Any]]]
+    ] = defaultdict(lambda: defaultdict(dict))
+    for row in rows:
+        workload = row.get("series_label", "unknown")
+        threads = row.get("thread_count")
+        db = row.get("database", "unknown")
+        by_workload[workload][threads][db] = {
+            "throughput_ops_sec": row.get("throughput_ops_sec"),
+            "average_latency_ms": row.get("average_latency_ms"),
+            "p50_latency_ms": row.get("p50_latency_ms"),
+            "p99_latency_ms": row.get("p99_latency_ms"),
+            "p99_9_latency_ms": row.get("p99_9_latency_ms"),
+        }
+
+    workloads: dict[str, dict[str, Any]] = {}
+    for wk in sorted(by_workload):
+        thread_data = by_workload[wk]
+        wk_rows = []
+        for threads in sorted(thread_data, key=lambda x: x or 0):
+            entry: dict[str, Any] = {"threads": threads}
+            ops_by_db: dict[str, float] = {}
+            for db in databases:
+                metrics = thread_data[threads].get(db, {})
+                entry[db] = metrics
+                ops = metrics.get("throughput_ops_sec")
+                if ops is not None:
+                    ops_by_db[db] = float(ops)
+            if ops_by_db:
+                ranked = sorted(ops_by_db.items(), key=lambda x: x[1], reverse=True)
+                leader_ops = ranked[0][1] if ranked else 0
+                ranks: dict[str, int] = {}
+                for rank_idx, (db_name, _) in enumerate(ranked, 1):
+                    ranks[db_name] = rank_idx
+                entry["ranks"] = ranks
+                entry["winner"] = ranked[0][0] if ranked else None
+                deltas: dict[str, Optional[float]] = {}
+                for db in databases:
+                    if db in ops_by_db and leader_ops > 0:
+                        deltas[db] = ((ops_by_db[db] - leader_ops) / leader_ops) * 100.0
+                    else:
+                        deltas[db] = None
+                entry["delta_pct"] = deltas
+            else:
+                entry["ranks"] = {}
+                entry["winner"] = None
+                entry["delta_pct"] = {}
+            wk_rows.append(entry)
+        workloads[wk] = {"rows": wk_rows}
+    return {"type": "thread_workload", "workloads": workloads}
+
+
+def _build_database_scorecard(
+    rows: list[dict[str, Any]], databases: list[str]
+) -> list[dict[str, Any]]:
+    """Build a scorecard: wins, losses, avg rank, best throughput, best p99 per database."""
+    if len(databases) < 2:
+        return []
+
+    # Group by comparison scenario
+    scenarios: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = defaultdict(dict)
+    for row in rows:
+        key = (
+            row.get("backend"),
+            row.get("series_label"),
+            row.get("thread_count"),
+        )
+        db = row.get("database", "unknown")
+        scenarios[key][db] = row
+
+    db_stats: dict[str, dict[str, Any]] = {
+        db: {"wins": 0, "losses": 0, "ranks": [], "best_throughput": 0.0, "best_p99": math.inf}
+        for db in databases
+    }
+
+    for key, db_map in scenarios.items():
+        if len(db_map) < 2:
+            continue
+        ops_by_db = {}
+        for db, row in db_map.items():
+            ops = row.get("throughput_ops_sec")
+            if ops is not None:
+                ops_by_db[db] = float(ops)
+        if not ops_by_db:
+            continue
+        ranked = sorted(ops_by_db.items(), key=lambda x: x[1], reverse=True)
+        for rank_idx, (db_name, ops_val) in enumerate(ranked, 1):
+            if db_name not in db_stats:
+                continue
+            db_stats[db_name]["ranks"].append(rank_idx)
+            if rank_idx == 1:
+                db_stats[db_name]["wins"] += 1
+            else:
+                db_stats[db_name]["losses"] += 1
+            db_stats[db_name]["best_throughput"] = max(
+                db_stats[db_name]["best_throughput"], ops_val
+            )
+            p99 = db_map[db_name].get("p99_latency_ms")
+            if p99 is not None:
+                db_stats[db_name]["best_p99"] = min(
+                    db_stats[db_name]["best_p99"], float(p99)
+                )
+
+    scorecard = []
+    for db in databases:
+        stats = db_stats.get(db)
+        if stats is None:
+            continue
+        avg_rank = mean(stats["ranks"]) if stats["ranks"] else None
+        scorecard.append(
+            {
+                "database": db,
+                "wins": stats["wins"],
+                "losses": stats["losses"],
+                "avg_rank": round(avg_rank, 2) if avg_rank is not None else None,
+                "best_throughput": stats["best_throughput"] if stats["best_throughput"] > 0 else None,
+                "best_p99": stats["best_p99"] if math.isfinite(stats["best_p99"]) else None,
+                "scenario_count": len(stats["ranks"]),
+            }
+        )
+    return scorecard
 
 
 # ---- key insights ----

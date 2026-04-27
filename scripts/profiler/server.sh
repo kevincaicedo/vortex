@@ -109,6 +109,60 @@ start_server() {
     wait_for_server "$host" "$port" 30
 }
 
+start_profiled_shutdown_controller() {
+    local profiler_name="$1" tool_pid="$2" host="$3" port="$4"
+    local command="$5" duration="$6" clients="$7" ready_timeout="$8"
+    local load_log="$9" server_log="${10}"
+
+    (
+        local ready=false
+        local deadline=$(( $(date +%s) + ready_timeout ))
+
+        info "Waiting for server at ${host}:${port}..."
+        while [[ $(date +%s) -lt $deadline ]]; do
+            if ! kill -0 "$tool_pid" 2>/dev/null; then
+                warn "${profiler_name} target exited before the server became ready. See ${server_log}"
+                break
+            fi
+
+            if probe_server_ready "$host" "$port"; then
+                local discovered_pid
+                discovered_pid="$(discover_pid_by_port "$port")"
+                record_session_pid "$discovered_pid"
+                ok "Server ready at ${host}:${port}"
+                ready=true
+                break
+            fi
+
+            sleep 0.3
+        done
+
+        if [[ "$ready" == "true" ]]; then
+            if [[ -n "$command" ]]; then
+                generate_load "$host" "$port" "$command" "$duration" "$clients" "$load_log"
+                wait_for_load "$duration"
+            else
+                info "No load configured for ${profiler_name}; idling for ${duration}s before shutdown"
+                sleep "$duration"
+            fi
+        else
+            warn "Skipping ${profiler_name} load generation because the server never became ready. See ${server_log}"
+        fi
+
+        local profiled_pid=""
+        profiled_pid="$(discover_pid_by_port "$port")"
+        if [[ -n "$profiled_pid" ]] && kill -0 "$profiled_pid" 2>/dev/null; then
+            info "Stopping ${profiler_name} target server (pid ${profiled_pid})..."
+            kill -INT "$profiled_pid" 2>/dev/null || true
+        elif kill -0 "$tool_pid" 2>/dev/null; then
+            info "Stopping ${profiler_name} profiler wrapper (pid ${tool_pid})..."
+            kill -INT "$tool_pid" 2>/dev/null || true
+        fi
+    ) &
+
+    printf '%s\n' "$!"
+}
+
 # ── Load generation ──────────────────────────────────────────────────────────
 generate_load() {
     local host="$1" port="$2" command="$3" duration="$4" clients="$5" logfile="$6"

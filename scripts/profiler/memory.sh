@@ -20,32 +20,32 @@ run_heaptrack() {
     [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
     [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
-    # heaptrack owns the process
-    (
-        sleep 5
-        if wait_for_server_ready "$host" "$port" 60; then
-            if [[ -n "$command" ]]; then
-                generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-heaptrack.log"
-            fi
-        else
-            warn "Skipping heaptrack load generation because the server never became ready. See ${session}/server-heaptrack.log"
-        fi
-    ) &
-    local bg_load=$!
-
     info "Running: heaptrack vortex-server"
-    heaptrack -o "${session}/heaptrack" \
-        "$PROFILING_BINARY" \
-        --bind "${host}:${port}" --threads "$threads" \
-        "${extra_args[@]}" \
-        >"${session}/server-heaptrack.log" 2>&1 || warn "Heaptrack exited with non-zero status"
+    (
+        exec heaptrack -o "${session}/heaptrack" \
+            "$PROFILING_BINARY" \
+            --bind "${host}:${port}" --threads "$threads" \
+            "${extra_args[@]}" \
+            >"${session}/server-heaptrack.log" 2>&1
+    ) &
+    local tool_pid=$!
+    local control_pid=""
 
-    [[ -n "${bg_load:-}" ]] && { kill "$bg_load" 2>/dev/null || true; wait "$bg_load" 2>/dev/null || true; }
+    control_pid="$(start_profiled_shutdown_controller \
+        "heaptrack" "$tool_pid" "$host" "$port" "$command" "$duration" "$clients" 60 \
+        "${session}/load-heaptrack.log" "${session}/server-heaptrack.log")"
+
+    wait "$tool_pid" 2>/dev/null || warn "Heaptrack exited with non-zero status"
+    [[ -n "$control_pid" ]] && wait "$control_pid" 2>/dev/null || true
 
     local ht_file
-    ht_file="$(ls -t "${session}"/heaptrack*.gz 2>/dev/null | head -1 || true)"
+    ht_file="$(ls -t "${session}"/heaptrack*.zst "${session}"/heaptrack*.gz 2>/dev/null | head -1 || true)"
     if [[ -n "$ht_file" ]]; then
         ok "Heaptrack data: ${ht_file}"
+        if has_cmd heaptrack_print; then
+            heaptrack_print "$ht_file" 2>/dev/null | head -80 > "${session}/heaptrack-summary.txt" || true
+            info "Heaptrack summary: ${session}/heaptrack-summary.txt"
+        fi
         info "Hint: heaptrack_gui ${ht_file}"
     else
         warn "Heaptrack data was not generated"
@@ -69,27 +69,24 @@ run_massif() {
     [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
     [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
-    (
-        sleep 5
-        if wait_for_server_ready "$host" "$port" 60; then
-            if [[ -n "$command" ]]; then
-                generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-massif.log"
-            fi
-        else
-            warn "Skipping massif load generation because the server never became ready. See ${session}/server-massif.log"
-        fi
-    ) &
-    local bg_load=$!
-
     info "Running: valgrind --tool=massif"
-    valgrind --tool=massif \
-        --massif-out-file="${session}/massif.out" \
-        "$PROFILING_BINARY" \
-        --bind "${host}:${port}" --threads "$threads" \
-        "${extra_args[@]}" \
-        >"${session}/server-massif.log" 2>&1 || warn "Massif exited with non-zero status"
+    (
+        exec valgrind --tool=massif \
+            --massif-out-file="${session}/massif.out" \
+            "$PROFILING_BINARY" \
+            --bind "${host}:${port}" --threads "$threads" \
+            "${extra_args[@]}" \
+            >"${session}/server-massif.log" 2>&1
+    ) &
+    local tool_pid=$!
+    local control_pid=""
 
-    [[ -n "${bg_load:-}" ]] && { kill "$bg_load" 2>/dev/null || true; wait "$bg_load" 2>/dev/null || true; }
+    control_pid="$(start_profiled_shutdown_controller \
+        "massif" "$tool_pid" "$host" "$port" "$command" "$duration" "$clients" 60 \
+        "${session}/load-massif.log" "${session}/server-massif.log")"
+
+    wait "$tool_pid" 2>/dev/null || warn "Massif exited with non-zero status"
+    [[ -n "$control_pid" ]] && wait "$control_pid" 2>/dev/null || true
 
     if [[ -f "${session}/massif.out" ]]; then
         ok "Massif data: ${session}/massif.out"

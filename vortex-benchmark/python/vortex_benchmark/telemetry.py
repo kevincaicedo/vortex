@@ -228,6 +228,7 @@ def _read_linux_proc_stat() -> Optional[dict[str, Any]]:
         return None
 
     cpu_fields: list[int] | None = None
+    per_cpu_fields: list[list[int]] = []
     payload: dict[str, Any] = {}
     text = _read_text(stat_path)
     if text is None:
@@ -237,6 +238,9 @@ def _read_linux_proc_stat() -> Optional[dict[str, Any]]:
         if line.startswith("cpu "):
             parts = line.split()[1:]
             cpu_fields = [int(part) for part in parts]
+        elif re.match(r"^cpu\d+ ", line):
+            parts = line.split()[1:]
+            per_cpu_fields.append([int(part) for part in parts])
         elif line.startswith("ctxt "):
             payload["context_switches"] = _parse_int(line.split()[1])
         elif line.startswith("procs_running "):
@@ -247,6 +251,7 @@ def _read_linux_proc_stat() -> Optional[dict[str, Any]]:
     if cpu_fields is None:
         return None
     payload["cpu_fields"] = cpu_fields
+    payload["per_cpu_fields"] = per_cpu_fields
     return payload
 
 
@@ -500,6 +505,104 @@ def _read_linux_diskstats() -> dict[str, Optional[int]]:
     }
 
 
+def _read_linux_tcp_stats() -> dict[str, Optional[int]]:
+    """Read TCP retransmit and listen overflow counters from /proc/net/snmp
+    and /proc/net/netstat.
+
+    Key metrics (Systems Performance ch. 10):
+    - RetransSegs: total TCP retransmits (indicates congestion/packet loss)
+    - ListenOverflows: SYN queue overflows (server too slow to accept())
+    - ListenDrops: connections dropped due to full accept queue
+    - TCPSynRetrans: SYN retransmits (connection establishment failures)
+    """
+    result: dict[str, Optional[int]] = {
+        "tcp_retrans_segs": None,
+        "tcp_in_segs": None,
+        "tcp_out_segs": None,
+        "tcp_active_opens": None,
+        "tcp_passive_opens": None,
+        "tcp_listen_overflows": None,
+        "tcp_listen_drops": None,
+        "tcp_syn_retrans": None,
+    }
+
+    # /proc/net/snmp — TCP retransmits and segment counts
+    snmp_text = _read_text(Path("/proc/net/snmp"))
+    if snmp_text is not None:
+        lines = snmp_text.splitlines()
+        for i in range(0, len(lines) - 1, 2):
+            if not lines[i].startswith("Tcp:"):
+                continue
+            headers = lines[i].split()
+            values = lines[i + 1].split()
+            if len(headers) != len(values):
+                continue
+            snmp_map = dict(zip(headers[1:], values[1:]))
+            result["tcp_retrans_segs"] = _parse_int(snmp_map.get("RetransSegs"))
+            result["tcp_in_segs"] = _parse_int(snmp_map.get("InSegs"))
+            result["tcp_out_segs"] = _parse_int(snmp_map.get("OutSegs"))
+            result["tcp_active_opens"] = _parse_int(snmp_map.get("ActiveOpens"))
+            result["tcp_passive_opens"] = _parse_int(snmp_map.get("PassiveOpens"))
+            break
+
+    # /proc/net/netstat — ListenOverflows, ListenDrops, TCPSynRetrans
+    netstat_text = _read_text(Path("/proc/net/netstat"))
+    if netstat_text is not None:
+        lines = netstat_text.splitlines()
+        for i in range(0, len(lines) - 1, 2):
+            if not lines[i].startswith("TcpExt:"):
+                continue
+            headers = lines[i].split()
+            values = lines[i + 1].split()
+            if len(headers) != len(values):
+                continue
+            netstat_map = dict(zip(headers[1:], values[1:]))
+            result["tcp_listen_overflows"] = _parse_int(netstat_map.get("ListenOverflows"))
+            result["tcp_listen_drops"] = _parse_int(netstat_map.get("ListenDrops"))
+            result["tcp_syn_retrans"] = _parse_int(netstat_map.get("TCPSynRetrans"))
+            break
+
+    return result
+
+
+def _read_linux_socket_queue(port: int) -> dict[str, Optional[int]]:
+    """Read socket queue depths from /proc/net/tcp for a specific port.
+
+    Returns recv-Q and send-Q depths for the listening socket, which are
+    key indicators of accept() backpressure (Systems Performance ch. 10).
+    """
+    result: dict[str, Optional[int]] = {
+        "socket_recv_q": None,
+        "socket_send_q": None,
+    }
+    if port <= 0:
+        return result
+
+    hex_port = f"{port:04X}"
+    tcp_text = _read_text(Path("/proc/net/tcp"))
+    if tcp_text is None:
+        return result
+
+    for line in tcp_text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        local_addr = fields[1]
+        if not local_addr.endswith(f":{hex_port}"):
+            continue
+        # State 0A = LISTEN
+        state = fields[3]
+        if state != "0A":
+            continue
+        queue_fields = fields[4]
+        if ":" in queue_fields:
+            tx_q, rx_q = queue_fields.split(":", 1)
+            result["socket_recv_q"] = int(rx_q, 16)
+            result["socket_send_q"] = int(tx_q, 16)
+        break
+
+    return result
+
 def _read_linux_process_stat(pid: int) -> dict[str, Optional[int]]:
     text = _read_text(Path(f"/proc/{pid}/stat"))
     if text is None:
@@ -643,10 +746,15 @@ class HostTelemetryCollector:
         self.summary_path = self.output_dir / f"{self.label}-host-telemetry-summary.json"
         self._samples: list[dict[str, Any]] = []
         self._prev_cpu_fields: Optional[list[int]] = None
+        self._prev_per_cpu_fields: Optional[list[list[int]]] = None
         self._prev_process_cpu: Optional[tuple[float, int]] = None
         self._started_monotonic: Optional[float] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._runtime_snapshot_captured = False
+        self._runtime_snapshot_successes = 0
+        self._last_runtime_snapshot_index = -1
+        self._runtime_snapshot_interval_samples = max(1, int(round(5.0 / interval_seconds)))
 
     @property
     def supported(self) -> bool:
@@ -702,6 +810,7 @@ class HostTelemetryCollector:
         proc_stat = _read_linux_proc_stat() if self.supported else None
         if proc_stat is not None:
             cpu_fields = proc_stat.get("cpu_fields")
+            per_cpu_fields = proc_stat.get("per_cpu_fields") or []
             if cpu_fields and self._prev_cpu_fields is not None:
                 total_delta = sum(cpu_fields) - sum(self._prev_cpu_fields)
                 idle_delta = (cpu_fields[3] + cpu_fields[4]) - (
@@ -720,7 +829,27 @@ class HostTelemetryCollector:
                     sample["system_cpu_iowait_pct"] = (
                         (cpu_fields[4] - self._prev_cpu_fields[4]) / total_delta
                     ) * 100.0
+
+            # Per-CPU utilization — compute max and list of per-core percentages
+            if per_cpu_fields and self._prev_per_cpu_fields is not None:
+                per_cpu_pcts: list[float] = []
+                for idx, cur in enumerate(per_cpu_fields):
+                    if idx >= len(self._prev_per_cpu_fields):
+                        break
+                    prev = self._prev_per_cpu_fields[idx]
+                    cpu_total = sum(cur) - sum(prev)
+                    cpu_idle = (cur[3] + cur[4]) - (prev[3] + prev[4])
+                    if cpu_total > 0:
+                        per_cpu_pcts.append(
+                            ((cpu_total - cpu_idle) / cpu_total) * 100.0
+                        )
+                if per_cpu_pcts:
+                    sample["per_cpu_max_pct"] = max(per_cpu_pcts)
+                    sample["per_cpu_min_pct"] = min(per_cpu_pcts)
+                    sample["per_cpu_count"] = len(per_cpu_pcts)
+
             self._prev_cpu_fields = cpu_fields
+            self._prev_per_cpu_fields = per_cpu_fields
             sample["system_context_switches"] = proc_stat.get("context_switches")
             sample["system_procs_running"] = proc_stat.get("procs_running")
             sample["system_procs_blocked"] = proc_stat.get("procs_blocked")
@@ -730,6 +859,36 @@ class HostTelemetryCollector:
         sample.update(_read_linux_loadavg() if self.supported else {})
         sample.update(_read_linux_net_dev() if self.supported else {})
         sample.update(_read_linux_diskstats() if self.supported else {})
+
+        # TCP retransmit, listen-drop, and socket-queue telemetry
+        if self.supported:
+            sample.update(_read_linux_tcp_stats())
+            port = 0
+            if self.service is not None and self.service.port:
+                port = self.service.port
+            if port > 0:
+                sample.update(_read_linux_socket_queue(port))
+
+        # Service-side runtime counters are sampled once the server becomes
+        # reachable and once more at shutdown. This keeps INFO traffic off the
+        # steady-state hot path while avoiding the start-up race where the
+        # sampler begins before the server is ready.
+        if self.service is not None:
+            should_try_runtime = self._runtime_snapshot_successes < 2 or self._stop_event.is_set()
+            if (
+                not should_try_runtime
+                and self._last_runtime_snapshot_index >= 0
+                and len(self._samples) - self._last_runtime_snapshot_index
+                >= self._runtime_snapshot_interval_samples
+            ):
+                should_try_runtime = True
+            if should_try_runtime:
+                runtime_snapshot = _capture_runtime_snapshot(self.service)
+                sample.update(runtime_snapshot)
+                if _runtime_snapshot_available(runtime_snapshot):
+                    self._runtime_snapshot_captured = True
+                    self._runtime_snapshot_successes += 1
+                    self._last_runtime_snapshot_index = len(self._samples)
 
         if self.service is not None and self.service.pid and self.supported:
             proc_sample = {}
@@ -817,6 +976,8 @@ class HostTelemetryCollector:
             "duration_seconds": duration_seconds,
             "system_cpu_utilization_avg_pct": avg("system_cpu_utilization_pct"),
             "system_cpu_utilization_peak_pct": peak("system_cpu_utilization_pct"),
+            "per_cpu_utilization_peak_pct": peak("per_cpu_max_pct"),
+            "per_cpu_utilization_floor_pct": minimum("per_cpu_min_pct"),
             "system_cpu_iowait_avg_pct": avg("system_cpu_iowait_pct"),
             "system_procs_running_peak": peak("system_procs_running"),
             "system_procs_blocked_peak": peak("system_procs_blocked"),
@@ -856,10 +1017,35 @@ class HostTelemetryCollector:
             "network_total_tx_errors_delta": delta("network_total_tx_errors"),
             "network_loopback_rx_bytes_delta": delta("network_loopback_rx_bytes"),
             "network_loopback_tx_bytes_delta": delta("network_loopback_tx_bytes"),
+            "tcp_retrans_segs_delta": delta("tcp_retrans_segs"),
+            "tcp_listen_overflows_delta": delta("tcp_listen_overflows"),
+            "tcp_listen_drops_delta": delta("tcp_listen_drops"),
+            "tcp_syn_retrans_delta": delta("tcp_syn_retrans"),
+            "socket_recv_q_peak": peak("socket_recv_q"),
+            "socket_send_q_peak": peak("socket_send_q"),
             "disk_read_bytes_delta": delta("disk_read_bytes"),
             "disk_write_bytes_delta": delta("disk_write_bytes"),
             "disk_io_time_delta_ms": delta("disk_io_time_ms"),
             "disk_io_in_progress_peak": peak("disk_io_in_progress"),
+            "runtime_reactor_slots": peak("runtime_reactor_slots"),
+            "reactor_loop_iterations_delta": delta("reactor_loop_iterations"),
+            "reactor_accept_eagain_rearms_delta": delta("reactor_accept_eagain_rearms"),
+            "reactor_completion_batches_delta": delta("reactor_completion_batches"),
+            "reactor_completion_batch_total_delta": delta("reactor_completion_batch_total"),
+            "reactor_completion_batch_max_peak": peak("reactor_completion_batch_max"),
+            "reactor_completion_batch_avg_peak": peak("reactor_completion_batch_avg"),
+            "reactor_command_batches_delta": delta("reactor_command_batches"),
+            "reactor_command_batch_total_delta": delta("reactor_command_batch_total"),
+            "reactor_command_batch_max_peak": peak("reactor_command_batch_max"),
+            "reactor_command_batch_avg_peak": peak("reactor_command_batch_avg"),
+            "reactor_active_expiry_runs_delta": delta("reactor_active_expiry_runs"),
+            "reactor_active_expiry_sampled_delta": delta("reactor_active_expiry_sampled"),
+            "reactor_active_expiry_expired_delta": delta("reactor_active_expiry_expired"),
+            "eviction_admissions_delta": delta("eviction_admissions"),
+            "eviction_shards_scanned_delta": delta("eviction_shards_scanned"),
+            "eviction_slots_sampled_delta": delta("eviction_slots_sampled"),
+            "eviction_bytes_freed_delta": delta("eviction_bytes_freed"),
+            "eviction_oom_after_scan_delta": delta("eviction_oom_after_scan"),
         }
 
 
@@ -904,6 +1090,36 @@ def _parse_info_response(payload: str) -> dict[str, str]:
         key, value = line.split(":", 1)
         info[key] = value
     return info
+
+
+def _capture_runtime_snapshot(service: ServiceState) -> dict[str, Any]:
+    raw_info = _redis_cli(service, ["INFO", "runtime"])
+    info = _parse_info_response(raw_info or "")
+    return {
+        "runtime_reactor_slots": _parse_int(info.get("runtime_reactor_slots")),
+        "reactor_loop_iterations": _parse_int(info.get("reactor_loop_iterations")),
+        "reactor_accept_eagain_rearms": _parse_int(info.get("reactor_accept_eagain_rearms")),
+        "reactor_completion_batches": _parse_int(info.get("reactor_completion_batches")),
+        "reactor_completion_batch_total": _parse_int(info.get("reactor_completion_batch_total")),
+        "reactor_completion_batch_max": _parse_int(info.get("reactor_completion_batch_max")),
+        "reactor_completion_batch_avg": _parse_float(info.get("reactor_completion_batch_avg")),
+        "reactor_command_batches": _parse_int(info.get("reactor_command_batches")),
+        "reactor_command_batch_total": _parse_int(info.get("reactor_command_batch_total")),
+        "reactor_command_batch_max": _parse_int(info.get("reactor_command_batch_max")),
+        "reactor_command_batch_avg": _parse_float(info.get("reactor_command_batch_avg")),
+        "reactor_active_expiry_runs": _parse_int(info.get("reactor_active_expiry_runs")),
+        "reactor_active_expiry_sampled": _parse_int(info.get("reactor_active_expiry_sampled")),
+        "reactor_active_expiry_expired": _parse_int(info.get("reactor_active_expiry_expired")),
+        "eviction_admissions": _parse_int(info.get("eviction_admissions")),
+        "eviction_shards_scanned": _parse_int(info.get("eviction_shards_scanned")),
+        "eviction_slots_sampled": _parse_int(info.get("eviction_slots_sampled")),
+        "eviction_bytes_freed": _parse_int(info.get("eviction_bytes_freed")),
+        "eviction_oom_after_scan": _parse_int(info.get("eviction_oom_after_scan")),
+    }
+
+
+def _runtime_snapshot_available(snapshot: dict[str, Any]) -> bool:
+    return any(value is not None for value in snapshot.values())
 
 
 _MEMORY_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?)\s*$", re.IGNORECASE)
@@ -957,6 +1173,7 @@ def _capture_process_memory_bytes(service: ServiceState) -> Optional[int]:
 def capture_service_snapshot(service: ServiceState) -> dict[str, Any]:
     raw_info = _redis_cli(service, ["INFO"])
     info = _parse_info_response(raw_info or "")
+    runtime = _capture_runtime_snapshot(service)
     latency_latest = _read_latency_latest(service)
 
     def latency_field(name: str, key: str) -> Optional[int]:
@@ -1022,6 +1239,7 @@ def capture_service_snapshot(service: ServiceState) -> dict[str, Any]:
         "latency_aof_pending_fsync_max_ms": latency_field(
             "aof-write-pending-fsync", "max_latency_ms"
         ),
+        **runtime,
     }
 
 
@@ -1059,6 +1277,20 @@ def diff_service_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dic
         "latency_aof_fsync_max_ms",
         "latency_aof_pending_fsync_latest_ms",
         "latency_aof_pending_fsync_max_ms",
+        "reactor_loop_iterations",
+        "reactor_accept_eagain_rearms",
+        "reactor_completion_batches",
+        "reactor_completion_batch_total",
+        "reactor_command_batches",
+        "reactor_command_batch_total",
+        "reactor_active_expiry_runs",
+        "reactor_active_expiry_sampled",
+        "reactor_active_expiry_expired",
+        "eviction_admissions",
+        "eviction_shards_scanned",
+        "eviction_slots_sampled",
+        "eviction_bytes_freed",
+        "eviction_oom_after_scan",
     ]
     delta: dict[str, Any] = {}
     for field in delta_fields:

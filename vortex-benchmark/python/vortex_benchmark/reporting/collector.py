@@ -148,6 +148,50 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "cache_efficiency": delta.get("cache_efficiency"),
         "evicted_keys_delta": delta.get("evicted_keys_delta"),
         "expired_keys_delta": delta.get("expired_keys_delta"),
+        "reactor_loop_iterations_before": before.get("reactor_loop_iterations"),
+        "reactor_loop_iterations_after": after.get("reactor_loop_iterations"),
+        "reactor_loop_iterations_delta": delta.get("reactor_loop_iterations_delta"),
+        "reactor_accept_eagain_rearms_before": before.get("reactor_accept_eagain_rearms"),
+        "reactor_accept_eagain_rearms_after": after.get("reactor_accept_eagain_rearms"),
+        "reactor_accept_eagain_rearms_delta": delta.get("reactor_accept_eagain_rearms_delta"),
+        "reactor_completion_batches_before": before.get("reactor_completion_batches"),
+        "reactor_completion_batches_after": after.get("reactor_completion_batches"),
+        "reactor_completion_batches_delta": delta.get("reactor_completion_batches_delta"),
+        "reactor_completion_batch_max_before": before.get("reactor_completion_batch_max"),
+        "reactor_completion_batch_max_after": after.get("reactor_completion_batch_max"),
+        "reactor_completion_batch_avg_before": before.get("reactor_completion_batch_avg"),
+        "reactor_completion_batch_avg_after": after.get("reactor_completion_batch_avg"),
+        "reactor_command_batches_before": before.get("reactor_command_batches"),
+        "reactor_command_batches_after": after.get("reactor_command_batches"),
+        "reactor_command_batches_delta": delta.get("reactor_command_batches_delta"),
+        "reactor_command_batch_max_before": before.get("reactor_command_batch_max"),
+        "reactor_command_batch_max_after": after.get("reactor_command_batch_max"),
+        "reactor_command_batch_avg_before": before.get("reactor_command_batch_avg"),
+        "reactor_command_batch_avg_after": after.get("reactor_command_batch_avg"),
+        "reactor_active_expiry_runs_before": before.get("reactor_active_expiry_runs"),
+        "reactor_active_expiry_runs_after": after.get("reactor_active_expiry_runs"),
+        "reactor_active_expiry_runs_delta": delta.get("reactor_active_expiry_runs_delta"),
+        "reactor_active_expiry_sampled_before": before.get("reactor_active_expiry_sampled"),
+        "reactor_active_expiry_sampled_after": after.get("reactor_active_expiry_sampled"),
+        "reactor_active_expiry_sampled_delta": delta.get("reactor_active_expiry_sampled_delta"),
+        "reactor_active_expiry_expired_before": before.get("reactor_active_expiry_expired"),
+        "reactor_active_expiry_expired_after": after.get("reactor_active_expiry_expired"),
+        "reactor_active_expiry_expired_delta": delta.get("reactor_active_expiry_expired_delta"),
+        "eviction_admissions_before": before.get("eviction_admissions"),
+        "eviction_admissions_after": after.get("eviction_admissions"),
+        "eviction_admissions_delta": delta.get("eviction_admissions_delta"),
+        "eviction_shards_scanned_before": before.get("eviction_shards_scanned"),
+        "eviction_shards_scanned_after": after.get("eviction_shards_scanned"),
+        "eviction_shards_scanned_delta": delta.get("eviction_shards_scanned_delta"),
+        "eviction_slots_sampled_before": before.get("eviction_slots_sampled"),
+        "eviction_slots_sampled_after": after.get("eviction_slots_sampled"),
+        "eviction_slots_sampled_delta": delta.get("eviction_slots_sampled_delta"),
+        "eviction_bytes_freed_before": before.get("eviction_bytes_freed"),
+        "eviction_bytes_freed_after": after.get("eviction_bytes_freed"),
+        "eviction_bytes_freed_delta": delta.get("eviction_bytes_freed_delta"),
+        "eviction_oom_after_scan_before": before.get("eviction_oom_after_scan"),
+        "eviction_oom_after_scan_after": after.get("eviction_oom_after_scan"),
+        "eviction_oom_after_scan_delta": delta.get("eviction_oom_after_scan_delta"),
         "aof_enabled_before": delta.get("aof_enabled_before"),
         "aof_enabled_after": delta.get("aof_enabled_after"),
         "aof_current_size_before_bytes": before.get("aof_current_size_bytes"),
@@ -192,6 +236,8 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "host_telemetry_duration_seconds": telemetry_summary.get("duration_seconds"),
         "system_cpu_utilization_avg_pct": telemetry_summary.get("system_cpu_utilization_avg_pct"),
         "system_cpu_utilization_peak_pct": telemetry_summary.get("system_cpu_utilization_peak_pct"),
+        "per_cpu_utilization_peak_pct": telemetry_summary.get("per_cpu_utilization_peak_pct"),
+        "per_cpu_utilization_floor_pct": telemetry_summary.get("per_cpu_utilization_floor_pct"),
         "system_cpu_iowait_avg_pct": telemetry_summary.get("system_cpu_iowait_avg_pct"),
         "system_procs_running_peak": telemetry_summary.get("system_procs_running_peak"),
         "system_procs_blocked_peak": telemetry_summary.get("system_procs_blocked_peak"),
@@ -231,10 +277,35 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "network_total_tx_errors_delta": telemetry_summary.get("network_total_tx_errors_delta"),
         "network_loopback_rx_bytes_delta": telemetry_summary.get("network_loopback_rx_bytes_delta"),
         "network_loopback_tx_bytes_delta": telemetry_summary.get("network_loopback_tx_bytes_delta"),
+        "tcp_retrans_segs_delta": telemetry_summary.get("tcp_retrans_segs_delta"),
+        "tcp_listen_overflows_delta": telemetry_summary.get("tcp_listen_overflows_delta"),
+        "tcp_listen_drops_delta": telemetry_summary.get("tcp_listen_drops_delta"),
+        "tcp_syn_retrans_delta": telemetry_summary.get("tcp_syn_retrans_delta"),
+        "socket_recv_q_peak": telemetry_summary.get("socket_recv_q_peak"),
+        "socket_send_q_peak": telemetry_summary.get("socket_send_q_peak"),
         "disk_read_bytes_delta": telemetry_summary.get("disk_read_bytes_delta"),
         "disk_write_bytes_delta": telemetry_summary.get("disk_write_bytes_delta"),
         "disk_io_time_delta_ms": telemetry_summary.get("disk_io_time_delta_ms"),
         "disk_io_in_progress_peak": telemetry_summary.get("disk_io_in_progress_peak"),
+        "runtime_reactor_slots": telemetry_summary.get("runtime_reactor_slots"),
+        "reactor_loop_iterations_host_delta": telemetry_summary.get("reactor_loop_iterations_delta"),
+        "reactor_accept_eagain_rearms_host_delta": telemetry_summary.get("reactor_accept_eagain_rearms_delta"),
+        "reactor_completion_batches_host_delta": telemetry_summary.get("reactor_completion_batches_delta"),
+        "reactor_completion_batch_total_host_delta": telemetry_summary.get("reactor_completion_batch_total_delta"),
+        "reactor_completion_batch_max_peak": telemetry_summary.get("reactor_completion_batch_max_peak"),
+        "reactor_completion_batch_avg_peak": telemetry_summary.get("reactor_completion_batch_avg_peak"),
+        "reactor_command_batches_host_delta": telemetry_summary.get("reactor_command_batches_delta"),
+        "reactor_command_batch_total_host_delta": telemetry_summary.get("reactor_command_batch_total_delta"),
+        "reactor_command_batch_max_peak": telemetry_summary.get("reactor_command_batch_max_peak"),
+        "reactor_command_batch_avg_peak": telemetry_summary.get("reactor_command_batch_avg_peak"),
+        "reactor_active_expiry_runs_host_delta": telemetry_summary.get("reactor_active_expiry_runs_delta"),
+        "reactor_active_expiry_sampled_host_delta": telemetry_summary.get("reactor_active_expiry_sampled_delta"),
+        "reactor_active_expiry_expired_host_delta": telemetry_summary.get("reactor_active_expiry_expired_delta"),
+        "eviction_admissions_host_delta": telemetry_summary.get("eviction_admissions_delta"),
+        "eviction_shards_scanned_host_delta": telemetry_summary.get("eviction_shards_scanned_delta"),
+        "eviction_slots_sampled_host_delta": telemetry_summary.get("eviction_slots_sampled_delta"),
+        "eviction_bytes_freed_host_delta": telemetry_summary.get("eviction_bytes_freed_delta"),
+        "eviction_oom_after_scan_host_delta": telemetry_summary.get("eviction_oom_after_scan_delta"),
     }
 
 
@@ -663,12 +734,14 @@ def build_report_payload(summary_paths: list[Path], title: Optional[str] = None)
     eviction_rows = [row for row in rows if row.get("evicted_keys_delta") not in {None, 0}]
     memory_rows = _build_memory_diagnostics(rows)
     aof_rows = _build_aof_diagnostics(rows)
+    timeseries_summaries = build_timeseries_summaries(rows)
     diagnostics = {
         "summary": _build_diagnostic_summary(rows, memory_rows, aof_rows),
         "memory_rows": memory_rows,
         "aof_rows": aof_rows,
         "aof_overhead": aof_overhead,
         "eviction_rows": eviction_rows,
+        "timeseries_summaries": timeseries_summaries,
     }
 
     return {
@@ -688,3 +761,151 @@ def build_report_payload(summary_paths: list[Path], title: Optional[str] = None)
         "aof_overhead": aof_overhead,
         "eviction_rows": eviction_rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# Time-series telemetry summaries
+# ---------------------------------------------------------------------------
+
+
+def build_timeseries_summaries(
+    rows: list[dict[str, Any]],
+    warmup_seconds: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Load JSONL host telemetry and compute per-interval rate summaries.
+
+    When warmup_seconds > 0, the first N seconds of samples are excluded
+    from the summary statistics (standard benchmarking practice to avoid
+    cold-start contamination).
+    """
+    summaries: list[dict[str, Any]] = []
+    for row in rows:
+        samples_path = row.get("host_telemetry_samples_path")
+        if not samples_path:
+            continue
+        path = Path(str(samples_path))
+        if not path.exists():
+            continue
+
+        samples = _load_jsonl(path)
+        if len(samples) < 2:
+            continue
+
+        # Apply warmup exclusion
+        if warmup_seconds > 0 and samples:
+            first_ts = _parse_timestamp(samples[0].get("captured_at"))
+            if first_ts is not None:
+                cutoff = first_ts + warmup_seconds
+                samples = [
+                    s for s in samples
+                    if (_parse_timestamp(s.get("captured_at")) or 0) >= cutoff
+                ]
+        if len(samples) < 2:
+            continue
+
+        summary = _compute_timeseries_summary(samples)
+        summary["database"] = row.get("database")
+        summary["backend"] = row.get("backend")
+        summary["series_label"] = row.get("series_label")
+        summary["thread_count"] = row.get("thread_count")
+        summary["sample_count"] = len(samples)
+        summaries.append(summary)
+
+    return summaries
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Load JSONL file into a list of dicts."""
+    import json
+    samples: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    samples.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return samples
+
+
+def _parse_timestamp(ts: Any) -> Optional[float]:
+    """Parse ISO 8601 timestamp to epoch seconds."""
+    if ts is None:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _stat_summary(values: list[float]) -> dict[str, Optional[float]]:
+    """Compute min, avg, p95, max for a list of values."""
+    if not values:
+        return {"min": None, "avg": None, "p95": None, "max": None}
+    values_sorted = sorted(values)
+    n = len(values_sorted)
+    p95_idx = min(int(n * 0.95), n - 1)
+    return {
+        "min": values_sorted[0],
+        "avg": sum(values) / n,
+        "p95": values_sorted[p95_idx],
+        "max": values_sorted[-1],
+    }
+
+
+def _compute_timeseries_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute per-interval rates and summary statistics from telemetry samples."""
+
+    # Direct value metrics (already per-interval)
+    direct_metrics = {
+        "system_cpu_pct": "system_cpu_utilization_pct",
+        "process_cpu_pct": "process_cpu_utilization_pct",
+        "process_rss_bytes": "process_rss_bytes",
+        "mem_dirty_bytes": "mem_dirty_bytes",
+        "loadavg_1": "loadavg_1",
+    }
+
+    # Delta metrics (need interval rate computation)
+    delta_metrics = {
+        "ctx_switches_per_sec": "system_context_switches",
+        "vol_ctx_per_sec": "process_voluntary_ctx_switches",
+        "nonvol_ctx_per_sec": "process_nonvoluntary_ctx_switches",
+        "net_lo_rx_bytes_per_sec": "network_loopback_rx_bytes",
+        "net_lo_tx_bytes_per_sec": "network_loopback_tx_bytes",
+        "disk_write_bytes_per_sec": "disk_write_bytes",
+        "disk_read_bytes_per_sec": "disk_read_bytes",
+    }
+
+    result: dict[str, Any] = {}
+
+    # Direct value summaries
+    for name, field in direct_metrics.items():
+        values = [
+            float(s[field]) for s in samples
+            if s.get(field) is not None
+        ]
+        result[name] = _stat_summary(values)
+
+    # Delta-rate summaries (per-second rates computed from consecutive samples)
+    timestamps = [_parse_timestamp(s.get("captured_at")) for s in samples]
+
+    for name, field in delta_metrics.items():
+        rates: list[float] = []
+        for i in range(1, len(samples)):
+            t0, t1 = timestamps[i - 1], timestamps[i]
+            v0 = samples[i - 1].get(field)
+            v1 = samples[i].get(field)
+            if t0 is None or t1 is None or v0 is None or v1 is None:
+                continue
+            dt = t1 - t0
+            if dt <= 0:
+                continue
+            rate = (float(v1) - float(v0)) / dt
+            if rate >= 0:  # ignore counter wraps
+                rates.append(rate)
+        result[name] = _stat_summary(rates)
+
+    return result

@@ -770,6 +770,7 @@ impl Reactor {
             self.cached_nanos = Timestamp::now().as_nanos();
             self.cached_unix_nanos = current_unix_time_nanos();
             self.now_secs = ((self.cached_nanos - self.start_nanos) / 1_000_000_000) as u32;
+            self.keyspace.record_reactor_loop_iteration(self.id);
 
             // 1. Flush pending submissions.
             if let Err(e) = self.backend.flush() {
@@ -785,6 +786,10 @@ impl Reactor {
                     tracing::error!(error = %e, "backend completions failed");
                     break;
                 }
+            }
+            if !self.cqe_buf.is_empty() {
+                self.keyspace
+                    .record_reactor_completion_batch(self.id, self.cqe_buf.len());
             }
 
             // 3. Process each completion.
@@ -822,6 +827,8 @@ impl Reactor {
             //     io_uring, avoiding a third io_uring_enter per iteration.
             self.cqe_buf.clear();
             if self.backend.drain_cq(&mut self.cqe_buf).is_ok() && !self.cqe_buf.is_empty() {
+                self.keyspace
+                    .record_reactor_completion_batch(self.id, self.cqe_buf.len());
                 let mut fast_completions = std::mem::take(&mut self.cqe_buf);
                 for cqe in &fast_completions {
                     let (conn_id, cgen, op) = decode_token(cqe.token);
@@ -877,6 +884,11 @@ impl Reactor {
                                 self.expiry_slot_cursor,
                                 MAX_EFFORT,
                                 now,
+                            );
+                            self.keyspace.record_reactor_active_expiry(
+                                self.id,
+                                sampled,
+                                expired,
                             );
                             // Advance cursors for next sweep.
                             self.expiry_slot_cursor =
@@ -966,6 +978,7 @@ impl Reactor {
             let errno = -cqe.result;
             // EAGAIN/EWOULDBLOCK is normal for non-blocking accept — retry.
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                self.keyspace.record_reactor_accept_eagain_rearm(self.id);
                 if !self.draining {
                     let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
                     let _ = self.backend.submit_accept(self.listener_fd, token);
@@ -1194,7 +1207,9 @@ impl Reactor {
             ) {
                 Ok(tape) => {
                     let batch_end = offset + tape.consumed();
+                    let mut batch_width = 0usize;
                     for frame in tape.iter() {
+                        batch_width += 1;
                         let (response, should_close) = self.dispatch_command(conn_id, &frame);
                         if should_close {
                             close_after_write = true;
@@ -1281,6 +1296,9 @@ impl Reactor {
                                 self.writev_states[conn_id].push_frame(resp_frame);
                             }
                         }
+                    }
+                    if batch_width != 0 {
+                        self.keyspace.record_reactor_command_batch(self.id, batch_width);
                     }
 
                     if close_after_write {

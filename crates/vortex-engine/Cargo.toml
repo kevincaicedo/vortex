@@ -16,6 +16,7 @@ unsafe_code = "allow"
 vortex-common = { workspace = true }
 vortex-proto = { workspace = true }
 vortex-memory = { workspace = true }
+vortex-sync = { workspace = true }
 ahash = { workspace = true }
 crossbeam-utils = { workspace = true }
 parking_lot = { workspace = true }
@@ -23,6 +24,8 @@ itoa = { workspace = true }
 ryu = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -35,6 +35,7 @@ use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use vortex_common::VortexKey;
+use vortex_sync::ShardedCounter;
 
 use crate::eviction::{
     EVICTION_MAX_SHARDS_PER_ADMISSION, EVICTION_SWEEP_WINDOW, EvictionConfig, EvictionConfigState,
@@ -154,6 +155,29 @@ pub struct EvictionMetricsSnapshot {
     pub oom_after_scan: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RuntimeMetricsSnapshot {
+    pub reactor_slots: usize,
+    pub loop_iterations: u64,
+    pub accept_eagain_rearms: u64,
+    pub completion_batch_count: u64,
+    pub completion_batch_total: u64,
+    pub completion_batch_max: u64,
+    pub completion_batch_avg: f64,
+    pub command_batch_count: u64,
+    pub command_batch_total: u64,
+    pub command_batch_max: u64,
+    pub command_batch_avg: f64,
+    pub active_expiry_runs: u64,
+    pub active_expiry_sampled: u64,
+    pub active_expiry_expired: u64,
+    pub eviction_admissions: u64,
+    pub eviction_shards_scanned: u64,
+    pub eviction_slots_sampled: u64,
+    pub eviction_bytes_freed: u64,
+    pub eviction_oom_after_scan: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EvictionScanReport {
     shards_scanned: usize,
@@ -211,6 +235,146 @@ impl EvictionMetrics {
             bytes_freed: self.bytes_freed.load(Ordering::Relaxed),
             oom_after_scan: self.oom_after_scan.load(Ordering::Relaxed),
         }
+    }
+}
+
+struct RuntimeMetrics {
+    loop_iterations: ShardedCounter,
+    accept_eagain_rearms: ShardedCounter,
+    completion_batch_count: ShardedCounter,
+    completion_batch_total: ShardedCounter,
+    command_batch_count: ShardedCounter,
+    command_batch_total: ShardedCounter,
+    active_expiry_runs: ShardedCounter,
+    active_expiry_sampled: ShardedCounter,
+    active_expiry_expired: ShardedCounter,
+    completion_batch_max: Box<[CachePadded<AtomicU64>]>,
+    command_batch_max: Box<[CachePadded<AtomicU64>]>,
+}
+
+impl RuntimeMetrics {
+    fn new(num_slots: usize) -> Self {
+        let slot_count = num_slots.max(1);
+        Self {
+            loop_iterations: ShardedCounter::new(slot_count),
+            accept_eagain_rearms: ShardedCounter::new(slot_count),
+            completion_batch_count: ShardedCounter::new(slot_count),
+            completion_batch_total: ShardedCounter::new(slot_count),
+            command_batch_count: ShardedCounter::new(slot_count),
+            command_batch_total: ShardedCounter::new(slot_count),
+            active_expiry_runs: ShardedCounter::new(slot_count),
+            active_expiry_sampled: ShardedCounter::new(slot_count),
+            active_expiry_expired: ShardedCounter::new(slot_count),
+            completion_batch_max: make_runtime_max_slots(slot_count),
+            command_batch_max: make_runtime_max_slots(slot_count),
+        }
+    }
+
+    fn slot_count(&self) -> usize {
+        self.completion_batch_max.len()
+    }
+
+    #[inline(always)]
+    fn record_loop_iteration(&self, slot: usize) {
+        self.loop_iterations.increment(slot);
+    }
+
+    #[inline(always)]
+    fn record_accept_eagain_rearm(&self, slot: usize) {
+        self.accept_eagain_rearms.increment(slot);
+    }
+
+    #[inline(always)]
+    fn record_completion_batch(&self, slot: usize, width: usize) {
+        if width == 0 {
+            return;
+        }
+        self.completion_batch_count.increment(slot);
+        self.completion_batch_total.add(slot, width as u64);
+        update_runtime_slot_max(&self.completion_batch_max, slot, width as u64);
+    }
+
+    #[inline(always)]
+    fn record_command_batch(&self, slot: usize, width: usize) {
+        if width == 0 {
+            return;
+        }
+        self.command_batch_count.increment(slot);
+        self.command_batch_total.add(slot, width as u64);
+        update_runtime_slot_max(&self.command_batch_max, slot, width as u64);
+    }
+
+    #[inline(always)]
+    fn record_active_expiry(&self, slot: usize, sampled: usize, expired: usize) {
+        self.active_expiry_runs.increment(slot);
+        if sampled != 0 {
+            self.active_expiry_sampled.add(slot, sampled as u64);
+        }
+        if expired != 0 {
+            self.active_expiry_expired.add(slot, expired as u64);
+        }
+    }
+
+    fn snapshot(&self, eviction: EvictionMetricsSnapshot) -> RuntimeMetricsSnapshot {
+        let completion_batch_count = self.completion_batch_count.total();
+        let completion_batch_total = self.completion_batch_total.total();
+        let command_batch_count = self.command_batch_count.total();
+        let command_batch_total = self.command_batch_total.total();
+
+        RuntimeMetricsSnapshot {
+            reactor_slots: self.slot_count(),
+            loop_iterations: self.loop_iterations.total(),
+            accept_eagain_rearms: self.accept_eagain_rearms.total(),
+            completion_batch_count,
+            completion_batch_total,
+            completion_batch_max: runtime_slot_max(&self.completion_batch_max),
+            completion_batch_avg: avg_counter(completion_batch_total, completion_batch_count),
+            command_batch_count,
+            command_batch_total,
+            command_batch_max: runtime_slot_max(&self.command_batch_max),
+            command_batch_avg: avg_counter(command_batch_total, command_batch_count),
+            active_expiry_runs: self.active_expiry_runs.total(),
+            active_expiry_sampled: self.active_expiry_sampled.total(),
+            active_expiry_expired: self.active_expiry_expired.total(),
+            eviction_admissions: eviction.admissions,
+            eviction_shards_scanned: eviction.shards_scanned,
+            eviction_slots_sampled: eviction.slots_sampled,
+            eviction_bytes_freed: eviction.bytes_freed,
+            eviction_oom_after_scan: eviction.oom_after_scan,
+        }
+    }
+}
+
+fn make_runtime_max_slots(num_slots: usize) -> Box<[CachePadded<AtomicU64>]> {
+    (0..num_slots)
+        .map(|_| CachePadded::new(AtomicU64::new(0)))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[inline(always)]
+fn update_runtime_slot_max(slots: &[CachePadded<AtomicU64>], slot: usize, value: u64) {
+    let Some(current) = slots.get(slot) else {
+        return;
+    };
+    if value > current.load(Ordering::Relaxed) {
+        current.store(value, Ordering::Relaxed);
+    }
+}
+
+fn runtime_slot_max(slots: &[CachePadded<AtomicU64>]) -> u64 {
+    slots
+        .iter()
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0)
+}
+
+fn avg_counter(total: u64, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total as f64 / count as f64
     }
 }
 
@@ -333,6 +497,8 @@ pub struct ConcurrentKeyspace {
     frequency_sketch: FrequencySketch,
     /// Slow-path observability for bounded eviction work.
     eviction_metrics: EvictionMetrics,
+    /// Always-on low-overhead counters exported through INFO runtime.
+    runtime_metrics: RuntimeMetrics,
     /// Optimistic WATCH side table. It is cold unless clients are actively
     /// watching keys; normal mutations avoid it behind `watch_active`.
     watch_shards: Box<[WatchShard]>,
@@ -399,6 +565,12 @@ impl ConcurrentKeyspace {
     /// Panics if `num_shards` is zero, not a power of two, or outside
     /// the range `[MIN_SHARD_COUNT, MAX_SHARD_COUNT]`.
     pub fn new(num_shards: usize) -> Self {
+        Self::new_with_runtime_slots(num_shards, 1)
+    }
+
+    /// Create a new keyspace with `num_shards` shards and `runtime_slots`
+    /// contention-free runtime counter slots.
+    pub fn new_with_runtime_slots(num_shards: usize, runtime_slots: usize) -> Self {
         assert!(
             num_shards > 0 && num_shards.is_power_of_two(),
             "num_shards must be a power of two, got {num_shards}"
@@ -437,6 +609,7 @@ impl ConcurrentKeyspace {
             eviction: EvictionConfigState::new(),
             frequency_sketch: FrequencySketch::new(),
             eviction_metrics: EvictionMetrics::default(),
+            runtime_metrics: RuntimeMetrics::new(runtime_slots),
             watch_shards,
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
@@ -617,6 +790,7 @@ impl ConcurrentKeyspace {
             eviction: EvictionConfigState::new(),
             frequency_sketch: FrequencySketch::new(),
             eviction_metrics: EvictionMetrics::default(),
+            runtime_metrics: RuntimeMetrics::new(1),
             watch_shards,
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
@@ -1312,6 +1486,42 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
+    pub fn runtime_metrics(&self) -> RuntimeMetricsSnapshot {
+        self.runtime_metrics.snapshot(self.eviction_metrics.snapshot())
+    }
+
+    #[inline(always)]
+    pub fn record_reactor_loop_iteration(&self, reactor_id: usize) {
+        self.runtime_metrics.record_loop_iteration(reactor_id);
+    }
+
+    #[inline(always)]
+    pub fn record_reactor_accept_eagain_rearm(&self, reactor_id: usize) {
+        self.runtime_metrics.record_accept_eagain_rearm(reactor_id);
+    }
+
+    #[inline(always)]
+    pub fn record_reactor_completion_batch(&self, reactor_id: usize, width: usize) {
+        self.runtime_metrics.record_completion_batch(reactor_id, width);
+    }
+
+    #[inline(always)]
+    pub fn record_reactor_command_batch(&self, reactor_id: usize, width: usize) {
+        self.runtime_metrics.record_command_batch(reactor_id, width);
+    }
+
+    #[inline(always)]
+    pub fn record_reactor_active_expiry(
+        &self,
+        reactor_id: usize,
+        sampled: usize,
+        expired: usize,
+    ) {
+        self.runtime_metrics
+            .record_active_expiry(reactor_id, sampled, expired);
+    }
+
+    #[inline]
     pub(crate) fn clock_hand(&self, shard_idx: usize) -> usize {
         debug_assert!(shard_idx < self.clock_hands.len());
         self.clock_hands[shard_idx].load(Ordering::Relaxed)
@@ -1845,6 +2055,37 @@ mod tests {
             t.get(&VortexKey::from_bytes(b"hello")).cloned()
         });
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn runtime_metrics_snapshot_aggregates_reactor_counters() {
+        let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 4);
+
+        ks.record_reactor_loop_iteration(0);
+        ks.record_reactor_loop_iteration(1);
+        ks.record_reactor_accept_eagain_rearm(1);
+        ks.record_reactor_completion_batch(0, 4);
+        ks.record_reactor_completion_batch(1, 2);
+        ks.record_reactor_command_batch(0, 3);
+        ks.record_reactor_command_batch(1, 1);
+        ks.record_reactor_active_expiry(2, 12, 5);
+
+        let snapshot = ks.runtime_metrics();
+
+        assert_eq!(snapshot.reactor_slots, 4);
+        assert_eq!(snapshot.loop_iterations, 2);
+        assert_eq!(snapshot.accept_eagain_rearms, 1);
+        assert_eq!(snapshot.completion_batch_count, 2);
+        assert_eq!(snapshot.completion_batch_total, 6);
+        assert_eq!(snapshot.completion_batch_max, 4);
+        assert!((snapshot.completion_batch_avg - 3.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.command_batch_count, 2);
+        assert_eq!(snapshot.command_batch_total, 4);
+        assert_eq!(snapshot.command_batch_max, 3);
+        assert!((snapshot.command_batch_avg - 2.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.active_expiry_runs, 1);
+        assert_eq!(snapshot.active_expiry_sampled, 12);
+        assert_eq!(snapshot.active_expiry_expired, 5);
     }
 
     #[test]

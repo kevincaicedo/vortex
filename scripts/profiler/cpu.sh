@@ -311,6 +311,11 @@ run_scheduler_focus() {
     else
         fatal "No scheduler-focused profiler tool is available on this host."
     fi
+
+    # BPF escalation: run-queue latency histogram
+    if [[ "$OS" == "linux" ]]; then
+        run_bpf_runqlat "$session" "$@"
+    fi
 }
 
 run_aof_disk_focus() {
@@ -327,6 +332,11 @@ run_aof_disk_focus() {
         run_samply "$session" "$@"
     else
         fatal "No disk-focused profiler tool is available on this host."
+    fi
+
+    # BPF escalation: block I/O latency histogram
+    if [[ "$OS" == "linux" ]]; then
+        run_bpf_biolatency "$session" "$@"
     fi
 }
 
@@ -345,4 +355,275 @@ run_network_focus() {
     else
         fatal "No network-focused profiler tool is available on this host."
     fi
+
+    # BPF escalation: TCP retransmit tracing
+    if [[ "$OS" == "linux" ]]; then
+        run_bpf_tcpretrans "$session" "$@"
+    fi
+}
+
+
+# ── BPF Tools — Escalation-mode diagnostics (Linux only) ─────────────────────
+# These run as optional add-ons inside focus modes. They require bcc-tools
+# or bpftrace to be installed and root/CAP_BPF privileges.
+
+bpf_capture_failed() {
+    local output_path="$1"
+    [[ -s "$output_path" ]] || return 1
+
+    grep -Eq \
+        'Failed to compile BPF module|Traceback \(most recent call last\)|use of undeclared identifier|invalid application of .* incomplete type|[0-9]+ errors generated\.' \
+        "$output_path"
+}
+
+write_bpf_skip_note() {
+    local output_path="$1" reason="$2" details_path="${3:-}"
+
+    {
+        printf 'status=skipped\n'
+        printf 'reason=%s\n' "$reason"
+        if [[ -n "$details_path" ]]; then
+            printf 'details=%s\n' "$(basename "$details_path")"
+        fi
+        printf 'fallback=tcp_retrans_segs_delta in host telemetry summary\n'
+    } >"$output_path"
+}
+
+run_bpf_runqlat() {
+    local session="$1" host="$2" port="$3" threads="$4" aof="$5" maxmemory="$6" eviction="$7"
+    local command="$8" duration="$9"
+
+    # Try bcc-tools runqlat first, then bpftrace fallback
+    local runqlat_bin=""
+    for candidate in runqlat runqlat-bpfcc /usr/share/bcc/tools/runqlat; do
+        if has_cmd "$candidate" || [[ -x "$candidate" ]]; then
+            runqlat_bin="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$runqlat_bin" ]]; then
+        info "runqlat not found — install bcc-tools for run-queue latency histograms (skipping)"
+        return 0
+    fi
+
+    header "BPF: runqlat (run-queue latency)"
+
+    ensure_sudo_access "sudo required for BPF runqlat"
+
+    info "Running: $runqlat_bin ${duration}s 1 (one histogram over full duration)"
+    run_with_sudo "BPF runqlat" timeout $((duration + 5)) "$runqlat_bin" "$duration" 1 \
+        >"${session}/bpf-runqlat.txt" 2>&1 || true
+
+    if [[ -s "${session}/bpf-runqlat.txt" ]]; then
+        ok "BPF runqlat histogram: ${session}/bpf-runqlat.txt"
+    else
+        warn "runqlat produced no output (may need CAP_BPF or kernel headers)"
+    fi
+}
+
+run_bpf_biolatency() {
+    local session="$1" host="$2" port="$3" threads="$4" aof="$5" maxmemory="$6" eviction="$7"
+    local command="$8" duration="$9"
+
+    local biolatency_bin=""
+    for candidate in biolatency biolatency-bpfcc /usr/share/bcc/tools/biolatency; do
+        if has_cmd "$candidate" || [[ -x "$candidate" ]]; then
+            biolatency_bin="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$biolatency_bin" ]]; then
+        info "biolatency not found — install bcc-tools for block I/O latency histograms (skipping)"
+        return 0
+    fi
+
+    header "BPF: biolatency (block I/O latency)"
+
+    ensure_sudo_access "sudo required for BPF biolatency"
+
+    info "Running: $biolatency_bin ${duration}s 1"
+    run_with_sudo "BPF biolatency" timeout $((duration + 5)) "$biolatency_bin" "$duration" 1 \
+        >"${session}/bpf-biolatency.txt" 2>&1 || true
+
+    if [[ -s "${session}/bpf-biolatency.txt" ]]; then
+        ok "BPF biolatency histogram: ${session}/bpf-biolatency.txt"
+    else
+        warn "biolatency produced no output (may need CAP_BPF or kernel headers)"
+    fi
+}
+
+run_bpf_tcpretrans() {
+    local session="$1" host="$2" port="$3" threads="$4" aof="$5" maxmemory="$6" eviction="$7"
+    local command="$8" duration="$9" clients="${10}"
+
+    local output_path="${session}/bpf-tcpretrans.txt"
+    local error_path="${session}/bpf-tcpretrans-error.log"
+    local bpftrace_script='tracepoint:tcp:tcp_retransmit_skb { @[comm] = count(); } END { print(@); }'
+    local tcpretrans_bin=""
+    for candidate in tcpretrans tcpretrans-bpfcc /usr/share/bcc/tools/tcpretrans; do
+        if has_cmd "$candidate" || [[ -x "$candidate" ]]; then
+            tcpretrans_bin="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$tcpretrans_bin" ]]; then
+        info "tcpretrans not found — install bcc-tools for TCP retransmit tracing (skipping)"
+        return 0
+    fi
+
+    header "BPF: tcpretrans (TCP retransmit tracing)"
+
+    ensure_sudo_access "sudo required for BPF tcpretrans"
+
+    start_server "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction" "${session}/server-tcpretrans.log"
+    generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-tcpretrans.log"
+
+    rm -f "$output_path" "$error_path"
+
+    if has_cmd bpftrace; then
+        info "Running: bpftrace tracepoint:tcp:tcp_retransmit_skb for ${duration}s"
+        run_with_sudo "BPF tcpretrans (bpftrace)" \
+            timeout --signal=INT $((duration + 5)) bpftrace -e "$bpftrace_script" \
+            >"$output_path" 2>&1 || true
+
+        if bpf_capture_failed "$output_path"; then
+            mv "$output_path" "$error_path"
+        elif grep -q '@' "$output_path"; then
+            wait_for_load "$duration"
+            _profiler_cleanup
+            SERVER_PID=""
+            LOAD_PID=""
+            ok "BPF tcpretrans trace: ${output_path}"
+            return 0
+        else
+            wait_for_load "$duration"
+            _profiler_cleanup
+            SERVER_PID=""
+            LOAD_PID=""
+            write_bpf_skip_note "$output_path" "no TCP retransmits were observed during the session"
+            info "tcpretrans captured no events (may indicate zero retransmits during run)"
+            return 0
+        fi
+    fi
+
+    info "Running: $tcpretrans_bin for ${duration}s"
+    run_with_sudo "BPF tcpretrans" timeout $((duration + 5)) "$tcpretrans_bin" \
+        >"$error_path" 2>&1 || true
+
+    if [[ -s "$error_path" ]] && ! bpf_capture_failed "$error_path"; then
+        wait_for_load "$duration"
+        _profiler_cleanup
+        SERVER_PID=""
+        LOAD_PID=""
+        mv "$error_path" "$output_path"
+        ok "BPF tcpretrans trace: ${output_path}"
+        return 0
+    fi
+
+    wait_for_load "$duration"
+    _profiler_cleanup
+    SERVER_PID=""
+    LOAD_PID=""
+
+    if [[ -s "$error_path" ]]; then
+        write_bpf_skip_note "$output_path" "tcpretrans tracing failed on this host or kernel" "$error_path"
+        warn "tcpretrans could not attach cleanly; wrote a skip note to ${output_path} and saved diagnostics to ${error_path}"
+    else
+        write_bpf_skip_note "$output_path" "no compatible tcpretrans tracer was available"
+        info "tcpretrans tracing skipped"
+    fi
+}
+
+
+# ── Differential Flamegraph Generation ───────────────────────────────────────
+# Compares perf.data from two profiling sessions using Brendan Gregg's
+# difffolded.pl + flamegraph.pl methodology, or inferno-diff-folded.
+
+run_diff_flamegraph() {
+    local session="$1"
+    local compare_to="$2"
+
+    if [[ -z "$compare_to" ]]; then
+        return 0
+    fi
+
+    # Find perf.data in both sessions
+    local current_perf="${session}/perf.data"
+    local baseline_perf="${compare_to}/perf.data"
+
+    if [[ ! -f "$current_perf" ]]; then
+        info "No perf.data in current session — skipping differential flamegraph"
+        return 0
+    fi
+    if [[ ! -f "$baseline_perf" ]]; then
+        info "No perf.data in baseline session (${compare_to}) — skipping differential flamegraph"
+        return 0
+    fi
+
+    header "Differential Flamegraph"
+
+    # Generate folded stacks from both sessions
+    local current_folded="${session}/current-stacks.folded"
+    local baseline_folded="${session}/baseline-stacks.folded"
+
+    info "Generating folded stacks from current session..."
+    perf script -i "$current_perf" 2>/dev/null \
+        | stackcollapse-perf.pl 2>/dev/null \
+        > "$current_folded" || true
+
+    info "Generating folded stacks from baseline session..."
+    perf script -i "$baseline_perf" 2>/dev/null \
+        | stackcollapse-perf.pl 2>/dev/null \
+        > "$baseline_folded" || true
+
+    if [[ ! -s "$current_folded" || ! -s "$baseline_folded" ]]; then
+        # Try inferno as fallback
+        if has_cmd inferno-collapse-perf && has_cmd inferno-diff-folded && has_cmd inferno-flamegraph; then
+            info "Falling back to inferno for differential flamegraph..."
+            inferno-collapse-perf < <(perf script -i "$current_perf" 2>/dev/null) > "$current_folded" 2>/dev/null || true
+            inferno-collapse-perf < <(perf script -i "$baseline_perf" 2>/dev/null) > "$baseline_folded" 2>/dev/null || true
+
+            if [[ -s "$current_folded" && -s "$baseline_folded" ]]; then
+                inferno-diff-folded "$baseline_folded" "$current_folded" \
+                    | inferno-flamegraph --title "Differential: $(basename "$session") vs $(basename "$compare_to")" \
+                    > "${session}/diff-flamegraph.svg" 2>/dev/null || true
+            fi
+        else
+            warn "Neither FlameGraph perl scripts nor inferno are available — install one for diff flamegraphs"
+            warn "  Perl: git clone https://github.com/brendangregg/FlameGraph && PATH+=:FlameGraph"
+            warn "  Rust: cargo install inferno"
+            return 0
+        fi
+    else
+        # Use Brendan Gregg's difffolded.pl + flamegraph.pl
+        if has_cmd difffolded.pl && has_cmd flamegraph.pl; then
+            info "Generating differential flamegraph (red = regression, blue = improvement)..."
+            difffolded.pl "$baseline_folded" "$current_folded" \
+                | flamegraph.pl --title "Differential: $(basename "$session") vs $(basename "$compare_to")" \
+                    --negate \
+                > "${session}/diff-flamegraph.svg" 2>/dev/null || true
+        elif has_cmd inferno-diff-folded && has_cmd inferno-flamegraph; then
+            info "Generating differential flamegraph via inferno..."
+            inferno-diff-folded "$baseline_folded" "$current_folded" \
+                | inferno-flamegraph --title "Differential: $(basename "$session") vs $(basename "$compare_to")" \
+                > "${session}/diff-flamegraph.svg" 2>/dev/null || true
+        else
+            warn "difffolded.pl/flamegraph.pl or inferno not found — cannot generate diff flamegraph"
+            return 0
+        fi
+    fi
+
+    if [[ -f "${session}/diff-flamegraph.svg" ]]; then
+        ok "Differential flamegraph: ${session}/diff-flamegraph.svg"
+        info "  Red stacks = grew since baseline (regression)"
+        info "  Blue stacks = shrank since baseline (improvement)"
+    else
+        warn "Differential flamegraph was not generated"
+    fi
+
+    # Clean up intermediate files
+    rm -f "$current_folded" "$baseline_folded" 2>/dev/null || true
 }

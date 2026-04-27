@@ -18,6 +18,7 @@ from .base import (
 )
 
 
+DEFAULT_VORTEX_MAXMEMORY = "1800mb"
 CONTAINER_RUNTIME_DIR = "/benchmark-runtime"
 
 
@@ -58,12 +59,18 @@ class VortexAdapter(DatabaseAdapter):
         )
 
     def resolve_runtime_config(self, request: StartRequest) -> dict[str, object]:
-        maxmemory = request.runtime_config.get("maxmemory")
+        maxmemory = str(
+            request.runtime_config.get("maxmemory", DEFAULT_VORTEX_MAXMEMORY)
+        )
         resolved: dict[str, object] = {
             "aof_enabled": bool(request.runtime_config.get("aof_enabled", False)),
             "aof_fsync": str(request.runtime_config.get("aof_fsync", DEFAULT_AOF_FSYNC)),
             "eviction_policy": str(
                 request.runtime_config.get("eviction_policy", DEFAULT_EVICTION_POLICY)
+            ),
+            "maxmemory": maxmemory,
+            "maxmemory_bytes": parse_size_literal_to_bytes(
+                maxmemory, label="runtime_config.maxmemory"
             ),
             "aof_path": (
                 str((request.runtime_dir / "vortex.aof").resolve())
@@ -75,11 +82,6 @@ class VortexAdapter(DatabaseAdapter):
             value = request.runtime_config.get(key)
             if value is not None:
                 resolved[key] = value
-        if maxmemory is not None:
-            resolved["maxmemory"] = str(maxmemory)
-            resolved["maxmemory_bytes"] = parse_size_literal_to_bytes(
-                str(maxmemory), label="runtime_config.maxmemory"
-            )
         return resolved
 
     def validate_runtime_config(self, request: StartRequest) -> None:

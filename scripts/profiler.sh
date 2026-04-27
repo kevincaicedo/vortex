@@ -297,6 +297,13 @@ if ! has_any_mode; then
     fi
 fi
 
+if [[ "${HOST_SAMPLER_INTERVAL_SECONDS:-1}" =~ ^1(\.0+)?$ ]] && {
+    $MODE_MEMORY || $MODE_CACHE || $TOOL_HEAPTRACK || $TOOL_CACHEGRIND || $TOOL_CALLGRIND || $TOOL_MASSIF;
+}; then
+    HOST_SAMPLER_INTERVAL_SECONDS="0.25"
+    info "Using 0.25s host telemetry sampling for short-lived memory/cache profiling sessions"
+fi
+
 shell_join() {
     local rendered=""
     local arg
@@ -541,6 +548,12 @@ fi
 
 # ── Session summary ──────────────────────────────────────────────────────────
 stop_host_sampler_pack
+
+# Generate differential flamegraph if --compare-to was specified
+if [[ -n "$COMPARE_TO" ]]; then
+    run_diff_flamegraph "$SESSION_DIR" "$COMPARE_TO"
+fi
+
 generate_post_session_summary "$SESSION_DIR" "$COMPARE_TO"
 finalize_session_contract "$SESSION_DIR" "completed" 0
 

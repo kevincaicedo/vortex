@@ -7,6 +7,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(feature = "sqpoll"))]
 use std::time::Duration;
@@ -21,6 +22,7 @@ use super::{Completion, IoBackend};
 /// io_uring-based I/O backend for Linux.
 pub struct IoUringBackend {
     ring: IoUring,
+    fixed_buffers_registered: AtomicBool,
 }
 
 impl IoUringBackend {
@@ -40,7 +42,10 @@ impl IoUringBackend {
         }
 
         let ring = builder.build(ring_size)?;
-        Ok(Self { ring })
+        Ok(Self {
+            ring,
+            fixed_buffers_registered: AtomicBool::new(false),
+        })
     }
 }
 
@@ -125,6 +130,11 @@ impl IoBackend for IoUringBackend {
         buf_index: u16,
         token: u64,
     ) -> io::Result<()> {
+        if !self.fixed_buffers_registered.load(Ordering::Relaxed) {
+            let _ = buf_index;
+            return self.submit_read(fd, buf_ptr, buf_len, token);
+        }
+
         let read = opcode::ReadFixed::new(Fd(fd), buf_ptr, buf_len as u32, buf_index)
             .build()
             .user_data(token);
@@ -149,6 +159,11 @@ impl IoBackend for IoUringBackend {
         buf_index: u16,
         token: u64,
     ) -> io::Result<()> {
+        if !self.fixed_buffers_registered.load(Ordering::Relaxed) {
+            let _ = buf_index;
+            return self.submit_write(fd, buf_ptr, buf_len, token);
+        }
+
         let write = opcode::WriteFixed::new(Fd(fd), buf_ptr, buf_len as u32, buf_index)
             .build()
             .user_data(token);
@@ -204,12 +219,16 @@ impl IoBackend for IoUringBackend {
     fn register_buffers(&self, iovecs: &[libc::iovec]) -> io::Result<()> {
         // SAFETY: iovecs point to valid, pinned memory that will outlive the
         // io_uring instance. The buffers are owned by the BufferPool.
-        unsafe {
+        let result = unsafe {
             self.ring
                 .submitter()
                 .register_buffers(iovecs)
                 .map_err(io::Error::other)
-        }
+        };
+
+        self.fixed_buffers_registered
+            .store(result.is_ok(), Ordering::Relaxed);
+        result
     }
 
     fn flush(&mut self) -> io::Result<usize> {

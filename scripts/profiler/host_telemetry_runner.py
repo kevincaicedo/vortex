@@ -14,6 +14,7 @@ VORTEX_BENCHMARK_PYTHON = REPO_ROOT / "vortex-benchmark" / "python"
 if str(VORTEX_BENCHMARK_PYTHON) not in sys.path:
     sys.path.insert(0, str(VORTEX_BENCHMARK_PYTHON))
 
+from vortex_benchmark.models import ServiceState, utc_now  # noqa: E402
 from vortex_benchmark.telemetry import start_host_telemetry_capture  # noqa: E402
 
 
@@ -22,13 +23,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
+    parser.add_argument("--database", default="vortex")
+    parser.add_argument("--mode", default="native")
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--pid", type=int)
     return parser.parse_args()
+
+
+def build_service(args: argparse.Namespace) -> ServiceState | None:
+    if not args.host or not args.port:
+        return None
+
+    timestamp = utc_now()
+    return ServiceState(
+        database=args.database,
+        mode=args.mode,
+        host=args.host,
+        port=args.port,
+        ready=True,
+        log_path="",
+        started_at=timestamp,
+        ready_at=timestamp,
+        pid=args.pid,
+    )
 
 
 def main() -> int:
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    service = build_service(args)
 
     stop_event = threading.Event()
 
@@ -41,6 +66,7 @@ def main() -> int:
     collector = start_host_telemetry_capture(
         output_dir,
         label=args.label,
+        service=service,
         interval_seconds=args.interval_seconds,
     )
 

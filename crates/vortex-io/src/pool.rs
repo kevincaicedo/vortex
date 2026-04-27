@@ -9,6 +9,7 @@
 //! before spawning reactor threads.
 
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -127,6 +128,20 @@ fn reactor_resource_share(
     (reactor_connections, reactor_buffers)
 }
 
+fn join_handles(handles: &mut [ReactorHandle]) {
+    for handle in handles {
+        if let Some(thread) = handle.thread.take() {
+            if let Err(e) = thread.join() {
+                tracing::error!(
+                    reactor_id = handle.reactor_id,
+                    "reactor thread panicked: {:?}",
+                    e
+                );
+            }
+        }
+    }
+}
+
 impl ReactorPool {
     /// Spawn `N` reactor threads (one per CPU core by default).
     ///
@@ -163,7 +178,10 @@ impl ReactorPool {
         let aof_fatal_state = Arc::new(AofFatalState::default());
 
         // ── Create shared ConcurrentKeyspace ────────────────────────
-        let keyspace = Arc::new(ConcurrentKeyspace::new(config.shard_count));
+        let keyspace = Arc::new(ConcurrentKeyspace::new_with_runtime_slots(
+            config.shard_count,
+            num_reactors,
+        ));
         tracing::info!(
             shard_count = config.shard_count,
             max_memory = config.max_memory,
@@ -216,6 +234,7 @@ impl ReactorPool {
         keyspace.configure_eviction(config.max_memory, config.eviction_policy);
 
         let mut handles = Vec::with_capacity(num_reactors);
+        let (startup_tx, startup_rx) = mpsc::channel();
 
         for i in 0..num_reactors {
             let (reactor_max_connections, reactor_buffer_count) = reactor_resource_share(
@@ -228,6 +247,7 @@ impl ReactorPool {
             let coord_clone = Arc::clone(&coordinator);
             let ks_clone = Arc::clone(&keyspace);
             let aof_fatal_state_clone = Arc::clone(&aof_fatal_state);
+            let startup_tx = startup_tx.clone();
 
             let reactor_config = ReactorConfig {
                 bind_addr: config.bind_addr,
@@ -259,21 +279,28 @@ impl ReactorPool {
                     let mut reactor = match Reactor::with_shared_keyspace_and_aof_state(
                         i,
                         reactor_config,
-                        coord_clone,
-                        ks_clone,
-                        aof_fatal_state_clone,
+                        Arc::clone(&coord_clone),
+                        Arc::clone(&ks_clone),
+                        Arc::clone(&aof_fatal_state_clone),
                         num_reactors,
                     ) {
                         Ok(r) => r,
                         Err(e) => {
+                            let _ = startup_tx.send((i, Err(e)));
+                            coord_clone.reactor_finished(i);
                             tracing::error!(
                                 reactor_id = i,
-                                error = %e,
+                                error = "startup failed before entering reactor loop",
                                 "failed to create reactor"
                             );
                             return;
                         }
                     };
+
+                    if startup_tx.send((i, Ok(()))).is_err() {
+                        coord_clone.reactor_finished(i);
+                        return;
+                    }
 
                     reactor.run();
                 })?;
@@ -283,6 +310,51 @@ impl ReactorPool {
                 reactor_id: i,
                 core_id,
             });
+        }
+
+        drop(startup_tx);
+
+        let mut started_reactors = 0usize;
+        let mut startup_failure: Option<(usize, std::io::Error)> = None;
+
+        for _ in 0..num_reactors {
+            match startup_rx.recv() {
+                Ok((_, Ok(()))) => started_reactors += 1,
+                Ok((reactor_id, Err(error))) => {
+                    if startup_failure.is_none() {
+                        startup_failure = Some((reactor_id, error));
+                    }
+                }
+                Err(recv_error) => {
+                    if startup_failure.is_none() {
+                        startup_failure = Some((
+                            usize::MAX,
+                            std::io::Error::other(format!(
+                                "reactor startup channel closed unexpectedly: {recv_error}"
+                            )),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some((reactor_id, error)) = startup_failure {
+            coordinator.initiate();
+            join_handles(&mut handles);
+
+            let reactor_label = if reactor_id == usize::MAX {
+                "unknown".to_owned()
+            } else {
+                reactor_id.to_string()
+            };
+
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "reactor pool startup failed after starting {started_reactors}/{num_reactors} reactors; reactor {reactor_label} failed: {error}"
+                ),
+            ));
         }
 
         tracing::info!(num_reactors, "reactor pool started");
@@ -301,17 +373,7 @@ impl ReactorPool {
 
     /// Wait for all reactor threads to finish.
     pub fn join(&mut self) {
-        for handle in &mut self.handles {
-            if let Some(thread) = handle.thread.take() {
-                if let Err(e) = thread.join() {
-                    tracing::error!(
-                        reactor_id = handle.reactor_id,
-                        "reactor thread panicked: {:?}",
-                        e
-                    );
-                }
-            }
-        }
+        join_handles(&mut self.handles);
     }
 
     /// Block until all reactors finish or the timeout expires.
@@ -377,5 +439,26 @@ mod tests {
                 .iter()
                 .all(|(connections, buffers)| *buffers >= (*connections * 2))
         );
+    }
+
+    #[test]
+    fn spawn_returns_error_when_listener_port_is_already_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind_addr = listener.local_addr().unwrap();
+
+        let error = match ReactorPool::spawn(ReactorPoolConfig {
+            bind_addr,
+            threads: 1,
+            max_connections: 1,
+            buffer_count: 2,
+            io_backend: IoBackendMode::Polling,
+            ..ReactorPoolConfig::default()
+        }) {
+            Ok(_) => panic!("expected spawn to fail when the listener port is already bound"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("reactor pool startup failed"));
     }
 }

@@ -92,6 +92,9 @@ start_host_sampler_pack() {
         python3 "${PROFILER_SCRIPT_DIR}/host_telemetry_runner.py" \
             --output-dir "$HOST_SAMPLER_DIR" \
             --label "$session_label" \
+            --host "$host" \
+            --port "$port" \
+            --pid "${SERVER_PID:-0}" \
             --interval-seconds "$HOST_SAMPLER_INTERVAL_SECONDS" \
             >"${HOST_SAMPLER_DIR}/host-telemetry.log" 2>&1 &
         HOST_SAMPLER_PIDS+=("$!")

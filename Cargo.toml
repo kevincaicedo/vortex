@@ -47,7 +47,7 @@ crc32fast = "1"
 # ── Memory & allocation ──
 tikv-jemallocator = "0.6"
 tikv-jemalloc-sys = "0.6"
-tikv-jemalloc-ctl = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 # ── Concurrency ──
 crossbeam-utils = "0.8"

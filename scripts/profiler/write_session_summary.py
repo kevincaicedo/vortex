@@ -52,6 +52,59 @@ def find_first(session_dir: Path, pattern: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def resolve_path(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    return str(path.resolve())
+
+
+def parse_text_preview(path: Path | None, *, max_lines: int = 20) -> list[str]:
+    if path is None or not path.exists():
+        return []
+
+    lines: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        lines.append(stripped)
+        if len(lines) >= max_lines:
+            break
+    return lines
+
+
+def collect_memory_profiles(session_dir: Path) -> dict[str, Any]:
+    heaptrack_path = find_first(session_dir, "heaptrack*.zst") or find_first(session_dir, "heaptrack*.gz")
+    heaptrack_summary_path = find_first(session_dir, "heaptrack-summary.txt")
+    massif_path = find_first(session_dir, "massif.out")
+    massif_summary_path = find_first(session_dir, "massif-summary.txt")
+
+    return {
+        "heaptrack_data_path": resolve_path(heaptrack_path),
+        "heaptrack_summary_path": resolve_path(heaptrack_summary_path),
+        "heaptrack_summary_preview": parse_text_preview(heaptrack_summary_path),
+        "massif_data_path": resolve_path(massif_path),
+        "massif_summary_path": resolve_path(massif_summary_path),
+        "massif_summary_preview": parse_text_preview(massif_summary_path),
+    }
+
+
+def collect_cache_profiles(session_dir: Path) -> dict[str, Any]:
+    cachegrind_path = find_first(session_dir, "cachegrind.out")
+    cachegrind_summary_path = find_first(session_dir, "cachegrind-summary.txt")
+    callgrind_path = find_first(session_dir, "callgrind.out")
+    callgrind_summary_path = find_first(session_dir, "callgrind-summary.txt")
+
+    return {
+        "cachegrind_data_path": resolve_path(cachegrind_path),
+        "cachegrind_summary_path": resolve_path(cachegrind_summary_path),
+        "cachegrind_summary_preview": parse_text_preview(cachegrind_summary_path),
+        "callgrind_data_path": resolve_path(callgrind_path),
+        "callgrind_summary_path": resolve_path(callgrind_summary_path),
+        "callgrind_summary_preview": parse_text_preview(callgrind_summary_path),
+    }
+
+
 def parse_perf_report(path: Path | None) -> list[dict[str, Any]]:
     if path is None or not path.exists():
         return []
@@ -184,6 +237,8 @@ def build_summary_payload(session_dir: Path) -> dict[str, Any]:
         "counter_highlights": parse_perf_stat(perf_stat_path),
         "criterion_benchmarks": parse_criterion(criterion_path),
         "host_context_summary": load_json(host_summary_path) if host_summary_path else {},
+        "memory_profiles": collect_memory_profiles(session_dir),
+        "cache_profiles": collect_cache_profiles(session_dir),
         "benchmark_artifacts": benchmark_artifacts(session_dir),
         "notes_path": session.get("notes_path"),
     }

@@ -8,7 +8,7 @@ use super::{
     CmdResult, CommandArgs, ExecutedCommand, NS_PER_SEC, RESP_EMPTY_ARRAY, RESP_OK,
     resolve_unix_time_now_nanos,
 };
-use crate::ConcurrentKeyspace;
+use crate::{ConcurrentKeyspace, keyspace::RuntimeMetricsSnapshot};
 
 /// Alpha-visible command set. This excludes commands that are still stubs,
 /// unsupported, or intentionally disabled for the alpha release.
@@ -124,13 +124,14 @@ pub fn cmd_flushall(
 /// INFO [section]
 ///
 /// Returns a bulk string with server statistics.
-/// Sections: server, clients, memory, keyspace. Default = all.
+/// Sections: server, clients, memory, runtime, keyspace. Default = all.
 pub fn cmd_info(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let section = CommandArgs::collect(frame)
         .and_then(|args| args.get(1))
         .unwrap_or(b"all");
     let all = eq_ci(section, b"all") || eq_ci(section, b"everything");
     let (keys, expires) = keyspace.info_keyspace(now_nanos);
+    let runtime = keyspace.runtime_metrics();
 
     let mut buf = Vec::with_capacity(512);
 
@@ -143,6 +144,9 @@ pub fn cmd_info(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
     if all || eq_ci(section, b"memory") {
         write_info_memory(&mut buf);
     }
+    if all || eq_ci(section, b"runtime") {
+        write_info_runtime(&mut buf, runtime);
+    }
     if all || eq_ci(section, b"keyspace") {
         write_info_keyspace(&mut buf, keys, expires);
     }
@@ -152,7 +156,9 @@ pub fn cmd_info(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
 
 fn write_info_server(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"# Server\r\n");
-    buf.extend_from_slice(b"vortex_version:0.1.0\r\n");
+    buf.extend_from_slice(b"vortex_version:");
+    buf.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+    buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(b"redis_version:7.4.0\r\n");
     #[cfg(target_arch = "aarch64")]
     buf.extend_from_slice(b"arch_bits:64\r\nserver_arch:aarch64\r\n");
@@ -173,8 +179,265 @@ fn write_info_clients(buf: &mut Vec<u8>) {
 
 fn write_info_memory(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"# Memory\r\n");
-    buf.extend_from_slice(b"used_memory:0\r\n");
-    buf.extend_from_slice(b"used_memory_human:0B\r\n\r\n");
+
+    // jemalloc epoch advance — ensures stats are current
+    let epoch: u64 = 1;
+    // SAFETY: Writing the epoch is a standard jemalloc API operation to refresh stats.
+    let _ = unsafe { tikv_jemalloc_ctl::raw::write(b"epoch\0", epoch) };
+
+    // Read jemalloc stats
+    let allocated = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0);
+    let active = tikv_jemalloc_ctl::stats::active::read().unwrap_or(0);
+    let resident = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0);
+    let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
+    let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0);
+
+    // Read process RSS from /proc/self/statm
+    let rss_bytes = read_proc_rss_bytes();
+
+    // Fragmentation ratio: resident / allocated (or 0 if allocated is 0)
+    let frag_ratio = if allocated > 0 {
+        resident as f64 / allocated as f64
+    } else {
+        0.0
+    };
+    let frag_bytes = if resident > allocated {
+        resident - allocated
+    } else {
+        0
+    };
+
+    // used_memory = jemalloc allocated (what the application asked for)
+    buf.extend_from_slice(b"used_memory:");
+    itoa_append(buf, allocated as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"used_memory_human:");
+    write_human_size(buf, allocated);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"used_memory_rss:");
+    itoa_append(buf, rss_bytes as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"used_memory_peak:");
+    itoa_append(buf, resident as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    // These fields map to what the benchmark harness reads for
+    // "Dataset After" and "Allocator Resident After":
+    buf.extend_from_slice(b"used_memory_dataset:");
+    itoa_append(buf, allocated as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"used_memory_overhead:");
+    itoa_append(buf, (active.saturating_sub(allocated)) as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"used_memory_startup:0\r\n");
+    buf.extend_from_slice(b"used_memory_scripts:0\r\n");
+
+    // Allocator stats — consumed by benchmark telemetry
+    buf.extend_from_slice(b"allocator_allocated:");
+    itoa_append(buf, allocated as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_active:");
+    itoa_append(buf, active as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_resident:");
+    itoa_append(buf, resident as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_frag_ratio:");
+    write_float(buf, frag_ratio);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_frag_bytes:");
+    itoa_append(buf, frag_bytes as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_rss_ratio:");
+    let rss_ratio = if active > 0 {
+        resident as f64 / active as f64
+    } else {
+        0.0
+    };
+    write_float(buf, rss_ratio);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_rss_bytes:");
+    itoa_append(buf, resident.saturating_sub(active) as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"mem_fragmentation_ratio:");
+    let mem_frag = if allocated > 0 {
+        rss_bytes as f64 / allocated as f64
+    } else {
+        0.0
+    };
+    write_float(buf, mem_frag);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"mem_fragmentation_bytes:");
+    itoa_append(buf, (rss_bytes as i64).saturating_sub(allocated as i64));
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_mapped:");
+    itoa_append(buf, mapped as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_retained:");
+    itoa_append(buf, retained as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"total_system_memory:");
+    itoa_append(buf, read_total_system_memory() as i64);
+    buf.extend_from_slice(b"\r\n\r\n");
+}
+
+/// Read process RSS from /proc/self/statm (Linux).
+fn read_proc_rss_bytes() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            let parts: Vec<&str> = statm.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(rss_pages) = parts[1].parse::<usize>() {
+                    return rss_pages * page_size();
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Read total system memory from /proc/meminfo (Linux).
+fn read_total_system_memory() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let rest = rest.trim();
+                    if let Some(kb_str) =
+                        rest.strip_suffix("kB").or_else(|| rest.strip_suffix("KB"))
+                    {
+                        if let Ok(kb) = kb_str.trim().parse::<usize>() {
+                            return kb * 1024;
+                        }
+                    }
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// System page size.
+fn page_size() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        4096
+    }
+}
+
+/// Write a float with 2 decimal places.
+fn write_float(buf: &mut Vec<u8>, v: f64) {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(16);
+    let _ = write!(s, "{:.2}", v);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// Write a human-readable size (e.g., "1.23M").
+fn write_human_size(buf: &mut Vec<u8>, bytes: usize) {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(16);
+    if bytes >= 1024 * 1024 * 1024 {
+        let _ = write!(s, "{:.2}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    } else if bytes >= 1024 * 1024 {
+        let _ = write!(s, "{:.2}M", bytes as f64 / (1024.0 * 1024.0));
+    } else if bytes >= 1024 {
+        let _ = write!(s, "{:.2}K", bytes as f64 / 1024.0);
+    } else {
+        let _ = write!(s, "{}B", bytes);
+    }
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
+    buf.extend_from_slice(b"# Runtime\r\n");
+    buf.extend_from_slice(b"runtime_reactor_slots:");
+    itoa_append(buf, runtime.reactor_slots as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_loop_iterations:");
+    itoa_append(buf, runtime.loop_iterations as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_accept_eagain_rearms:");
+    itoa_append(buf, runtime.accept_eagain_rearms as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_completion_batches:");
+    itoa_append(buf, runtime.completion_batch_count as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_completion_batch_total:");
+    itoa_append(buf, runtime.completion_batch_total as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_completion_batch_max:");
+    itoa_append(buf, runtime.completion_batch_max as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_completion_batch_avg:");
+    write_float(buf, runtime.completion_batch_avg);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_command_batches:");
+    itoa_append(buf, runtime.command_batch_count as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_command_batch_total:");
+    itoa_append(buf, runtime.command_batch_total as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_command_batch_max:");
+    itoa_append(buf, runtime.command_batch_max as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_command_batch_avg:");
+    write_float(buf, runtime.command_batch_avg);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_active_expiry_runs:");
+    itoa_append(buf, runtime.active_expiry_runs as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_active_expiry_sampled:");
+    itoa_append(buf, runtime.active_expiry_sampled as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_active_expiry_expired:");
+    itoa_append(buf, runtime.active_expiry_expired as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"eviction_admissions:");
+    itoa_append(buf, runtime.eviction_admissions as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"eviction_shards_scanned:");
+    itoa_append(buf, runtime.eviction_shards_scanned as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"eviction_slots_sampled:");
+    itoa_append(buf, runtime.eviction_slots_sampled as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"eviction_bytes_freed:");
+    itoa_append(buf, runtime.eviction_bytes_freed as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"eviction_oom_after_scan:");
+    itoa_append(buf, runtime.eviction_oom_after_scan as i64);
+    buf.extend_from_slice(b"\r\n\r\n");
 }
 
 fn write_info_keyspace(buf: &mut Vec<u8>, keys: usize, expires: usize) {
@@ -511,7 +774,18 @@ mod tests {
         assert_bulk_contains(&r, b"# Server");
         assert_bulk_contains(&r, b"# Clients");
         assert_bulk_contains(&r, b"# Memory");
+        assert_bulk_contains(&r, b"# Runtime");
         assert_bulk_contains(&r, b"# Keyspace");
+    }
+
+    #[test]
+    fn info_runtime_section_contains_runtime_fields() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"INFO", b"runtime"]);
+        assert_bulk_contains(&r, b"# Runtime");
+        assert_bulk_contains(&r, b"reactor_loop_iterations:");
+        assert_bulk_contains(&r, b"reactor_completion_batch_avg:");
+        assert_bulk_contains(&r, b"eviction_shards_scanned:");
     }
 
     #[test]

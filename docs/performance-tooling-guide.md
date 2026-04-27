@@ -200,6 +200,29 @@ Important benchmark report outputs:
 
 Repeat-aware reports aggregate replicate rows into medians and attach spread, min/max, and outlier counts. Mixed-signature comparisons are surfaced in `comparison_validity` and excluded from winner tables and cross-database comparison tables.
 
+### Runtime Counter Artifacts
+
+Vortex now exposes a low-overhead `INFO runtime` section for always-on diagnostic counters. The implementation uses per-reactor relaxed atomics in the shared keyspace and exports them through a dedicated `INFO runtime` section instead of piggybacking on the heavier general `INFO` path.
+
+These counters show up in three places:
+
+- benchmark result JSON under `observability.before`, `observability.after`, and `observability.delta`
+- flattened benchmark report rows as `reactor_*` and `eviction_*` columns
+- profiler and benchmark host telemetry summaries as `reactor_*_delta`, `*_peak`, and `eviction_*_delta`
+
+Raw interval samples still live in `host/*-host-telemetry.jsonl`. That JSONL stream is where to inspect per-sample `per_cpu_max_pct`, `per_cpu_min_pct`, `tcp_*`, and `socket_*` fields instead of only their rolled-up summary values.
+
+Important fields and how to read them:
+
+- `reactor_loop_iterations_delta`: total event-loop turns during the measurement window
+- `reactor_accept_eagain_rearms_delta`: non-blocking accept rearms; rising values usually mean idle accept wakeups or accept-backlog pressure
+- `reactor_completion_batches_delta`, `reactor_completion_batch_max_peak`, `reactor_completion_batch_avg_peak`: completion-drain batching on the I/O side
+- `reactor_command_batches_delta`, `reactor_command_batch_max_peak`, `reactor_command_batch_avg_peak`: RESP pipeline width per parsed command batch
+- `reactor_active_expiry_runs_delta`, `reactor_active_expiry_sampled_delta`, `reactor_active_expiry_expired_delta`: active TTL cleanup work paid during the run
+- `eviction_admissions_delta`, `eviction_shards_scanned_delta`, `eviction_slots_sampled_delta`, `eviction_bytes_freed_delta`: bounded eviction scan effort and resulting reclaim work
+
+Current boundary: true always-on shard lock contention is still intentionally not exported. Accurate lock-wait instrumentation would need to touch hot lock acquisition paths or add timing probes that could perturb the workload being measured.
+
 ## Profiler Workflows
 
 ### Quick Start
@@ -239,6 +262,23 @@ just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/l
 
 This uses `vortex_bench attach` and writes benchmark-side artifacts under the profiler session `bench/` subtree.
 
+### BPF Escalation And Session Diffs
+
+The question-first profiler modes now carry their matching Linux BPF escalation artifacts:
+
+- `just profiler --scheduler ...` writes `bpf-runqlat.txt` when `runqlat` is available
+- `just profiler --aof-disk ...` writes `bpf-biolatency.txt` when `biolatency` is available
+- `just profiler --network ...` writes `bpf-tcpretrans.txt` when `tcpretrans` is available
+
+`--compare-to` now also attempts to write `diff-flamegraph.svg` when both sessions contain `perf.data` and either Brendan Gregg's FlameGraph scripts or `inferno` are installed.
+
+Interpretation rules:
+
+- `bpf-runqlat.txt`: scheduler delay histogram; look for a fat right tail before blaming CPU hotspots alone
+- `bpf-biolatency.txt`: block-device latency histogram; this is the first place to check when AOF durability work stretches p99
+- `bpf-tcpretrans.txt`: retransmit events during the session; zero output is valid and usually means the run saw no retransmits
+- `diff-flamegraph.svg`: red stacks grew versus baseline, blue stacks shrank versus baseline
+
 ### Profiler Manifests
 
 Profiler manifests live under `scripts/profiler/manifests/`.
@@ -276,6 +316,8 @@ Minimum note fields:
 
 Do not skip the note. Raw flamegraphs and `perf` output are not a substitute for explicit interpretation.
 
+For sessions against Vortex, the host telemetry summary now also captures boundary snapshots of `INFO runtime`. Read those counters alongside the flamegraph or perf output to distinguish batching, expiry, and eviction work from scheduler or I/O pressure.
+
 ## Recommended Optimization Workflow
 
 This is the operating loop derived from the performance methodology and systems-performance material.
@@ -299,6 +341,33 @@ This is the operating loop derived from the performance methodology and systems-
 - Do not aggregate mismatched runtime settings and call it a comparison. The report now flags those scenarios as invalid.
 - Treat `io_uring` as a hypothesis, not a status symbol. Measure `polling`, `auto`, and `uring` on the same workload.
 - One code change, one hypothesis, one before/after evidence set.
+
+## CI Publication
+
+For benchmark jobs, publish at minimum:
+
+- `.artifacts/benchmarks/reports/latest/report.json`
+- `.artifacts/benchmarks/reports/latest/report.csv`
+- `.artifacts/benchmarks/reports/latest/report.md`
+- the request manifest or resolved request used for the run
+- the source summary JSON files for each benchmark session included in the report
+
+For profiler jobs, publish at minimum:
+
+- `summary.json`
+- `summary-compare.json` when `--compare-to` was used
+- `notes.md`
+- `host/*host-telemetry-summary.json`
+- `diff-flamegraph.svg` when present
+
+Publish raw `perf.data`, FlameGraph intermediates, or full host JSONL only when the review actually needs them. They are valuable, but they are much larger and noisier than the summary contract.
+
+PR or CI summaries should always state:
+
+- workload manifest or request path
+- server runtime configuration differences
+- repeat count or evidence tier
+- whether BPF tools, PMU counters, or diff flamegraphs were available
 
 ## Validation Examples
 

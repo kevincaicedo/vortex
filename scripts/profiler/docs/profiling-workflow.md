@@ -278,6 +278,51 @@ All artifacts land in a timestamped session directory:
 
 `session.json` records the session contract, `notes.md` is the engineer note template, `summary.json` is the concise machine-readable summary, and `summary-compare.json` appears when `--compare-to` is used.
 
+## Runtime Counter Snapshots
+
+Profiler host telemetry now captures boundary snapshots of Vortex `INFO runtime` when the target server is Vortex and the profiler knows the host, port, and pid.
+
+Those counters are intentionally cheap:
+
+- reactor loop counts and accept `EAGAIN` rearms use per-reactor relaxed atomics
+- completion and command batch width use per-reactor counters plus per-slot max tracking
+- active expiry and eviction scan effort reuse existing bounded-work counters
+
+Read the rolled-up counters from `host/*-host-telemetry-summary.json`.
+Read raw interval samples, including `per_cpu_*`, `tcp_*`, and `socket_*`, from `host/*-host-telemetry.jsonl`.
+
+Important fields:
+
+- `reactor_loop_iterations_delta`
+- `reactor_accept_eagain_rearms_delta`
+- `reactor_completion_batches_delta`
+- `reactor_completion_batch_max_peak`
+- `reactor_command_batches_delta`
+- `reactor_command_batch_max_peak`
+- `reactor_active_expiry_runs_delta`
+- `reactor_active_expiry_sampled_delta`
+- `reactor_active_expiry_expired_delta`
+- `eviction_*_delta`
+
+Current limit: true always-on shard lock contention is not exported here yet. Measuring lock wait directly would require hotter instrumentation on the lock-acquisition path and would risk perturbing the workload.
+
+## BPF Artifacts And Session Diffs
+
+The question-first Linux modes emit extra artifacts when the corresponding BPF tools are installed:
+
+- `--scheduler` -> `bpf-runqlat.txt`
+- `--aof-disk` -> `bpf-biolatency.txt`
+- `--network` -> `bpf-tcpretrans.txt`
+
+`--compare-to` also attempts to generate `diff-flamegraph.svg` when both sessions contain `perf.data`.
+
+Interpretation rules:
+
+- `bpf-runqlat.txt`: check the long-tail buckets before assuming a hotspot is purely CPU-bound
+- `bpf-biolatency.txt`: rising right-tail latency points to block-layer stalls rather than pure userspace cost
+- `bpf-tcpretrans.txt`: empty output is valid; it usually means no retransmits occurred in that session window
+- `diff-flamegraph.svg`: red stacks grew relative to baseline, blue stacks shrank
+
 ## Tool Installation
 
 ### macOS
