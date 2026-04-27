@@ -14,9 +14,13 @@
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORIGINAL_ARGS=("$@")
 
 # Source component scripts
 source "${SCRIPTS_DIR}/profiler/common.sh"
+source "${SCRIPTS_DIR}/profiler/host.sh"
+source "${SCRIPTS_DIR}/profiler/bench.sh"
+source "${SCRIPTS_DIR}/profiler/summary.sh"
 source "${SCRIPTS_DIR}/profiler/build.sh"
 source "${SCRIPTS_DIR}/profiler/server.sh"
 source "${SCRIPTS_DIR}/profiler/cpu.sh"
@@ -34,8 +38,11 @@ Usage: just profiler [mode flags] [options]
 
 Modes (at least one required, combinable):
   --cpu              Full CPU profiling (flamegraph + perf stat + perf record)
+    --scheduler        Scheduler-focused diagnostics with host context
   --memory           Heap allocation profiling (heaptrack / massif / Instruments)
   --cache            Cache locality analysis (cachegrind)
+    --aof-disk         AOF and disk-focused diagnostics with host context
+    --network          Network-focused diagnostics with host context
   --all              Run cpu + memory + cache sequentially
 
 Specific tools (only one, runs that tool alone):
@@ -59,6 +66,9 @@ Workload (how load is generated internally):
   --duration SECS    Load duration in seconds (default: 15)
   --clients N        Number of parallel clients (default: 50)
   --manifest PATH    Profiling manifest YAML (see scripts/profiler/manifests/)
+    --bench-manifest   Use a vortex_bench manifest as the load source
+    --bench-request    Use a prior vortex_bench run-request JSON as the load source
+    --compare-to PATH  Write a machine-readable comparison against an earlier session
 
 Server configuration:
   --threads N        Server thread count (default: 4)
@@ -87,6 +97,7 @@ macOS note:
 
 Examples:
   just profiler --command SET,GET
+    just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
   just profiler --cpu --command SET,GET --duration 20
   just profiler --flamegraph --command SET --threads 2
   just profiler --memory --command SET --duration 15
@@ -102,8 +113,11 @@ EOF
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 MODE_CPU=false
+MODE_SCHEDULER=false
 MODE_MEMORY=false
 MODE_CACHE=false
+MODE_AOF_DISK=false
+MODE_NETWORK=false
 MODE_ALL=false
 MODE_CRITERION=false
 MODE_CHECK=false
@@ -121,14 +135,17 @@ TOOL_MASSIF=false
 # Workload
 COMMAND=""
 DURATION=15
+DURATION_SET_BY_CLI=false
 CLIENTS=50
 MANIFEST=""
+COMPARE_TO=""
 
 # Server
 HOST="127.0.0.1"
 PORT="16379"
 THREADS=4
 AOF=false
+AOF_SET_BY_CLI=false
 MAXMEMORY=""
 EVICTION=""
 IO_BACKEND=""
@@ -151,8 +168,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         # Modes
         --cpu)          MODE_CPU=true;           shift ;;
+        --scheduler)    MODE_SCHEDULER=true;     shift ;;
         --memory)       MODE_MEMORY=true;        shift ;;
         --cache)        MODE_CACHE=true;         shift ;;
+        --aof-disk)     MODE_AOF_DISK=true;      shift ;;
+        --network)      MODE_NETWORK=true;       shift ;;
         --all)          MODE_ALL=true;           shift ;;
         --criterion)    MODE_CRITERION=true;     shift ;;
         --check)        MODE_CHECK=true;         shift ;;
@@ -169,15 +189,18 @@ while [[ $# -gt 0 ]]; do
 
         # Workload
         --command)      COMMAND="$2";            shift 2 ;;
-        --duration)     DURATION="$2";           shift 2 ;;
+        --duration)     DURATION="$2"; DURATION_SET_BY_CLI=true; shift 2 ;;
         --clients)      CLIENTS="$2";            shift 2 ;;
         --manifest)     MANIFEST="$2";           shift 2 ;;
+        --bench-manifest) BENCH_MANIFEST="$2";  shift 2 ;;
+        --bench-request) BENCH_REQUEST="$2";    shift 2 ;;
+        --compare-to)   COMPARE_TO="$2";         shift 2 ;;
 
         # Server
         --host)         HOST="$2";               shift 2 ;;
         --port)         PORT="$2";               shift 2 ;;
         --threads)      THREADS="$2";            shift 2 ;;
-        --aof)          AOF=true;                shift ;;
+        --aof)          AOF=true; AOF_SET_BY_CLI=true; shift ;;
         --maxmemory)    MAXMEMORY="$2";          shift 2 ;;
         --eviction)     EVICTION="$2";           shift 2 ;;
         --io-backend)   IO_BACKEND="$2";         shift 2 ;;
@@ -226,8 +249,11 @@ if [[ -n "$MANIFEST" ]]; then
         for _m in "${_manifest_modes[@]}"; do
             case "$_m" in
                 cpu)              MODE_CPU=true ;;
+                scheduler)        MODE_SCHEDULER=true ;;
                 memory)           MODE_MEMORY=true ;;
                 cache)            MODE_CACHE=true ;;
+                aof-disk)         MODE_AOF_DISK=true ;;
+                network)          MODE_NETWORK=true ;;
                 all)              MODE_ALL=true ;;
                 criterion)        MODE_CRITERION=true ;;
                 flamegraph)       TOOL_FLAMEGRAPH=true ;;
@@ -251,21 +277,120 @@ if $MODE_ALL; then
     MODE_CACHE=true
 fi
 
+if $MODE_AOF_DISK && [[ "$AOF_SET_BY_CLI" != "true" ]] && ! benchmark_bridge_enabled; then
+    AOF=true
+fi
+
 # ── Default mode: if only --command is given with no mode, default to --cpu ──
 has_any_mode() {
-    $MODE_CPU || $MODE_MEMORY || $MODE_CACHE || $MODE_CRITERION || $MODE_CHECK || \
+    $MODE_CPU || $MODE_SCHEDULER || $MODE_MEMORY || $MODE_CACHE || $MODE_AOF_DISK || $MODE_NETWORK || $MODE_CRITERION || $MODE_CHECK || \
     $TOOL_FLAMEGRAPH || $TOOL_PERF_STAT || $TOOL_SAMPLY || $TOOL_INSTRUMENTS || \
     $TOOL_HEAPTRACK || $TOOL_CACHEGRIND || $TOOL_CALLGRIND || $TOOL_MASSIF
 }
 
 if ! has_any_mode; then
-    if [[ -n "$COMMAND" ]]; then
+    if [[ -n "$COMMAND" ]] || benchmark_bridge_enabled; then
         TOOL_FLAMEGRAPH=true
         info "No mode specified, defaulting to --flamegraph"
     else
         fatal "No mode specified. Run 'just profiler --help' for usage."
     fi
 fi
+
+shell_join() {
+    local rendered=""
+    local arg
+    for arg in "$@"; do
+        printf -v rendered '%s%q ' "$rendered" "$arg"
+    done
+    printf '%s' "${rendered% }"
+}
+
+resolve_requested_tools() {
+    local tools=()
+
+    $MODE_CPU && tools+=("cpu-suite")
+    $MODE_SCHEDULER && tools+=("scheduler-focus")
+    $MODE_MEMORY && tools+=("memory-suite")
+    $MODE_CACHE && tools+=("cache-suite")
+    $MODE_AOF_DISK && tools+=("aof-disk-focus")
+    $MODE_NETWORK && tools+=("network-focus")
+    $MODE_CRITERION && tools+=("criterion")
+    $TOOL_FLAMEGRAPH && tools+=("flamegraph")
+    $TOOL_PERF_STAT && tools+=("perf-stat")
+    $TOOL_SAMPLY && tools+=("samply")
+    $TOOL_INSTRUMENTS && tools+=("instruments")
+    $TOOL_HEAPTRACK && tools+=("heaptrack")
+    $TOOL_CACHEGRIND && tools+=("cachegrind")
+    $TOOL_CALLGRIND && tools+=("callgrind")
+    $TOOL_MASSIF && tools+=("massif")
+
+    printf '%s\n' "${tools[@]}"
+}
+
+resolve_workload_source() {
+    if benchmark_bridge_enabled; then
+        printf '%s' "$(benchmark_workload_source_label)"
+        return 0
+    fi
+    if [[ -n "$MANIFEST" ]]; then
+        printf '%s' "profiler-manifest"
+        return 0
+    fi
+    if [[ -n "$COMMAND" ]]; then
+        printf '%s' "redis-benchmark"
+        return 0
+    fi
+    printf '%s' "manual-or-none"
+}
+
+describe_workload() {
+    if benchmark_bridge_enabled; then
+        printf '%s' "$(benchmark_workload_description_text)"
+        return 0
+    fi
+    if [[ -n "$MANIFEST" ]]; then
+        printf '%s' "manifest=${MANIFEST}; command=${COMMAND:-n/a}; duration=${DURATION}s; clients=${CLIENTS}"
+        return 0
+    fi
+    if [[ -n "$COMMAND" ]]; then
+        printf '%s' "redis-benchmark command set ${COMMAND} for ${DURATION}s with ${CLIENTS} clients"
+        return 0
+    fi
+    printf '%s' "no internal load configured"
+}
+
+prepare_session_contract_context() {
+    local mode="$1"
+    local cargo_profile="$2"
+    local binary_path="$3"
+    local tool_name
+
+    SESSION_MODE="$mode"
+    SESSION_CARGO_PROFILE="$cargo_profile"
+    SESSION_BINARY_PATH="$binary_path"
+    SESSION_COMMAND_LINE="$(shell_join "$0" "${ORIGINAL_ARGS[@]}")"
+    SESSION_WORKLOAD_SOURCE="$(resolve_workload_source)"
+    SESSION_WORKLOAD_DESCRIPTION="$(describe_workload)"
+    SESSION_WORKLOAD_COMMAND="$COMMAND"
+    SESSION_WORKLOAD_DURATION="$DURATION"
+    SESSION_WORKLOAD_CLIENTS="$CLIENTS"
+    if benchmark_bridge_enabled; then
+        SESSION_WORKLOAD_MANIFEST_PATH="$BENCH_EFFECTIVE_MANIFEST"
+        SESSION_WORKLOAD_REQUEST_PATH="$BENCH_EFFECTIVE_REQUEST_PATH"
+    else
+        SESSION_WORKLOAD_MANIFEST_PATH="$MANIFEST"
+        SESSION_WORKLOAD_REQUEST_PATH=""
+    fi
+    SESSION_TOOLS_REQUESTED=""
+    SESSION_TOOLS_EXECUTED=""
+    SESSION_TARGET_PIDS=""
+
+    while IFS= read -r tool_name; do
+        [[ -z "$tool_name" ]] && continue
+        record_requested_tool "$tool_name"
+    done < <(resolve_requested_tools)
+}
 
 # ── Check mode ───────────────────────────────────────────────────────────────
 if $MODE_CHECK; then
@@ -275,8 +400,14 @@ fi
 
 # ── Criterion mode (no server, no build of vortex-server) ────────────────────
 if $MODE_CRITERION; then
+    if benchmark_bridge_enabled; then
+        fatal "--bench-manifest and --bench-request are only supported for server-based profiler sessions"
+    fi
     SESSION_DIR="$(make_session_dir criterion)"
     mkdir -p "${SESSION_DIR}"
+    prepare_session_contract_context "criterion" "criterion" ""
+    initialize_session_contract "$SESSION_DIR"
+    start_host_sampler_pack "$SESSION_DIR" "$HOST" "$PORT"
 
     printf "${C_BOLD}${C_BLUE}╔═══════════════════════════════════════════════╗${C_RESET}\n"
     printf "${C_BOLD}${C_BLUE}║    Vortex Profiler — Criterion Benchmarks     ║${C_RESET}\n"
@@ -284,7 +415,11 @@ if $MODE_CRITERION; then
     printf "  OS:      %s\n" "$OS"
     printf "  Session: %s\n\n" "$SESSION_DIR"
 
+    record_executed_tool "criterion"
     run_criterion_mode "$SESSION_DIR" "$CRITERION_PACKAGE" "$CRITERION_BENCH_TARGET" "$CRITERION_FILTER"
+    stop_host_sampler_pack
+    generate_post_session_summary "$SESSION_DIR" "$COMPARE_TO"
+    finalize_session_contract "$SESSION_DIR" "completed" 0
 
     echo ""
     printf "${C_BOLD}${C_GREEN}═══ Session Complete ═══${C_RESET}\n"
@@ -295,9 +430,16 @@ fi
 # ── Server-based profiling ───────────────────────────────────────────────────
 SESSION_DIR="$(make_session_dir profiling)"
 register_cleanup
+resolve_benchmark_bridge "$SESSION_DIR"
+if benchmark_bridge_enabled && [[ "$DURATION_SET_BY_CLI" != "true" ]] && [[ -n "$BENCH_EFFECTIVE_DURATION_SECONDS" ]]; then
+    DURATION="$BENCH_EFFECTIVE_DURATION_SECONDS"
+fi
 
 # Build the binary (unless --bin was provided)
 build_profiling_binary "$BIN_OVERRIDE"
+prepare_session_contract_context "profiling" "$PROFILING_CARGO_PROFILE" "$PROFILING_BINARY"
+initialize_session_contract "$SESSION_DIR"
+start_host_sampler_pack "$SESSION_DIR" "$HOST" "$PORT"
 
 # Print session banner
 printf "\n${C_BOLD}${C_BLUE}╔═══════════════════════════════════════════════╗${C_RESET}\n"
@@ -327,51 +469,81 @@ COMMON_ARGS=("$SESSION_DIR" "$HOST" "$PORT" "$THREADS" "$AOF" "$MAXMEMORY" "$EVI
 
 # ── Dispatch specific tools ──────────────────────────────────────────────────
 if $TOOL_FLAMEGRAPH; then
+    record_executed_tool "flamegraph"
     run_flamegraph "${COMMON_ARGS[@]}" "$FREQUENCY"
 fi
 
 if $TOOL_PERF_STAT; then
+    record_executed_tool "perf-stat"
     run_perf_stat "${COMMON_ARGS[@]}"
 fi
 
 if $TOOL_SAMPLY; then
+    record_executed_tool "samply"
     run_samply "${COMMON_ARGS[@]}"
 fi
 
 if $TOOL_INSTRUMENTS; then
+    record_executed_tool "instruments"
     run_instruments "${COMMON_ARGS[@]}"
 fi
 
 if $TOOL_HEAPTRACK; then
+    record_executed_tool "heaptrack"
     run_heaptrack "${COMMON_ARGS[@]}"
 fi
 
 if $TOOL_CACHEGRIND; then
+    record_executed_tool "cachegrind"
     run_cachegrind "${COMMON_ARGS[@]}"
 fi
 
 if $TOOL_CALLGRIND; then
+    record_executed_tool "callgrind"
     run_callgrind "${COMMON_ARGS[@]}"
 fi
 
 if $TOOL_MASSIF; then
+    record_executed_tool "massif"
     run_massif "${COMMON_ARGS[@]}"
 fi
 
 # ── Dispatch composite modes ────────────────────────────────────────────────
 if $MODE_CPU; then
+    record_executed_tool "cpu-suite"
     run_cpu_all "${COMMON_ARGS[@]}" "$FREQUENCY"
 fi
 
+if $MODE_SCHEDULER; then
+    record_executed_tool "scheduler-focus"
+    run_scheduler_focus "${COMMON_ARGS[@]}"
+fi
+
 if $MODE_MEMORY; then
+    record_executed_tool "memory-suite"
     run_memory_all "${COMMON_ARGS[@]}"
 fi
 
 if $MODE_CACHE; then
+    record_executed_tool "cache-suite"
     run_cachegrind "${COMMON_ARGS[@]}"
 fi
 
+if $MODE_AOF_DISK; then
+    record_executed_tool "aof-disk-focus"
+    run_aof_disk_focus "${COMMON_ARGS[@]}"
+fi
+
+if $MODE_NETWORK; then
+    record_executed_tool "network-focus"
+    run_network_focus "${COMMON_ARGS[@]}"
+fi
+
 # ── Session summary ──────────────────────────────────────────────────────────
+stop_host_sampler_pack
+generate_post_session_summary "$SESSION_DIR" "$COMPARE_TO"
+finalize_session_contract "$SESSION_DIR" "completed" 0
+
 echo ""
 printf "${C_BOLD}${C_GREEN}═══ Session Complete ═══${C_RESET}\n\n"
 printf "  Artifacts:\n"

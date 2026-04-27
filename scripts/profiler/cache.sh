@@ -21,17 +21,17 @@ run_cachegrind() {
     [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
     [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
-    if [[ -n "$command" ]]; then
-        (
-            sleep 8
-            if wait_for_server_ready "$host" "$port" 120; then
+    (
+        sleep 8
+        if wait_for_server_ready "$host" "$port" 120; then
+            if [[ -n "$command" ]]; then
                 generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-cachegrind.log"
-            else
-                warn "Skipping cachegrind load generation because the server never became ready. See ${session}/server-cachegrind.log"
             fi
-        ) &
-        local bg_load=$!
-    fi
+        else
+            warn "Skipping cachegrind load generation because the server never became ready. See ${session}/server-cachegrind.log"
+        fi
+    ) &
+    local bg_load=$!
 
     info "Running: valgrind --tool=cachegrind"
     valgrind --tool=cachegrind \
@@ -73,17 +73,17 @@ run_callgrind() {
     [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
     [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
-    if [[ -n "$command" ]]; then
-        (
-            sleep 8
-            if wait_for_server_ready "$host" "$port" 120; then
+    (
+        sleep 8
+        if wait_for_server_ready "$host" "$port" 120; then
+            if [[ -n "$command" ]]; then
                 generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-callgrind.log"
-            else
-                warn "Skipping callgrind load generation because the server never became ready. See ${session}/server-callgrind.log"
             fi
-        ) &
-        local bg_load=$!
-    fi
+        else
+            warn "Skipping callgrind load generation because the server never became ready. See ${session}/server-callgrind.log"
+        fi
+    ) &
+    local bg_load=$!
 
     info "Running: valgrind --tool=callgrind --simulate-cache=yes --collect-jumps=yes"
     valgrind --tool=callgrind \

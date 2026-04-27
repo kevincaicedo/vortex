@@ -9,10 +9,44 @@ from vortex_benchmark.backends.base import BackendExecutionRecord
 from vortex_benchmark.env import build_layout, load_environment_state, probe_redis_endpoint
 from vortex_benchmark.manifests import resolve_benchmark_spec, validate_run_inputs
 from vortex_benchmark.models import EnvironmentState, split_csv_values, timestamp_slug, utc_now
-from vortex_benchmark.telemetry import capture_host_metadata
+from vortex_benchmark.telemetry import capture_host_metadata, capture_run_validity
 
 
 VORTEX_ONLY_RUNTIME_KEYS = {"io_backend", "ring_size", "fixed_buffers", "sqpoll_idle_ms"}
+
+
+def _replicate_id(replicate_index: int) -> str:
+    return f"rep{replicate_index:02d}"
+
+
+def _annotate_record_with_replicate(
+    record: BackendExecutionRecord,
+    *,
+    suite_run_id: str,
+    replicate_index: int,
+    replicate_count: int,
+) -> None:
+    replicate_id = _replicate_id(replicate_index)
+    record.selection = {
+        **(record.selection or {}),
+        "replicate_index": replicate_index,
+        "replicate_count": replicate_count,
+        "replicate_id": replicate_id,
+    }
+    record.artifacts = {
+        **(record.artifacts or {}),
+        "suite_run_id": suite_run_id,
+        "replicate_run_id": record.artifacts.get("replicate_run_id") if record.artifacts else record.backend,
+        "replicate_id": replicate_id,
+    }
+    record.artifacts["replicate_run_id"] = record.artifacts.get("replicate_run_id") or f"{suite_run_id}-{replicate_id}"
+
+    for item in record.items:
+        item["suite_run_id"] = suite_run_id
+        item["replicate_index"] = replicate_index
+        item["replicate_count"] = replicate_count
+        item["replicate_id"] = replicate_id
+        item["replicate_run_id"] = record.artifacts["replicate_run_id"]
 
 
 def has_run_selection(args) -> bool:
@@ -89,12 +123,25 @@ def execute_run(args, preloaded_state: Optional[EnvironmentState] = None) -> Pat
 
     layout = build_layout(spec.output_dir or state.artifact_root)
     request_path = layout.requests_dir / f"{timestamp_slug()}-{state.environment_id}-run-request.json"
+    selected_services = [
+        service
+        for service in state.services
+        if service.database in selected_databases
+    ]
+    request_validity = capture_run_validity(
+        services=selected_services,
+        repo_root=Path(state.project_root).expanduser().resolve(),
+        evidence_tier=spec.evidence_tier,
+        requested_repeat_count=spec.repeat_count,
+        aggregates_multiple_replicates=spec.repeat_count > 1,
+    )
     payload = {
         "schema_version": 1,
         "generated_at": utc_now(),
         "environment_id": state.environment_id,
         "state_file": state.state_file,
         "host_metadata": capture_host_metadata(),
+        "validity": request_validity,
         "mode": state.mode,
         "selected_databases": selected_databases,
         "duration": spec.duration,
@@ -126,8 +173,7 @@ def execute_run(args, preloaded_state: Optional[EnvironmentState] = None) -> Pat
                 "resource_config": service.resource_config,
                 "runtime_config": service.runtime_config,
             }
-            for service in state.services
-            if service.database in selected_databases
+            for service in selected_services
         ],
     }
     request_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -141,40 +187,78 @@ def execute_run(args, preloaded_state: Optional[EnvironmentState] = None) -> Pat
     records: list[BackendExecutionRecord] = []
     failures: list[str] = []
 
-    for database in selected_databases:
-        service = service_by_database[database]
-        context = BackendRunContext(
-            spec=spec,
-            state=state,
-            service=service,
-            layout=layout,
-            request_path=request_path,
-            run_id=run_id,
-            selected_workloads=list(spec.workloads),
-            selected_commands=list(spec.effective_commands),
+    for replicate_index in range(1, spec.repeat_count + 1):
+        replicate_run_id = (
+            run_id
+            if spec.repeat_count == 1
+            else f"{run_id}-{_replicate_id(replicate_index)}"
         )
-        for backend_name in resolved_backends:
-            backend_started = utc_now()
-            try:
-                record = execute_backend(backend_name, context)
-            except Exception as error:
-                failures.append(f"{backend_name}:{database}: {error}")
-                record = BackendExecutionRecord(
-                    backend=backend_name,
-                    database=database,
-                    status="failed",
-                    started_at=backend_started,
-                    completed_at=utc_now(),
-                    duration_seconds=0.0,
-                    selection={
-                        "commands": context.selected_commands,
-                        "workloads": context.selected_workloads,
-                    },
-                    notes=[str(error)],
+        for database in selected_databases:
+            service = service_by_database[database]
+            context = BackendRunContext(
+                spec=spec,
+                state=state,
+                service=service,
+                layout=layout,
+                request_path=request_path,
+                run_id=replicate_run_id,
+                suite_run_id=run_id,
+                replicate_index=replicate_index,
+                replicate_count=spec.repeat_count,
+                selected_workloads=list(spec.workloads),
+                selected_commands=list(spec.effective_commands),
+            )
+            for backend_name in resolved_backends:
+                backend_started = utc_now()
+                try:
+                    record = execute_backend(backend_name, context)
+                except Exception as error:
+                    failures.append(
+                        f"{backend_name}:{database}:{_replicate_id(replicate_index)}: {error}"
+                    )
+                    record = BackendExecutionRecord(
+                        backend=backend_name,
+                        database=database,
+                        status="failed",
+                        started_at=backend_started,
+                        completed_at=utc_now(),
+                        duration_seconds=0.0,
+                        selection={
+                            "commands": context.selected_commands,
+                            "workloads": context.selected_workloads,
+                        },
+                        artifacts={
+                            "replicate_run_id": replicate_run_id,
+                        },
+                        notes=[str(error)],
+                    )
+                _annotate_record_with_replicate(
+                    record,
+                    suite_run_id=run_id,
+                    replicate_index=replicate_index,
+                    replicate_count=spec.repeat_count,
                 )
-            records.append(record)
+                records.append(record)
 
     summary_path = layout.results_dir / f"{run_id}-summary.json"
+    telemetry_summary_paths = sorted(
+        {
+            telemetry.get("summary_path")
+            for record in records
+            for item in record.items
+            for telemetry in [
+                ((item.get("observability") or {}).get("host_telemetry") or {})
+            ]
+            if telemetry.get("summary_path")
+        }
+    )
+    summary_validity = {
+        **request_validity,
+        "repeat_count_executed": spec.repeat_count,
+        "aggregates_multiple_replicates": spec.repeat_count > 1,
+        "host_telemetry_captured": bool(telemetry_summary_paths),
+        "host_telemetry_summary_paths": telemetry_summary_paths,
+    }
     summary_payload = {
         "schema_version": 1,
         "generated_at": utc_now(),
@@ -182,6 +266,7 @@ def execute_run(args, preloaded_state: Optional[EnvironmentState] = None) -> Pat
         "environment_id": state.environment_id,
         "request_path": str(request_path),
         "summary_path": str(summary_path),
+        "validity": summary_validity,
         "selected_databases": selected_databases,
         "resolved_backends": resolved_backends,
         "failure_count": len(failures),

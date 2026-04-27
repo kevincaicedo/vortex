@@ -224,8 +224,22 @@ impl CommandRouter {
         self.scratch[..len].copy_from_slice(cmd_bytes);
         uppercase_inplace(&mut self.scratch[..len]);
 
-        // PHF lookup. SAFETY: scratch contains valid UTF-8 (uppercase ASCII).
-        let name_str = unsafe { std::str::from_utf8_unchecked(&self.scratch[..len]) };
+        Self::dispatch_normalized(frame, &self.scratch[..len])
+    }
+
+    /// Dispatch a frame using a command name that was already normalized to
+    /// uppercase ASCII by the caller.
+    #[inline]
+    pub fn dispatch_normalized<'a>(
+        frame: &crate::FrameRef<'_>,
+        name: &'a [u8],
+    ) -> DispatchResult<'a> {
+        if name.is_empty() || !name.is_ascii() {
+            return DispatchResult::UnknownCommand;
+        }
+
+        // PHF lookup. SAFETY: `is_ascii()` guarantees valid UTF-8.
+        let name_str = unsafe { std::str::from_utf8_unchecked(name) };
         let meta = match COMMAND_TABLE.get(name_str).copied() {
             Some(m) => m,
             None => return DispatchResult::UnknownCommand,
@@ -246,11 +260,7 @@ impl CommandRouter {
             return DispatchResult::WrongArity { meta };
         }
 
-        DispatchResult::Dispatch {
-            meta,
-            name: &self.scratch[..len],
-            argc,
-        }
+        DispatchResult::Dispatch { meta, name, argc }
     }
 }
 
@@ -395,6 +405,30 @@ mod tests {
             dispatch_wire(&mut router, b"*1\r\n$7\r\nINVALID\r\n"),
             DispatchResult::UnknownCommand
         ));
+    }
+
+    #[test]
+    fn dispatch_rejects_non_ascii_command_name() {
+        let mut router = CommandRouter::new();
+        assert!(matches!(
+            dispatch_wire(&mut router, b"*1\r\n$3\r\nG\xffT\r\n"),
+            DispatchResult::UnknownCommand
+        ));
+    }
+
+    #[test]
+    fn dispatch_normalized_reuses_caller_command_name() {
+        let tape =
+            RespTape::parse_pipeline(b"*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n").expect("valid RESP");
+        let frame = tape.iter().next().expect("at least one frame");
+        match CommandRouter::dispatch_normalized(&frame, b"GET") {
+            DispatchResult::Dispatch { meta, name, argc } => {
+                assert_eq!(meta.name, "GET");
+                assert_eq!(name, b"GET");
+                assert_eq!(argc, 2);
+            }
+            _ => panic!("expected Dispatch"),
+        }
     }
 
     #[test]

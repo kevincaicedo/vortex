@@ -14,6 +14,7 @@ Benchmark manifests support JSON and YAML and currently accept these top-level s
 | `commands` | Explicit point commands for `redis-benchmark`. |
 | `command_groups` | High-level command bundles such as `strings`, `keys`, `server`, and `transactions`. |
 | `backends` | One or more backends such as `redis-benchmark`, `memtier_benchmark`, or `custom-rust`. |
+| `repeat` | Replicate count for every selected scenario when CLI `--repeat` is not provided. |
 | `duration` | Duration literal such as `20s`, `5m`, or `1h`. |
 | `environment` | Mode, state-file, output-root, port-base, and build behavior. |
 | `resource_config` | CPU, memory, and thread allocation hints for service startup. |
@@ -50,14 +51,32 @@ The repository now ships CI-oriented example manifests:
 - `manifests/examples/ci-regression-native.yaml`
 - `manifests/examples/aof-everysec-native.yaml`
 - `manifests/examples/eviction-allkeys-lru-native.yaml`
+- `manifests/examples/local-native-redis-benchmark-repeat.yaml`
 
 The intended workflow for a new scenario file is:
 
 1. Copy the closest example under `manifests/examples/`.
 2. Pick the databases and execution mode.
 3. Choose either `commands` or `workloads` or both.
-4. Pin backend-specific settings in `settings`.
-5. Add `runtime_config` if the scenario depends on AOF, maxmemory, or eviction.
+4. Add `repeat` when the scenario should carry its own replicate count.
+5. Pin backend-specific settings in `settings`.
+6. Add `runtime_config` if the scenario depends on AOF, maxmemory, or eviction.
+
+Example repeat-aware snippet:
+
+```yaml
+schema_version: 1
+name: citation-read-heavy
+databases: [vortex, redis]
+backends: [redis-benchmark]
+commands: [GET, SET]
+repeat: 3
+duration: 5s
+environment:
+  mode: native
+```
+
+CLI `--repeat` overrides manifest `repeat`. When neither is set, the resolved benchmark spec defaults to `1`.
 
 ## Quick Scenario File Versus Built-In Workload Definitions
 

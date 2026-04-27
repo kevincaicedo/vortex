@@ -22,6 +22,7 @@ from vortex_benchmark.models import (
 )
 
 SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
+SUPPORTED_EVIDENCE_TIERS = ("exploratory", "engineering", "citation-grade")
 
 
 def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_file: bool) -> None:
@@ -39,7 +40,7 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         parser.add_argument("--state-file", help="Path to an environment state file.")
     parser.add_argument(
         "--output-dir",
-        help="Artifact root directory. Defaults to vortex-benchmark/.artifacts.",
+        help="Artifact root directory. Defaults to .artifacts/benchmarks under the repo root.",
     )
     parser.add_argument(
         "--port-base",
@@ -122,6 +123,18 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
 
 def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--evidence-tier",
+        choices=SUPPORTED_EVIDENCE_TIERS,
+        default="engineering",
+        help="Validity tier for the run metadata. Default: engineering.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=None,
+        help="Execute each selected scenario multiple times. Overrides manifest repeat; defaults to 1 when neither is set.",
+    )
+    parser.add_argument(
         "--backend",
         dest="backends",
         action="append",
@@ -166,7 +179,7 @@ def add_report_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--results-dir",
-        help="Directory containing *-summary.json files. Defaults to vortex-benchmark/.artifacts/results when no summary file is passed.",
+        help="Directory containing *-summary.json files. Defaults to .artifacts/benchmarks/results when no summary file is passed.",
     )
     parser.add_argument(
         "--output-dir",

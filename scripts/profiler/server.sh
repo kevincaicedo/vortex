@@ -37,7 +37,30 @@ _profiler_cleanup() {
 }
 
 register_cleanup() {
-    trap _profiler_cleanup EXIT INT TERM
+    trap _profiler_cleanup_and_finalize EXIT INT TERM
+}
+
+_profiler_cleanup_and_finalize() {
+    local exit_code=$?
+
+    trap - EXIT INT TERM
+    _profiler_cleanup >/dev/null 2>&1 || true
+    if declare -F stop_host_sampler_pack >/dev/null 2>&1; then
+        stop_host_sampler_pack || true
+    fi
+    if declare -F generate_post_session_summary >/dev/null 2>&1 && [[ -n "${SESSION_DIR:-}" ]]; then
+        generate_post_session_summary "$SESSION_DIR" "${COMPARE_TO:-}" || true
+    fi
+
+    if declare -F finalize_session_contract >/dev/null 2>&1 && [[ -n "${SESSION_DIR:-}" ]]; then
+        if [[ "$exit_code" -eq 0 ]]; then
+            finalize_session_contract "$SESSION_DIR" "completed" "$exit_code" || true
+        else
+            finalize_session_contract "$SESSION_DIR" "failed" "$exit_code" || true
+        fi
+    fi
+
+    exit "$exit_code"
 }
 
 # ── Build server args ────────────────────────────────────────────────────────
@@ -80,6 +103,7 @@ start_server() {
     info "Starting vortex-server: ${PROFILING_BINARY} ${args[*]}"
     "$PROFILING_BINARY" "${args[@]}" >"$logfile" 2>&1 &
     SERVER_PID=$!
+    record_session_pid "$SERVER_PID"
     info "Server started (pid ${SERVER_PID})"
 
     wait_for_server "$host" "$port" 30
@@ -88,6 +112,11 @@ start_server() {
 # ── Load generation ──────────────────────────────────────────────────────────
 generate_load() {
     local host="$1" port="$2" command="$3" duration="$4" clients="$5" logfile="$6"
+
+    if declare -F benchmark_bridge_enabled >/dev/null 2>&1 && benchmark_bridge_enabled; then
+        generate_benchmark_load "$host" "$port" "$duration" "$logfile"
+        return 0
+    fi
 
     if [[ -z "$command" ]]; then
         warn "No --command specified. No load will be generated."

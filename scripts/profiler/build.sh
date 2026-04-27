@@ -13,11 +13,13 @@ build_profiling_binary() {
             fatal "--bin path '${bin_override}' does not exist or is not executable"
         fi
         PROFILING_BINARY="$bin_override"
+        PROFILING_CARGO_PROFILE="external"
         ensure_macos_debuggable_binary "$PROFILING_BINARY"
         ok "Using pre-built binary: ${PROFILING_BINARY}"
         return 0
     fi
 
+    PROFILING_CARGO_PROFILE="profiling"
     info "Building vortex-server (--profile profiling)..."
     if ! (cd "$REPO_ROOT" && cargo build --profile profiling --bin vortex-server 2>&1); then
         fatal "Build failed. Fix compilation errors and retry."

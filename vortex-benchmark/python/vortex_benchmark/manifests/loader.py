@@ -23,6 +23,7 @@ MANIFEST_TOP_LEVEL_KEYS = {
     "commands",
     "command_groups",
     "backends",
+    "repeat",
     "duration",
     "environment",
     "resource_config",
@@ -57,6 +58,7 @@ class BenchmarkManifest:
     commands: list[str] = field(default_factory=list)
     command_groups: list[str] = field(default_factory=list)
     backends: list[str] = field(default_factory=list)
+    repeat: Optional[int] = None
     duration: Optional[str] = None
     environment: dict[str, Any] = field(default_factory=dict)
     resource_config: dict[str, Any] = field(default_factory=dict)
@@ -267,6 +269,7 @@ def load_manifest(path: Path) -> BenchmarkManifest:
         commands=_optional_string_list(payload.get("commands"), "commands"),
         command_groups=_optional_string_list(payload.get("command_groups"), "command_groups"),
         backends=_optional_string_list(payload.get("backends"), "backends"),
+        repeat=_optional_positive_int(payload.get("repeat"), "repeat"),
         duration=_optional_string(payload.get("duration"), "duration"),
         environment=_validate_environment(_require_mapping(payload.get("environment"), "environment")),
         resource_config=_validate_resource_config(

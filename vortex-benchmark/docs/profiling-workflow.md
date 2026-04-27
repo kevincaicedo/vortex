@@ -222,7 +222,7 @@ That keeps one benchmark and report surface whether the target was started by `v
 Profiling artifacts should live under:
 
 ```text
-vortex-benchmark/.artifacts/profiling/<timestamp>/
+.artifacts/profiling/<timestamp>/
   session.json
   notes.md
   profiler/

@@ -49,6 +49,9 @@ class BackendRunContext:
     layout: "ArtifactLayout"
     request_path: Path
     run_id: str
+    suite_run_id: str
+    replicate_index: int
+    replicate_count: int
     selected_workloads: list[str]
     selected_commands: list[str]
 

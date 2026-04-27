@@ -1,6 +1,6 @@
 # Profiling Workflow
 
-> `just profiler` is a **profiling tool manager** for vortex-server. It detects the OS, checks available tools, builds the binary, starts the server, runs the selected profiler, generates load internally, and collects artifacts. It is **not** a benchmark wrapper. `vortex_bench` is the separate benchmark tool for any Redis-compatible server.
+> `just profiler` is a profiler-first workflow manager for `vortex-server`. It builds the profiling binary, starts the server, runs the selected profiler, captures host context, and can now drive load either through the built-in `redis-benchmark` path or through `vortex_bench attach` so profiling and benchmark artifacts land in one session root.
 
 ## Quick Start
 
@@ -17,11 +17,20 @@ just profiler --flamegraph --io-backend uring --ring-size 4096 --sqpoll-idle-ms 
 # Full CPU suite (flamegraph + perf/samply/instruments)
 just profiler --cpu --command SET,GET --duration 20
 
+# Scheduler-focused diagnostics driven by a benchmark manifest
+just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml --duration 5
+
 # Memory heap tracking
 just profiler --memory --command SET --duration 15
 
 # Cache miss analysis
 just profiler --cache --command SET --threads 1
+
+# AOF and disk diagnostics
+just profiler --aof-disk --command SET,INCR --duration 20
+
+# Network-focused diagnostics
+just profiler --network --command SET,GET,INCR --duration 20
 
 # Everything
 just profiler --all --command SET,GET
@@ -31,6 +40,9 @@ just profiler --criterion --filter cmd_get_inline
 
 # Use a profiling manifest for reproducibility
 just profiler --manifest scripts/profiler/manifests/cpu-set-heavy.yaml
+
+# Compare a new session to an earlier matching workload
+just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml --compare-to .artifacts/profiling/<previous-session>
 ```
 
 ## Build Configuration
@@ -72,13 +84,16 @@ rustflags = [
 
 ## Mode Reference
 
-### Composite Modes
+### Question-First Modes
 
 | Flag | What Runs | Description |
 |------|-----------|-------------|
 | `--cpu` | flamegraph + perf stat + perf record (Linux) or samply + instruments CPU suite [Time Profiler, System Trace] (macOS) | Full CPU analysis |
+| `--scheduler` | perf stat (Linux) or Instruments/System Trace fallback (macOS) + host sampler pack | Run queue, context-switch, and scheduling pressure triage |
 | `--memory` | heaptrack or massif (Linux) or heaptrack or instruments Memory suite [Allocations, Leaks] (macOS) | Heap allocation tracking |
 | `--cache` | cachegrind | Cache locality L1/L2/LL miss rates |
+| `--aof-disk` | perf stat (Linux) or Instruments/System Trace fallback (macOS) + host sampler pack | AOF write path and disk-pressure investigation |
+| `--network` | perf stat or samply/instruments fallback + host sampler pack | Socket, loopback, and network-path diagnostics |
 | `--all` | `--cpu` + `--memory` + `--cache` sequentially | Full profiling gauntlet |
 
 ### Specific Tool Flags
@@ -193,6 +208,23 @@ just profiler --manifest scripts/profiler/manifests/cpu-set-heavy.yaml --duratio
 | `cpu-set-heavy.yaml` | Flamegraph + CPU profiling under SET-heavy load |
 | `full-suite.yaml` | All modes under mixed SET,GET,INCR workload |
 | `memory-write-pressure.yaml` | Heap tracking under write pressure with 64mb maxmemory |
+| `scheduler-read-heavy.yaml` | Scheduler-focused diagnostics under read-heavy pressure |
+| `aof-disk-write-pressure.yaml` | AOF and disk diagnostics under sustained writes |
+| `network-mixed.yaml` | Network-focused diagnostics under mixed load |
+
+## `vortex_bench` Bridge
+
+When you need the profiler to reuse an already defined benchmark workload, use one of these flags instead of `--command`:
+
+```bash
+# Reuse a benchmark manifest as the profiling load source
+just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
+
+# Reuse a previously normalized benchmark request
+just profiler --scheduler --bench-request .artifacts/benchmarks/requests/<request>.json
+```
+
+The profiler now uses `vortex_bench attach` under the hood, writes the attached state file into the current profiler session, and keeps the benchmark request/result artifacts under `bench/` so the profiling session and benchmark workload stay aligned.
 
 ## Standard Optimization Loop
 
@@ -212,6 +244,20 @@ All artifacts land in a timestamped session directory:
 
 ```
 .artifacts/profiling/<YYYYMMDD-HHMMSS>-profiling/
+├── session.json
+├── notes.md
+├── summary.json
+├── summary-compare.json
+├── host/
+│   ├── *-host-telemetry.jsonl
+│   ├── *-host-telemetry-summary.json
+│   ├── process-probe.log
+│   └── socket-summary.log
+├── bench/
+│   ├── environments/
+│   ├── requests/
+│   ├── results/
+│   └── backend-runs/
 ├── flamegraph.svg
 ├── perf.data
 ├── perf-stat.txt
@@ -226,8 +272,11 @@ All artifacts land in a timestamped session directory:
 ├── heaptrack.*.gz
 ├── server-*.log
 ├── load-*.log
+├── summary.log
 └── criterion/
 ```
+
+`session.json` records the session contract, `notes.md` is the engineer note template, `summary.json` is the concise machine-readable summary, and `summary-compare.json` appears when `--compare-to` is used.
 
 ## Tool Installation
 
@@ -282,7 +331,9 @@ scripts/
 ├── profiler.sh                     ← Entry point (arg parsing, dispatch)
 └── profiler/
     ├── common.sh                   ← Colors, OS detection, tool helpers, PING probe
+    ├── bench.sh                    ← vortex_bench attach/run bridge helpers
     ├── build.sh                    ← cargo build --profile profiling
+    ├── host.sh                     ← Host telemetry runner and socket/process logs
     ├── server.sh                   ← Server lifecycle, load generation, cleanup
     ├── cpu.sh                      ← flamegraph, perf, samply, instruments (xctrace)
     ├── memory.sh                   ← heaptrack, massif, instruments allocs/leaks
@@ -290,10 +341,16 @@ scripts/
     ├── criterion.sh                ← cargo bench --profile profiling
     ├── check.sh                    ← Tool availability diagnostics
     ├── parse_manifest.py           ← YAML manifest parser (Python, stateless)
+    ├── prepare_benchmark_bridge.py ← Normalizes bench manifests/requests for profiling
+    ├── summary.sh                  ← Summary lifecycle wrapper
+    ├── write_session_summary.py    ← Machine-readable session summary + comparison
     ├── docs/
     │   └── profiling-workflow.md   ← This document
     └── manifests/
+      ├── aof-disk-write-pressure.yaml
         ├── cpu-set-heavy.yaml
         ├── full-suite.yaml
-        └── memory-write-pressure.yaml
+      ├── memory-write-pressure.yaml
+      ├── network-mixed.yaml
+      └── scheduler-read-heavy.yaml
 ```

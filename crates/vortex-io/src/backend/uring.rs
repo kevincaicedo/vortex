@@ -29,7 +29,10 @@ impl IoUringBackend {
     /// `ring_size` is the number of SQEs (must be power of two).
     /// If `sqpoll` feature is enabled and `sqpoll_idle_ms > 0`, enables SQPOLL mode.
     pub fn new(ring_size: u32, _sqpoll_idle_ms: u32) -> io::Result<Self> {
+        #[cfg(feature = "sqpoll")]
         let mut builder = IoUring::builder();
+        #[cfg(not(feature = "sqpoll"))]
+        let builder = IoUring::builder();
 
         #[cfg(feature = "sqpoll")]
         if _sqpoll_idle_ms > 0 {

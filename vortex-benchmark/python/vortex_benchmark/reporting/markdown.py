@@ -62,23 +62,37 @@ def render_markdown_report(
     chart_paths: dict[str, Path],
 ) -> str:
     host = report_payload.get("host_metadata") or {}
+    validity = report_payload.get("validity") or {}
     databases = report_payload.get("databases") or []
     workloads = report_payload.get("workloads") or []
-    rows = report_payload.get("rows") or []
+    benchmark = report_payload.get("benchmark") or {}
+    diagnostics = report_payload.get("diagnostics") or {}
+    rows = benchmark.get("rows") or report_payload.get("rows") or []
     source_runs = report_payload.get("source_runs") or []
-    aof_overhead = report_payload.get("aof_overhead") or []
-    eviction_rows = report_payload.get("eviction_rows") or []
-    analysis = report_payload.get("analysis") or {}
+    aof_overhead = diagnostics.get("aof_overhead") or report_payload.get("aof_overhead") or []
+    eviction_rows = diagnostics.get("eviction_rows") or report_payload.get("eviction_rows") or []
+    memory_rows = diagnostics.get("memory_rows") or []
+    aof_rows = diagnostics.get("aof_rows") or []
+    diagnostic_summary = diagnostics.get("summary") or {}
+    analysis = benchmark.get("analysis") or report_payload.get("analysis") or {}
 
     lines: list[str] = []
 
     _section_header(lines, report_payload, source_runs, rows)
-    _section_environment(lines, host, source_runs)
+    _section_environment(lines, host, source_runs, validity)
     _section_database_targets(lines, databases)
     _section_workloads(lines, workloads)
     _section_cross_db_comparison(lines, analysis, databases)
     _section_performance_analysis(lines, analysis)
-    _section_detailed_results(lines, rows, aof_overhead, eviction_rows)
+    _section_diagnostics(
+        lines,
+        diagnostic_summary,
+        memory_rows,
+        aof_rows,
+        aof_overhead,
+        eviction_rows,
+    )
+    _section_detailed_results(lines, rows)
     _section_key_insights(lines, analysis)
     _section_visualizations(lines, markdown_path, chart_paths)
     _section_artifacts(lines, report_payload)
@@ -103,7 +117,7 @@ def _section_header(
     lines.append("")
     lines.append(f"- **Generated at:** {payload.get('generated_at', 'n/a')}")
     lines.append(f"- **Source runs:** {len(source_runs)}")
-    lines.append(f"- **Normalized rows:** {len(rows)}")
+    lines.append(f"- **Benchmark series:** {len(rows)}")
     dbs = sorted({r.get("database", "unknown") for r in rows})
     backends = sorted({r.get("backend", "unknown") for r in rows})
     lines.append(f"- **Databases:** {', '.join(dbs) or 'n/a'}")
@@ -115,7 +129,10 @@ def _section_environment(
     lines: list[str],
     host: dict[str, Any],
     source_runs: list[dict[str, Any]],
+    validity: dict[str, Any],
 ) -> None:
+    host_validity = validity.get("host") or {}
+    git_validity = validity.get("git") or {}
     lines.append("## Environment")
     lines.append("")
     lines.append("| Field | Value |")
@@ -131,6 +148,26 @@ def _section_environment(
     lines.append(
         f"| Total memory | {_fmt_bytes(host.get('total_memory_bytes'))} |"
     )
+    lines.append(f"| Evidence tier | {validity.get('evidence_tier') or 'n/a'} |")
+    lines.append(f"| Requested repeat count | {validity.get('requested_repeat_count') or 'n/a'} |")
+    lines.append(
+        f"| Aggregates multiple source runs | {validity.get('report_aggregates_multiple_source_runs', 'n/a')} |"
+    )
+    lines.append(
+        f"| Aggregates multiple replicates | {validity.get('report_aggregates_multiple_replicates', 'n/a')} |"
+    )
+    lines.append(f"| CPU governor | {host_validity.get('cpu_governor') or 'n/a'} |")
+    lines.append(
+        f"| Energy preference | {host_validity.get('energy_performance_preference') or 'n/a'} |"
+    )
+    lines.append(f"| Power profile | {host_validity.get('power_profile') or 'n/a'} |")
+    lines.append(f"| Thermal degraded | {host_validity.get('thermal_degraded')!s} |")
+    lines.append(
+        f"| perf_event_paranoid | {host_validity.get('perf_event_paranoid') or 'n/a'} |"
+    )
+    lines.append(f"| PMU available | {host_validity.get('pmu_available')!s} |")
+    lines.append(f"| Git revision | {git_validity.get('revision') or 'n/a'} |")
+    lines.append(f"| Git dirty | {git_validity.get('dirty')!s} |")
     lines.append("")
 
 
@@ -355,8 +392,10 @@ def _section_performance_analysis(
 ) -> None:
     scalability = analysis.get("scalability") or []
     breakdown = analysis.get("latency_breakdown") or []
+    series_statistics = analysis.get("series_statistics") or []
+    comparison_validity = analysis.get("comparison_validity") or []
     winners = analysis.get("winners") or {}
-    if not scalability and not breakdown and not winners:
+    if not scalability and not breakdown and not series_statistics and not comparison_validity and not winners:
         return
 
     lines.append("---")
@@ -424,6 +463,67 @@ def _section_performance_analysis(
             )
         lines.append("")
 
+    if series_statistics:
+        lines.append("### Replicate Variance")
+        lines.append("")
+        lines.append(
+            "| Database | Backend | Series | Threads | Reps | Throughput Median | Throughput Spread % | Throughput Outliers | P99 Median ms | P99 Spread % | P99 Outliers |"
+        )
+        lines.append(
+            "|----------|---------|--------|--------:|-----:|------------------:|--------------------:|-------------------:|--------------:|-------------:|-------------:|"
+        )
+        for row in series_statistics:
+            lines.append(
+                f"| {row.get('database') or 'n/a'} "
+                f"| {row.get('backend') or 'n/a'} "
+                f"| {row.get('series_label') or 'n/a'} "
+                f"| {row.get('thread_count') or 'n/a'} "
+                f"| {row.get('replicate_count') or 0} "
+                f"| {_fmt_ops(row.get('throughput_median'))} "
+                f"| {_fmt_float(row.get('throughput_spread_pct'), 2)} "
+                f"| {row.get('throughput_outlier_replicates') or 0} "
+                f"| {_fmt_float(row.get('p99_latency_median'), 2)} "
+                f"| {_fmt_float(row.get('p99_latency_spread_pct'), 2)} "
+                f"| {row.get('p99_latency_outlier_replicates') or 0} |"
+            )
+        lines.append("")
+
+    if comparison_validity:
+        lines.append("### Invalid Comparisons")
+        lines.append("")
+        lines.append(
+            "| Backend | Series | Threads | Reason | Signatures |"
+        )
+        lines.append(
+            "|---------|--------|--------:|--------|------------|"
+        )
+        for row in comparison_validity:
+            signatures = "; ".join(
+                ", ".join(
+                    filter(
+                        None,
+                        [
+                            f"dbs={','.join(signature.get('databases') or [])}",
+                            f"svc_threads={signature.get('configured_service_threads')}",
+                            f"aof={signature.get('configured_aof_enabled')}",
+                            f"fsync={signature.get('configured_aof_fsync')}",
+                            f"maxmemory={signature.get('configured_maxmemory')}",
+                            f"eviction={signature.get('configured_eviction_policy')}",
+                            f"mode={signature.get('database_mode')}",
+                        ],
+                    )
+                )
+                for signature in row.get('signatures') or []
+            )
+            lines.append(
+                f"| {row.get('backend') or 'n/a'} "
+                f"| {row.get('series_label') or 'n/a'} "
+                f"| {row.get('thread_count') or 'n/a'} "
+                f"| {row.get('reason') or 'n/a'} "
+                f"| {signatures or 'n/a'} |"
+            )
+        lines.append("")
+
     # Winner by Category
     if winners:
         _render_winners(lines, winners)
@@ -476,26 +576,24 @@ def _render_winners(
 def _section_detailed_results(
     lines: list[str],
     rows: list[dict[str, Any]],
-    aof_overhead: list[dict[str, Any]],
-    eviction_rows: list[dict[str, Any]],
 ) -> None:
     lines.append("---")
     lines.append("")
-    lines.append("## Detailed Results")
+    lines.append("## Benchmark Results")
     lines.append("")
 
     # Full latency & throughput
     lines.append("### Latency And Throughput")
     lines.append("")
     lines.append(
-        "| Database | Backend | Series | Threads "
-        "| Throughput ops/s | Avg ms | P50 ms "
-        "| P99 ms | P99.9 ms | P99.999 ms |"
+        "| Database | Backend | Series | Threads | Reps "
+        "| Throughput Median ops/s | Tp Spread % | Avg ms | P50 ms "
+        "| P99 ms | P99 Spread % | P99.9 ms |"
     )
     lines.append(
-        "|----------|---------|--------|--------:"
-        "|-----------------:|-------:|-------:"
-        "|-------:|---------:|-----------:|"
+        "|----------|---------|--------|--------:|-----:"
+        "|------------------------:|-----------:|-------:|-------:"
+        "|-------:|-------------:|---------:|"
     )
     for row in rows:
         lines.append(
@@ -503,60 +601,160 @@ def _section_detailed_results(
             f"| {row.get('backend') or 'n/a'} "
             f"| {row.get('series_label') or 'n/a'} "
             f"| {row.get('thread_count') or 'n/a'} "
+            f"| {row.get('replicate_count') or 1} "
             f"| {_fmt_ops(row.get('throughput_ops_sec'))} "
+            f"| {_fmt_float(row.get('throughput_ops_sec_spread_pct'), 2)} "
             f"| {_fmt_float(row.get('average_latency_ms'), 2)} "
             f"| {_fmt_float(row.get('p50_latency_ms'))} "
             f"| {_fmt_float(row.get('p99_latency_ms'))} "
-            f"| {_fmt_float(row.get('p99_9_latency_ms'))} "
-            f"| {_fmt_float(row.get('p99_999_latency_ms'))} |"
+            f"| {_fmt_float(row.get('p99_latency_ms_spread_pct'), 2)} "
+            f"| {_fmt_float(row.get('p99_9_latency_ms'))} |"
         )
     if not rows:
         lines.append(
-            "| n/a | n/a | n/a | n/a "
-            "| n/a | n/a | n/a | n/a | n/a | n/a |"
+            "| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
         )
     lines.append("")
 
-    # Memory, Cache, And Eviction
-    lines.append("### Memory, Cache, And Eviction")
+    lines.append("### Cache And Keyspace")
     lines.append("")
     lines.append(
-        "| Database | Backend | Series | Maxmemory | Eviction "
-        "| Memory Delta | RSS Delta | Hit Rate | Evicted Keys |"
+        "| Database | Backend | Series | Threads | Hit Rate | Evicted Keys | Expired Keys |"
     )
     lines.append(
-        "|----------|---------|--------|-----------|----------"
-        "|-------------:|----------:|---------:|-------------:|"
+        "|----------|---------|--------|--------:|---------:|-------------:|-------------:|"
     )
     for row in rows:
         lines.append(
             f"| {row.get('database') or 'n/a'} "
             f"| {row.get('backend') or 'n/a'} "
             f"| {row.get('series_label') or 'n/a'} "
-            f"| {row.get('configured_maxmemory') or 'n/a'} "
-            f"| {row.get('configured_eviction_policy') or 'n/a'} "
-            f"| {_fmt_bytes(row.get('used_memory_delta_bytes'))} "
-            f"| {_fmt_bytes(row.get('process_memory_delta_bytes'))} "
+            f"| {row.get('thread_count') or 'n/a'} "
             f"| {_fmt_float(row.get('cache_hit_rate'))} "
-            f"| {_fmt_float(row.get('evicted_keys_delta'), 0)} |"
+            f"| {_fmt_float(row.get('evicted_keys_delta'), 0)} "
+            f"| {_fmt_float(row.get('expired_keys_delta'), 0)} |"
         )
     if not rows:
-        lines.append(
-            "| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
-        )
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a |")
     lines.append("")
 
-    # AOF Overhead
+
+def _section_diagnostics(
+    lines: list[str],
+    diagnostic_summary: dict[str, Any],
+    memory_rows: list[dict[str, Any]],
+    aof_rows: list[dict[str, Any]],
+    aof_overhead: list[dict[str, Any]],
+    eviction_rows: list[dict[str, Any]],
+) -> None:
+    if not any((diagnostic_summary, memory_rows, aof_rows, aof_overhead, eviction_rows)):
+        return
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## Diagnostic Summary")
+    lines.append("")
+
+    if diagnostic_summary:
+        lines.append("| Field | Value |")
+        lines.append("|-------|-------|")
+        lines.append(
+            f"| Raw diagnostic rows | {diagnostic_summary.get('raw_row_count') or diagnostic_summary.get('normalized_row_count') or 0} |"
+        )
+        lines.append(
+            f"| Rows with host telemetry | {diagnostic_summary.get('rows_with_host_telemetry') or 0} |"
+        )
+        lines.append(
+            f"| Rows with memory diagnostics | {diagnostic_summary.get('rows_with_memory_diagnostics') or 0} |"
+        )
+        lines.append(
+            f"| Rows with reclaim or writeback pressure | {diagnostic_summary.get('rows_with_reclaim_or_writeback_pressure') or 0} |"
+        )
+        lines.append(
+            f"| Rows with AOF diagnostics | {diagnostic_summary.get('rows_with_aof_diagnostics') or 0} |"
+        )
+        lines.append(
+            f"| Rows with AOF fsync pressure | {diagnostic_summary.get('rows_with_aof_fsync_pressure') or 0} |"
+        )
+        lines.append(
+            f"| Max process RSS peak | {_fmt_bytes(diagnostic_summary.get('max_process_rss_peak_bytes'))} |"
+        )
+        lines.append(
+            f"| Max allocator resident after | {_fmt_bytes(diagnostic_summary.get('max_allocator_resident_after_bytes'))} |"
+        )
+        lines.append(
+            f"| Max dirty memory peak | {_fmt_bytes(diagnostic_summary.get('max_system_mem_dirty_peak_bytes'))} |"
+        )
+        lines.append(
+            f"| Max writeback memory peak | {_fmt_bytes(diagnostic_summary.get('max_system_mem_writeback_peak_bytes'))} |"
+        )
+        lines.append(
+            f"| Max disk write delta | {_fmt_bytes(diagnostic_summary.get('max_disk_write_bytes_delta'))} |"
+        )
+        lines.append(
+            f"| Max AOF fsync latency | {_fmt_float(diagnostic_summary.get('max_aof_fsync_latency_ms'), 2)} ms |"
+        )
+        lines.append("")
+
+    if memory_rows:
+        lines.append("### Memory And Reclaim")
+        lines.append("")
+        lines.append(
+            "| Database | Backend | Series | Threads | RSS Peak | Dataset After | Allocator Resident After | Frag Ratio | Dirty Peak | Writeback Peak | Direct Scan | Allocstall |"
+        )
+        lines.append(
+            "|----------|---------|--------|--------:|---------:|--------------:|------------------------:|-----------:|-----------:|---------------:|------------:|-----------:|"
+        )
+        for row in memory_rows:
+            lines.append(
+                f"| {row.get('database') or 'n/a'} "
+                f"| {row.get('backend') or 'n/a'} "
+                f"| {row.get('series_label') or 'n/a'} "
+                f"| {row.get('thread_count') or 'n/a'} "
+                f"| {_fmt_bytes(row.get('process_rss_peak_bytes'))} "
+                f"| {_fmt_bytes(row.get('used_memory_dataset_after_bytes'))} "
+                f"| {_fmt_bytes(row.get('allocator_resident_after_bytes'))} "
+                f"| {_fmt_float(row.get('mem_fragmentation_ratio_after'), 2)} "
+                f"| {_fmt_bytes(row.get('system_mem_dirty_peak_bytes'))} "
+                f"| {_fmt_bytes(row.get('system_mem_writeback_peak_bytes'))} "
+                f"| {_fmt_float(row.get('system_vm_page_scan_direct_delta'), 0)} "
+                f"| {_fmt_float(row.get('system_vm_allocstall_delta'), 0)} |"
+            )
+        lines.append("")
+
+    if aof_rows:
+        lines.append("### AOF And Disk")
+        lines.append("")
+        lines.append(
+            "| Database | Backend | Series | Threads | AOF Size Delta | Process Writes | Disk Writes | Delayed Fsyncs | AOF Fsync Max ms | Pending Fsync Max ms | Writeback Peak |"
+        )
+        lines.append(
+            "|----------|---------|--------|--------:|---------------:|---------------:|------------:|----------------:|------------------:|---------------------:|---------------:|"
+        )
+        for row in aof_rows:
+            lines.append(
+                f"| {row.get('database') or 'n/a'} "
+                f"| {row.get('backend') or 'n/a'} "
+                f"| {row.get('series_label') or 'n/a'} "
+                f"| {row.get('thread_count') or 'n/a'} "
+                f"| {_fmt_bytes(row.get('aof_current_size_delta_bytes'))} "
+                f"| {_fmt_bytes(row.get('process_write_bytes_delta'))} "
+                f"| {_fmt_bytes(row.get('disk_write_bytes_delta'))} "
+                f"| {_fmt_float(row.get('aof_delayed_fsync_delta'), 0)} "
+                f"| {_fmt_float(row.get('latency_aof_fsync_max_after_ms'), 2)} "
+                f"| {_fmt_float(row.get('latency_aof_pending_fsync_max_after_ms'), 2)} "
+                f"| {_fmt_bytes(row.get('system_mem_writeback_peak_bytes'))} |"
+            )
+        lines.append("")
+
     lines.append("### AOF Overhead")
     lines.append("")
     if aof_overhead:
         lines.append(
-            "| Database | Backend | Series | Threads "
-            "| Throughput Overhead % | P99 Overhead % |"
+            "| Database | Backend | Series | Threads | Throughput Overhead % | P99 Overhead % |"
         )
         lines.append(
-            "|----------|---------|--------|---------|"
-            "---------------------:|---------------:|"
+            "|----------|---------|--------|---------|---------------------:|---------------:|"
         )
         for row in aof_overhead:
             lines.append(
@@ -569,22 +767,18 @@ def _section_detailed_results(
             )
     else:
         lines.append(
-            "No comparable baseline and AOF-enabled runs were present "
-            "in the source summaries."
+            "No comparable baseline and AOF-enabled runs were present in the source summaries."
         )
     lines.append("")
 
-    # Eviction Observations
     lines.append("### Eviction Observations")
     lines.append("")
     if eviction_rows:
         lines.append(
-            "| Database | Backend | Series | Threads "
-            "| Evicted Keys | Throughput ops/s |"
+            "| Database | Backend | Series | Threads | Evicted Keys | Throughput ops/s |"
         )
         lines.append(
-            "|----------|---------|--------|---------|"
-            "-------------:|-------------------:|"
+            "|----------|---------|--------|---------|-------------:|-------------------:|"
         )
         for row in eviction_rows:
             lines.append(
@@ -596,9 +790,7 @@ def _section_detailed_results(
                 f"| {_fmt_ops(row.get('throughput_ops_sec'))} |"
             )
     else:
-        lines.append(
-            "No eviction events were observed in the source summaries."
-        )
+        lines.append("No eviction events were observed in the source summaries.")
     lines.append("")
 
 

@@ -42,6 +42,8 @@ class ResolvedBenchmarkSpec:
     resolved_commands: list[str]
     effective_commands: list[str]
     backends: list[str]
+    evidence_tier: str
+    repeat_count: int
     duration: Optional[str]
     mode: Optional[str]
     output_dir: Optional[str]
@@ -178,6 +180,7 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
     manifest_commands = manifest.commands if manifest else []
     manifest_groups = manifest.command_groups if manifest else []
     manifest_backends = manifest.backends if manifest else []
+    manifest_repeat = manifest.repeat if manifest else None
     manifest_environment = manifest.environment if manifest else {}
     manifest_resource_config = manifest.resource_config if manifest else {}
     manifest_runtime_config = manifest.runtime_config if manifest else {}
@@ -273,6 +276,9 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
         raise ValueError("port base must be a positive integer")
     if cpus <= 0:
         raise ValueError("cpus must be a positive integer")
+    repeat_count = int(_coalesce_scalar(getattr(args, "repeat", None), manifest_repeat, 1) or 1)
+    if repeat_count <= 0:
+        raise ValueError("repeat must be a positive integer")
     if threads is not None and threads <= 0:
         raise ValueError("threads must be a positive integer when provided")
     if not isinstance(memory, str) or not memory.strip():
@@ -319,6 +325,8 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
         resolved_commands=resolved_commands,
         effective_commands=effective_commands,
         backends=backends,
+        evidence_tier=str(getattr(args, "evidence_tier", None) or "engineering"),
+        repeat_count=repeat_count,
         duration=_validate_duration(_coalesce_scalar(getattr(args, "duration", None), manifest.duration if manifest else None, None)),
         mode=mode,
         output_dir=output_dir,
@@ -338,6 +346,9 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
 def validate_run_inputs(spec: ResolvedBenchmarkSpec, selected_databases: list[str]) -> None:
     if not selected_databases:
         raise ValueError("run requires at least one database selection via --db, manifest, or state file")
+
+    if spec.repeat_count <= 0:
+        raise ValueError("run repeat count must be a positive integer")
 
     if not (spec.workloads or spec.commands or spec.command_groups):
         raise ValueError(

@@ -158,18 +158,18 @@ just benchmark --setup --workload-manifest vortex-benchmark/manifests/examples/c
 just benchmark-local
 just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
 just benchmark-local --db vortex,redis --native --backend redis-benchmark --command SET,GET,INCR
-just benchmark run --state-file vortex-benchmark/.artifacts/environments/<state>.json --workload uniform-read_heavy --duration 60s
-just benchmark run --state-file vortex-benchmark/.artifacts/environments/<state>.json --workload-manifest vortex-benchmark/manifests/examples/mixed-container.json
-just benchmark run --state-file vortex-benchmark/.artifacts/environments/<state>.json --workload-manifest vortex-benchmark/manifests/examples/aof-everysec-native.yaml
-just benchmark run --state-file vortex-benchmark/.artifacts/environments/<state>.json --backend redis-benchmark --command SET,GET,INCR
-just benchmark run --state-file vortex-benchmark/.artifacts/environments/<state>.json --backend memtier_benchmark --workload uniform-mixed
-just benchmark run --state-file vortex-benchmark/.artifacts/environments/<state>.json --backend custom-rust --workload multi_key_tx_mixed
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json --workload uniform-read_heavy --duration 60s
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json --workload-manifest vortex-benchmark/manifests/examples/mixed-container.json
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json --workload-manifest vortex-benchmark/manifests/examples/aof-everysec-native.yaml
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json --backend redis-benchmark --command SET,GET,INCR
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json --backend memtier_benchmark --workload uniform-mixed
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json --backend custom-rust --workload multi_key_tx_mixed
 just benchmark attach --db vortex --host 127.0.0.1 --port 16379 --pid 4242 --label ttl-profile
-just benchmark report --results-dir vortex-benchmark/.artifacts/results --output-dir vortex-benchmark/.artifacts
-just benchmark teardown --state-file vortex-benchmark/.artifacts/environments/<state>.json
+just benchmark report --results-dir .artifacts/benchmarks/results --output-dir .artifacts/benchmarks
+just benchmark teardown --state-file .artifacts/benchmarks/environments/<state>.json
 ```
 
-Generated artifacts currently live under `vortex-benchmark/.artifacts/`:
+Generated artifacts currently live under `.artifacts/benchmarks/`:
 
 - `environments/` — machine-readable service state files
 - `logs/` — per-service startup and teardown logs
@@ -203,6 +203,7 @@ Manifest files support these top-level sections:
 - `commands`
 - `command_groups`
 - `backends`
+- `repeat`
 - `duration`
 - `environment`
 - `resource_config`

@@ -1,5 +1,7 @@
 # VortexDB Benchmark Methodology
 
+Current tool note: the active operator workflow for `vortex_bench`, `just profiler`, manifest authoring, artifact layout, and optimization practice is documented in `docs/performance-tooling-guide.md`. This file remains useful as historical benchmark context and comparative-methodology background.
+
 This document describes how VortexDB benchmarks are conducted, what hardware is used, and how to reproduce results independently. The benchmark program now has two complementary layers: `redis-benchmark` for point-command throughput and `memtier_benchmark` for mixed Gaussian workloads.
 
 ---

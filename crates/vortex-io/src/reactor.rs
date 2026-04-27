@@ -25,8 +25,8 @@ use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_memory::{ArenaAllocator, BufferPool};
 use vortex_persist::aof::writer::AofFileWriter;
 use vortex_proto::{
-    BorrowedRespTape, CommandFlags, CommandRouter, DispatchResult, FrameRef, IovecWriter,
-    ParseError, RespFrame, RespSerializer, TapeEntry,
+    BorrowedRespTape, CommandFlags, CommandMeta, CommandRouter, DispatchResult, FrameRef,
+    IovecWriter, ParseError, RespFrame, RespSerializer, TapeEntry, uppercase_inplace,
 };
 
 /// Default read buffer size per connection (16 KB).
@@ -1489,8 +1489,13 @@ impl Reactor {
         }
         let mut upper = [0u8; 32];
         upper[..len].copy_from_slice(cmd_name);
-        upper[..len].make_ascii_uppercase();
+        uppercase_inplace(&mut upper[..len]);
         Some((upper, len))
+    }
+
+    #[inline]
+    fn command_requires_keyspace_gate(&self, meta: &CommandMeta) -> bool {
+        meta.flags.contains(CommandFlags::WRITE) || meta.flags.contains(CommandFlags::READ)
     }
 
     fn frame_to_owned_resp(&mut self, frame: &FrameRef<'_>) -> io::Result<Box<[u8]>> {
@@ -1832,7 +1837,7 @@ impl Reactor {
             _ => {}
         }
 
-        match self.command_router.dispatch(frame) {
+        match CommandRouter::dispatch_normalized(frame, command_name) {
             DispatchResult::Dispatch { meta, name, .. } => {
                 if self.aof_writer.is_some()
                     && self.aof_fatal_state.is_failed()
@@ -1842,8 +1847,10 @@ impl Reactor {
                 }
 
                 let clock = CommandClock::new(self.cached_nanos, self.cached_unix_nanos);
-                let executed = {
+                let executed = if self.command_requires_keyspace_gate(meta) {
                     let _command_gate = self.keyspace.enter_command_gate_slot(self.id);
+                    execute_command(&self.keyspace, name, frame, clock)
+                } else {
                     execute_command(&self.keyspace, name, frame, clock)
                 };
                 match executed {
@@ -2774,6 +2781,28 @@ mod tests {
     }
 
     #[test]
+    fn command_gate_is_skipped_for_non_keyspace_commands() {
+        let reactor = test_reactor();
+        let get = vortex_proto::command::lookup_command("GET").expect("GET metadata");
+        let set = vortex_proto::command::lookup_command("SET").expect("SET metadata");
+        let ping = vortex_proto::command::lookup_command("PING").expect("PING metadata");
+        let dbsize = vortex_proto::command::lookup_command("DBSIZE").expect("DBSIZE metadata");
+
+        assert!(reactor.command_requires_keyspace_gate(get));
+        assert!(reactor.command_requires_keyspace_gate(dbsize));
+        assert!(!reactor.command_requires_keyspace_gate(ping));
+        assert!(reactor.command_requires_keyspace_gate(set));
+    }
+
+    #[test]
+    fn read_commands_gate_even_without_expiry() {
+        let reactor = test_reactor();
+        let get = vortex_proto::command::lookup_command("GET").expect("GET metadata");
+
+        assert!(reactor.command_requires_keyspace_gate(get));
+    }
+
+    #[test]
     fn multi_exec_queues_and_returns_array() {
         let mut reactor = test_reactor();
 
@@ -2821,6 +2850,46 @@ mod tests {
         assert_eq!(response_bytes(resp), b"*-1\r\n");
 
         let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
+        assert_eq!(response_bytes(resp), b"$-1\r\n");
+    }
+
+    #[test]
+    fn watch_aborts_when_read_lazily_expires_watched_key() {
+        let mut reactor = test_reactor();
+        reactor.cached_nanos = 0;
+        reactor.cached_unix_nanos = 0;
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            1,
+            b"*5\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n$2\r\nPX\r\n$3\r\n100\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        reactor.cached_nanos = 200_000_000;
+        reactor.cached_unix_nanos = 200_000_000;
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 1, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"$-1\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$6\r\nqueued\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
         assert_eq!(response_bytes(resp), b"$-1\r\n");
     }
 

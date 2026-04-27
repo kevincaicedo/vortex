@@ -21,17 +21,17 @@ run_heaptrack() {
     [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
     # heaptrack owns the process
-    if [[ -n "$command" ]]; then
-        (
-            sleep 5
-            if wait_for_server_ready "$host" "$port" 60; then
+    (
+        sleep 5
+        if wait_for_server_ready "$host" "$port" 60; then
+            if [[ -n "$command" ]]; then
                 generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-heaptrack.log"
-            else
-                warn "Skipping heaptrack load generation because the server never became ready. See ${session}/server-heaptrack.log"
             fi
-        ) &
-        local bg_load=$!
-    fi
+        else
+            warn "Skipping heaptrack load generation because the server never became ready. See ${session}/server-heaptrack.log"
+        fi
+    ) &
+    local bg_load=$!
 
     info "Running: heaptrack vortex-server"
     heaptrack -o "${session}/heaptrack" \
@@ -69,17 +69,17 @@ run_massif() {
     [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
     [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
 
-    if [[ -n "$command" ]]; then
-        (
-            sleep 5
-            if wait_for_server_ready "$host" "$port" 60; then
+    (
+        sleep 5
+        if wait_for_server_ready "$host" "$port" 60; then
+            if [[ -n "$command" ]]; then
                 generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-massif.log"
-            else
-                warn "Skipping massif load generation because the server never became ready. See ${session}/server-massif.log"
             fi
-        ) &
-        local bg_load=$!
-    fi
+        else
+            warn "Skipping massif load generation because the server never became ready. See ${session}/server-massif.log"
+        fi
+    ) &
+    local bg_load=$!
 
     info "Running: valgrind --tool=massif"
     valgrind --tool=massif \

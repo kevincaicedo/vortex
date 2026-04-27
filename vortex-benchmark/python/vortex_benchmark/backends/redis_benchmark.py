@@ -22,7 +22,11 @@ from vortex_benchmark.backends.base import (
     write_json,
 )
 from vortex_benchmark.models import sanitize_identifier, utc_now
-from vortex_benchmark.telemetry import capture_service_snapshot, diff_service_snapshots
+from vortex_benchmark.telemetry import (
+    capture_service_snapshot,
+    diff_service_snapshots,
+    start_host_telemetry_capture,
+)
 
 
 @dataclass(frozen=True)
@@ -268,7 +272,16 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
             command.extend(item.command_args)
 
         snapshot_before = capture_service_snapshot(context.service)
-        _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+        host_telemetry = None
+        telemetry = start_host_telemetry_capture(
+            backend_dir,
+            label=slug,
+            service=context.service,
+        )
+        try:
+            _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+        finally:
+            host_telemetry = telemetry.stop()
         snapshot_after = capture_service_snapshot(context.service)
         metrics = _parse_csv_metrics(stdout_path, label=item.label)
         result_items.append(
@@ -284,6 +297,7 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
                     "before": snapshot_before,
                     "after": snapshot_after,
                     "delta": diff_service_snapshots(snapshot_before, snapshot_after),
+                    "host_telemetry": host_telemetry,
                 },
             }
         )
@@ -323,6 +337,11 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
         artifacts={
             "backend_dir": str(backend_dir),
             "result_json": str(result_path),
+            "host_telemetry_summary_paths": [
+                ((item.get("observability") or {}).get("host_telemetry") or {}).get("summary_path")
+                for item in result_items
+                if ((item.get("observability") or {}).get("host_telemetry") or {}).get("summary_path")
+            ],
         },
         items=result_items,
         notes=notes,

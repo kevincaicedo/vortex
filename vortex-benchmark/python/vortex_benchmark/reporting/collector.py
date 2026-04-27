@@ -73,11 +73,25 @@ def _service_record(state: dict[str, Any], database: str) -> dict[str, Any]:
 
 def _runtime_fields(service: dict[str, Any]) -> dict[str, Any]:
     runtime_config = service.get("runtime_config") or {}
+    resource_config = service.get("resource_config") or {}
     return {
         "configured_aof_enabled": runtime_config.get("aof_enabled"),
         "configured_aof_fsync": runtime_config.get("aof_fsync"),
         "configured_maxmemory": runtime_config.get("maxmemory"),
         "configured_eviction_policy": runtime_config.get("eviction_policy"),
+        "configured_service_threads": resource_config.get("threads"),
+    }
+
+
+def _replicate_fields(record: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    selection = record.get("selection") or {}
+    artifacts = record.get("artifacts") or {}
+    return {
+        "suite_run_id": item.get("suite_run_id") or artifacts.get("suite_run_id") or record.get("suite_run_id"),
+        "replicate_run_id": item.get("replicate_run_id") or artifacts.get("replicate_run_id"),
+        "replicate_index": item.get("replicate_index") or selection.get("replicate_index"),
+        "replicate_count": item.get("replicate_count") or selection.get("replicate_count"),
+        "replicate_id": item.get("replicate_id") or artifacts.get("replicate_id") or selection.get("replicate_id"),
     }
 
 
@@ -86,6 +100,8 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
     before = observability.get("before") or {}
     after = observability.get("after") or {}
     delta = observability.get("delta") or {}
+    host_telemetry = observability.get("host_telemetry") or {}
+    telemetry_summary = host_telemetry.get("summary") or {}
     return {
         "used_memory_before_bytes": before.get("used_memory_bytes"),
         "used_memory_after_bytes": after.get("used_memory_bytes"),
@@ -93,9 +109,39 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "used_memory_rss_before_bytes": before.get("used_memory_rss_bytes"),
         "used_memory_rss_after_bytes": after.get("used_memory_rss_bytes"),
         "used_memory_rss_delta_bytes": delta.get("used_memory_rss_bytes_delta"),
+        "used_memory_dataset_before_bytes": before.get("used_memory_dataset_bytes"),
+        "used_memory_dataset_after_bytes": after.get("used_memory_dataset_bytes"),
+        "used_memory_dataset_delta_bytes": delta.get("used_memory_dataset_bytes_delta"),
+        "used_memory_overhead_before_bytes": before.get("used_memory_overhead_bytes"),
+        "used_memory_overhead_after_bytes": after.get("used_memory_overhead_bytes"),
+        "used_memory_overhead_delta_bytes": delta.get("used_memory_overhead_bytes_delta"),
         "process_memory_before_bytes": before.get("process_memory_bytes"),
         "process_memory_after_bytes": after.get("process_memory_bytes"),
         "process_memory_delta_bytes": delta.get("process_memory_bytes_delta"),
+        "allocator_allocated_before_bytes": before.get("allocator_allocated_bytes"),
+        "allocator_allocated_after_bytes": after.get("allocator_allocated_bytes"),
+        "allocator_allocated_delta_bytes": delta.get("allocator_allocated_bytes_delta"),
+        "allocator_active_before_bytes": before.get("allocator_active_bytes"),
+        "allocator_active_after_bytes": after.get("allocator_active_bytes"),
+        "allocator_active_delta_bytes": delta.get("allocator_active_bytes_delta"),
+        "allocator_resident_before_bytes": before.get("allocator_resident_bytes"),
+        "allocator_resident_after_bytes": after.get("allocator_resident_bytes"),
+        "allocator_resident_delta_bytes": delta.get("allocator_resident_bytes_delta"),
+        "allocator_frag_ratio_before": before.get("allocator_frag_ratio"),
+        "allocator_frag_ratio_after": after.get("allocator_frag_ratio"),
+        "allocator_frag_bytes_before": before.get("allocator_frag_bytes"),
+        "allocator_frag_bytes_after": after.get("allocator_frag_bytes"),
+        "allocator_frag_bytes_delta": delta.get("allocator_frag_bytes_delta"),
+        "allocator_rss_ratio_before": before.get("allocator_rss_ratio"),
+        "allocator_rss_ratio_after": after.get("allocator_rss_ratio"),
+        "allocator_rss_before_bytes": before.get("allocator_rss_bytes"),
+        "allocator_rss_after_bytes": after.get("allocator_rss_bytes"),
+        "allocator_rss_delta_bytes": delta.get("allocator_rss_bytes_delta"),
+        "mem_fragmentation_ratio_before": before.get("mem_fragmentation_ratio"),
+        "mem_fragmentation_ratio_after": after.get("mem_fragmentation_ratio"),
+        "mem_fragmentation_bytes_before": before.get("mem_fragmentation_bytes"),
+        "mem_fragmentation_bytes_after": after.get("mem_fragmentation_bytes"),
+        "mem_fragmentation_bytes_delta": delta.get("mem_fragmentation_bytes_delta"),
         "keyspace_hits_delta": delta.get("keyspace_hits_delta"),
         "keyspace_misses_delta": delta.get("keyspace_misses_delta"),
         "cache_hit_rate": delta.get("cache_hit_rate"),
@@ -107,22 +153,132 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "aof_current_size_before_bytes": before.get("aof_current_size_bytes"),
         "aof_current_size_after_bytes": after.get("aof_current_size_bytes"),
         "aof_current_size_delta_bytes": delta.get("aof_current_size_bytes_delta"),
+        "aof_buffer_length_before_bytes": before.get("aof_buffer_length"),
+        "aof_buffer_length_after_bytes": after.get("aof_buffer_length"),
+        "aof_buffer_length_delta_bytes": delta.get("aof_buffer_length_delta"),
+        "aof_pending_bio_fsync_before": before.get("aof_pending_bio_fsync"),
+        "aof_pending_bio_fsync_after": after.get("aof_pending_bio_fsync"),
+        "aof_pending_bio_fsync_delta": delta.get("aof_pending_bio_fsync_delta"),
+        "aof_delayed_fsync_before": before.get("aof_delayed_fsync"),
+        "aof_delayed_fsync_after": after.get("aof_delayed_fsync"),
+        "aof_delayed_fsync_delta": delta.get("aof_delayed_fsync_delta"),
+        "aof_pending_rewrite_before": before.get("aof_pending_rewrite"),
+        "aof_pending_rewrite_after": after.get("aof_pending_rewrite"),
+        "aof_pending_rewrite_delta": delta.get("aof_pending_rewrite_delta"),
+        "aof_last_write_status_before": before.get("aof_last_write_status"),
+        "aof_last_write_status_after": after.get("aof_last_write_status"),
+        "latency_aof_write_latest_before_ms": before.get("latency_aof_write_latest_ms"),
+        "latency_aof_write_latest_after_ms": after.get("latency_aof_write_latest_ms"),
+        "latency_aof_write_latest_delta_ms": delta.get("latency_aof_write_latest_ms_delta"),
+        "latency_aof_write_max_before_ms": before.get("latency_aof_write_max_ms"),
+        "latency_aof_write_max_after_ms": after.get("latency_aof_write_max_ms"),
+        "latency_aof_write_max_delta_ms": delta.get("latency_aof_write_max_ms_delta"),
+        "latency_aof_fsync_latest_before_ms": before.get("latency_aof_fsync_latest_ms"),
+        "latency_aof_fsync_latest_after_ms": after.get("latency_aof_fsync_latest_ms"),
+        "latency_aof_fsync_latest_delta_ms": delta.get("latency_aof_fsync_latest_ms_delta"),
+        "latency_aof_fsync_max_before_ms": before.get("latency_aof_fsync_max_ms"),
+        "latency_aof_fsync_max_after_ms": after.get("latency_aof_fsync_max_ms"),
+        "latency_aof_fsync_max_delta_ms": delta.get("latency_aof_fsync_max_ms_delta"),
+        "latency_aof_pending_fsync_latest_before_ms": before.get("latency_aof_pending_fsync_latest_ms"),
+        "latency_aof_pending_fsync_latest_after_ms": after.get("latency_aof_pending_fsync_latest_ms"),
+        "latency_aof_pending_fsync_latest_delta_ms": delta.get("latency_aof_pending_fsync_latest_ms_delta"),
+        "latency_aof_pending_fsync_max_before_ms": before.get("latency_aof_pending_fsync_max_ms"),
+        "latency_aof_pending_fsync_max_after_ms": after.get("latency_aof_pending_fsync_max_ms"),
+        "latency_aof_pending_fsync_max_delta_ms": delta.get("latency_aof_pending_fsync_max_ms_delta"),
+        "host_telemetry_supported": host_telemetry.get("supported"),
+        "host_telemetry_samples_path": host_telemetry.get("samples_path"),
+        "host_telemetry_summary_path": host_telemetry.get("summary_path"),
+        "host_telemetry_sample_count": telemetry_summary.get("sample_count"),
+        "host_telemetry_duration_seconds": telemetry_summary.get("duration_seconds"),
+        "system_cpu_utilization_avg_pct": telemetry_summary.get("system_cpu_utilization_avg_pct"),
+        "system_cpu_utilization_peak_pct": telemetry_summary.get("system_cpu_utilization_peak_pct"),
+        "system_cpu_iowait_avg_pct": telemetry_summary.get("system_cpu_iowait_avg_pct"),
+        "system_procs_running_peak": telemetry_summary.get("system_procs_running_peak"),
+        "system_procs_blocked_peak": telemetry_summary.get("system_procs_blocked_peak"),
+        "system_loadavg_1_peak": telemetry_summary.get("system_loadavg_1_peak"),
+        "system_mem_available_min_bytes": telemetry_summary.get("system_mem_available_min_bytes"),
+        "system_mem_dirty_peak_bytes": telemetry_summary.get("system_mem_dirty_peak_bytes"),
+        "system_mem_writeback_peak_bytes": telemetry_summary.get("system_mem_writeback_peak_bytes"),
+        "system_mem_active_file_peak_bytes": telemetry_summary.get("system_mem_active_file_peak_bytes"),
+        "system_mem_inactive_file_peak_bytes": telemetry_summary.get("system_mem_inactive_file_peak_bytes"),
+        "system_mem_slab_reclaimable_peak_bytes": telemetry_summary.get("system_mem_slab_reclaimable_peak_bytes"),
+        "system_swap_free_min_bytes": telemetry_summary.get("system_swap_free_min_bytes"),
+        "system_vm_page_faults_delta": telemetry_summary.get("system_vm_page_faults_delta"),
+        "system_vm_major_page_faults_delta": telemetry_summary.get("system_vm_major_page_faults_delta"),
+        "system_vm_page_scan_kswapd_delta": telemetry_summary.get("system_vm_page_scan_kswapd_delta"),
+        "system_vm_page_scan_direct_delta": telemetry_summary.get("system_vm_page_scan_direct_delta"),
+        "system_vm_page_steal_kswapd_delta": telemetry_summary.get("system_vm_page_steal_kswapd_delta"),
+        "system_vm_page_steal_direct_delta": telemetry_summary.get("system_vm_page_steal_direct_delta"),
+        "system_vm_swap_in_delta": telemetry_summary.get("system_vm_swap_in_delta"),
+        "system_vm_swap_out_delta": telemetry_summary.get("system_vm_swap_out_delta"),
+        "system_vm_allocstall_delta": telemetry_summary.get("system_vm_allocstall_delta"),
+        "system_vm_page_reclaim_delta": telemetry_summary.get("system_vm_page_reclaim_delta"),
+        "process_cpu_utilization_avg_pct": telemetry_summary.get("process_cpu_utilization_avg_pct"),
+        "process_cpu_utilization_peak_pct": telemetry_summary.get("process_cpu_utilization_peak_pct"),
+        "process_rss_peak_bytes": telemetry_summary.get("process_rss_peak_bytes"),
+        "process_minor_faults_delta": telemetry_summary.get("process_minor_faults_delta"),
+        "process_major_faults_delta": telemetry_summary.get("process_major_faults_delta"),
+        "process_read_bytes_delta": telemetry_summary.get("process_read_bytes_delta"),
+        "process_write_bytes_delta": telemetry_summary.get("process_write_bytes_delta"),
+        "process_cancelled_write_bytes_delta": telemetry_summary.get("process_cancelled_write_bytes_delta"),
+        "process_syscr_delta": telemetry_summary.get("process_syscr_delta"),
+        "process_syscw_delta": telemetry_summary.get("process_syscw_delta"),
+        "process_voluntary_ctx_switches_delta": telemetry_summary.get("process_voluntary_ctx_switches_delta"),
+        "process_nonvoluntary_ctx_switches_delta": telemetry_summary.get("process_nonvoluntary_ctx_switches_delta"),
+        "network_total_rx_bytes_delta": telemetry_summary.get("network_total_rx_bytes_delta"),
+        "network_total_tx_bytes_delta": telemetry_summary.get("network_total_tx_bytes_delta"),
+        "network_total_rx_errors_delta": telemetry_summary.get("network_total_rx_errors_delta"),
+        "network_total_tx_errors_delta": telemetry_summary.get("network_total_tx_errors_delta"),
+        "network_loopback_rx_bytes_delta": telemetry_summary.get("network_loopback_rx_bytes_delta"),
+        "network_loopback_tx_bytes_delta": telemetry_summary.get("network_loopback_tx_bytes_delta"),
+        "disk_read_bytes_delta": telemetry_summary.get("disk_read_bytes_delta"),
+        "disk_write_bytes_delta": telemetry_summary.get("disk_write_bytes_delta"),
+        "disk_io_time_delta_ms": telemetry_summary.get("disk_io_time_delta_ms"),
+        "disk_io_in_progress_peak": telemetry_summary.get("disk_io_in_progress_peak"),
     }
+
+
+def _detect_report_aggregates_multiple_replicates(rows: list[dict[str, Any]]) -> bool:
+    seen: dict[tuple[Any, ...], set[str]] = {}
+    for row in rows:
+        key = (
+            row.get("database"),
+            row.get("backend"),
+            row.get("series_kind"),
+            row.get("series_label"),
+            row.get("thread_count"),
+            row.get("configured_aof_enabled"),
+            row.get("configured_aof_fsync"),
+            row.get("configured_maxmemory"),
+            row.get("configured_eviction_policy"),
+        )
+        replicate_source = str(
+            row.get("replicate_run_id")
+            or row.get("run_id")
+            or row.get("source_summary")
+            or ""
+        )
+        seen.setdefault(key, set()).add(replicate_source)
+    return any(len(replicate_sources) > 1 for replicate_sources in seen.values())
 
 
 def _normalize_redis_rows(
     result: dict[str, Any],
+    record: dict[str, Any],
     summary: dict[str, Any],
     request: dict[str, Any],
     service: dict[str, Any],
     summary_path: Path,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for item in result.get("items", []):
+    record_items = record.get("items") or []
+    for index, item in enumerate(result.get("items", [])):
+        record_item = record_items[index] if index < len(record_items) else {}
         metrics = item.get("metrics") or {}
         rows.append(
             {
-                "run_id": summary.get("run_id"),
+                "run_id": (_replicate_fields(record, record_item).get("replicate_run_id") or summary.get("run_id")),
+                **_replicate_fields(record, record_item),
                 "environment_id": summary.get("environment_id"),
                 "benchmark_date_time": summary.get("generated_at"),
                 "database": result.get("database"),
@@ -151,6 +307,7 @@ def _normalize_redis_rows(
 
 def _normalize_memtier_rows(
     result: dict[str, Any],
+    record: dict[str, Any],
     summary: dict[str, Any],
     request: dict[str, Any],
     service: dict[str, Any],
@@ -162,12 +319,15 @@ def _normalize_memtier_rows(
         if isinstance(definition, dict)
     }
     rows: list[dict[str, Any]] = []
-    for item in result.get("items", []):
+    record_items = record.get("items") or []
+    for index, item in enumerate(result.get("items", [])):
+        record_item = record_items[index] if index < len(record_items) else {}
         totals = ((item.get("metrics") or {}).get("totals") or {})
         workload = item.get("workload")
         rows.append(
             {
-                "run_id": summary.get("run_id"),
+                "run_id": (_replicate_fields(record, record_item).get("replicate_run_id") or summary.get("run_id")),
+                **_replicate_fields(record, record_item),
                 "environment_id": summary.get("environment_id"),
                 "benchmark_date_time": summary.get("generated_at"),
                 "database": result.get("database"),
@@ -196,6 +356,7 @@ def _normalize_memtier_rows(
 
 def _normalize_custom_rows(
     result: dict[str, Any],
+    record: dict[str, Any],
     summary: dict[str, Any],
     request: dict[str, Any],
     service: dict[str, Any],
@@ -207,12 +368,15 @@ def _normalize_custom_rows(
         if isinstance(definition, dict)
     }
     rows: list[dict[str, Any]] = []
-    for item in result.get("items", []):
+    record_items = record.get("items") or []
+    for index, item in enumerate(result.get("items", [])):
+        record_item = record_items[index] if index < len(record_items) else {}
         metrics = item.get("metrics") or {}
         workload = item.get("workload")
         rows.append(
             {
-                "run_id": summary.get("run_id"),
+                "run_id": (_replicate_fields(record, record_item).get("replicate_run_id") or summary.get("run_id")),
+                **_replicate_fields(record, record_item),
                 "environment_id": summary.get("environment_id"),
                 "benchmark_date_time": summary.get("generated_at"),
                 "database": result.get("database"),
@@ -247,11 +411,11 @@ def _normalize_rows(summary_path: Path, summary: dict[str, Any], request: dict[s
         service = _service_record(state, record.get("database", ""))
         backend = record.get("backend")
         if backend == "redis-benchmark":
-            rows.extend(_normalize_redis_rows(backend_result, summary, request, service, summary_path))
+            rows.extend(_normalize_redis_rows(backend_result, record, summary, request, service, summary_path))
         elif backend == "memtier_benchmark":
-            rows.extend(_normalize_memtier_rows(backend_result, summary, request, service, summary_path))
+            rows.extend(_normalize_memtier_rows(backend_result, record, summary, request, service, summary_path))
         elif backend == "custom-rust":
-            rows.extend(_normalize_custom_rows(backend_result, summary, request, service, summary_path))
+            rows.extend(_normalize_custom_rows(backend_result, record, summary, request, service, summary_path))
     return rows
 
 
@@ -294,12 +458,157 @@ def _build_aof_overhead(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return comparisons
 
 
+def _row_identity(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "database": row.get("database"),
+        "backend": row.get("backend"),
+        "series_kind": row.get("series_kind"),
+        "series_label": row.get("series_label"),
+        "thread_count": row.get("thread_count"),
+        "configured_aof_enabled": row.get("configured_aof_enabled"),
+        "configured_aof_fsync": row.get("configured_aof_fsync"),
+        "configured_maxmemory": row.get("configured_maxmemory"),
+        "configured_eviction_policy": row.get("configured_eviction_policy"),
+        "source_summary": row.get("source_summary"),
+    }
+
+
+def _max_numeric(rows: list[dict[str, Any]], key: str) -> Optional[float]:
+    values = [
+        float(value)
+        for value in (_coerce_float(row.get(key)) for row in rows)
+        if value is not None
+    ]
+    if not values:
+        return None
+    return max(values)
+
+
+def _build_memory_diagnostics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for row in rows:
+        diagnostics.append(
+            {
+                **_row_identity(row),
+                "throughput_ops_sec": row.get("throughput_ops_sec"),
+                "process_rss_peak_bytes": row.get("process_rss_peak_bytes"),
+                "used_memory_rss_after_bytes": row.get("used_memory_rss_after_bytes"),
+                "used_memory_dataset_after_bytes": row.get("used_memory_dataset_after_bytes"),
+                "used_memory_overhead_after_bytes": row.get("used_memory_overhead_after_bytes"),
+                "allocator_allocated_after_bytes": row.get("allocator_allocated_after_bytes"),
+                "allocator_active_after_bytes": row.get("allocator_active_after_bytes"),
+                "allocator_resident_after_bytes": row.get("allocator_resident_after_bytes"),
+                "allocator_frag_ratio_after": row.get("allocator_frag_ratio_after"),
+                "mem_fragmentation_ratio_after": row.get("mem_fragmentation_ratio_after"),
+                "process_minor_faults_delta": row.get("process_minor_faults_delta"),
+                "process_major_faults_delta": row.get("process_major_faults_delta"),
+                "system_mem_dirty_peak_bytes": row.get("system_mem_dirty_peak_bytes"),
+                "system_mem_writeback_peak_bytes": row.get("system_mem_writeback_peak_bytes"),
+                "system_vm_page_scan_kswapd_delta": row.get("system_vm_page_scan_kswapd_delta"),
+                "system_vm_page_scan_direct_delta": row.get("system_vm_page_scan_direct_delta"),
+                "system_vm_allocstall_delta": row.get("system_vm_allocstall_delta"),
+                "system_vm_swap_out_delta": row.get("system_vm_swap_out_delta"),
+            }
+        )
+    return diagnostics
+
+
+def _build_aof_diagnostics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for row in rows:
+        aof_enabled = row.get("configured_aof_enabled") is True or row.get("aof_enabled_after") is True
+        has_aof_signal = any(
+            row.get(key) is not None
+            for key in (
+                "aof_current_size_delta_bytes",
+                "aof_delayed_fsync_delta",
+                "aof_pending_bio_fsync_after",
+                "latency_aof_fsync_max_after_ms",
+                "latency_aof_write_max_after_ms",
+            )
+        )
+        if not aof_enabled and not has_aof_signal:
+            continue
+
+        diagnostics.append(
+            {
+                **_row_identity(row),
+                "aof_enabled_after": row.get("aof_enabled_after"),
+                "aof_current_size_delta_bytes": row.get("aof_current_size_delta_bytes"),
+                "aof_buffer_length_after_bytes": row.get("aof_buffer_length_after_bytes"),
+                "aof_pending_bio_fsync_after": row.get("aof_pending_bio_fsync_after"),
+                "aof_delayed_fsync_delta": row.get("aof_delayed_fsync_delta"),
+                "aof_last_write_status_after": row.get("aof_last_write_status_after"),
+                "process_write_bytes_delta": row.get("process_write_bytes_delta"),
+                "process_cancelled_write_bytes_delta": row.get("process_cancelled_write_bytes_delta"),
+                "process_syscw_delta": row.get("process_syscw_delta"),
+                "disk_write_bytes_delta": row.get("disk_write_bytes_delta"),
+                "disk_io_time_delta_ms": row.get("disk_io_time_delta_ms"),
+                "system_mem_writeback_peak_bytes": row.get("system_mem_writeback_peak_bytes"),
+                "latency_aof_write_max_after_ms": row.get("latency_aof_write_max_after_ms"),
+                "latency_aof_fsync_max_after_ms": row.get("latency_aof_fsync_max_after_ms"),
+                "latency_aof_pending_fsync_max_after_ms": row.get("latency_aof_pending_fsync_max_after_ms"),
+            }
+        )
+    return diagnostics
+
+
+def _build_diagnostic_summary(
+    rows: list[dict[str, Any]],
+    memory_rows: list[dict[str, Any]],
+    aof_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reclaim_rows = [
+        row
+        for row in memory_rows
+        if any(
+            (_coerce_float(row.get(key)) or 0.0) > 0.0
+            for key in (
+                "system_mem_writeback_peak_bytes",
+                "system_vm_page_scan_kswapd_delta",
+                "system_vm_page_scan_direct_delta",
+                "system_vm_allocstall_delta",
+                "system_vm_swap_out_delta",
+            )
+        )
+    ]
+    aof_pressure_rows = [
+        row
+        for row in aof_rows
+        if any(
+            (_coerce_float(row.get(key)) or 0.0) > 0.0
+            for key in (
+                "aof_delayed_fsync_delta",
+                "aof_pending_bio_fsync_after",
+                "latency_aof_fsync_max_after_ms",
+                "latency_aof_pending_fsync_max_after_ms",
+            )
+        )
+    ]
+    return {
+        "raw_row_count": len(rows),
+        "normalized_row_count": len(rows),
+        "rows_with_host_telemetry": sum(1 for row in rows if row.get("host_telemetry_supported")),
+        "rows_with_memory_diagnostics": len(memory_rows),
+        "rows_with_reclaim_or_writeback_pressure": len(reclaim_rows),
+        "rows_with_aof_diagnostics": len(aof_rows),
+        "rows_with_aof_fsync_pressure": len(aof_pressure_rows),
+        "max_process_rss_peak_bytes": _max_numeric(memory_rows, "process_rss_peak_bytes"),
+        "max_allocator_resident_after_bytes": _max_numeric(memory_rows, "allocator_resident_after_bytes"),
+        "max_system_mem_dirty_peak_bytes": _max_numeric(memory_rows, "system_mem_dirty_peak_bytes"),
+        "max_system_mem_writeback_peak_bytes": _max_numeric(memory_rows, "system_mem_writeback_peak_bytes"),
+        "max_disk_write_bytes_delta": _max_numeric(aof_rows, "disk_write_bytes_delta"),
+        "max_aof_fsync_latency_ms": _max_numeric(aof_rows, "latency_aof_fsync_max_after_ms"),
+    }
+
+
 def build_report_payload(summary_paths: list[Path], title: Optional[str] = None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     host_metadata: dict[str, Any] | None = None
     database_records: dict[str, dict[str, Any]] = {}
     workloads: dict[str, dict[str, Any]] = {}
     source_runs: list[dict[str, Any]] = []
+    report_validity: dict[str, Any] | None = None
 
     for path in summary_paths:
         summary = _read_json(path)
@@ -331,9 +640,12 @@ def build_report_payload(summary_paths: list[Path], title: Optional[str] = None)
                 "generated_at": summary.get("generated_at"),
                 "selected_databases": summary.get("selected_databases", []),
                 "resolved_backends": summary.get("resolved_backends", []),
+                "validity": summary.get("validity") or request.get("validity") or {},
             }
         )
         rows.extend(_normalize_rows(path, summary, request, state))
+        if report_validity is None:
+            report_validity = dict(summary.get("validity") or request.get("validity") or {})
 
     rows.sort(
         key=lambda row: (
@@ -344,14 +656,35 @@ def build_report_payload(summary_paths: list[Path], title: Optional[str] = None)
         )
     )
 
+    normalized_validity = dict(report_validity or {})
+    normalized_validity["report_aggregates_multiple_source_runs"] = len(source_runs) > 1
+    normalized_validity["report_aggregates_multiple_replicates"] = _detect_report_aggregates_multiple_replicates(rows)
+    aof_overhead = _build_aof_overhead(rows)
+    eviction_rows = [row for row in rows if row.get("evicted_keys_delta") not in {None, 0}]
+    memory_rows = _build_memory_diagnostics(rows)
+    aof_rows = _build_aof_diagnostics(rows)
+    diagnostics = {
+        "summary": _build_diagnostic_summary(rows, memory_rows, aof_rows),
+        "memory_rows": memory_rows,
+        "aof_rows": aof_rows,
+        "aof_overhead": aof_overhead,
+        "eviction_rows": eviction_rows,
+    }
+
     return {
         "schema_version": 1,
         "title": title or "Vortex Benchmark Report",
         "source_runs": source_runs,
         "host_metadata": host_metadata or capture_host_metadata(),
+        "validity": normalized_validity,
         "databases": [database_records[key] for key in sorted(database_records)],
         "workloads": [workloads[key] for key in sorted(workloads)],
+        "benchmark": {
+            "rows": rows,
+            "analysis": {},
+        },
+        "diagnostics": diagnostics,
         "rows": rows,
-        "aof_overhead": _build_aof_overhead(rows),
-        "eviction_rows": [row for row in rows if row.get("evicted_keys_delta") not in {None, 0}],
+        "aof_overhead": aof_overhead,
+        "eviction_rows": eviction_rows,
     }

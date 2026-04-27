@@ -20,7 +20,7 @@ just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native
 just benchmark-local --db vortex,redis --native --backend custom-rust --workload multi_key_only
 ```
 
-`just benchmark-local` runs setup, run, report, and teardown as one operation. When no arguments are provided it defaults to `vortex-benchmark/manifests/examples/local-native-full-cycle.yaml` and writes artifacts under `vortex-benchmark/.artifacts/local-dev/`.
+`just benchmark-local` runs setup, run, report, and teardown as one operation. When no arguments are provided it defaults to `vortex-benchmark/manifests/examples/local-native-full-cycle.yaml` and writes artifacts under `.artifacts/benchmarks/local-dev/`.
 
 ## Quick Start
 
@@ -34,16 +34,16 @@ bash vortex-benchmark/bin/vortex_bench setup \
   --duration 30s
 
 bash vortex-benchmark/bin/vortex_bench run \
-  --state-file vortex-benchmark/.artifacts/environments/<state>.json \
+  --state-file .artifacts/benchmarks/environments/<state>.json \
   --backend redis-benchmark \
   --command SET,GET,INCR
 
 bash vortex-benchmark/bin/vortex_bench report \
-  --results-dir vortex-benchmark/.artifacts/results \
-  --output-dir vortex-benchmark/.artifacts
+  --results-dir .artifacts/benchmarks/results \
+  --output-dir .artifacts/benchmarks
 
 bash vortex-benchmark/bin/vortex_bench teardown \
-  --state-file vortex-benchmark/.artifacts/environments/<state>.json
+  --state-file .artifacts/benchmarks/environments/<state>.json
 ```
 
 Attach an already running profiled server:
@@ -57,10 +57,18 @@ bash vortex-benchmark/bin/vortex_bench attach \
   --label ttl-profile
 
 bash vortex-benchmark/bin/vortex_bench run \
-  --state-file vortex-benchmark/.artifacts/environments/<attached-state>.json \
+  --state-file .artifacts/benchmarks/environments/<attached-state>.json \
   --backend redis-benchmark \
   --command SET,GET,INCR
 ```
+
+Citation-grade repeatability can live in the manifest itself:
+
+```bash
+just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark-repeat.yaml
+```
+
+CLI `--repeat` still overrides the manifest value when you want to change replicate count without editing the scenario file.
 
 Explicit AOF scenario:
 
@@ -115,7 +123,7 @@ These values are recorded in the saved environment state. Later `run` commands v
 
 ## Artifact Layout
 
-The default artifact root is `vortex-benchmark/.artifacts/` and contains:
+The default artifact root is `.artifacts/benchmarks/` under the repository root and contains:
 
 - `environments/` — saved setup state files
 - `logs/` — per-service startup and teardown logs

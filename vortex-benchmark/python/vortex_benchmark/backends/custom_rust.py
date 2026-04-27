@@ -22,7 +22,22 @@ from vortex_benchmark.backends.base import (
 )
 from vortex_benchmark.env import resolve_benchmark_root
 from vortex_benchmark.models import sanitize_identifier, utc_now
-from vortex_benchmark.telemetry import capture_service_snapshot, diff_service_snapshots
+from vortex_benchmark.telemetry import (
+    capture_service_snapshot,
+    diff_service_snapshots,
+    start_host_telemetry_capture,
+)
+
+
+def _resolve_result_json(item_dir: Path) -> Path | None:
+    candidates = [
+        path
+        for path in sorted(item_dir.glob("*.json"))
+        if not path.name.endswith("-host-telemetry-summary.json")
+    ]
+    if not candidates:
+        return None
+    return candidates[0]
 
 
 def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecord:
@@ -120,18 +135,27 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
             ]
 
             snapshot_before = capture_service_snapshot(context.service)
-            _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+            host_telemetry = None
+            telemetry = start_host_telemetry_capture(
+                item_dir,
+                label="custom-rust",
+                service=context.service,
+            )
+            try:
+                _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+            finally:
+                host_telemetry = telemetry.stop()
             snapshot_after = capture_service_snapshot(context.service)
             total_elapsed += elapsed
             run_commands.append(quote_command(command))
 
-            result_files = sorted(item_dir.glob("*.json"))
-            if not result_files:
+            result_file = _resolve_result_json(item_dir)
+            if result_file is None:
                 raise BackendError(
                     f"custom-rust did not produce a JSON result for workload {workload} thread count {thread_count}"
                 )
 
-            payload = read_json(result_files[0])
+            payload = read_json(result_file)
             items.append(
                 {
                     "workload": payload.get("workload"),
@@ -140,7 +164,7 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
                     "duration_seconds": round(elapsed, 6),
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
-                    "json_path": str(result_files[0]),
+                    "json_path": str(result_file),
                     "metrics": {
                         "total_ops": payload.get("total_ops"),
                         "aggregate_throughput_ops_sec": payload.get("aggregate_throughput_ops_sec"),
@@ -156,6 +180,7 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
                         "before": snapshot_before,
                         "after": snapshot_after,
                         "delta": diff_service_snapshots(snapshot_before, snapshot_after),
+                        "host_telemetry": host_telemetry,
                     },
                 }
             )
@@ -210,6 +235,11 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
             "result_json": str(result_path),
             "build_stdout": str(build_stdout),
             "build_stderr": str(build_stderr),
+            "host_telemetry_summary_paths": [
+                ((item.get("observability") or {}).get("host_telemetry") or {}).get("summary_path")
+                for item in items
+                if ((item.get("observability") or {}).get("host_telemetry") or {}).get("summary_path")
+            ],
         },
         items=items,
         notes=notes,

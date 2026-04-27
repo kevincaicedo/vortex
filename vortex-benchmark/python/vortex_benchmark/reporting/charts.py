@@ -298,8 +298,14 @@ def _render_heatmap_dashboard(
         {r.get("database") for r in rows if r.get("database")}
     )
 
+    def _label(value: Any, fallback: str = "?") -> str:
+        if value is None:
+            return fallback
+        text = str(value).strip()
+        return text or fallback
+
     def _series_key(r: dict[str, Any]) -> str:
-        parts = [r.get("backend", "?"), r.get("series_label", "?")]
+        parts = [_label(r.get("backend")), _label(r.get("series_label"), "unlabeled")]
         if r.get("thread_count") is not None:
             parts.append(f"{r['thread_count']}T")
         return "/".join(parts)

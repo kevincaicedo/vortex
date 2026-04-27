@@ -41,10 +41,15 @@ run_flamegraph() {
         >"${session}/server-flamegraph.log" 2>&1) &
     local tool_pid=$!
 
+    local target_ready=false
+    sleep 4
+    if wait_for_server_ready "$host" "$port" 30; then
+        target_ready=true
+    fi
+
     # Foreground handles the load
     if [[ -n "$command" ]]; then
-        sleep 4
-        if wait_for_server_ready "$host" "$port" 30; then
+        if [[ "$target_ready" == "true" ]]; then
             generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-flamegraph.log"
         else
             warn "Skipping load generation because the flamegraph target never became ready. See ${session}/server-flamegraph.log"
@@ -172,9 +177,14 @@ run_samply() {
         >"${session}/server-samply.log" 2>&1) &
     local tool_pid=$!
 
+    local target_ready=false
+    sleep 4
+    if wait_for_server_ready "$host" "$port" 30; then
+        target_ready=true
+    fi
+
     if [[ -n "$command" ]]; then
-        sleep 4
-        if wait_for_server_ready "$host" "$port" 30; then
+        if [[ "$target_ready" == "true" ]]; then
             generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-samply.log"
         else
             warn "Skipping load generation because the samply target never became ready. See ${session}/server-samply.log"
@@ -283,5 +293,56 @@ run_cpu_all() {
         else
             warn "Xcode Instruments not installed — skipping"
         fi
+    fi
+}
+
+run_scheduler_focus() {
+    local session="$1"
+    shift
+
+    info "Running scheduler diagnostics for ${OS}..."
+
+    if [[ "$OS" == "linux" ]] && has_cmd perf; then
+        run_perf_stat "$session" "$@"
+    elif [[ "$OS" == "macos" ]] && has_cmd xcrun; then
+        run_instruments "$session" "$@"
+    elif has_cmd samply; then
+        run_samply "$session" "$@"
+    else
+        fatal "No scheduler-focused profiler tool is available on this host."
+    fi
+}
+
+run_aof_disk_focus() {
+    local session="$1"
+    shift
+
+    info "Running AOF/disk diagnostics for ${OS}..."
+
+    if [[ "$OS" == "linux" ]] && has_cmd perf; then
+        run_perf_stat "$session" "$@"
+    elif [[ "$OS" == "macos" ]] && has_cmd xcrun; then
+        run_instruments "$session" "$@"
+    elif has_cmd samply; then
+        run_samply "$session" "$@"
+    else
+        fatal "No disk-focused profiler tool is available on this host."
+    fi
+}
+
+run_network_focus() {
+    local session="$1"
+    shift
+
+    info "Running network diagnostics for ${OS}..."
+
+    if [[ "$OS" == "linux" ]] && has_cmd perf; then
+        run_perf_stat "$session" "$@"
+    elif has_cmd samply; then
+        run_samply "$session" "$@"
+    elif [[ "$OS" == "macos" ]] && has_cmd xcrun; then
+        run_instruments "$session" "$@"
+    else
+        fatal "No network-focused profiler tool is available on this host."
     fi
 }

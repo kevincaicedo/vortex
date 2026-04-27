@@ -28,7 +28,11 @@ from vortex_benchmark.backends.base import (
 )
 from vortex_benchmark.catalog import get_workload_definition
 from vortex_benchmark.models import sanitize_identifier, utc_now
-from vortex_benchmark.telemetry import capture_service_snapshot, diff_service_snapshots
+from vortex_benchmark.telemetry import (
+    capture_service_snapshot,
+    diff_service_snapshots,
+    start_host_telemetry_capture,
+)
 
 
 def _redis_cli(service, args: list[str], *, input_text: str = "") -> subprocess.CompletedProcess[str]:
@@ -242,7 +246,16 @@ def run_memtier_backend(context: BackendRunContext) -> BackendExecutionRecord:
                 command.extend(["--rate-limiting", str(rate_limiting)])
 
             snapshot_before = capture_service_snapshot(context.service)
-            _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+            host_telemetry = None
+            telemetry = start_host_telemetry_capture(
+                backend_dir,
+                label=stem,
+                service=context.service,
+            )
+            try:
+                _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+            finally:
+                host_telemetry = telemetry.stop()
             snapshot_after = capture_service_snapshot(context.service)
             metrics = _parse_memtier_json(json_path)
             hdr_files = sorted(str(path) for path in backend_dir.glob(f"{stem}-hdr*"))
@@ -261,6 +274,7 @@ def run_memtier_backend(context: BackendRunContext) -> BackendExecutionRecord:
                         "before": snapshot_before,
                         "after": snapshot_after,
                         "delta": diff_service_snapshots(snapshot_before, snapshot_after),
+                        "host_telemetry": host_telemetry,
                     },
                 }
             )
@@ -316,6 +330,11 @@ def run_memtier_backend(context: BackendRunContext) -> BackendExecutionRecord:
         artifacts={
             "backend_dir": str(backend_dir),
             "result_json": str(result_path),
+            "host_telemetry_summary_paths": [
+                ((item.get("observability") or {}).get("host_telemetry") or {}).get("summary_path")
+                for item in items
+                if ((item.get("observability") or {}).get("host_telemetry") or {}).get("summary_path")
+            ],
         },
         items=items,
         notes=notes,

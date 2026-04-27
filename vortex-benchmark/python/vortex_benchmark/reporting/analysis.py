@@ -3,7 +3,27 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from statistics import mean, median, quantiles, stdev
 from typing import Any, Optional
+
+
+_METRIC_FIELDS = (
+    "throughput_ops_sec",
+    "average_latency_ms",
+    "p50_latency_ms",
+    "p99_latency_ms",
+    "p99_9_latency_ms",
+    "p99_999_latency_ms",
+)
+
+_COMPARISON_SIGNATURE_FIELDS = (
+    "configured_service_threads",
+    "configured_aof_enabled",
+    "configured_aof_fsync",
+    "configured_maxmemory",
+    "configured_eviction_policy",
+    "database_mode",
+)
 
 
 def _fmt_ops(value: Optional[float]) -> str:
@@ -18,12 +38,198 @@ def _fmt_ops(value: Optional[float]) -> str:
     return f"{v:,.0f}"
 
 
+def _replicate_group_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("database"),
+        row.get("backend"),
+        row.get("series_kind"),
+        row.get("series_label"),
+        row.get("thread_count"),
+        row.get("configured_service_threads"),
+        row.get("configured_aof_enabled"),
+        row.get("configured_aof_fsync"),
+        row.get("configured_maxmemory"),
+        row.get("configured_eviction_policy"),
+        row.get("database_mode"),
+        row.get("database_version"),
+    )
+
+
+def _comparison_group_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("backend"),
+        row.get("series_kind"),
+        row.get("series_label"),
+        row.get("thread_count"),
+    )
+
+
+def _comparison_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(row.get(field) for field in _COMPARISON_SIGNATURE_FIELDS)
+
+
+def _metric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        value = row.get(key)
+        if value is None:
+            continue
+        values.append(float(value))
+    return values
+
+
+def _spread_pct(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    med = median(values)
+    if med <= 0:
+        return None
+    return ((max(values) - min(values)) / med) * 100.0
+
+
+def _outlier_count(values: list[float]) -> int:
+    if len(values) < 4:
+        return 0
+    ordered = sorted(values)
+    q1, _, q3 = quantiles(ordered, n=4, method="inclusive")
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    return sum(1 for value in ordered if value < lower or value > upper)
+
+
+def _build_series_statistics(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_replicate_group_key(row)].append(row)
+
+    aggregated_rows: list[dict[str, Any]] = []
+    series_statistics: list[dict[str, Any]] = []
+
+    for key in sorted(grouped):
+        group = sorted(
+            grouped[key],
+            key=lambda row: (
+                row.get("replicate_index") or 0,
+                str(row.get("source_summary") or ""),
+                str(row.get("run_id") or ""),
+            ),
+        )
+        base = dict(group[0])
+        base["suite_run_id"] = base.get("suite_run_id") or base.get("run_id")
+        base["replicate_count"] = len(group)
+        base["replicate_indexes"] = [row.get("replicate_index") for row in group]
+        base["replicate_run_ids"] = [row.get("replicate_run_id") for row in group]
+        base["source_summary_count"] = len(
+            {str(row.get("source_summary") or "") for row in group}
+        )
+        if len(group) > 1:
+            base["run_id"] = base.get("suite_run_id")
+            base["replicate_run_id"] = None
+            base["replicate_index"] = None
+            base["replicate_id"] = None
+
+        stats_entry: dict[str, Any] = {
+            "database": base.get("database"),
+            "backend": base.get("backend"),
+            "series_kind": base.get("series_kind"),
+            "series_label": base.get("series_label"),
+            "thread_count": base.get("thread_count"),
+            "replicate_count": len(group),
+        }
+
+        for metric in _METRIC_FIELDS:
+            values = _metric_values(group, metric)
+            if not values:
+                continue
+            med = median(values)
+            base[metric] = med
+            base[f"{metric}_min"] = min(values)
+            base[f"{metric}_max"] = max(values)
+            base[f"{metric}_mean"] = mean(values)
+            base[f"{metric}_stdev"] = stdev(values) if len(values) > 1 else None
+            base[f"{metric}_spread_pct"] = _spread_pct(values)
+
+            stats_key = metric.removesuffix("_ops_sec").removesuffix("_ms")
+            stats_entry[f"{stats_key}_median"] = med
+            stats_entry[f"{stats_key}_spread_pct"] = _spread_pct(values)
+
+        throughput_values = _metric_values(group, "throughput_ops_sec")
+        p99_values = _metric_values(group, "p99_latency_ms")
+        base["throughput_outlier_replicates"] = _outlier_count(throughput_values)
+        base["p99_latency_outlier_replicates"] = _outlier_count(p99_values)
+        stats_entry["throughput_outlier_replicates"] = base[
+            "throughput_outlier_replicates"
+        ]
+        stats_entry["p99_latency_outlier_replicates"] = base[
+            "p99_latency_outlier_replicates"
+        ]
+
+        aggregated_rows.append(base)
+        series_statistics.append(stats_entry)
+
+    return aggregated_rows, series_statistics
+
+
+def _build_comparison_validity(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_comparison_group_key(row)].append(row)
+
+    issues: list[dict[str, Any]] = []
+    for key in sorted(grouped):
+        group = grouped[key]
+        databases = {row.get("database") for row in group if row.get("database")}
+        if len(databases) < 2:
+            continue
+
+        signature_map: dict[tuple[Any, ...], list[str]] = defaultdict(list)
+        for row in group:
+            signature_map[_comparison_signature(row)].append(
+                str(row.get("database") or "unknown")
+            )
+
+        duplicate_databases = len(group) != len(databases)
+        if len(signature_map) <= 1 and not duplicate_databases:
+            continue
+
+        signatures = []
+        for signature, signature_databases in signature_map.items():
+            signatures.append(
+                {
+                    field: signature[index]
+                    for index, field in enumerate(_COMPARISON_SIGNATURE_FIELDS)
+                }
+                | {"databases": sorted(set(signature_databases))}
+            )
+
+        issues.append(
+            {
+                "backend": key[0],
+                "series_kind": key[1],
+                "series_label": key[2],
+                "thread_count": key[3],
+                "reason": "mismatched runtime or duplicate scenario rows across compared databases",
+                "signatures": signatures,
+            }
+        )
+
+    return issues
+
+
 def build_analysis(
     rows: list[dict[str, Any]], databases: list[str]
 ) -> dict[str, Any]:
     """Build all derived analysis structures from normalized rows."""
     if not rows:
         return {
+            "aggregated_rows": [],
+            "series_statistics": [],
+            "comparison_validity": [],
             "backend_comparisons": {},
             "scalability": [],
             "latency_breakdown": [],
@@ -31,16 +237,51 @@ def build_analysis(
             "key_insights": [],
         }
 
+    aggregated_rows, series_statistics = _build_series_statistics(rows)
+    comparison_validity = _build_comparison_validity(aggregated_rows)
+    invalid_keys = {
+        (
+            entry.get("backend"),
+            entry.get("series_kind"),
+            entry.get("series_label"),
+            entry.get("thread_count"),
+        )
+        for entry in comparison_validity
+    }
+    for row in aggregated_rows:
+        comparison_key = _comparison_group_key(row)
+        row["comparison_invalid"] = comparison_key in invalid_keys
+
+    analysis_rows = [row for row in aggregated_rows if not row.get("comparison_invalid")]
+
     db_names = databases or sorted(
-        {r.get("database", "unknown") for r in rows}
+        {r.get("database", "unknown") for r in aggregated_rows}
     )
 
+    key_insights = _build_key_insights(analysis_rows, db_names)
+    if comparison_validity:
+        key_insights.insert(
+            0,
+            f"**Invalid comparisons excluded**: {len(comparison_validity)} scenario group(s) had mismatched runtime settings or duplicate rows across databases.",
+        )
+
     return {
-        "backend_comparisons": _build_backend_comparisons(rows, db_names),
-        "scalability": _build_scalability(rows, db_names),
-        "latency_breakdown": _build_latency_breakdown(rows, db_names),
-        "winners": _build_winners(rows, db_names),
-        "key_insights": _build_key_insights(rows, db_names),
+        "aggregated_rows": aggregated_rows,
+        "series_statistics": series_statistics,
+        "comparison_validity": comparison_validity,
+        "backend_comparisons": _build_backend_comparisons(analysis_rows, db_names)
+        if analysis_rows
+        else {},
+        "scalability": _build_scalability(analysis_rows, db_names)
+        if analysis_rows
+        else [],
+        "latency_breakdown": _build_latency_breakdown(analysis_rows, db_names)
+        if analysis_rows
+        else [],
+        "winners": _build_winners(analysis_rows, db_names)
+        if analysis_rows
+        else {},
+        "key_insights": key_insights,
     }
 
 
@@ -223,6 +464,8 @@ def _build_winners(
         parts = [row.get("backend", ""), row.get("series_label", "")]
         if row.get("thread_count"):
             parts.append(f"({row['thread_count']}T)")
+        if (row.get("replicate_count") or 0) > 1:
+            parts.append(f"[{row['replicate_count']} reps]")
         return " ".join(p for p in parts if p)
 
     # Peak throughput
@@ -381,23 +624,42 @@ def _build_key_insights(
                 f"{best['min_threads']}→{best['max_threads']} threads"
             )
 
-    # Memory efficiency insights
-    mem_by_db: dict[str, list[float]] = defaultdict(list)
-    for r in rows:
-        delta = r.get("used_memory_delta_bytes")
-        if isinstance(delta, (int, float)):
-            mem_by_db[r.get("database", "unknown")].append(float(delta))
-    if len(mem_by_db) >= 2:
-        avg_mem = {
-            db: sum(vals) / len(vals) for db, vals in mem_by_db.items()
-        }
-        ranked = sorted(avg_mem.items(), key=lambda x: x[1])
-        if ranked[0][1] < ranked[-1][1]:
-            insights.append(
-                f"**Memory efficiency**: {ranked[0][0]} uses "
-                f"{abs(ranked[0][1]) / 1024:.1f} KiB avg memory delta "
-                f"vs {ranked[-1][0]} at "
-                f"{abs(ranked[-1][1]) / 1024:.1f} KiB"
+    # Diagnostic insights
+    reclaim_rows = [
+        r
+        for r in rows
+        if any(
+            (r.get(key) or 0) > 0
+            for key in (
+                "system_mem_writeback_peak_bytes",
+                "system_vm_page_scan_kswapd_delta",
+                "system_vm_page_scan_direct_delta",
+                "system_vm_allocstall_delta",
+                "system_vm_swap_out_delta",
             )
+        )
+    ]
+    if reclaim_rows:
+        insights.append(
+            f"**Memory pressure observed**: {len(reclaim_rows)} row(s) recorded reclaim or writeback activity; use the diagnostic tables instead of memory-delta ranking when comparing efficiency."
+        )
+
+    aof_pressure_rows = [
+        r
+        for r in rows
+        if any(
+            (r.get(key) or 0) > 0
+            for key in (
+                "aof_delayed_fsync_delta",
+                "aof_pending_bio_fsync_after",
+                "latency_aof_fsync_max_after_ms",
+                "latency_aof_pending_fsync_max_after_ms",
+            )
+        )
+    ]
+    if aof_pressure_rows:
+        insights.append(
+            f"**AOF pressure observed**: {len(aof_pressure_rows)} row(s) recorded fsync backlog or AOF latency signals; check writeback and fsync diagnostics before drawing persistence conclusions."
+        )
 
     return insights

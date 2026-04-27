@@ -25,11 +25,15 @@ def resolve_benchmark_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def resolve_default_artifact_root() -> Path:
+    return resolve_repo_root() / ".artifacts" / "benchmarks"
+
+
 def build_layout(output_dir: Optional[str]) -> ArtifactLayout:
     root = (
         Path(output_dir).expanduser().resolve()
         if output_dir
-        else resolve_benchmark_root() / ".artifacts"
+        else resolve_default_artifact_root()
     )
     layout = ArtifactLayout(
         root=root,

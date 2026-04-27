@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEFAULT_MANIFEST="$ROOT/vortex-benchmark/manifests/examples/local-native-full-cycle.yaml"
-OUTPUT_BASE="$ROOT/vortex-benchmark/.artifacts/local-dev"
+OUTPUT_BASE="$ROOT/.artifacts/benchmarks/local-dev"
 
 REPORT_TITLE="Local Native Benchmark Cycle"
 LABEL="cycle"

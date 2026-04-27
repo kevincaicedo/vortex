@@ -59,6 +59,7 @@ pub fn cmd_get(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
             let had_ttl = matches!(wguard.get_entry_ttl(&key), Some(ttl) if ttl != 0);
             if super::context::remove_if_expired(&mut wguard, &key, now_nanos) {
                 keyspace.update_expiry_count(shard_index, had_ttl, false);
+                keyspace.bump_watch_key(&key);
             }
             CmdResult::Static(RESP_NIL)
         }
