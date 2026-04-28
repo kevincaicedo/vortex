@@ -56,6 +56,9 @@ pub struct VortexConfig {
     pub threads: usize,
 
     /// Maximum number of client connections.
+    ///
+    /// The server may cap the effective active-client budget further when the
+    /// configured fixed buffer pool cannot supply two buffers per connection.
     #[arg(long, default_value = "10000", env = "VORTEX_MAX_CLIENTS")]
     pub max_clients: usize,
 
@@ -76,7 +79,10 @@ pub struct VortexConfig {
     pub ring_size: u32,
 
     /// Number of fixed I/O buffers pre-registered with io_uring.
-    #[arg(long, default_value = "20000", env = "VORTEX_FIXED_BUFFERS")]
+    ///
+    /// Each active connection leases one read buffer and one write buffer, so
+    /// the fixed-buffer pool can sustain `fixed_buffers / 2` active clients.
+    #[arg(long, default_value = "1024", env = "VORTEX_FIXED_BUFFERS")]
     pub fixed_buffers: usize,
 
     /// Size of each I/O buffer in bytes (minimum 4096).
@@ -147,7 +153,7 @@ impl Default for VortexConfig {
             eviction_policy: "noeviction".to_string(),
             io_backend: IoBackendKind::Auto,
             ring_size: 4096,
-            fixed_buffers: 20_000,
+            fixed_buffers: 1_024,
             buffer_size: 16_384,
             connection_timeout_secs: 300,
             sqpoll_idle_ms: 1000,
@@ -224,16 +230,10 @@ impl VortexConfig {
                 self.buffer_size
             ));
         }
-        let min_fixed_buffers = self.max_clients.checked_mul(2).ok_or_else(|| {
-            format!(
-                "max_clients is too large to derive the minimum fixed_buffers: {}",
-                self.max_clients
-            )
-        })?;
-        if self.fixed_buffers < min_fixed_buffers {
+        if self.fixed_buffers < 1 {
             return Err(format!(
-                "fixed_buffers must be at least max_clients * 2 ({}), got {}",
-                min_fixed_buffers, self.fixed_buffers
+                "fixed_buffers must be at least 1 (one fixed read buffer), got {}",
+                self.fixed_buffers
             ));
         }
         if !["always", "everysec", "no"].contains(&self.aof_fsync.as_str()) {
@@ -351,6 +351,16 @@ impl VortexConfig {
     pub fn effective_threads(&self) -> usize {
         self.threads
     }
+
+    /// Returns the active-client capacity implied by the fixed read buffer pool.
+    pub fn fixed_buffer_client_capacity(&self) -> usize {
+        self.fixed_buffers
+    }
+
+    /// Returns the effective active-client budget after accounting for buffer capacity.
+    pub fn effective_max_clients(&self) -> usize {
+        self.max_clients.min(self.fixed_buffer_client_capacity())
+    }
 }
 
 #[cfg(test)]
@@ -362,7 +372,8 @@ mod tests {
         let config = VortexConfig::default();
         assert_eq!(config.bind.port(), 6379);
         assert_eq!(config.max_clients, 10_000);
-        assert_eq!(config.fixed_buffers, 20_000);
+        assert_eq!(config.fixed_buffers, 1_024);
+        assert_eq!(config.effective_max_clients(), 1_024);
         assert!(!config.aof_enabled);
         assert_eq!(config.io_backend, IoBackendKind::Auto);
         assert_eq!(config.ring_size, 4096);
@@ -403,19 +414,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fixed_buffers_below_two_per_client() {
-        let error = VortexConfig::from_args([
+    fn accepts_fixed_buffers_below_requested_max_clients() {
+        let config = VortexConfig::from_args([
             "vortex-server".to_string(),
             "--threads".to_string(),
             "1".to_string(),
             "--max-clients".to_string(),
-            "1024".to_string(),
+            "2048".to_string(),
             "--fixed-buffers".to_string(),
             "1024".to_string(),
         ])
+        .unwrap();
+
+        assert_eq!(config.max_clients, 2048);
+        assert_eq!(config.fixed_buffer_client_capacity(), 1024);
+        assert_eq!(config.effective_max_clients(), 1024);
+    }
+
+    #[test]
+    fn rejects_zero_fixed_buffers() {
+        let error = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--fixed-buffers".to_string(),
+            "0".to_string(),
+        ])
         .unwrap_err();
 
-        assert!(error.contains("fixed_buffers must be at least max_clients * 2"));
+        assert!(error.contains("fixed_buffers must be at least 1"));
     }
 
     #[test]

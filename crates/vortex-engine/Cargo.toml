@@ -25,6 +25,7 @@ ryu = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

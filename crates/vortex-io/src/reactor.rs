@@ -71,13 +71,12 @@ static RESP_ERR_TX_QUEUE_FULL: &[u8] = b"-ERR transaction queue limit exceeded\r
 #[derive(Debug)]
 enum CommandResponse {
     /// Pre-computed static response (PONG, OK, ERR).
-    /// Copied directly into the connection write buffer.
+    /// Emitted as a zero-copy `writev` segment.
     Static(&'static [u8]),
     /// Tiny dynamic response already serialized into inline RESP bytes.
     Inline(vortex_engine::commands::InlineResp),
     /// Dynamic RESP frame requiring serialization.
-    /// Uses `serialize_to_iovecs()` + `submit_writev()` for large responses,
-    /// or `serialize_to_slice()` + memcpy for small ones.
+    /// Serialized into `writev` segments owned by [`PendingWritev`].
     Frame(RespFrame),
     /// Owned serialized RESP bytes.
     Owned(Box<[u8]>),
@@ -195,6 +194,7 @@ impl AofFatalState {
 struct PendingWritev {
     writer: IovecWriter,
     frames: Vec<RespFrame>,
+    owned: Vec<Box<[u8]>>,
     iovecs: Vec<libc::iovec>,
     iov_start: usize,
     total_len: usize,
@@ -205,6 +205,7 @@ impl PendingWritev {
         Self {
             writer: IovecWriter::new(),
             frames: Vec::new(),
+            owned: Vec::new(),
             iovecs: Vec::new(),
             iov_start: 0,
             total_len: 0,
@@ -214,6 +215,7 @@ impl PendingWritev {
     fn clear(&mut self) {
         self.writer.clear();
         self.frames.clear();
+        self.owned.clear();
         self.iovecs.clear();
         self.iov_start = 0;
         self.total_len = 0;
@@ -223,12 +225,17 @@ impl PendingWritev {
         self.writer.push_static(buf);
     }
 
-    fn push_bytes(&mut self, buf: &[u8]) {
-        self.writer.push_bytes(buf);
-    }
-
     fn push_inline(&mut self, buf: &[u8]) {
         self.writer.push_scratch(buf);
+    }
+
+    fn push_owned(&mut self, buf: Box<[u8]>) {
+        if buf.is_empty() {
+            return;
+        }
+        self.owned.push(buf);
+        let idx = self.owned.len() - 1;
+        self.writer.push_bytes(self.owned[idx].as_ref());
     }
 
     fn push_frame(&mut self, frame: RespFrame) {
@@ -358,10 +365,10 @@ impl Default for ReactorConfig {
 fn try_make_uring_backend(config: &ReactorConfig) -> std::io::Result<Box<dyn IoBackend>> {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     {
-        return Ok(Box::new(crate::backend::IoUringBackend::new(
+        Ok(Box::new(crate::backend::IoUringBackend::new(
             config.ring_size,
             config.sqpoll_idle_ms,
-        )?));
+        )?))
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -504,12 +511,7 @@ impl Reactor {
     }
 
     pub(crate) fn min_buffer_count_for_connections(max_connections: usize) -> io::Result<usize> {
-        max_connections.checked_mul(2).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "max_connections is too large to derive the minimum buffer_count",
-            )
-        })
+        Ok(max_connections)
     }
 
     fn validate_buffer_configuration(
@@ -528,7 +530,7 @@ impl Reactor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "buffer_count ({buffer_count}) must be at least max_connections * 2 ({min_buffer_count})"
+                    "buffer_count ({buffer_count}) must be at least max_connections ({min_buffer_count})"
                 ),
             ));
         }
@@ -759,8 +761,7 @@ impl Reactor {
         tracing::info!(reactor_id = self.id, "reactor starting");
 
         // Submit initial accept.
-        let accept_token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-        if let Err(e) = self.backend.submit_accept(self.listener_fd, accept_token) {
+        if let Err(e) = self.submit_accept_rearm() {
             tracing::error!(error = %e, "failed to submit initial accept");
             return;
         }
@@ -885,11 +886,8 @@ impl Reactor {
                                 MAX_EFFORT,
                                 now,
                             );
-                            self.keyspace.record_reactor_active_expiry(
-                                self.id,
-                                sampled,
-                                expired,
-                            );
+                            self.keyspace
+                                .record_reactor_active_expiry(self.id, sampled, expired);
                             // Advance cursors for next sweep.
                             self.expiry_slot_cursor =
                                 self.expiry_slot_cursor.wrapping_add(MAX_EFFORT);
@@ -980,15 +978,13 @@ impl Reactor {
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                 self.keyspace.record_reactor_accept_eagain_rearm(self.id);
                 if !self.draining {
-                    let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-                    let _ = self.backend.submit_accept(self.listener_fd, token);
+                    let _ = self.submit_accept_rearm();
                 }
                 return;
             }
             tracing::warn!(errno, "accept failed");
             if !self.draining {
-                let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-                let _ = self.backend.submit_accept(self.listener_fd, token);
+                let _ = self.submit_accept_rearm();
             }
             return;
         }
@@ -998,8 +994,7 @@ impl Reactor {
 
         // Re-arm accept (unless draining).
         if !self.draining {
-            let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
-            let _ = self.backend.submit_accept(self.listener_fd, token);
+            let _ = self.submit_accept_rearm();
         }
     }
 
@@ -1061,22 +1056,10 @@ impl Reactor {
                 return;
             }
         };
-        let write_idx = match self.buffer_pool.lease_index() {
-            Some(idx) => idx,
-            None => {
-                tracing::warn!("buffer pool exhausted (write), rejecting connection");
-                self.buffer_pool.release_index(read_idx);
-                unsafe {
-                    libc::close(new_fd);
-                }
-                return;
-            }
-        };
 
-        let mut meta = ConnectionMeta::new(new_fd, 0);
+        let mut meta = ConnectionMeta::new(new_fd, read_idx as u32);
         meta.last_active = self.now_secs;
         meta.read_buf_offset = read_idx as u32;
-        meta.write_buf_offset = write_idx as u32;
         meta.read_buf_len = 0;
         meta.write_buf_len = 0;
         let conn_id = self.connections.insert(meta);
@@ -1095,7 +1078,6 @@ impl Reactor {
             fd = new_fd,
             cgen,
             read_idx,
-            write_idx,
             "connection accepted"
         );
 
@@ -1159,21 +1141,12 @@ impl Reactor {
 
     /// Parse RESP frames from the read buffer and generate responses.
     ///
-    /// Uses two write strategies based on response type:
-    /// - **Direct copy** (`CommandResponse::Static`): memcpy into the pool write buffer,
-    ///   then submit `write_fixed`. Used for pre-computed responses (PONG, ERR, OK).
-    /// - **Scatter-gather** (`CommandResponse::Frame`): serialize via
-    ///   `serialize_to_slice()` into the write buffer when it fits. If the response
-    ///   exceeds the remaining write buffer, switch the entire batch to scatter-gather
-    ///   mode using `IovecWriter` + `submit_writev()`. The threshold
-    ///   (`WRITEV_THRESHOLD`) is unused for the mode switch — any overflow triggers it.
+    /// Responses are accumulated into [`PendingWritev`] and submitted via
+    /// `writev` / `IORING_OP_WRITEV`. This keeps request parsing on a single
+    /// fixed read buffer while the response path owns its payloads separately.
     fn process_commands(&mut self, conn_id: usize, fd: RawFd) {
-        let (read_idx, cursor, write_idx) = match self.connections.get(conn_id) {
-            Some(c) => (
-                c.read_buf_offset as usize,
-                c.read_buf_len as usize,
-                c.write_buf_offset as usize,
-            ),
+        let (read_idx, cursor) = match self.connections.get(conn_id) {
+            Some(c) => (c.read_buf_offset as usize, c.read_buf_len as usize),
             None => return,
         };
 
@@ -1182,22 +1155,16 @@ impl Reactor {
             return;
         }
 
-        let buf_size = self.buffer_pool.buffer_size();
-        let read_ptr = self.buffer_pool.ptr(read_idx);
-        let write_ptr = self.buffer_pool.ptr(write_idx);
+        self.writev_states[conn_id].clear();
 
-        // SAFETY: read_ptr and write_ptr point to distinct mmap-backed regions
-        // (different pool indices) that are valid for `buf_size` bytes. Access
-        // is single-threaded (reactor owns the pool).
+        let read_ptr = self.buffer_pool.ptr(read_idx);
+
+        // SAFETY: read_ptr points to a reactor-owned mmap-backed region that is
+        // valid for `cursor` bytes. Access is single-threaded on the reactor.
         let read_slice = unsafe { std::slice::from_raw_parts(read_ptr, cursor) };
-        let write_buf = unsafe { std::slice::from_raw_parts_mut(write_ptr, buf_size) };
 
         let mut offset = 0;
-        let mut write_cursor = 0usize;
         let mut close_after_write = false;
-        // Tracks whether we've switched to scatter-gather mode for this batch.
-        // Once true, all subsequent responses go through the IovecWriter.
-        let mut scatter_gather = false;
         let mut parse_entries = std::mem::take(&mut self.parse_entries);
 
         while offset < cursor {
@@ -1215,90 +1182,21 @@ impl Reactor {
                             close_after_write = true;
                         }
                         match response {
-                            CommandResponse::Static(buf) => {
-                                if scatter_gather {
-                                    // Already in scatter-gather mode — push as static iovec.
-                                    self.writev_states[conn_id].push_static(buf);
-                                } else {
-                                    let end = write_cursor + buf.len();
-                                    if end > buf_size {
-                                        tracing::warn!(
-                                            conn_id,
-                                            "write buffer full, closing after flush"
-                                        );
-                                        close_after_write = true;
-                                        offset = cursor;
-                                        break;
-                                    }
-                                    write_buf[write_cursor..end].copy_from_slice(buf);
-                                    write_cursor = end;
-                                }
-                            }
+                            CommandResponse::Static(buf) => self.writev_states[conn_id].push_static(buf),
                             CommandResponse::Inline(inline) => {
-                                let buf = inline.as_bytes();
-                                if scatter_gather {
-                                    self.writev_states[conn_id].push_inline(buf);
-                                } else {
-                                    let end = write_cursor + buf.len();
-                                    if end <= buf_size {
-                                        write_buf[write_cursor..end].copy_from_slice(buf);
-                                        write_cursor = end;
-                                    } else {
-                                        scatter_gather = true;
-                                        self.writev_states[conn_id].clear();
-                                        if write_cursor > 0 {
-                                            self.writev_states[conn_id]
-                                                .push_bytes(&write_buf[..write_cursor]);
-                                        }
-                                        self.writev_states[conn_id].push_inline(buf);
-                                    }
-                                }
+                                self.writev_states[conn_id].push_inline(inline.as_bytes());
                             }
                             CommandResponse::Owned(bytes) => {
-                                let buf = bytes.as_ref();
-                                if scatter_gather {
-                                    self.writev_states[conn_id].push_bytes(buf);
-                                } else {
-                                    let end = write_cursor + buf.len();
-                                    if end <= buf_size {
-                                        write_buf[write_cursor..end].copy_from_slice(buf);
-                                        write_cursor = end;
-                                    } else {
-                                        scatter_gather = true;
-                                        self.writev_states[conn_id].clear();
-                                        if write_cursor > 0 {
-                                            self.writev_states[conn_id]
-                                                .push_bytes(&write_buf[..write_cursor]);
-                                        }
-                                        self.writev_states[conn_id].push_bytes(buf);
-                                    }
-                                }
+                                self.writev_states[conn_id].push_owned(bytes);
                             }
                             CommandResponse::Frame(resp_frame) => {
-                                if !scatter_gather {
-                                    // Try direct serialization into write buffer first.
-                                    let remaining = &mut write_buf[write_cursor..];
-                                    if let Some(n) =
-                                        RespSerializer::serialize_to_slice(&resp_frame, remaining)
-                                    {
-                                        write_cursor += n;
-                                        continue;
-                                    }
-                                    // Doesn't fit — switch entire batch to scatter-gather.
-                                    scatter_gather = true;
-                                    self.writev_states[conn_id].clear();
-                                    if write_cursor > 0 {
-                                        // Transfer accumulated write_buf data into iovec.
-                                        self.writev_states[conn_id]
-                                            .push_bytes(&write_buf[..write_cursor]);
-                                    }
-                                }
                                 self.writev_states[conn_id].push_frame(resp_frame);
                             }
                         }
                     }
                     if batch_width != 0 {
-                        self.keyspace.record_reactor_command_batch(self.id, batch_width);
+                        self.keyspace
+                            .record_reactor_command_batch(self.id, batch_width);
                     }
 
                     if close_after_write {
@@ -1313,23 +1211,7 @@ impl Reactor {
                     | ParseError::NestingTooDeep
                     | ParseError::InvalidFrame,
                 ) => {
-                    if scatter_gather {
-                        self.writev_states[conn_id].push_static(RESP_ERR_PROTOCOL);
-                    } else {
-                        let end = write_cursor + RESP_ERR_PROTOCOL.len();
-                        if end > buf_size {
-                            tracing::warn!(
-                                conn_id,
-                                "protocol error response does not fit, closing"
-                            );
-                            self.close_connection(conn_id);
-                            parse_entries.clear();
-                            self.parse_entries = parse_entries;
-                            return;
-                        }
-                        write_buf[write_cursor..end].copy_from_slice(RESP_ERR_PROTOCOL);
-                        write_cursor = end;
-                    }
+                    self.writev_states[conn_id].push_static(RESP_ERR_PROTOCOL);
                     close_after_write = true;
                     offset = cursor;
                     break;
@@ -1359,55 +1241,28 @@ impl Reactor {
         parse_entries.clear();
         self.parse_entries = parse_entries;
 
-        // Write all responses, or re-arm read if no complete command was parsed.
-        if scatter_gather {
-            // Scatter-gather path: submit writev with the assembled iovecs.
-            self.writev_states[conn_id].finalize();
-            let total = self.writev_states[conn_id].remaining_len();
-            if total > 0 {
-                if let Some(c) = self.connections.get_mut(conn_id) {
-                    c.write_buf_len = total as u32;
-                }
-                let remaining_iovecs = self.writev_states[conn_id].remaining_iovecs();
-                let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
-                let token = encode_token(conn_id, cgen, OpType::Writev);
-                if self
-                    .backend
-                    .submit_writev(fd, remaining_iovecs.as_ptr(), remaining_iovecs.len(), token)
-                    .is_err()
-                {
-                    self.writev_states[conn_id].clear();
-                    self.close_connection(conn_id);
-                } else {
-                    self.mark_inflight_submitted(conn_id, OpType::Writev);
-                }
-            } else if close_after_write {
-                self.close_connection(conn_id);
-            } else {
-                self.writev_states[conn_id].clear();
-                self.submit_read_for(conn_id, fd);
-            }
-        } else if write_cursor > 0 {
-            // Direct copy path: submit write_fixed from the pool buffer.
+        self.writev_states[conn_id].finalize();
+        let total = self.writev_states[conn_id].remaining_len();
+        if total > 0 {
             if let Some(c) = self.connections.get_mut(conn_id) {
-                c.write_buf_len = write_cursor as u32;
+                c.write_buf_len = total as u32;
             }
+            let (iov_ptr, iov_count) = {
+                let remaining_iovecs = self.writev_states[conn_id].remaining_iovecs();
+                (remaining_iovecs.as_ptr(), remaining_iovecs.len())
+            };
             let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
-            let token = encode_token(conn_id, cgen, OpType::Write);
+            let token = encode_token(conn_id, cgen, OpType::Writev);
             if self
-                .backend
-                .submit_write_fixed(
-                    fd,
-                    write_ptr as *const u8,
-                    write_cursor,
-                    write_idx as u16,
-                    token,
-                )
-                .is_ok()
+                .submit_backend_op("writev", |backend| {
+                    backend.submit_writev(fd, iov_ptr, iov_count, token)
+                })
+                .is_err()
             {
-                self.mark_inflight_submitted(conn_id, OpType::Write);
-            } else {
+                self.writev_states[conn_id].clear();
                 self.close_connection(conn_id);
+            } else {
+                self.mark_inflight_submitted(conn_id, OpType::Writev);
             }
         } else if close_after_write {
             self.close_connection(conn_id);
@@ -1416,6 +1271,7 @@ impl Reactor {
             self.close_connection(conn_id);
         } else {
             // No complete command yet — re-arm read.
+            self.writev_states[conn_id].clear();
             self.submit_read_for(conn_id, fd);
         }
     }
@@ -2222,14 +2078,15 @@ impl Reactor {
                     let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
                     let token = encode_token(conn_id, cgen, OpType::Write);
                     if self
-                        .backend
-                        .submit_write_fixed(
-                            fd,
-                            write_ptr as *const u8,
-                            remaining,
-                            write_idx as u16,
-                            token,
-                        )
+                        .submit_backend_op("write_fixed_partial", |backend| {
+                            backend.submit_write_fixed(
+                                fd,
+                                write_ptr as *const u8,
+                                remaining,
+                                write_idx as u16,
+                                token,
+                            )
+                        })
                         .is_ok()
                     {
                         self.mark_inflight_submitted(conn_id, OpType::Write);
@@ -2244,10 +2101,14 @@ impl Reactor {
                     }
                     let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
                     let token = encode_token(conn_id, cgen, OpType::Writev);
-                    let remaining_iovecs = self.writev_states[conn_id].remaining_iovecs();
+                    let (iov_ptr, iov_count) = {
+                        let remaining_iovecs = self.writev_states[conn_id].remaining_iovecs();
+                        (remaining_iovecs.as_ptr(), remaining_iovecs.len())
+                    };
                     if self
-                        .backend
-                        .submit_writev(fd, remaining_iovecs.as_ptr(), remaining_iovecs.len(), token)
+                        .submit_backend_op("writev_partial", |backend| {
+                            backend.submit_writev(fd, iov_ptr, iov_count, token)
+                        })
                         .is_err()
                     {
                         self.writev_states[conn_id].clear();
@@ -2290,6 +2151,47 @@ impl Reactor {
 
     // ── Helpers ────────────────────────────────────────────────────
 
+    fn submit_accept_rearm(&mut self) -> io::Result<()> {
+        let token = encode_token(ACCEPT_CONN_ID, 0, OpType::Accept);
+        let listener_fd = self.listener_fd;
+        self.submit_backend_op("accept", |backend| {
+            backend.submit_accept(listener_fd, token)
+        })
+    }
+
+    fn submit_backend_op<F>(&mut self, op_name: &'static str, mut submit: F) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn IoBackend) -> io::Result<()>,
+    {
+        match submit(self.backend.as_mut()) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.kind() == io::ErrorKind::Other && error.to_string() == "SQ full" =>
+            {
+                self.keyspace.record_reactor_submit_sq_full_retry(self.id);
+                if let Err(flush_error) = self.backend.flush() {
+                    self.keyspace.record_reactor_submit_failure(self.id);
+                    tracing::warn!(op = op_name, error = %flush_error, "submit retry flush failed");
+                    return Err(flush_error);
+                }
+
+                match submit(self.backend.as_mut()) {
+                    Ok(()) => Ok(()),
+                    Err(retry_error) => {
+                        self.keyspace.record_reactor_submit_failure(self.id);
+                        tracing::warn!(op = op_name, error = %retry_error, "submit retry failed");
+                        Err(retry_error)
+                    }
+                }
+            }
+            Err(error) => {
+                self.keyspace.record_reactor_submit_failure(self.id);
+                tracing::warn!(op = op_name, error = %error, "submit failed");
+                Err(error)
+            }
+        }
+    }
+
     /// Submit a read SQE for the given connection using the fixed buffer pool.
     fn submit_read_for(&mut self, conn_id: usize, fd: RawFd) {
         let (read_idx, cursor) = match self.connections.get(conn_id) {
@@ -2320,8 +2222,9 @@ impl Reactor {
         let cgen = self.generations.get(conn_id).copied().unwrap_or(0);
         let token = encode_token(conn_id, cgen, OpType::Read);
         if self
-            .backend
-            .submit_read_fixed(fd, buf_ptr, remaining, read_idx as u16, token)
+            .submit_backend_op("read_fixed", |backend| {
+                backend.submit_read_fixed(fd, buf_ptr, remaining, read_idx as u16, token)
+            })
             .is_ok()
         {
             self.mark_inflight_submitted(conn_id, OpType::Read);
@@ -2409,7 +2312,9 @@ impl Reactor {
         let read_idx = connection.read_buf_offset as usize;
         let write_idx = connection.write_buf_offset as usize;
         self.buffer_pool.release_index(read_idx);
-        self.buffer_pool.release_index(write_idx);
+        if write_idx != read_idx {
+            self.buffer_pool.release_index(write_idx);
+        }
         if conn_id < self.writev_states.len() {
             self.writev_states[conn_id].clear();
         }
@@ -2550,7 +2455,9 @@ impl Reactor {
         for &conn_id in &conn_ids {
             if let Some(c) = self.connections.get(conn_id) {
                 self.buffer_pool.release_index(c.read_buf_offset as usize);
-                self.buffer_pool.release_index(c.write_buf_offset as usize);
+                if c.write_buf_offset != c.read_buf_offset {
+                    self.buffer_pool.release_index(c.write_buf_offset as usize);
+                }
             }
             if conn_id < self.writev_states.len() {
                 self.writev_states[conn_id].clear();
@@ -2594,14 +2501,33 @@ mod tests {
         cancels: Vec<u64>,
         closes: Vec<u64>,
         completions: VecDeque<Completion>,
+        flushes: usize,
+        fail_next_submit_sq_full: bool,
+        fail_retry_submit_sq_full: bool,
     }
 
     struct MockBackend {
         state: Arc<Mutex<MockBackendState>>,
     }
 
+    impl MockBackend {
+        fn maybe_fail_submit(&self) -> std::io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_next_submit_sq_full {
+                state.fail_next_submit_sq_full = false;
+                return Err(io::Error::other("SQ full"));
+            }
+            if state.fail_retry_submit_sq_full {
+                state.fail_retry_submit_sq_full = false;
+                return Err(io::Error::other("SQ full"));
+            }
+            Ok(())
+        }
+    }
+
     impl IoBackend for MockBackend {
         fn submit_accept(&mut self, _listener_fd: RawFd, _token: u64) -> std::io::Result<()> {
+            self.maybe_fail_submit()?;
             Ok(())
         }
 
@@ -2612,6 +2538,7 @@ mod tests {
             _buf_len: usize,
             _token: u64,
         ) -> std::io::Result<()> {
+            self.maybe_fail_submit()?;
             Ok(())
         }
 
@@ -2622,6 +2549,7 @@ mod tests {
             _buf_len: usize,
             _token: u64,
         ) -> std::io::Result<()> {
+            self.maybe_fail_submit()?;
             Ok(())
         }
 
@@ -2632,6 +2560,7 @@ mod tests {
             _iov_count: usize,
             _token: u64,
         ) -> std::io::Result<()> {
+            self.maybe_fail_submit()?;
             Ok(())
         }
 
@@ -2646,6 +2575,7 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<usize> {
+            self.state.lock().unwrap().flushes += 1;
             Ok(0)
         }
 
@@ -3327,12 +3257,12 @@ mod tests {
         let config = ReactorConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             max_connections: 4,
-            buffer_count: 7,
+            buffer_count: 3,
             ..Default::default()
         };
 
         let error = match Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))) {
-            Ok(_) => panic!("reactor creation should fail when buffer_count < max_connections * 2"),
+            Ok(_) => panic!("reactor creation should fail when buffer_count < max_connections"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -3428,5 +3358,57 @@ mod tests {
         assert!(reactor.connections.get(conn_id).is_none());
         assert_eq!(reactor.buffer_pool.outstanding(), 0);
         assert_eq!(reactor.writev_states[conn_id].remaining_len(), 0);
+    }
+
+    #[test]
+    fn submit_read_sq_full_flushes_and_retries_once() {
+        let state = Arc::new(Mutex::new(MockBackendState {
+            fail_next_submit_sq_full: true,
+            ..Default::default()
+        }));
+        let mut reactor = test_reactor_with_backend(state.clone());
+
+        let read_idx = reactor.buffer_pool.lease_index().unwrap();
+        let write_idx = reactor.buffer_pool.lease_index().unwrap();
+        let mut meta = ConnectionMeta::new(123, 0);
+        meta.read_buf_offset = read_idx as u32;
+        meta.write_buf_offset = write_idx as u32;
+        let conn_id = reactor.connections.insert(meta);
+
+        reactor.submit_read_for(conn_id, 123);
+
+        assert!(reactor.inflight_ops[conn_id].read);
+        assert_eq!(state.lock().unwrap().flushes, 1);
+
+        let runtime = reactor.keyspace.runtime_metrics();
+        assert_eq!(runtime.submit_sq_full_retries, 1);
+        assert_eq!(runtime.submit_failures, 0);
+    }
+
+    #[test]
+    fn submit_read_sq_full_retry_failure_closes_connection() {
+        let state = Arc::new(Mutex::new(MockBackendState {
+            fail_next_submit_sq_full: true,
+            fail_retry_submit_sq_full: true,
+            ..Default::default()
+        }));
+        let mut reactor = test_reactor_with_backend(state.clone());
+
+        let read_idx = reactor.buffer_pool.lease_index().unwrap();
+        let write_idx = reactor.buffer_pool.lease_index().unwrap();
+        let mut meta = ConnectionMeta::new(123, 0);
+        meta.read_buf_offset = read_idx as u32;
+        meta.write_buf_offset = write_idx as u32;
+        let conn_id = reactor.connections.insert(meta);
+        reactor.generations[conn_id] = 11;
+
+        reactor.submit_read_for(conn_id, 123);
+
+        assert!(reactor.connections.get(conn_id).unwrap().is_closing());
+        assert_eq!(state.lock().unwrap().flushes, 1);
+
+        let runtime = reactor.keyspace.runtime_metrics();
+        assert_eq!(runtime.submit_sq_full_retries, 1);
+        assert_eq!(runtime.submit_failures, 1);
     }
 }

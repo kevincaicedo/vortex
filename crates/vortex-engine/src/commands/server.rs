@@ -84,6 +84,15 @@ fn lookup_supported_command(name: &str) -> Option<&'static CommandMeta> {
         .and_then(vortex_proto::command::lookup_command)
 }
 
+#[inline]
+fn lookup_supported_command_bytes(name: &[u8]) -> Option<&'static CommandMeta> {
+    SUPPORTED_COMMANDS
+        .iter()
+        .copied()
+        .find(|candidate| name.eq_ignore_ascii_case(candidate.as_bytes()))
+        .and_then(vortex_proto::command::lookup_command)
+}
+
 /// DBSIZE
 ///
 /// Returns the number of keys in the shard as an integer.
@@ -142,7 +151,7 @@ pub fn cmd_info(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
         write_info_clients(&mut buf);
     }
     if all || eq_ci(section, b"memory") {
-        write_info_memory(&mut buf);
+        write_info_memory(&mut buf, keyspace);
     }
     if all || eq_ci(section, b"runtime") {
         write_info_runtime(&mut buf, runtime);
@@ -177,7 +186,7 @@ fn write_info_clients(buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"connected_clients:0\r\n\r\n");
 }
 
-fn write_info_memory(buf: &mut Vec<u8>) {
+fn write_info_memory(buf: &mut Vec<u8>, keyspace: &ConcurrentKeyspace) {
     buf.extend_from_slice(b"# Memory\r\n");
 
     // jemalloc epoch advance — ensures stats are current
@@ -191,6 +200,7 @@ fn write_info_memory(buf: &mut Vec<u8>) {
     let resident = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0);
     let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
     let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0);
+    let dataset_bytes = keyspace.memory_used();
 
     // Read process RSS from /proc/self/statm
     let rss_bytes = read_proc_rss_bytes();
@@ -201,11 +211,7 @@ fn write_info_memory(buf: &mut Vec<u8>) {
     } else {
         0.0
     };
-    let frag_bytes = if resident > allocated {
-        resident - allocated
-    } else {
-        0
-    };
+    let frag_bytes = resident.saturating_sub(allocated);
 
     // used_memory = jemalloc allocated (what the application asked for)
     buf.extend_from_slice(b"used_memory:");
@@ -224,14 +230,14 @@ fn write_info_memory(buf: &mut Vec<u8>) {
     itoa_append(buf, resident as i64);
     buf.extend_from_slice(b"\r\n");
 
-    // These fields map to what the benchmark harness reads for
-    // "Dataset After" and "Allocator Resident After":
+    // Expose live keyspace bytes separately from allocator state so benchmark
+    // reports can distinguish logical dataset growth from allocator churn.
     buf.extend_from_slice(b"used_memory_dataset:");
-    itoa_append(buf, allocated as i64);
+    itoa_append(buf, dataset_bytes as i64);
     buf.extend_from_slice(b"\r\n");
 
     buf.extend_from_slice(b"used_memory_overhead:");
-    itoa_append(buf, (active.saturating_sub(allocated)) as i64);
+    itoa_append(buf, allocated.saturating_sub(dataset_bytes) as i64);
     buf.extend_from_slice(b"\r\n");
 
     buf.extend_from_slice(b"used_memory_startup:0\r\n");
@@ -248,6 +254,14 @@ fn write_info_memory(buf: &mut Vec<u8>) {
 
     buf.extend_from_slice(b"allocator_resident:");
     itoa_append(buf, resident as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_mapped:");
+    itoa_append(buf, mapped as i64);
+    buf.extend_from_slice(b"\r\n");
+
+    buf.extend_from_slice(b"allocator_retained:");
+    itoa_append(buf, retained as i64);
     buf.extend_from_slice(b"\r\n");
 
     buf.extend_from_slice(b"allocator_frag_ratio:");
@@ -390,6 +404,12 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"reactor_accept_eagain_rearms:");
     itoa_append(buf, runtime.accept_eagain_rearms as i64);
     buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_submit_sq_full_retries:");
+    itoa_append(buf, runtime.submit_sq_full_retries as i64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(b"reactor_submit_failures:");
+    itoa_append(buf, runtime.submit_failures as i64);
+    buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(b"reactor_completion_batches:");
     itoa_append(buf, runtime.completion_batch_count as i64);
     buf.extend_from_slice(b"\r\n");
@@ -509,12 +529,7 @@ fn cmd_command_info(args: &CommandArgs<'_>) -> CmdResult {
     let mut frames = Vec::with_capacity(argc.saturating_sub(2));
     for i in 2..argc {
         if let Some(name_bytes) = args.get(i) {
-            let mut buf = [0u8; 32];
-            let len = name_bytes.len().min(32);
-            buf[..len].copy_from_slice(&name_bytes[..len]);
-            vortex_proto::uppercase_inplace(&mut buf[..len]);
-            let name_str = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
-            match lookup_supported_command(name_str) {
+            match lookup_supported_command_bytes(name_bytes) {
                 Some(meta) => frames.push(command_meta_to_frame(meta)),
                 None => frames.push(RespFrame::Null),
             }
@@ -640,11 +655,15 @@ mod tests {
     }
 
     fn exec(h: &TestHarness, parts: &[&[u8]]) -> CmdResult {
+        exec_at(h, parts, 0)
+    }
+
+    fn exec_at(h: &TestHarness, parts: &[&[u8]], now_nanos: u64) -> CmdResult {
         let wire = make_resp(parts);
         let tape = RespTape::parse_pipeline(&wire).expect("valid RESP");
         let frame = tape.iter().next().unwrap();
         let name_upper: Vec<u8> = parts[0].iter().map(|b| b.to_ascii_uppercase()).collect();
-        crate::commands::execute_command(&h.keyspace, &name_upper, &frame, 0)
+        crate::commands::execute_command(&h.keyspace, &name_upper, &frame, now_nanos)
             .expect("command should be recognized")
             .response
     }
@@ -741,6 +760,24 @@ mod tests {
         assert_integer(&r, 3);
     }
 
+    #[test]
+    fn dbsize_excludes_expired_keys() {
+        let h = TestHarness::new();
+        use vortex_common::{VortexKey, VortexValue};
+
+        let deadline = NS_PER_SEC;
+        let now = deadline + 1;
+        h.set(VortexKey::from("live"), VortexValue::from_bytes(b"1"));
+        h.set_with_ttl(
+            VortexKey::from("expired"),
+            VortexValue::from_bytes(b"2"),
+            deadline,
+        );
+
+        let r = exec_at(&h, &[b"DBSIZE"], now);
+        assert_integer(&r, 1);
+    }
+
     // ── FLUSHDB ──
 
     #[test]
@@ -784,6 +821,8 @@ mod tests {
         let r = exec(&h, &[b"INFO", b"runtime"]);
         assert_bulk_contains(&r, b"# Runtime");
         assert_bulk_contains(&r, b"reactor_loop_iterations:");
+        assert_bulk_contains(&r, b"reactor_submit_sq_full_retries:");
+        assert_bulk_contains(&r, b"reactor_submit_failures:");
         assert_bulk_contains(&r, b"reactor_completion_batch_avg:");
         assert_bulk_contains(&r, b"eviction_shards_scanned:");
     }
@@ -805,6 +844,24 @@ mod tests {
         h.set(VortexKey::from("k2"), VortexValue::from_bytes(b"v2"));
         let r = exec(&h, &[b"INFO", b"keyspace"]);
         assert_bulk_contains(&r, b"db0:keys=2");
+    }
+
+    #[test]
+    fn info_keyspace_excludes_expired_keys() {
+        let h = TestHarness::new();
+        use vortex_common::{VortexKey, VortexValue};
+
+        let deadline = NS_PER_SEC;
+        let now = deadline + 1;
+        h.set(VortexKey::from("live"), VortexValue::from_bytes(b"v1"));
+        h.set_with_ttl(
+            VortexKey::from("expired"),
+            VortexValue::from_bytes(b"v2"),
+            deadline,
+        );
+
+        let r = exec_at(&h, &[b"INFO", b"keyspace"], now);
+        assert_bulk_contains(&r, b"db0:keys=1,expires=0");
     }
 
     // ── COMMAND ──
@@ -856,6 +913,18 @@ mod tests {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
                 assert!(matches!(arr.first(), Some(RespFrame::Null)));
                 assert!(matches!(arr.get(1), Some(RespFrame::Null)));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_info_invalid_utf8_returns_null() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"COMMAND", b"INFO", b"\xffGET"]);
+        match &r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert!(matches!(arr.first(), Some(RespFrame::Null)));
             }
             other => panic!("expected Array, got {other:?}"),
         }

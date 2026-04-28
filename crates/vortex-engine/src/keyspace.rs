@@ -28,12 +28,14 @@
 //!   the hot path — the mask guarantees `idx < shards.len()`.
 
 use std::collections::HashMap;
+use std::ffi::{CString, c_void};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tikv_jemalloc_sys::mallctl;
 use vortex_common::VortexKey;
 use vortex_sync::ShardedCounter;
 
@@ -71,6 +73,45 @@ const MUTATION_FEATURE_AOF: usize = 1 << 2;
 /// A single shard: a `SwissTable` behind a `RwLock`, padded to a full
 /// 128-byte boundary so that adjacent shard locks never share a cache line.
 type Shard = CachePadded<RwLock<SwissTable>>;
+
+fn purge_allocator_after_flush() {
+    unsafe {
+        if let Ok(name) = CString::new("thread.tcache.flush") {
+            let _ = mallctl(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+
+        let mut arena_count: libc::c_uint = 0;
+        let mut arena_len = std::mem::size_of::<libc::c_uint>();
+        if let Ok(name) = CString::new("arenas.narenas") {
+            let rc = mallctl(
+                name.as_ptr(),
+                (&mut arena_count as *mut libc::c_uint).cast::<c_void>(),
+                &mut arena_len,
+                std::ptr::null_mut(),
+                0,
+            );
+            if rc == 0 {
+                for arena_idx in 0..arena_count {
+                    if let Ok(name) = CString::new(format!("arena.{arena_idx}.purge")) {
+                        let _ = mallctl(
+                            name.as_ptr(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            0,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Return type for multi-key read lock acquisition.
 /// `(guards_with_shard_id, sorted_unique_shard_indices, per_key_shard_indices)`
@@ -133,6 +174,57 @@ pub struct TransactionGateGuard<'a> {
     gate: &'a TransactionGate,
 }
 
+/// RAII guard for a memory reservation. Automatically releases the reserved
+/// bytes from the global reservation counter on drop, preventing leaks on
+/// error paths. The caller must call `settle()` after mutation to adjust
+/// the reservation to the actual memory delta.
+pub(crate) struct MemoryReservation<'a> {
+    keyspace: &'a ConcurrentKeyspace,
+    reserved_bytes: usize,
+}
+
+impl std::fmt::Debug for MemoryReservation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryReservation")
+            .field("reserved_bytes", &self.reserved_bytes)
+            .finish()
+    }
+}
+
+impl<'a> MemoryReservation<'a> {
+    #[inline]
+    pub(crate) fn new(keyspace: &'a ConcurrentKeyspace, reserved_bytes: usize) -> Self {
+        Self {
+            keyspace,
+            reserved_bytes,
+        }
+    }
+
+    /// Settle the reservation: release the reserved bytes from the
+    /// reservation counter. Should be called after the mutation has
+    /// committed and the actual delta is reflected in `global_memory_used`.
+    #[inline]
+    pub(crate) fn settle(mut self) {
+        if self.reserved_bytes != 0 {
+            self.keyspace
+                .memory_reserved
+                .fetch_sub(self.reserved_bytes, Ordering::Release);
+            self.reserved_bytes = 0;
+        }
+    }
+}
+
+impl Drop for MemoryReservation<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.reserved_bytes != 0 {
+            self.keyspace
+                .memory_reserved
+                .fetch_sub(self.reserved_bytes, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EvictionAdmissionError {
     pub(crate) response: &'static [u8],
@@ -160,6 +252,8 @@ pub struct RuntimeMetricsSnapshot {
     pub reactor_slots: usize,
     pub loop_iterations: u64,
     pub accept_eagain_rearms: u64,
+    pub submit_sq_full_retries: u64,
+    pub submit_failures: u64,
     pub completion_batch_count: u64,
     pub completion_batch_total: u64,
     pub completion_batch_max: u64,
@@ -241,6 +335,8 @@ impl EvictionMetrics {
 struct RuntimeMetrics {
     loop_iterations: ShardedCounter,
     accept_eagain_rearms: ShardedCounter,
+    submit_sq_full_retries: ShardedCounter,
+    submit_failures: ShardedCounter,
     completion_batch_count: ShardedCounter,
     completion_batch_total: ShardedCounter,
     command_batch_count: ShardedCounter,
@@ -258,6 +354,8 @@ impl RuntimeMetrics {
         Self {
             loop_iterations: ShardedCounter::new(slot_count),
             accept_eagain_rearms: ShardedCounter::new(slot_count),
+            submit_sq_full_retries: ShardedCounter::new(slot_count),
+            submit_failures: ShardedCounter::new(slot_count),
             completion_batch_count: ShardedCounter::new(slot_count),
             completion_batch_total: ShardedCounter::new(slot_count),
             command_batch_count: ShardedCounter::new(slot_count),
@@ -282,6 +380,16 @@ impl RuntimeMetrics {
     #[inline(always)]
     fn record_accept_eagain_rearm(&self, slot: usize) {
         self.accept_eagain_rearms.increment(slot);
+    }
+
+    #[inline(always)]
+    fn record_submit_sq_full_retry(&self, slot: usize) {
+        self.submit_sq_full_retries.increment(slot);
+    }
+
+    #[inline(always)]
+    fn record_submit_failure(&self, slot: usize) {
+        self.submit_failures.increment(slot);
     }
 
     #[inline(always)]
@@ -325,6 +433,8 @@ impl RuntimeMetrics {
             reactor_slots: self.slot_count(),
             loop_iterations: self.loop_iterations.total(),
             accept_eagain_rearms: self.accept_eagain_rearms.total(),
+            submit_sq_full_retries: self.submit_sq_full_retries.total(),
+            submit_failures: self.submit_failures.total(),
             completion_batch_count,
             completion_batch_total,
             completion_batch_max: runtime_slot_max(&self.completion_batch_max),
@@ -467,6 +577,18 @@ pub struct ConcurrentKeyspace {
     table_hasher: RandomState,
     /// Global approximate memory counter — updated in threshold-flushed chunks.
     global_memory_used: AtomicUsize,
+    /// Global reservation counter for linearizable maxmemory admission.
+    ///
+    /// Writers `fetch_add` their projected positive delta before mutation,
+    /// then `fetch_sub` it (settle) after the actual delta is published to
+    /// `global_memory_used` via the shard write guard drop. This prevents
+    /// concurrent writers from all passing admission against the same stale
+    /// published counter.
+    ///
+    /// Admission checks: `published_memory_used() + memory_reserved ≤ maxmemory`.
+    ///
+    /// Uses `CachePadded` to avoid false sharing with `global_memory_used`.
+    memory_reserved: CachePadded<AtomicUsize>,
     /// When `maxmemory` is active, publish shard-local drift on every write
     /// guard drop so eviction can rely on the global counter without a full
     /// keyspace lock sweep.
@@ -601,6 +723,7 @@ impl ConcurrentKeyspace {
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
             global_memory_used: AtomicUsize::new(0),
+            memory_reserved: CachePadded::new(AtomicUsize::new(0)),
             strict_memory_accounting: AtomicBool::new(false),
             mutation_features: AtomicUsize::new(0),
             replay_depth: AtomicUsize::new(0),
@@ -685,7 +808,8 @@ impl ConcurrentKeyspace {
     pub fn watch_key(&self, key: VortexKey) -> WatchKeyState {
         self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
         let shard_idx = self.watch_shard_index(key.as_bytes());
-        // TODO: Check Deadlock-free guarantees for WATCH operations.
+        // Lock-order note: WATCH registration only takes a single watch-shard
+        // lock and never nests data-shard or transaction-gate acquisition.
         let mut guard = self.watch_shards[shard_idx].write();
         let slot = guard.entry(key.clone()).or_insert(WatchSlot {
             version: 0,
@@ -704,7 +828,8 @@ impl ConcurrentKeyspace {
     pub fn unwatch_keys(&self, keys: &[WatchKeyState]) {
         for watched in keys {
             let shard_idx = self.watch_shard_index(watched.key.as_bytes());
-            // TODO: Check Deadlock-free guarantees for WATCH operations.
+            // UNWATCH takes at most one watch-shard lock at a time, so there is
+            // no multi-lock cycle across watched keys.
             let mut guard = self.watch_shards[shard_idx].write();
             if let Some(slot) = guard.get_mut(&watched.key) {
                 if slot.refs > 1 {
@@ -726,7 +851,9 @@ impl ConcurrentKeyspace {
 
         for watched in keys {
             let shard_idx = self.watch_shard_index(watched.key.as_bytes());
-            // TODO: Check Deadlock-free guarantees for WATCH operations.
+            // EXEC validation only reads watch shards. Queued writes run after
+            // validation completes, so the watch-shard -> data-shard order does
+            // not exist.
             let guard = self.watch_shards[shard_idx].read();
             let Some(slot) = guard.get(&watched.key) else {
                 return true;
@@ -782,6 +909,7 @@ impl ConcurrentKeyspace {
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
             global_memory_used: AtomicUsize::new(0),
+            memory_reserved: CachePadded::new(AtomicUsize::new(0)),
             strict_memory_accounting: AtomicBool::new(false),
             mutation_features: AtomicUsize::new(0),
             replay_depth: AtomicUsize::new(0),
@@ -972,63 +1100,96 @@ impl ConcurrentKeyspace {
         }
     }
 
+    /// Admit a mutation that will increase memory by `additional_bytes`.
+    ///
+    /// Returns `(EvictedKeys, MemoryReservation)` on success. The reservation
+    /// holds `additional_bytes` in the global reservation counter so that
+    /// concurrent writers see the pending allocation. The caller **must**
+    /// call `reservation.settle()` after the mutation commits and the shard
+    /// write guard drops (which publishes the actual delta to
+    /// `global_memory_used`).
+    ///
+    /// If admission fails (OOM / noeviction), the reservation is never created.
     pub(crate) fn ensure_memory_for(
         &self,
         preferred_shard: usize,
         additional_bytes: usize,
         now_nanos: u64,
-    ) -> Result<EvictedKeys, EvictionAdmissionError> {
+    ) -> Result<(EvictedKeys, MemoryReservation<'_>), EvictionAdmissionError> {
         if self.replay_mode_active() {
-            return Ok(None);
+            return Ok((None, MemoryReservation::new(self, 0)));
         }
 
         if additional_bytes == 0 {
-            return Ok(None);
+            return Ok((None, MemoryReservation::new(self, 0)));
         }
 
         let snapshot = self.eviction_config();
         self.ensure_memory_for_snapshot(preferred_shard, additional_bytes, now_nanos, snapshot)
     }
 
+    /// Reservation-based admission against a pre-loaded eviction config snapshot.
+    ///
+    /// Protocol:
+    /// 1. Reserve `additional_bytes` in `memory_reserved` via `fetch_add`.
+    /// 2. Check `published_memory_used() + memory_reserved <= maxmemory`.
+    /// 3. If over limit: try eviction, then re-check.
+    /// 4. If still over limit: release reservation, return OOM.
+    /// 5. On success: return `MemoryReservation` that the caller settles
+    ///    after mutation (settlement = `fetch_sub(reserved_bytes)`).
+    ///
+    /// This guarantees linearizable admission: concurrent writers cannot all
+    /// pass against the same stale published counter because each one's
+    /// reservation is visible to the others.
     pub(crate) fn ensure_memory_for_snapshot(
         &self,
         preferred_shard: usize,
         additional_bytes: usize,
         now_nanos: u64,
         snapshot: EvictionConfig,
-    ) -> Result<EvictedKeys, EvictionAdmissionError> {
-        // Alpha note: this is a concurrent preflight against the published
-        // global counter, not a linearizable reservation. Racing writers can
-        // still overshoot until a future reservation protocol lands.
+    ) -> Result<(EvictedKeys, MemoryReservation<'_>), EvictionAdmissionError> {
         if additional_bytes == 0 {
-            return Ok(None);
+            return Ok((None, MemoryReservation::new(self, 0)));
         }
 
         if snapshot.max_memory == 0 {
-            return Ok(None);
+            return Ok((None, MemoryReservation::new(self, 0)));
         }
 
-        if self
-            .published_memory_used()
-            .saturating_add(additional_bytes)
-            <= snapshot.max_memory
-        {
-            return Ok(None);
+        // Step 1: Reserve the projected delta atomically.
+        self.memory_reserved
+            .fetch_add(additional_bytes, Ordering::Acquire);
+
+        // Step 2: Check whether the combined (published + reserved) fits.
+        let committed = self.committed_memory_pressure();
+        if committed <= snapshot.max_memory {
+            // Fast path: fits within maxmemory even accounting for all
+            // concurrent reservations. No eviction needed.
+            return Ok((None, MemoryReservation::new(self, additional_bytes)));
         }
 
+        // Step 3: Over limit — try eviction before rejecting.
         if snapshot.policy.is_noeviction() {
+            // Release reservation before returning error.
+            self.memory_reserved
+                .fetch_sub(additional_bytes, Ordering::Release);
             return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
         }
 
         let mut report = EvictionScanReport::default();
         if snapshot.policy.is_volatile_only() && !self.has_expiring_keys() {
+            self.memory_reserved
+                .fetch_sub(additional_bytes, Ordering::Release);
             report.oom_after_scan = true;
             self.eviction_metrics.record(report);
             return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
         }
 
         let mut evicted = Vec::new();
-        let target_used = snapshot.max_memory.saturating_sub(additional_bytes);
+        // Evict until published + reserved fits within maxmemory.
+        let target_used = snapshot
+            .max_memory
+            .saturating_sub(self.memory_reserved.load(Ordering::Acquire));
         report.bytes_freed = self.evict_until_target(
             preferred_shard,
             target_used,
@@ -1038,20 +1199,43 @@ impl ConcurrentKeyspace {
             &mut evicted,
         );
 
-        report.oom_after_scan = self
-            .published_memory_used()
-            .saturating_add(additional_bytes)
-            > snapshot.max_memory;
+        // Step 4: Re-check after eviction.
+        report.oom_after_scan = self.committed_memory_pressure() > snapshot.max_memory;
         self.eviction_metrics.record(report);
 
         if !report.oom_after_scan {
-            Ok(evicted_keys_to_box(evicted))
+            Ok((
+                evicted_keys_to_box(evicted),
+                MemoryReservation::new(self, additional_bytes),
+            ))
         } else {
+            // Release reservation — admission failed.
+            self.memory_reserved
+                .fetch_sub(additional_bytes, Ordering::Release);
             Err(EvictionAdmissionError::new(
                 crate::commands::ERR_OOM,
                 evicted_keys_to_box(evicted),
             ))
         }
+    }
+
+    /// Returns `published_memory_used + memory_reserved`.
+    ///
+    /// This is the total memory pressure including in-flight reservations
+    /// from concurrent writers that have passed admission but have not yet
+    /// committed their mutations.
+    #[inline]
+    fn committed_memory_pressure(&self) -> usize {
+        self.published_memory_used()
+            .saturating_add(self.memory_reserved.load(Ordering::Acquire))
+    }
+
+    /// Returns the current outstanding reservation counter value.
+    /// Useful for testing and diagnostics.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn memory_reserved(&self) -> usize {
+        self.memory_reserved.load(Ordering::Relaxed)
     }
 
     fn evict_until_target(
@@ -1487,7 +1671,8 @@ impl ConcurrentKeyspace {
 
     #[inline]
     pub fn runtime_metrics(&self) -> RuntimeMetricsSnapshot {
-        self.runtime_metrics.snapshot(self.eviction_metrics.snapshot())
+        self.runtime_metrics
+            .snapshot(self.eviction_metrics.snapshot())
     }
 
     #[inline(always)]
@@ -1501,8 +1686,19 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
+    pub fn record_reactor_submit_sq_full_retry(&self, reactor_id: usize) {
+        self.runtime_metrics.record_submit_sq_full_retry(reactor_id);
+    }
+
+    #[inline(always)]
+    pub fn record_reactor_submit_failure(&self, reactor_id: usize) {
+        self.runtime_metrics.record_submit_failure(reactor_id);
+    }
+
+    #[inline(always)]
     pub fn record_reactor_completion_batch(&self, reactor_id: usize, width: usize) {
-        self.runtime_metrics.record_completion_batch(reactor_id, width);
+        self.runtime_metrics
+            .record_completion_batch(reactor_id, width);
     }
 
     #[inline(always)]
@@ -1511,12 +1707,7 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
-    pub fn record_reactor_active_expiry(
-        &self,
-        reactor_id: usize,
-        sampled: usize,
-        expired: usize,
-    ) {
+    pub fn record_reactor_active_expiry(&self, reactor_id: usize, sampled: usize, expired: usize) {
         self.runtime_metrics
             .record_active_expiry(reactor_id, sampled, expired);
     }
@@ -1924,12 +2115,36 @@ impl ConcurrentKeyspace {
 
     // ─── Metadata ───────────────────────────────────────────────────
 
-    /// DBSIZE: returns the total number of keys across all shards.
+    /// Approximate total number of keys across all shards.
     ///
-    /// Acquires a read lock on each shard sequentially. The result is
-    /// best-effort: keys may be added/removed between shard reads.
+    /// This is cheap metadata based on per-shard lengths and does not filter
+    /// expired-yet-not-cleaned entries.
     pub fn dbsize(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
+    }
+
+    /// Exact live key and expiring-key counts from a consistent all-shard snapshot.
+    ///
+    /// This administrative path acquires read locks for every shard and counts
+    /// only entries that are still live at `now_nanos`.
+    pub(crate) fn exact_keyspace_counts(&self, now_nanos: u64) -> (usize, usize) {
+        let guards: Vec<_> = self.shards.iter().map(|shard| shard.read()).collect();
+        let mut keys = 0usize;
+        let mut expires = 0usize;
+
+        for guard in &guards {
+            for entry in guard.iter_entries() {
+                if entry.is_expired(now_nanos) {
+                    continue;
+                }
+                keys += 1;
+                if entry.ttl_deadline() != 0 {
+                    expires += 1;
+                }
+            }
+        }
+
+        (keys, expires)
     }
 
     /// FLUSHDB / FLUSHALL: remove all keys from all shards.
@@ -1948,6 +2163,8 @@ impl ConcurrentKeyspace {
         }
         self.expiry_key_total.store(0, Ordering::Relaxed);
         self.global_memory_used.store(0, Ordering::Relaxed);
+        self.memory_reserved.store(0, Ordering::Relaxed);
+        purge_allocator_after_flush();
         self.bump_all_watches();
     }
 
@@ -1968,6 +2185,9 @@ impl ConcurrentKeyspace {
         }
         self.expiry_key_total.store(0, Ordering::Relaxed);
         self.global_memory_used.store(0, Ordering::Relaxed);
+        self.memory_reserved.store(0, Ordering::Relaxed);
+        drop(guards);
+        purge_allocator_after_flush();
         if had_entries {
             self.bump_all_watches();
         }
@@ -2064,6 +2284,8 @@ mod tests {
         ks.record_reactor_loop_iteration(0);
         ks.record_reactor_loop_iteration(1);
         ks.record_reactor_accept_eagain_rearm(1);
+        ks.record_reactor_submit_sq_full_retry(2);
+        ks.record_reactor_submit_failure(3);
         ks.record_reactor_completion_batch(0, 4);
         ks.record_reactor_completion_batch(1, 2);
         ks.record_reactor_command_batch(0, 3);
@@ -2075,6 +2297,8 @@ mod tests {
         assert_eq!(snapshot.reactor_slots, 4);
         assert_eq!(snapshot.loop_iterations, 2);
         assert_eq!(snapshot.accept_eagain_rearms, 1);
+        assert_eq!(snapshot.submit_sq_full_retries, 1);
+        assert_eq!(snapshot.submit_failures, 1);
         assert_eq!(snapshot.completion_batch_count, 2);
         assert_eq!(snapshot.completion_batch_total, 6);
         assert_eq!(snapshot.completion_batch_max, 4);
@@ -2103,6 +2327,51 @@ mod tests {
 
         ks.flush_all();
         assert_eq!(ks.dbsize(), 0);
+    }
+
+    #[test]
+    fn watch_registration_and_bumps_release_all_refs_under_contention() {
+        let ks = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+        let barrier = Arc::new(Barrier::new(7));
+        let key = VortexKey::from("watched:key");
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let ks = Arc::clone(&ks);
+            let barrier = Arc::clone(&barrier);
+            let key = key.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..1_000 {
+                    let watched = ks.watch_key(key.clone());
+                    let epoch = ks.current_watch_epoch();
+                    let _ = ks.watched_keys_changed(epoch, std::slice::from_ref(&watched));
+                    ks.unwatch_keys(&[watched]);
+                }
+            }));
+        }
+
+        for _ in 0..2 {
+            let ks = Arc::clone(&ks);
+            let barrier = Arc::clone(&barrier);
+            let key = key.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..2_000 {
+                    ks.bump_watch_key(&key);
+                }
+            }));
+        }
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("watch worker should not panic");
+        }
+
+        let live_watch_slots: usize = ks.watch_shards.iter().map(|shard| shard.read().len()).sum();
+        assert_eq!(live_watch_slots, 0);
+        assert_eq!(ks.watch_active.load(Ordering::Acquire), 0);
+        assert!(!ks.watch_tracking_active());
     }
 
     #[test]
@@ -2693,5 +2962,88 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(result.unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn reservation_prevents_concurrent_overshoot_under_noeviction() {
+        let ks = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+        let max_mem = ks.memory_used() + 1024;
+        ks.configure_eviction(max_mem, EvictionPolicy::NoEviction);
+
+        // N threads racing to allocate 512 bytes each.
+        // With max_mem = used + 1024, only 2 threads should succeed.
+        let mut handles = Vec::new();
+        let success_count = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..10 {
+            let worker_ks = Arc::clone(&ks);
+            let success_count = Arc::clone(&success_count);
+            handles.push(thread::spawn(move || {
+                let res = worker_ks.ensure_memory_for(0, 512, 0);
+                if let Ok((_, reservation)) = res {
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                    // Simulate doing some work and holding the reservation
+                    thread::sleep(Duration::from_millis(5));
+
+                    // Manually increment published used to simulate commit
+                    worker_ks
+                        .global_memory_used
+                        .fetch_add(512, Ordering::SeqCst);
+                    reservation.settle();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            success_count.load(Ordering::SeqCst),
+            2,
+            "Only 2 concurrent reservations should succeed"
+        );
+        assert_eq!(
+            ks.memory_reserved(),
+            0,
+            "All reservations should be settled"
+        );
+    }
+
+    #[test]
+    fn reservation_settles_on_error_paths() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let max_mem = ks.memory_used() + 1024;
+        ks.configure_eviction(max_mem, EvictionPolicy::NoEviction);
+
+        {
+            let res = ks.ensure_memory_for(0, 512, 0);
+            assert!(res.is_ok());
+            let (_, reservation) = res.unwrap();
+            assert_eq!(ks.memory_reserved(), 512);
+            // Drop without calling settle() simulates an error path
+            drop(reservation);
+        }
+
+        assert_eq!(
+            ks.memory_reserved(),
+            0,
+            "Reservation should be auto-settled via Drop"
+        );
+    }
+
+    #[test]
+    fn reservation_counter_returns_to_zero_after_operations() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        ks.configure_eviction(1024 * 1024, EvictionPolicy::NoEviction);
+
+        let (evicted, reservation) = ks.ensure_memory_for(0, 100, 0).unwrap();
+        assert!(evicted.is_none());
+        assert_eq!(ks.memory_reserved(), 100);
+
+        // Simulating mutation and shard drop
+        reservation.settle();
+
+        assert_eq!(ks.memory_reserved(), 0);
     }
 }

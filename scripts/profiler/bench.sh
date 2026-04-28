@@ -18,6 +18,7 @@ BENCH_RUNTIME_MAXMEMORY=""
 BENCH_RUNTIME_EVICTION_POLICY=""
 BENCH_RUNTIME_IO_BACKEND=""
 BENCH_RUNTIME_RING_SIZE=""
+BENCH_RUNTIME_FIXED_BUFFERS=""
 BENCH_RUNTIME_SQPOLL_IDLE_MS=""
 BENCH_OUTPUT_DIR=""
 BENCH_STATE_FILE=""
@@ -67,6 +68,7 @@ resolve_benchmark_bridge() {
     [[ -z "$EVICTION" && -n "$BENCH_RUNTIME_EVICTION_POLICY" ]] && EVICTION="$BENCH_RUNTIME_EVICTION_POLICY"
     [[ -z "$IO_BACKEND" && -n "$BENCH_RUNTIME_IO_BACKEND" ]] && IO_BACKEND="$BENCH_RUNTIME_IO_BACKEND"
     [[ -z "$RING_SIZE" && -n "$BENCH_RUNTIME_RING_SIZE" ]] && RING_SIZE="$BENCH_RUNTIME_RING_SIZE"
+    [[ -z "$FIXED_BUFFERS" && -n "$BENCH_RUNTIME_FIXED_BUFFERS" ]] && FIXED_BUFFERS="$BENCH_RUNTIME_FIXED_BUFFERS"
     [[ -z "$SQPOLL_IDLE_MS" && -n "$BENCH_RUNTIME_SQPOLL_IDLE_MS" ]] && SQPOLL_IDLE_MS="$BENCH_RUNTIME_SQPOLL_IDLE_MS"
     [[ "$THREADS" == "4" && -n "$BENCH_RESOURCE_THREADS" ]] && THREADS="$BENCH_RESOURCE_THREADS"
 
@@ -131,6 +133,7 @@ generate_benchmark_load() {
     [[ -n "$EVICTION" ]] && attach_cmd+=(--eviction-policy "$EVICTION")
     [[ -n "$IO_BACKEND" ]] && attach_cmd+=(--io-backend "$IO_BACKEND")
     [[ -n "$RING_SIZE" ]] && attach_cmd+=(--ring-size "$RING_SIZE")
+    [[ -n "$FIXED_BUFFERS" ]] && attach_cmd+=(--fixed-buffers "$FIXED_BUFFERS")
     [[ -n "$SQPOLL_IDLE_MS" ]] && attach_cmd+=(--sqpoll-idle-ms "$SQPOLL_IDLE_MS")
 
     info "Attaching profiler session to vortex_bench artifact root"

@@ -43,6 +43,17 @@ fn main() {
         config.max_memory,
     );
 
+    let effective_max_clients = config.effective_max_clients();
+    if effective_max_clients < config.max_clients {
+        tracing::warn!(
+            requested_max_clients = config.max_clients,
+            effective_max_clients,
+            fixed_buffers = config.fixed_buffers,
+            buffer_size = config.buffer_size,
+            "fixed buffer pool can sustain fewer active clients than max_clients; capping runtime connection budget"
+        );
+    }
+
     // ── Spawn reactor pool ─────────────────────────────────────────
     let aof_config = if config.aof_enabled {
         let policy = match config.aof_fsync.as_str() {
@@ -66,7 +77,7 @@ fn main() {
     let pool_config = ReactorPoolConfig {
         bind_addr: config.bind,
         threads: config.threads,
-        max_connections: config.max_clients,
+        max_connections: effective_max_clients,
         buffer_size: config.buffer_size,
         buffer_count: config.fixed_buffers,
         connection_timeout: config.connection_timeout_secs as u32,

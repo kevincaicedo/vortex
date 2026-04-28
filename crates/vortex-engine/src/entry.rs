@@ -225,7 +225,7 @@ impl Entry {
     /// The caller must ensure the referenced key bytes and value outlive this
     /// entry, or that the entry is rewritten before those owners move or drop.
     #[inline]
-    pub unsafe fn write_heap(
+    pub(super) unsafe fn write_heap(
         &mut self,
         h2: u8,
         key: &VortexKey,

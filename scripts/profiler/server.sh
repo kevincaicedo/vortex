@@ -84,6 +84,9 @@ build_server_args() {
     if [[ -n "${RING_SIZE:-}" ]]; then
         args+=("--ring-size" "$RING_SIZE")
     fi
+    if [[ -n "${FIXED_BUFFERS:-}" ]]; then
+        args+=("--fixed-buffers" "$FIXED_BUFFERS")
+    fi
     if [[ -n "${SQPOLL_IDLE_MS:-}" ]]; then
         args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
     fi
@@ -107,6 +110,53 @@ start_server() {
     info "Server started (pid ${SERVER_PID})"
 
     wait_for_server "$host" "$port" 30
+}
+
+pid_is_live() {
+    local pid="$1"
+    local state=""
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    if has_cmd ps; then
+        state="$(ps -o stat= -p "$pid" 2>/dev/null | awk 'NR==1 { print $1 }')"
+        if [[ "$state" == Z* ]]; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+stop_profiled_pid() {
+    local pid="$1"
+    local label="$2"
+    local attempts=0
+
+    kill -INT "$pid" 2>/dev/null || true
+    while pid_is_live "$pid" && [[ $attempts -lt 20 ]]; do
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    if ! pid_is_live "$pid"; then
+        return 0
+    fi
+
+    warn "${label} did not stop after SIGINT; escalating to SIGTERM"
+    kill -TERM "$pid" 2>/dev/null || true
+    attempts=0
+    while pid_is_live "$pid" && [[ $attempts -lt 50 ]]; do
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    if ! pid_is_live "$pid"; then
+        return 0
+    fi
+
+    warn "${label} did not stop after SIGTERM; escalating to SIGKILL"
+    kill -KILL "$pid" 2>/dev/null || true
 }
 
 start_profiled_shutdown_controller() {
@@ -151,12 +201,12 @@ start_profiled_shutdown_controller() {
 
         local profiled_pid=""
         profiled_pid="$(discover_pid_by_port "$port")"
-        if [[ -n "$profiled_pid" ]] && kill -0 "$profiled_pid" 2>/dev/null; then
+        if [[ -n "$profiled_pid" ]] && pid_is_live "$profiled_pid"; then
             info "Stopping ${profiler_name} target server (pid ${profiled_pid})..."
-            kill -INT "$profiled_pid" 2>/dev/null || true
-        elif kill -0 "$tool_pid" 2>/dev/null; then
+            stop_profiled_pid "$profiled_pid" "${profiler_name} target"
+        elif pid_is_live "$tool_pid"; then
             info "Stopping ${profiler_name} profiler wrapper (pid ${tool_pid})..."
-            kill -INT "$tool_pid" 2>/dev/null || true
+            stop_profiled_pid "$tool_pid" "${profiler_name} profiler wrapper"
         fi
     ) &
 

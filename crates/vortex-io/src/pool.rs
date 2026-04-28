@@ -121,9 +121,9 @@ fn reactor_resource_share(
     reactor_idx: usize,
 ) -> (usize, usize) {
     let reactor_connections = share_evenly(total_connections, num_reactors, reactor_idx);
-    let required_buffers = total_connections.saturating_mul(2);
+    let required_buffers = total_connections;
     let spare_buffers = total_buffers - required_buffers;
-    let reactor_buffers = reactor_connections.saturating_mul(2)
+    let reactor_buffers = reactor_connections
         + share_evenly(spare_buffers, num_reactors, reactor_idx);
     (reactor_connections, reactor_buffers)
 }
@@ -168,7 +168,7 @@ impl ReactorPool {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "buffer_count ({}) must be at least max_connections * 2 ({min_buffer_count})",
+                    "buffer_count ({}) must be at least max_connections ({min_buffer_count})",
                     config.buffer_count
                 ),
             ));
@@ -437,7 +437,7 @@ mod tests {
         assert!(
             shares
                 .iter()
-                .all(|(connections, buffers)| *buffers >= (*connections * 2))
+                .all(|(connections, buffers)| *buffers >= *connections)
         );
     }
 
@@ -450,7 +450,7 @@ mod tests {
             bind_addr,
             threads: 1,
             max_connections: 1,
-            buffer_count: 2,
+            buffer_count: 1,
             io_backend: IoBackendMode::Polling,
             ..ReactorPoolConfig::default()
         }) {

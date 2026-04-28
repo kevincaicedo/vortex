@@ -18,11 +18,11 @@ use super::{
     CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand, NS_PER_MS,
     NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos, arg_bytes,
     deadline_nanos_to_absolute_unix_nanos, encode_aof_persist, encode_aof_pexpireat,
-    encode_aof_set_pxat, int_resp, key_from_bytes, owned_value_to_resp, value_from_bytes,
-    value_to_resp,
+    encode_aof_set, encode_aof_set_pxat, int_resp, key_from_bytes, owned_value_to_resp,
+    value_from_bytes, value_to_resp,
 };
 use crate::ConcurrentKeyspace;
-use crate::commands::context::{MutationOutcome, SetOptions, SetResult};
+use crate::commands::context::{MutationOutcome, SetOptions, SetResult, TtlState};
 
 #[cfg(test)]
 use super::ERR_OVERFLOW;
@@ -816,10 +816,21 @@ pub fn cmd_decrby(
 /// INCRBYFLOAT key increment.
 ///
 /// Result is stored as a string (Redis behavior).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cmd_incrbyfloat(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
     now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_incrbyfloat_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_incrbyfloat_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
 ) -> ExecutedCommand {
     let Some(args) = CommandArgs::collect(frame) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -852,11 +863,35 @@ pub fn cmd_incrbyfloat(
             value,
             aof_records,
             aof_lsn,
-        }) => ExecutedCommand::with_aof_records(
-            CmdResult::Resp(RespFrame::bulk_string(value)),
-            aof_records,
-            aof_lsn,
-        ),
+        }) => {
+            let aof_payload = if aof_lsn.is_some() {
+                match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
+                    TtlState::Persistent => Some(encode_aof_set(key_bytes, value.as_ref())),
+                    TtlState::Deadline(deadline) if unix_now_nanos != 0 => {
+                        let absolute_deadline_ms = deadline_nanos_to_absolute_unix_nanos(
+                            deadline,
+                            now_nanos,
+                            unix_now_nanos,
+                        ) / NS_PER_MS;
+                        Some(encode_aof_set_pxat(
+                            key_bytes,
+                            value.as_ref(),
+                            absolute_deadline_ms,
+                        ))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            ExecutedCommand::with_optional_aof_payload_and_records(
+                CmdResult::Resp(RespFrame::bulk_string(value)),
+                aof_records,
+                aof_lsn,
+                aof_payload,
+            )
+        }
         Err(err) => err.into_executed(),
     }
 }
@@ -1134,6 +1169,10 @@ mod tests {
         }
     }
 
+    fn assert_aof_payload(result: &ExecutedCommand, expected: &[u8]) {
+        assert_eq!(result.aof_payload.as_deref(), Some(expected));
+    }
+
     fn same_shard_keys(keyspace: &ConcurrentKeyspace, count: usize) -> Vec<Vec<u8>> {
         let mut found = Vec::with_capacity(count);
         let target = keyspace.shard_index(b"evict:seed");
@@ -1212,20 +1251,22 @@ mod tests {
     }
 
     #[test]
-    fn get_expired_key_cleans_up_ttl_count() {
+    fn get_expired_key_cleans_up_raw_ttl_count() {
         let h = TestHarness::new();
         let key = VortexKey::from(b"ttl" as &[u8]);
         let deadline = NS_PER_SEC;
         let now = deadline + 1;
         h.set_with_ttl(key.clone(), VortexValue::from_bytes(b"bar"), deadline);
 
-        assert_eq!(h.keyspace.info_keyspace(now), (1, 1));
+        assert_eq!(h.keyspace.info_keyspace(now), (0, 0));
+        assert_eq!(h.keyspace.total_expiry_keys(), 1);
 
         let tape = make_tape(b"*2\r\n$3\r\nGET\r\n$3\r\nttl\r\n");
         let frame = tape.iter().next().unwrap();
         let result = cmd_get(&h.keyspace, &frame, now);
         assert_static(&result, RESP_NIL);
         assert_eq!(h.keyspace.info_keyspace(now), (0, 0));
+        assert_eq!(h.keyspace.total_expiry_keys(), 0);
     }
 
     // ── SET ──
@@ -1670,6 +1711,43 @@ mod tests {
         assert!((v - 10.5).abs() < 1e-10);
     }
 
+    #[test]
+    fn incrbyfloat_emits_canonical_set_aof_payload() {
+        let h = TestHarness::new();
+        h.keyspace.enable_aof_recording();
+        h.set(
+            VortexKey::from(b"float" as &[u8]),
+            VortexValue::from_bytes(b"1.5"),
+        );
+
+        let tape = make_tape(b"*3\r\n$11\r\nINCRBYFLOAT\r\n$5\r\nfloat\r\n$4\r\n0.25\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_incrbyfloat_with_clock(&h.keyspace, &frame, NS_PER_SEC, 10 * NS_PER_SEC);
+
+        let expected = encode_aof_set(b"float", resp_bytes(&result));
+        assert_aof_payload(&result, expected.as_ref());
+    }
+
+    #[test]
+    fn incrbyfloat_preserves_ttl_in_canonical_aof_payload() {
+        let h = TestHarness::new();
+        h.keyspace.enable_aof_recording();
+        let key = VortexKey::from(b"floatttl" as &[u8]);
+        let now_nanos = 5 * NS_PER_SEC;
+        let unix_now_nanos = 100 * NS_PER_SEC;
+        let deadline = now_nanos + 7 * NS_PER_SEC;
+        h.set_with_ttl(key, VortexValue::from_bytes(b"1.5"), deadline);
+
+        let tape = make_tape(b"*3\r\n$11\r\nINCRBYFLOAT\r\n$8\r\nfloatttl\r\n$3\r\n0.5\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_incrbyfloat_with_clock(&h.keyspace, &frame, now_nanos, unix_now_nanos);
+
+        let absolute_deadline_ms =
+            deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos) / NS_PER_MS;
+        let expected = encode_aof_set_pxat(b"floatttl", resp_bytes(&result), absolute_deadline_ms);
+        assert_aof_payload(&result, expected.as_ref());
+    }
+
     // ── MGET ──
 
     #[test]
@@ -1861,6 +1939,31 @@ mod tests {
         let frame = tape.iter().next().unwrap();
         let result = cmd_setrange(&h.keyspace, &frame, 0);
         assert_eq!(resp_int(&result), 10); // 5 zeros + "hello"
+    }
+
+    #[test]
+    fn setrange_preserves_ttl_accounting_and_expiry() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"ttlrange" as &[u8]);
+        let deadline = NS_PER_SEC;
+        let expire_at = deadline + 1;
+        h.set_with_ttl(key, VortexValue::from_bytes(b"hello"), deadline);
+
+        assert_eq!(h.keyspace.info_keyspace(0), (1, 1));
+
+        let tape = make_tape(b"*4\r\n$8\r\nSETRANGE\r\n$8\r\nttlrange\r\n$1\r\n1\r\n$1\r\na\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_setrange(&h.keyspace, &frame, 0);
+
+        assert_eq!(resp_int(&result), 5);
+        assert_eq!(h.keyspace.info_keyspace(0), (1, 1));
+
+        let get_tape = make_tape(b"*2\r\n$3\r\nGET\r\n$8\r\nttlrange\r\n");
+        let get_frame = get_tape.iter().next().unwrap();
+        let get_result = cmd_get(&h.keyspace, &get_frame, expire_at);
+
+        assert_static(&get_result, RESP_NIL);
+        assert_eq!(h.keyspace.info_keyspace(expire_at), (0, 0));
     }
 
     // ── MSETNX ──

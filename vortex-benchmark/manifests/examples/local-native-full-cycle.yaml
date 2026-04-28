@@ -20,9 +20,9 @@ environment:
   mode: native
   port_base: 17679
 resource_config:
-  cpus: 8
+  cpus: 4
   memory: 2g
-  threads: 8
+  threads: 4
 runtime_config:
   aof_enabled: false
   eviction_policy: noeviction

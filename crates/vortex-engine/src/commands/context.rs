@@ -14,7 +14,7 @@ use vortex_proto::RespFrame;
 
 use crate::SwissTable;
 use crate::entry::Entry;
-use crate::keyspace::{ConcurrentKeyspace, EvictedKeys, EvictionAdmissionError};
+use crate::keyspace::{ConcurrentKeyspace, EvictedKeys, EvictionAdmissionError, MemoryReservation};
 
 use super::pattern::glob_match;
 use super::{
@@ -1095,7 +1095,7 @@ impl ConcurrentKeyspace {
         let projected_delta = self
             .read_shard_by_index(shard_index)
             .projected_insert_delta(&key, &value);
-        let evicted =
+        let (evicted, reservation) =
             self.ensure_memory_for(shard_index, positive_delta(projected_delta), now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
@@ -1106,6 +1106,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_key {
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             previous,
             self.next_aof_lsn(),
@@ -1168,10 +1170,10 @@ impl ConcurrentKeyspace {
         // Pre-hash for the table BEFORE acquiring the write lock.
         let table_hash = self.table_hash_key(key_bytes);
         let features = self.mutation_features();
-        let evicted = if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
+        let (evicted, reservation) = if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
             let eviction = self.eviction_config();
             if eviction.max_memory == 0 || self.replay_mode_active() {
-                None
+                (None, MemoryReservation::new(self, 0))
             } else {
                 let projected_delta = self
                     .read_shard_by_index(shard_index)
@@ -1184,7 +1186,7 @@ impl ConcurrentKeyspace {
                 )?
             }
         } else {
-            None
+            (None, MemoryReservation::new(self, 0))
         };
         let mut guard = self.write_shard_by_index(shard_index);
         let watched_key = ConcurrentKeyspace::mutation_feature_watch(features).then(|| key.clone());
@@ -1196,6 +1198,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_key {
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             (),
             self.next_aof_lsn_with_features(features),
@@ -1217,7 +1221,8 @@ impl ConcurrentKeyspace {
             options,
             now_nanos,
         );
-        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
         let (result, has_ttl) =
@@ -1228,6 +1233,8 @@ impl ConcurrentKeyspace {
             self.record_frequency_hash(self.table_hash_key(key.as_bytes()));
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             result,
             changed.then(|| self.next_aof_lsn()).flatten(),
@@ -1330,7 +1337,7 @@ impl ConcurrentKeyspace {
                 positive_delta(guard.projected_insert_delta(key, value))
             })
             .sum();
-        let evicted = self.ensure_memory_for(
+        let (evicted, reservation) = self.ensure_memory_for(
             self.shard_index(pairs[0].0.as_bytes()),
             projected_delta,
             now_nanos,
@@ -1356,6 +1363,8 @@ impl ConcurrentKeyspace {
             self.update_expiry_count(lookup.shard_idx, old_had_ttl, false);
             self.record_frequency_hash(lookup.table_hash);
         }
+        drop(guards);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             (),
             self.next_aof_lsn(),
@@ -1391,7 +1400,7 @@ impl ConcurrentKeyspace {
                 positive_delta(guard.projected_insert_delta(key, value))
             })
             .sum();
-        let evicted = self.ensure_memory_for(
+        let (evicted, reservation) = self.ensure_memory_for(
             self.shard_index(pairs[0].0.as_bytes()),
             projected_delta,
             now_nanos,
@@ -1416,6 +1425,8 @@ impl ConcurrentKeyspace {
                 now_nanos,
             );
             if table.contains_key_prehashed(key_bytes, lookup.table_hash) {
+                drop(guards);
+                reservation.settle();
                 return Ok(mutation_outcome_with_evictions(false, None, evicted));
             }
         }
@@ -1434,6 +1445,8 @@ impl ConcurrentKeyspace {
             table.insert_new_prehashed(key, value, lookup.table_hash);
             self.record_frequency_hash(lookup.table_hash);
         }
+        drop(guards);
+        reservation.settle();
 
         Ok(mutation_outcome_with_evictions(
             true,
@@ -1487,7 +1500,8 @@ impl ConcurrentKeyspace {
         let read_guard = self.read_shard_by_index(shard_index);
         let projected_delta = projected_increment_delta(&read_guard, &key, delta, now_nanos)?;
         drop(read_guard);
-        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let watched_key = self.watch_tracking_active().then(|| key.clone());
         let (result, transition) = match increment_table_by(&mut guard, key, delta, now_nanos) {
@@ -1499,6 +1513,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_key {
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             result,
             self.next_aof_lsn(),
@@ -1519,7 +1535,8 @@ impl ConcurrentKeyspace {
         let projected_delta =
             projected_increment_by_float_delta(&read_guard, &key, increment, now_nanos)?;
         drop(read_guard);
-        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let ttl_deadline = guard.get_entry_ttl(&key);
         let watched_key = self.watch_tracking_active().then(|| key.clone());
@@ -1536,6 +1553,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_key {
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             result,
             self.next_aof_lsn(),
@@ -1555,7 +1574,8 @@ impl ConcurrentKeyspace {
         let read_guard = self.read_shard_by_index(shard_index);
         let projected_delta = projected_append_delta(&read_guard, &key, append_bytes, now_nanos)?;
         drop(read_guard);
-        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let ttl_deadline = guard.get_entry_ttl(&key);
         let watched_key = self.watch_tracking_active().then(|| key.clone());
@@ -1572,6 +1592,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_key {
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             length,
             self.next_aof_lsn(),
@@ -1646,19 +1668,24 @@ impl ConcurrentKeyspace {
         let projected_delta =
             projected_setrange_delta(&read_guard, &key, offset, new_bytes, now_nanos)?;
         drop(read_guard);
-        let evicted = self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(shard_index, projected_delta, now_nanos)?;
         let mut guard = self.write_shard_by_index(shard_index);
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
+        let ttl_probe_key = key.clone();
         let watched_key = self.watch_tracking_active().then(|| key.clone());
         let length = match setrange_in_table(&mut guard, key, offset, new_bytes, now_nanos) {
             Ok(length) => length,
             Err(err) => return Err(MutationError::with_evictions(err, evicted)),
         };
-        self.update_expiry_count(shard_index, had_ttl, false);
+        let has_ttl_after = ttl_present(guard.get_entry_ttl(&ttl_probe_key));
+        self.update_expiry_count(shard_index, had_ttl, has_ttl_after);
         self.record_frequency_hash(table_hash);
         if let Some(key) = watched_key {
             self.bump_watch_key(&key);
         }
+        drop(guard);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             length,
             self.next_aof_lsn(),
@@ -1897,7 +1924,8 @@ impl ConcurrentKeyspace {
             nx,
         )?;
         drop(read_guards);
-        let evicted = self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
 
         let (mut guards, sorted_shards, per_key_shards) = self.multi_write(&key_refs);
         let src_position = ConcurrentKeyspace::guard_position(&sorted_shards, per_key_shards[0]);
@@ -1922,6 +1950,8 @@ impl ConcurrentKeyspace {
             ));
         }
         if nx && dst_table.contains_key(&new_key) {
+            drop(guards);
+            reservation.settle();
             return Ok(mutation_outcome_with_evictions(false, None, evicted));
         }
 
@@ -1942,6 +1972,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_new_key {
             self.bump_watch_key(&key);
         }
+        drop(guards);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             true,
             self.next_aof_lsn(),
@@ -2045,7 +2077,8 @@ impl ConcurrentKeyspace {
             let projected_delta =
                 projected_copy_delta(source_value, &read_guard, &dst, replace, now_nanos);
             drop(read_guard);
-            let evicted = self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
+            let (evicted, reservation) =
+                self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
             let destination = dst.clone();
             let mut guard = self.write_shard_by_index(source_shard);
             let _ = self.cleanup_expired_key(source_shard, &mut guard, src, now_nanos);
@@ -2060,6 +2093,8 @@ impl ConcurrentKeyspace {
                 self.record_frequency_hash(dst_hash);
                 self.bump_watch_key(&destination);
             }
+            drop(guard);
+            reservation.settle();
             return Ok(mutation_outcome_with_evictions(
                 copied,
                 copied.then(|| self.next_aof_lsn()).flatten(),
@@ -2085,7 +2120,8 @@ impl ConcurrentKeyspace {
             now_nanos,
         );
         drop(read_guards);
-        let evicted = self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
+        let (evicted, reservation) =
+            self.ensure_memory_for(destination_shard, projected_delta, now_nanos)?;
 
         let (mut guards, sorted_shards, per_key_shards) = self.multi_write(&key_refs);
         let src_position = ConcurrentKeyspace::guard_position(&sorted_shards, per_key_shards[0]);
@@ -2104,6 +2140,7 @@ impl ConcurrentKeyspace {
         let dst_had_ttl = ttl_present(dst_table.get_entry_ttl(&dst));
         let (value_clone, ttl) = {
             let Some((value, ttl)) = src_table.get_with_ttl(src) else {
+                // Source key vanished — reservation will auto-settle via Drop.
                 return Ok(mutation_outcome_with_evictions(false, None, evicted));
             };
             if ttl != 0 && ttl <= now_nanos {
@@ -2128,6 +2165,8 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_dst {
             self.bump_watch_key(&key);
         }
+        drop(guards);
+        reservation.settle();
         Ok(mutation_outcome_with_evictions(
             true,
             self.next_aof_lsn(),
@@ -2136,8 +2175,8 @@ impl ConcurrentKeyspace {
     }
 
     pub(crate) fn cmd_dbsize(&self, now_nanos: u64) -> usize {
-        let _ = now_nanos;
-        self.dbsize()
+        let (keys, _) = self.exact_keyspace_counts(now_nanos);
+        keys
     }
 
     pub(crate) fn cmd_flush_all(&self) -> Option<u64> {
@@ -2145,9 +2184,6 @@ impl ConcurrentKeyspace {
     }
 
     pub(crate) fn info_keyspace(&self, now_nanos: u64) -> (usize, usize) {
-        let _ = now_nanos;
-        let keys = self.dbsize();
-        let expires = self.total_expiry_keys();
-        (keys, expires)
+        self.exact_keyspace_counts(now_nanos)
     }
 }

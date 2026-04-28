@@ -356,11 +356,11 @@ def _render_command_comparison(
         lines.append("")
         header2 = ["Command"]
         for db in db_names:
-            header2.extend([f"{db} P50", f"{db} P99", f"{db} P99.9"])
+            header2.extend([f"{db} P50", f"{db} P95", f"{db} P99", f"{db} P99.99"])
         lines.append("| " + " | ".join(header2) + " |")
         sep2 = ["---------"]
         for _ in db_names:
-            sep2.extend(["------:", "------:", "--------:"])
+            sep2.extend(["------:", "------:", "------:", "--------:"])
         lines.append("|" + "|".join(sep2) + "|")
 
         for row in comp.get("rows", []):
@@ -368,8 +368,9 @@ def _render_command_comparison(
             for db in db_names:
                 m = row.get(db, {})
                 cells2.append(_fmt_float(m.get("p50_latency_ms"), 2))
+                cells2.append(_fmt_float(m.get("p95_latency_ms"), 2))
                 cells2.append(_fmt_float(m.get("p99_latency_ms"), 2))
-                cells2.append(_fmt_float(m.get("p99_9_latency_ms"), 2))
+                cells2.append(_fmt_float(m.get("p99_99_latency_ms"), 2))
             lines.append("| " + " | ".join(cells2) + " |")
         lines.append("")
 
@@ -416,12 +417,12 @@ def _render_thread_workload_comparison(
             header2 = ["Threads"]
             for db in db_names:
                 header2.extend(
-                    [f"{db} P50", f"{db} P99", f"{db} P99.9"]
+                    [f"{db} P50", f"{db} P95", f"{db} P99", f"{db} P99.99"]
                 )
             lines.append("| " + " | ".join(header2) + " |")
             sep2 = ["--------:"]
             for _ in db_names:
-                sep2.extend(["------:", "------:", "--------:"])
+                sep2.extend(["------:", "------:", "------:", "--------:"])
             lines.append("|" + "|".join(sep2) + "|")
 
             for row in wk_data.get("rows", []):
@@ -437,10 +438,13 @@ def _render_thread_workload_comparison(
                         _fmt_float(m.get("p50_latency_ms"), 2)
                     )
                     cells2.append(
+                        _fmt_float(m.get("p95_latency_ms"), 2)
+                    )
+                    cells2.append(
                         _fmt_float(m.get("p99_latency_ms"), 2)
                     )
                     cells2.append(
-                        _fmt_float(m.get("p99_9_latency_ms"), 2)
+                        _fmt_float(m.get("p99_99_latency_ms"), 2)
                     )
                 lines.append("| " + " | ".join(cells2) + " |")
             lines.append("")
@@ -1215,6 +1219,11 @@ def _section_visualizations(
     chart_order = [
         ("throughput_comparison", "Throughput Comparison"),
         ("latency_comparison", "Latency Comparison (Avg + P99)"),
+        ("latency_cdf", "Latency CDF"),
+        ("latency_over_time", "Latency Over Time"),
+        ("cpu_timeseries", "CPU Usage Over Time"),
+        ("rss_timeseries", "Process RSS Over Time"),
+        ("network_timeseries", "Loopback TX Throughput Over Time"),
         ("heatmap_dashboard", "Performance Heatmap Dashboard"),
         ("radar_profile", "Radar Profile"),
         ("latency_heatmap", "Latency Heatmap"),

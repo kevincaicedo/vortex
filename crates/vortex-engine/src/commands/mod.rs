@@ -302,6 +302,11 @@ fn push_decimal<T: itoa::Integer>(buf: &mut Vec<u8>, value: T) {
 }
 
 #[inline]
+pub(crate) fn encode_aof_set(key_bytes: &[u8], value_bytes: &[u8]) -> Box<[u8]> {
+    encode_resp_bulk_command(&[b"SET", key_bytes, value_bytes])
+}
+
+#[inline]
 pub(crate) fn encode_aof_set_pxat(
     key_bytes: &[u8],
     value_bytes: &[u8],
@@ -381,7 +386,12 @@ pub fn execute_command(
         b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos)),
         b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos)),
         b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos)),
-        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(keyspace, frame, now_nanos)),
+        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
         b"MGET" => Some(string::cmd_mget(keyspace, frame, now_nanos).into()),
         b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos)),
         b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos)),

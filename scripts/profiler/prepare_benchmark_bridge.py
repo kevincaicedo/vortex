@@ -115,6 +115,7 @@ def main() -> int:
     print(shell_assign("BENCH_RUNTIME_EVICTION_POLICY", str(runtime_config.get("eviction_policy", ""))))
     print(shell_assign("BENCH_RUNTIME_IO_BACKEND", str(runtime_config.get("io_backend", ""))))
     print(shell_assign("BENCH_RUNTIME_RING_SIZE", str(runtime_config.get("ring_size", ""))))
+    print(shell_assign("BENCH_RUNTIME_FIXED_BUFFERS", str(runtime_config.get("fixed_buffers", ""))))
     print(shell_assign("BENCH_RUNTIME_SQPOLL_IDLE_MS", str(runtime_config.get("sqpoll_idle_ms", ""))))
     return 0
 

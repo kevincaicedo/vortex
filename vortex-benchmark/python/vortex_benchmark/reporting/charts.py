@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -14,6 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import Normalize
+from matplotlib.ticker import FuncFormatter
 
 # Consistent color palette across all charts
 _DB_COLORS = [
@@ -55,6 +57,306 @@ def _compact_ops(val: float) -> str:
     if val >= 1_000:
         return f"{val / 1_000:.0f}K"
     return f"{val:.0f}"
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latency_scale_anchor(values: list[float]) -> float | None:
+    finite = [
+        value for value in values
+        if math.isfinite(value) and value > 0
+    ]
+    if not finite:
+        return None
+    if len(finite) == 1:
+        return finite[0]
+    return float(np.percentile(finite, 75))
+
+
+def _latency_unit(values: list[float]) -> tuple[str, float]:
+    anchor_ms = _latency_scale_anchor(values)
+    if anchor_ms is None or anchor_ms >= 1.0:
+        return "ms", 1.0
+    if anchor_ms >= 0.001:
+        return "us", 1_000.0
+    return "ns", 1_000_000.0
+
+
+def _scale_latency_values(values: list[float], factor: float) -> list[float]:
+    return [
+        value * factor if math.isfinite(value) else float("nan")
+        for value in values
+    ]
+
+
+def _normalize_series_label(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-")
+
+
+def _database_colors(rows: list[dict[str, Any]]) -> dict[str, str]:
+    databases = sorted(
+        {str(row.get("database") or "unknown") for row in rows}
+    )
+    return {
+        database: _get_db_color(index)
+        for index, database in enumerate(databases)
+    }
+
+
+def _row_chart_label(row: dict[str, Any]) -> str:
+    parts = [
+        str(row.get("database") or "unknown"),
+        str(row.get("backend") or "backend"),
+        str(row.get("series_label") or "series"),
+    ]
+    thread_count = row.get("thread_count")
+    if thread_count is not None:
+        parts.append(f"{thread_count}T")
+    return " / ".join(parts)
+
+
+def _select_representative_rows(
+    rows: list[dict[str, Any]],
+    predicate,
+    *,
+    max_rows: int = 8,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        if not predicate(row):
+            continue
+        key = (
+            row.get("database"),
+            row.get("backend"),
+            row.get("series_label"),
+        )
+        existing = grouped.get(key)
+        existing_threads = existing.get("thread_count") if existing else None
+        current_threads = row.get("thread_count")
+        if existing is None:
+            grouped[key] = row
+            continue
+        if isinstance(current_threads, int) and not isinstance(existing_threads, int):
+            grouped[key] = row
+            continue
+        if isinstance(current_threads, int) and isinstance(existing_threads, int):
+            if current_threads > existing_threads:
+                grouped[key] = row
+                continue
+            if current_threads < existing_threads:
+                continue
+        current_ops = _coerce_float(row.get("throughput_ops_sec")) or 0.0
+        existing_ops = _coerce_float(existing.get("throughput_ops_sec")) or 0.0
+        if current_ops > existing_ops:
+            grouped[key] = row
+
+    selected = list(grouped.values())
+    selected.sort(
+        key=lambda row: (
+            -(int(row.get("thread_count") or 0)),
+            -(_coerce_float(row.get("throughput_ops_sec")) or 0.0),
+            str(row.get("database") or ""),
+            str(row.get("series_label") or ""),
+        )
+    )
+    return selected[:max_rows]
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                samples.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return samples
+
+
+def _parse_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_memtier_cdf_points(path: Path) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("Value") or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                latency_ms = _coerce_float(parts[0])
+                percentile = _coerce_float(parts[1])
+                if latency_ms is None or percentile is None:
+                    continue
+                if not 0.0 <= percentile <= 1.0:
+                    continue
+                points.append((latency_ms, percentile * 100.0))
+    except OSError:
+        return []
+    return points
+
+
+def _select_telemetry_scenarios(
+    rows: list[dict[str, Any]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    scenario_specs = [
+        ("custom-rust", "multi_key_only", "Custom Rust / Multi-Key Only"),
+        ("custom-rust", "uniform-read_heavy", "Custom Rust / Uniform Read Heavy"),
+        (
+            "memtier_benchmark",
+            "uniform-read_heavy",
+            "Memtier Benchmark / Uniform Read Heavy",
+        ),
+    ]
+
+    scenarios: list[tuple[str, list[dict[str, Any]]]] = []
+    for backend, series_label, title in scenario_specs:
+        normalized_series = _normalize_series_label(series_label)
+        candidates = [
+            row for row in rows
+            if row.get("backend") == backend
+            and _normalize_series_label(row.get("series_label")) == normalized_series
+            and row.get("host_telemetry_samples_path")
+        ]
+        thread_counts = [
+            int(row["thread_count"])
+            for row in candidates
+            if isinstance(row.get("thread_count"), int)
+        ]
+        if not thread_counts:
+            continue
+        max_threads = max(thread_counts)
+
+        selected_by_database: dict[str, dict[str, Any]] = {}
+        for row in candidates:
+            if row.get("thread_count") != max_threads:
+                continue
+            database = str(row.get("database") or "unknown")
+            existing = selected_by_database.get(database)
+            if existing is None:
+                selected_by_database[database] = row
+                continue
+            current_ops = _coerce_float(row.get("throughput_ops_sec")) or 0.0
+            existing_ops = _coerce_float(existing.get("throughput_ops_sec")) or 0.0
+            if current_ops > existing_ops:
+                selected_by_database[database] = row
+
+        selected = sorted(
+            selected_by_database.values(),
+            key=lambda row: str(row.get("database") or ""),
+        )
+        if selected:
+            scenarios.append((f"{title} ({max_threads}T)", selected))
+
+    return scenarios
+
+
+def _extract_memtier_latency_series(
+    path: Path,
+) -> tuple[str | None, list[dict[str, float]]]:
+    try:
+        payload = _read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None, []
+
+    all_stats = payload.get("ALL STATS") or {}
+    for section_name in ("Totals", "Sets", "Gets"):
+        section = all_stats.get(section_name) or {}
+        time_series = section.get("Time-Serie") or {}
+        if not isinstance(time_series, dict) or not time_series:
+            continue
+
+        series: list[dict[str, float]] = []
+        for second_key, bucket in sorted(
+            time_series.items(),
+            key=lambda item: int(item[0]) if str(item[0]).isdigit() else str(item[0]),
+        ):
+            if not isinstance(bucket, dict):
+                continue
+            second = _coerce_float(second_key)
+            if second is None:
+                continue
+            series.append(
+                {
+                    "second": second,
+                    "avg": _coerce_float(bucket.get("Average Latency")) or float("nan"),
+                    "p95": _coerce_float(bucket.get("p95.00")) or float("nan"),
+                    "p99": _coerce_float(bucket.get("p99.00")) or float("nan"),
+                }
+            )
+        if series:
+            return section_name, series
+
+    return None, []
+
+
+def _extract_telemetry_series(path: Path) -> dict[str, list[tuple[float, float]]]:
+    samples = _load_jsonl(path)
+    if len(samples) < 2:
+        return {}
+
+    base_ts = _parse_timestamp(samples[0].get("captured_at"))
+    if base_ts is None:
+        return {}
+
+    cpu_points: list[tuple[float, float]] = []
+    rss_points: list[tuple[float, float]] = []
+    net_points: list[tuple[float, float]] = []
+
+    prev_ts = None
+    prev_net = None
+    for sample in samples:
+        ts = _parse_timestamp(sample.get("captured_at"))
+        if ts is None:
+            continue
+        elapsed = ts - base_ts
+
+        cpu = _coerce_float(sample.get("system_cpu_utilization_pct"))
+        if cpu is not None:
+            cpu_points.append((elapsed, cpu))
+
+        rss = _coerce_float(sample.get("process_rss_bytes"))
+        if rss is not None:
+            rss_points.append((elapsed, rss / (1024.0 * 1024.0)))
+
+        current_net = _coerce_float(sample.get("network_loopback_tx_bytes"))
+        if prev_ts is not None and prev_net is not None and current_net is not None:
+            dt = ts - prev_ts
+            if dt > 0 and current_net >= prev_net:
+                net_points.append((elapsed, (current_net - prev_net) / dt / (1024.0 * 1024.0)))
+        prev_ts = ts
+        prev_net = current_net
+
+    return {
+        "cpu": cpu_points,
+        "rss_mib": rss_points,
+        "net_tx_mib_per_sec": net_points,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +994,220 @@ def _render_scaling_chart(
     plt.close(figure)
 
 
+def _render_latency_cdf(rows: list[dict[str, Any]], path: Path) -> None:
+    selected = _select_representative_rows(
+        rows,
+        lambda row: row.get("backend") == "memtier_benchmark" and bool(row.get("backend_hdr_files")),
+        max_rows=8,
+    )
+    if not selected:
+        _plot_empty(path, "Latency CDF", "No memtier HDR percentile data available.")
+        return
+
+    figure, axis = plt.subplots(figsize=(10, 6))
+    db_colors = _database_colors(selected)
+    all_latencies_ms: list[float] = []
+    plotted = 0
+    for index, row in enumerate(selected):
+        hdr_files = row.get("backend_hdr_files") or []
+        hdr_path = None
+        for raw_path in hdr_files:
+            candidate = Path(str(raw_path))
+            if candidate.name.endswith("FULL_RUN_1.txt") or (
+                candidate.name.endswith(".txt") and "FULL_RUN" in candidate.name
+            ):
+                hdr_path = candidate
+                break
+        if hdr_path is None or not hdr_path.exists():
+            continue
+        points = _read_memtier_cdf_points(hdr_path)
+        if not points:
+            continue
+        latencies = [point[0] for point in points if point[0] > 0]
+        percentiles = [point[1] for point in points if point[0] > 0]
+        if not latencies:
+            continue
+        all_latencies_ms.extend(latencies)
+        database = str(row.get("database") or "unknown")
+        color = db_colors.get(database, _get_db_color(index))
+        axis.plot(
+            percentiles,
+            latencies,
+            linewidth=2,
+            label=_row_chart_label(row),
+            color=color,
+        )
+        plotted += 1
+
+    if plotted == 0:
+        plt.close(figure)
+        _plot_empty(path, "Latency CDF", "No readable memtier HDR percentile data available.")
+        return
+
+    unit, factor = _latency_unit(all_latencies_ms)
+    for line in axis.lines:
+        y_data = np.asarray(line.get_ydata(), dtype=float)
+        line.set_ydata(y_data * factor)
+
+    axis.set_title("Latency CDF")
+    axis.set_xlabel("Cumulative Percentile")
+    axis.set_ylabel(f"Latency ({unit})")
+    axis.set_xlim(0, 100)
+    axis.set_yscale("log")
+    axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: f"{value:.0f}%"))
+    axis.grid(alpha=0.3, which="both")
+    axis.legend(fontsize=8, loc="upper left")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _render_latency_over_time(rows: list[dict[str, Any]], path: Path) -> None:
+    selected = _select_representative_rows(
+        rows,
+        lambda row: row.get("backend") == "memtier_benchmark" and bool(row.get("backend_json_path")),
+        max_rows=6,
+    )
+    if not selected:
+        _plot_empty(path, "Latency Over Time", "No memtier latency time series available.")
+        return
+
+    loaded_series: list[tuple[dict[str, Any], list[dict[str, float]]]] = []
+    avg_max_values: list[float] = []
+    p99_max_values: list[float] = []
+    for row in selected:
+        json_path = Path(str(row.get("backend_json_path")))
+        if not json_path.exists():
+            continue
+        _, series = _extract_memtier_latency_series(json_path)
+        if not series:
+            continue
+        loaded_series.append((row, series))
+        avg_max_values.extend(point["avg"] for point in series)
+        p99_max_values.extend(point["p99"] for point in series)
+
+    if not loaded_series:
+        _plot_empty(path, "Latency Over Time", "No readable memtier latency time series available.")
+        return
+
+    avg_unit, avg_factor = _latency_unit(avg_max_values)
+    p99_unit, p99_factor = _latency_unit(p99_max_values)
+    db_colors = _database_colors([row for row, _series in loaded_series])
+
+    figure, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    avg_axis, p99_axis = axes
+    plotted = 0
+    for row, series in loaded_series:
+        seconds = [point["second"] for point in series]
+        avg_values = _scale_latency_values(
+            [point["avg"] for point in series],
+            avg_factor,
+        )
+        p99_values = _scale_latency_values(
+            [point["p99"] for point in series],
+            p99_factor,
+        )
+        label = _row_chart_label(row)
+        database = str(row.get("database") or "unknown")
+        color = db_colors.get(database, "#333333")
+        avg_axis.plot(seconds, avg_values, linewidth=2, label=label, color=color)
+        p99_axis.plot(seconds, p99_values, linewidth=2, label=label, color=color)
+        plotted += 1
+
+    if plotted == 0:
+        plt.close(figure)
+        _plot_empty(path, "Latency Over Time", "No readable memtier latency time series available.")
+        return
+
+    avg_axis.set_title("Average Latency Over Time")
+    avg_axis.set_ylabel(f"Average Latency ({avg_unit})")
+    avg_axis.grid(alpha=0.3)
+    avg_axis.legend(fontsize=8, loc="best")
+
+    p99_axis.set_title("P99 Latency Over Time")
+    p99_axis.set_xlabel("Elapsed Time (s)")
+    p99_axis.set_ylabel(f"P99 Latency ({p99_unit})")
+    p99_axis.grid(alpha=0.3)
+    p99_axis.legend(fontsize=8, loc="best")
+
+    figure.tight_layout()
+    figure.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _render_telemetry_metric(
+    rows: list[dict[str, Any]],
+    path: Path,
+    *,
+    metric_key: str,
+    title: str,
+    y_label: str,
+) -> None:
+    scenarios = _select_telemetry_scenarios(rows)
+    if not scenarios:
+        _plot_empty(path, title, "No host telemetry samples available for the selected workloads.")
+        return
+
+    figure, axes = plt.subplots(
+        len(scenarios),
+        1,
+        figsize=(11, 3.6 * len(scenarios)),
+        sharex=False,
+    )
+    axes = np.atleast_1d(axes)
+    db_colors = _database_colors(
+        [row for _scenario_title, scenario_rows in scenarios for row in scenario_rows]
+    )
+    plotted = 0
+
+    for axis, (scenario_title, scenario_rows) in zip(axes, scenarios):
+        scenario_plotted = 0
+        for row in scenario_rows:
+            samples_path = Path(str(row.get("host_telemetry_samples_path")))
+            if not samples_path.exists():
+                continue
+            series = _extract_telemetry_series(samples_path)
+            metric_points = series.get(metric_key) or []
+            if not metric_points:
+                continue
+            database = str(row.get("database") or "unknown")
+            axis.plot(
+                [point[0] for point in metric_points],
+                [point[1] for point in metric_points],
+                linewidth=2,
+                label=database,
+                color=db_colors.get(database, "#333333"),
+            )
+            scenario_plotted += 1
+            plotted += 1
+
+        axis.set_title(scenario_title)
+        axis.set_ylabel(y_label)
+        axis.grid(alpha=0.3)
+        if scenario_plotted:
+            axis.legend(fontsize=8, loc="best", ncols=min(3, scenario_plotted))
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No readable samples available.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+
+    if plotted == 0:
+        plt.close(figure)
+        _plot_empty(path, title, "No readable host telemetry samples available for the selected workloads.")
+        return
+
+    axes[-1].set_xlabel("Elapsed Time (s)")
+    figure.suptitle(title)
+    figure.tight_layout(rect=(0, 0, 1, 0.98))
+    figure.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
 # ---------------------------------------------------------------------------
 # Public entry-point
 # ---------------------------------------------------------------------------
@@ -716,6 +1232,44 @@ def render_report_charts(
     hm_path = assets_dir / "heatmap-dashboard.png"
     _render_heatmap_dashboard(rows, hm_path)
     paths["heatmap_dashboard"] = hm_path
+
+    cdf_path = assets_dir / "latency-cdf.png"
+    _render_latency_cdf(rows, cdf_path)
+    paths["latency_cdf"] = cdf_path
+
+    lot_path = assets_dir / "latency-over-time.png"
+    _render_latency_over_time(rows, lot_path)
+    paths["latency_over_time"] = lot_path
+
+    cpu_path = assets_dir / "cpu-timeseries.png"
+    _render_telemetry_metric(
+        rows,
+        cpu_path,
+        metric_key="cpu",
+        title="CPU Usage Over Time",
+        y_label="System CPU (%)",
+    )
+    paths["cpu_timeseries"] = cpu_path
+
+    rss_path = assets_dir / "rss-timeseries.png"
+    _render_telemetry_metric(
+        rows,
+        rss_path,
+        metric_key="rss_mib",
+        title="Process RSS Over Time",
+        y_label="RSS (MiB)",
+    )
+    paths["rss_timeseries"] = rss_path
+
+    net_path = assets_dir / "network-timeseries.png"
+    _render_telemetry_metric(
+        rows,
+        net_path,
+        metric_key="net_tx_mib_per_sec",
+        title="Loopback TX Throughput Over Time",
+        y_label="TX Throughput (MiB/s)",
+    )
+    paths["network_timeseries"] = net_path
 
     # Existing charts
     radar_path = assets_dir / "radar-profile.png"

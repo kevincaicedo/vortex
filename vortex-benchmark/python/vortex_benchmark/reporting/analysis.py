@@ -367,8 +367,10 @@ def _build_command_comparison(
             "throughput_ops_sec": row.get("throughput_ops_sec"),
             "average_latency_ms": row.get("average_latency_ms"),
             "p50_latency_ms": row.get("p50_latency_ms"),
+            "p95_latency_ms": row.get("p95_latency_ms"),
             "p99_latency_ms": row.get("p99_latency_ms"),
             "p99_9_latency_ms": row.get("p99_9_latency_ms"),
+            "p99_99_latency_ms": row.get("p99_99_latency_ms"),
         }
 
     table_rows = []
@@ -394,8 +396,10 @@ def _build_thread_workload_comparison(
             "throughput_ops_sec": row.get("throughput_ops_sec"),
             "average_latency_ms": row.get("average_latency_ms"),
             "p50_latency_ms": row.get("p50_latency_ms"),
+            "p95_latency_ms": row.get("p95_latency_ms"),
             "p99_latency_ms": row.get("p99_latency_ms"),
             "p99_9_latency_ms": row.get("p99_9_latency_ms"),
+            "p99_99_latency_ms": row.get("p99_99_latency_ms"),
         }
 
     workloads: dict[str, dict[str, Any]] = {}
@@ -491,8 +495,10 @@ def _build_latency_breakdown(
             "throughput_ops_sec": r.get("throughput_ops_sec"),
             "average_latency_ms": r.get("average_latency_ms"),
             "p50_latency_ms": r.get("p50_latency_ms"),
+            "p95_latency_ms": r.get("p95_latency_ms"),
             "p99_latency_ms": r.get("p99_latency_ms"),
             "p99_9_latency_ms": r.get("p99_9_latency_ms"),
+            "p99_99_latency_ms": r.get("p99_99_latency_ms"),
             "p99_999_latency_ms": r.get("p99_999_latency_ms"),
         }
         for r in [best[k] for k in sorted(best)]
@@ -622,8 +628,10 @@ def _build_command_rankings(
             "throughput_ops_sec": row.get("throughput_ops_sec"),
             "average_latency_ms": row.get("average_latency_ms"),
             "p50_latency_ms": row.get("p50_latency_ms"),
+            "p95_latency_ms": row.get("p95_latency_ms"),
             "p99_latency_ms": row.get("p99_latency_ms"),
             "p99_9_latency_ms": row.get("p99_9_latency_ms"),
+            "p99_99_latency_ms": row.get("p99_99_latency_ms"),
         }
 
     table_rows = []
@@ -675,8 +683,10 @@ def _build_thread_workload_rankings(
             "throughput_ops_sec": row.get("throughput_ops_sec"),
             "average_latency_ms": row.get("average_latency_ms"),
             "p50_latency_ms": row.get("p50_latency_ms"),
+            "p95_latency_ms": row.get("p95_latency_ms"),
             "p99_latency_ms": row.get("p99_latency_ms"),
             "p99_9_latency_ms": row.get("p99_9_latency_ms"),
+            "p99_99_latency_ms": row.get("p99_99_latency_ms"),
         }
 
     workloads: dict[str, dict[str, Any]] = {}
