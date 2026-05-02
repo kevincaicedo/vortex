@@ -123,8 +123,8 @@ fn reactor_resource_share(
     let reactor_connections = share_evenly(total_connections, num_reactors, reactor_idx);
     let required_buffers = total_connections;
     let spare_buffers = total_buffers - required_buffers;
-    let reactor_buffers = reactor_connections
-        + share_evenly(spare_buffers, num_reactors, reactor_idx);
+    let reactor_buffers =
+        reactor_connections + share_evenly(spare_buffers, num_reactors, reactor_idx);
     (reactor_connections, reactor_buffers)
 }
 

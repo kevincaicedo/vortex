@@ -205,7 +205,7 @@ fn bench_entry_write_inline(c: &mut Criterion) {
         b.iter_batched(
             Entry::empty,
             |mut entry| {
-                entry.write_inline(
+                entry.write_inline_string(
                     black_box(0x91),
                     black_box(&key),
                     black_box(&value),
@@ -220,7 +220,7 @@ fn bench_entry_write_inline(c: &mut Criterion) {
 
 fn bench_entry_read_inline(c: &mut Criterion) {
     let mut entry = Entry::empty();
-    entry.write_inline(0x91, b"0123456789", b"abcdefghij", 42);
+    entry.write_inline_string(0x91, b"0123456789", b"abcdefghij", 42);
 
     c.bench_function("entry_read_inline", |b| {
         b.iter(|| black_box(entry.read_key()));
@@ -230,16 +230,16 @@ fn bench_entry_read_inline(c: &mut Criterion) {
 fn bench_entry_matches_key(c: &mut Criterion) {
     let mut entry = Entry::empty();
     let key = b"0123456789";
-    entry.write_inline(0x91, key, b"abcdefghij", 42);
+    entry.write_inline_string(0x91, key, b"abcdefghij", 42);
 
     c.bench_function("entry_matches_key", |b| {
-        b.iter(|| black_box(entry.matches_key_with_ctrl(black_box(key), black_box(0x91))));
+        b.iter(|| black_box(entry.matches_key(black_box(key))));
     });
 }
 
 fn bench_entry_is_expired(c: &mut Criterion) {
     let mut entry = Entry::empty();
-    entry.write_inline(0x91, b"0123456789", b"abcdefghij", 1_000);
+    entry.write_inline_string(0x91, b"0123456789", b"abcdefghij", 1_000);
 
     c.bench_function("entry_is_expired", |b| {
         b.iter(|| black_box(entry.is_expired(black_box(1_001))));
@@ -253,7 +253,7 @@ fn bench_entry_write_integer(c: &mut Criterion) {
         b.iter_batched(
             Entry::empty,
             |mut entry| {
-                entry.write_integer(
+                entry.write_inline_integer(
                     black_box(0x91),
                     black_box(&key),
                     black_box(123_456_i64),
@@ -393,7 +393,7 @@ fn bench_swiss_table_mixed_50_50(c: &mut Criterion) {
 
 fn bench_entry_read_integer(c: &mut Criterion) {
     let mut entry = Entry::empty();
-    entry.write_integer(0x91, b"counter\x00\x00\x00", 42_i64, 0);
+    entry.write_inline_integer(0x91, b"counter\x00\x00\x00", 42_i64, 0);
 
     c.bench_function("entry_read_integer", |b| {
         b.iter(|| black_box(entry.read_value()));

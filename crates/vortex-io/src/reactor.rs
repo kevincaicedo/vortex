@@ -1182,7 +1182,9 @@ impl Reactor {
                             close_after_write = true;
                         }
                         match response {
-                            CommandResponse::Static(buf) => self.writev_states[conn_id].push_static(buf),
+                            CommandResponse::Static(buf) => {
+                                self.writev_states[conn_id].push_static(buf)
+                            }
                             CommandResponse::Inline(inline) => {
                                 self.writev_states[conn_id].push_inline(inline.as_bytes());
                             }
@@ -1476,7 +1478,7 @@ impl Reactor {
             if self.transaction_states[conn_id]
                 .watched
                 .iter()
-                .any(|watched| watched.key == key)
+                .any(|watched| watched.key() == &key)
             {
                 continue;
             }
@@ -2799,6 +2801,141 @@ mod tests {
 
         let (resp, _) = dispatch_reactor_wire(&mut reactor, b"*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n");
         assert_eq!(response_bytes(resp), b"$-1\r\n");
+    }
+
+    #[test]
+    fn watch_missing_key_aborts_after_set_delete_churn() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$7\r\nmissing\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            1,
+            b"*3\r\n$3\r\nSET\r\n$7\r\nmissing\r\n$5\r\nvalue\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 1, b"*2\r\n$3\r\nDEL\r\n$7\r\nmissing\r\n");
+        assert_eq!(response_bytes(resp), b":1\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$6\r\nqueued\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
+    }
+
+    #[test]
+    fn watch_aborts_after_flushall() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$3\r\nfoo\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 1, b"*1\r\n$8\r\nFLUSHALL\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$6\r\nqueued\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
+    }
+
+    #[test]
+    fn watch_aborts_after_pexpire_only_mutation() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$9\r\nwatch:ttl\r\n$2\r\nv1\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) =
+            dispatch_reactor_wire_on(&mut reactor, 0, b"*2\r\n$5\r\nWATCH\r\n$9\r\nwatch:ttl\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            1,
+            b"*3\r\n$7\r\nPEXPIRE\r\n$9\r\nwatch:ttl\r\n$5\r\n60000\r\n",
+        );
+        assert_eq!(response_bytes(resp), b":1\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$6\r\nqueued\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
+    }
+
+    #[test]
+    fn watch_aborts_after_persist_only_mutation() {
+        let mut reactor = test_reactor();
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*5\r\n$3\r\nSET\r\n$13\r\nwatch:persist\r\n$2\r\nv1\r\n$2\r\nEX\r\n$2\r\n60\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*2\r\n$5\r\nWATCH\r\n$13\r\nwatch:persist\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            1,
+            b"*2\r\n$7\r\nPERSIST\r\n$13\r\nwatch:persist\r\n",
+        );
+        assert_eq!(response_bytes(resp), b":1\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response_bytes(resp), b"+OK\r\n");
+        let (resp, _) = dispatch_reactor_wire_on(
+            &mut reactor,
+            0,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$6\r\nqueued\r\n",
+        );
+        assert_eq!(response_bytes(resp), b"+QUEUED\r\n");
+
+        let (resp, _) = dispatch_reactor_wire_on(&mut reactor, 0, b"*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response_bytes(resp), b"*-1\r\n");
     }
 
     #[test]

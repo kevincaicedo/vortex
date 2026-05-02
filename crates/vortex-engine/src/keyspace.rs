@@ -62,7 +62,7 @@ const AHASH_SEED_0: u64 = 0x517c_c1b7_2722_0a95;
 const AHASH_SEED_1: u64 = 0x6c62_272e_07bb_0142;
 const AHASH_SEED_2: u64 = 0x8fbc_2d2b_9e3a_6ee8;
 const AHASH_SEED_3: u64 = 0xcf41_41b0_ed82_a837;
-const WATCH_SHARD_COUNT: usize = 256;
+const ABSENT_WATCH_SHARD_COUNT: usize = 256;
 const TRANSACTION_GATE_COUNTERS: usize = 128;
 const MUTATION_FEATURE_MAXMEMORY: usize = 1 << 0;
 const MUTATION_FEATURE_WATCH: usize = 1 << 1;
@@ -134,18 +134,28 @@ pub(crate) struct EvictedKey {
 pub(crate) type EvictedKeys = Option<Box<[EvictedKey]>>;
 
 #[derive(Debug)]
-/// Cold WATCH metadata kept outside the 64-byte Entry hot path.
-struct WatchSlot {
+/// Cold WATCH metadata for keys that were absent when WATCH ran.
+struct AbsentWatchSlot {
     version: u64,
     refs: usize,
 }
 
-type WatchShard = CachePadded<RwLock<HashMap<VortexKey, WatchSlot>>>;
+type AbsentWatchShard = CachePadded<RwLock<HashMap<VortexKey, AbsentWatchSlot>>>;
 
 #[derive(Clone, Debug)]
 pub struct WatchKeyState {
-    pub key: VortexKey,
-    pub version: u64,
+    key: VortexKey,
+    shard_index: usize,
+    table_hash: u64,
+    version: u64,
+    present: bool,
+}
+
+impl WatchKeyState {
+    #[inline]
+    pub fn key(&self) -> &VortexKey {
+        &self.key
+    }
 }
 
 #[derive(Debug)]
@@ -621,11 +631,15 @@ pub struct ConcurrentKeyspace {
     eviction_metrics: EvictionMetrics,
     /// Always-on low-overhead counters exported through INFO runtime.
     runtime_metrics: RuntimeMetrics,
-    /// Optimistic WATCH side table. It is cold unless clients are actively
-    /// watching keys; normal mutations avoid it behind `watch_active`.
-    watch_shards: Box<[WatchShard]>,
+    /// Cold WATCH registry used only for keys that were absent at WATCH time.
+    /// Present-key validation reads entry-resident LSNs directly.
+    absent_watch_shards: Box<[AbsentWatchShard]>,
+    /// Number of active WATCH registrations for keys that were absent when
+    /// watched. This keeps absent-key invalidation off the mutation hot path
+    /// unless it is required for Redis-compatible semantics.
+    absent_watch_active: AtomicUsize,
     /// Number of active WATCH registrations. Zero means write paths skip the
-    /// side table entirely.
+    /// cold-path invalidation hooks entirely.
     watch_active: AtomicUsize,
     /// Global invalidation epoch for full-keyspace writes such as FLUSHALL.
     watch_epoch: AtomicU64,
@@ -653,8 +667,8 @@ impl std::fmt::Debug for ConcurrentKeyspace {
     }
 }
 
-fn make_watch_shards() -> Box<[WatchShard]> {
-    (0..WATCH_SHARD_COUNT)
+fn make_absent_watch_shards() -> Box<[AbsentWatchShard]> {
+    (0..ABSENT_WATCH_SHARD_COUNT)
         .map(|_| CachePadded::new(RwLock::new(HashMap::new())))
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -712,7 +726,7 @@ impl ConcurrentKeyspace {
         let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
-        let watch_shards = make_watch_shards();
+        let absent_watch_shards = make_absent_watch_shards();
 
         Self {
             shards: shards.into_boxed_slice(),
@@ -733,7 +747,8 @@ impl ConcurrentKeyspace {
             frequency_sketch: FrequencySketch::new(),
             eviction_metrics: EvictionMetrics::default(),
             runtime_metrics: RuntimeMetrics::new(runtime_slots),
-            watch_shards,
+            absent_watch_shards,
+            absent_watch_active: AtomicUsize::new(0),
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
             transaction_gate: CachePadded::new(TransactionGate::default()),
@@ -807,39 +822,53 @@ impl ConcurrentKeyspace {
 
     pub fn watch_key(&self, key: VortexKey) -> WatchKeyState {
         self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
-        let shard_idx = self.watch_shard_index(key.as_bytes());
-        // Lock-order note: WATCH registration only takes a single watch-shard
-        // lock and never nests data-shard or transaction-gate acquisition.
-        let mut guard = self.watch_shards[shard_idx].write();
-        let slot = guard.entry(key.clone()).or_insert(WatchSlot {
-            version: 0,
-            refs: 0,
-        });
-        slot.refs += 1;
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+
+        let (version, present) = match self
+            .read_shard_by_index(shard_index)
+            .get_lsn_version_prehashed(key_bytes, table_hash)
+        {
+            Some(version) => (version, true),
+            None => {
+                let _ = self.register_absent_watch_key(&key, table_hash);
+                match self
+                    .read_shard_by_index(shard_index)
+                    .get_lsn_version_prehashed(key_bytes, table_hash)
+                {
+                    Some(version) => {
+                        self.release_absent_watch_key(key_bytes, table_hash);
+                        (version, true)
+                    }
+                    None => (
+                        self.absent_watch_version(key_bytes, table_hash)
+                            .expect("absent watch must exist after registration"),
+                        false,
+                    ),
+                }
+            }
+        };
+
         if self.watch_active.fetch_add(1, Ordering::Release) == 0 {
             self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
         }
         WatchKeyState {
             key,
-            version: slot.version,
+            shard_index,
+            table_hash,
+            version,
+            present,
         }
     }
 
     pub fn unwatch_keys(&self, keys: &[WatchKeyState]) {
         for watched in keys {
-            let shard_idx = self.watch_shard_index(watched.key.as_bytes());
-            // UNWATCH takes at most one watch-shard lock at a time, so there is
-            // no multi-lock cycle across watched keys.
-            let mut guard = self.watch_shards[shard_idx].write();
-            if let Some(slot) = guard.get_mut(&watched.key) {
-                if slot.refs > 1 {
-                    slot.refs -= 1;
-                } else {
-                    guard.remove(&watched.key);
-                }
-                if self.watch_active.fetch_sub(1, Ordering::Release) == 1 {
-                    self.disable_mutation_feature(MUTATION_FEATURE_WATCH);
-                }
+            if !watched.present {
+                self.release_absent_watch_key(watched.key.as_bytes(), watched.table_hash);
+            }
+            if self.watch_active.fetch_sub(1, Ordering::Release) == 1 {
+                self.disable_mutation_feature(MUTATION_FEATURE_WATCH);
             }
         }
     }
@@ -850,15 +879,23 @@ impl ConcurrentKeyspace {
         }
 
         for watched in keys {
-            let shard_idx = self.watch_shard_index(watched.key.as_bytes());
-            // EXEC validation only reads watch shards. Queued writes run after
-            // validation completes, so the watch-shard -> data-shard order does
-            // not exist.
-            let guard = self.watch_shards[shard_idx].read();
-            let Some(slot) = guard.get(&watched.key) else {
+            let key_bytes = watched.key.as_bytes();
+            let guard = self.read_shard_by_index(watched.shard_index);
+            let current_lsn = guard.get_lsn_version_prehashed(key_bytes, watched.table_hash);
+            drop(guard);
+
+            if watched.present {
+                if current_lsn != Some(watched.version) {
+                    return true;
+                }
+                continue;
+            }
+
+            if current_lsn.is_some() {
                 return true;
-            };
-            if slot.version != watched.version {
+            }
+
+            if self.absent_watch_version(key_bytes, watched.table_hash) != Some(watched.version) {
                 return true;
             }
         }
@@ -898,7 +935,7 @@ impl ConcurrentKeyspace {
         let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
-        let watch_shards = make_watch_shards();
+        let absent_watch_shards = make_absent_watch_shards();
 
         Self {
             shards: shards.into_boxed_slice(),
@@ -919,7 +956,8 @@ impl ConcurrentKeyspace {
             frequency_sketch: FrequencySketch::new(),
             eviction_metrics: EvictionMetrics::default(),
             runtime_metrics: RuntimeMetrics::new(1),
-            watch_shards,
+            absent_watch_shards,
+            absent_watch_active: AtomicUsize::new(0),
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
             transaction_gate: CachePadded::new(TransactionGate::default()),
@@ -1003,11 +1041,6 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
-    pub(crate) fn next_aof_lsn_with_features(&self, features: usize) -> Option<u64> {
-        Self::mutation_feature_aof(features).then(|| self.next_lsn())
-    }
-
-    #[inline(always)]
     fn mutation_feature_active(&self, feature: usize) -> bool {
         self.mutation_features.load(Ordering::Acquire) & feature != 0
     }
@@ -1059,8 +1092,8 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    fn watch_shard_index(&self, key_bytes: &[u8]) -> usize {
-        (self.table_hash_key(key_bytes) as usize) & (WATCH_SHARD_COUNT - 1)
+    fn absent_watch_shard_index(&self, table_hash: u64) -> usize {
+        (table_hash as usize) & (ABSENT_WATCH_SHARD_COUNT - 1)
     }
 
     #[inline]
@@ -1073,14 +1106,18 @@ impl ConcurrentKeyspace {
         if !self.watch_tracking_active() {
             return;
         }
-        self.bump_watch_key_known_active(key);
+        self.bump_watch_key_known_active(key.as_bytes(), self.table_hash_key(key.as_bytes()));
     }
 
     #[inline]
-    pub(crate) fn bump_watch_key_known_active(&self, key: &VortexKey) {
-        let shard_idx = self.watch_shard_index(key.as_bytes());
-        let mut guard = self.watch_shards[shard_idx].write();
-        if let Some(slot) = guard.get_mut(key) {
+    pub(crate) fn bump_watch_key_known_active(&self, key_bytes: &[u8], table_hash: u64) {
+        if self.absent_watch_active.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        let shard_idx = self.absent_watch_shard_index(table_hash);
+        let mut guard = self.absent_watch_shards[shard_idx].write();
+        if let Some(slot) = guard.get_mut(key_bytes) {
             slot.version = slot.version.wrapping_add(1).max(1);
         }
     }
@@ -1090,13 +1127,47 @@ impl ConcurrentKeyspace {
         if !self.watch_tracking_active() {
             return;
         }
-        self.bump_watch_key(&VortexKey::from(key_bytes));
+        self.bump_watch_key_known_active(key_bytes, self.table_hash_key(key_bytes));
     }
 
     #[inline]
     pub(crate) fn bump_all_watches(&self) {
         if self.watch_active.load(Ordering::Acquire) != 0 {
             self.watch_epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn absent_watch_version(&self, key_bytes: &[u8], table_hash: u64) -> Option<u64> {
+        let shard_idx = self.absent_watch_shard_index(table_hash);
+        let guard = self.absent_watch_shards[shard_idx].read();
+        guard.get(key_bytes).map(|slot| slot.version)
+    }
+
+    #[inline]
+    fn register_absent_watch_key(&self, key: &VortexKey, table_hash: u64) -> u64 {
+        let shard_idx = self.absent_watch_shard_index(table_hash);
+        let mut guard = self.absent_watch_shards[shard_idx].write();
+        let slot = guard.entry(key.clone()).or_insert(AbsentWatchSlot {
+            version: 0,
+            refs: 0,
+        });
+        slot.refs += 1;
+        self.absent_watch_active.fetch_add(1, Ordering::Release);
+        slot.version
+    }
+
+    #[inline]
+    fn release_absent_watch_key(&self, key_bytes: &[u8], table_hash: u64) {
+        let shard_idx = self.absent_watch_shard_index(table_hash);
+        let mut guard = self.absent_watch_shards[shard_idx].write();
+        if let Some(slot) = guard.get_mut(key_bytes) {
+            if slot.refs > 1 {
+                slot.refs -= 1;
+            } else {
+                guard.remove(key_bytes);
+            }
+            self.absent_watch_active.fetch_sub(1, Ordering::Release);
         }
     }
 
@@ -1589,7 +1660,10 @@ impl ConcurrentKeyspace {
         self.update_expiry_count(shard_idx, ttl != 0, false);
         if let Some(key) = key {
             if track_watch {
-                self.bump_watch_key_known_active(&key);
+                self.bump_watch_key_known_active(
+                    key.as_bytes(),
+                    self.table_hash_key(key.as_bytes()),
+                );
             }
             if record_aof {
                 evicted.push(EvictedKey {
@@ -1775,6 +1849,21 @@ impl ConcurrentKeyspace {
     #[inline(always)]
     pub(crate) fn next_aof_lsn(&self) -> Option<u64> {
         self.aof_recording_enabled().then(|| self.next_lsn())
+    }
+
+    #[inline(always)]
+    pub(crate) fn allocate_mutation_lsn(&self) -> (u64, Option<u64>) {
+        let lsn = self.next_lsn();
+        (lsn, self.aof_recording_enabled().then_some(lsn))
+    }
+
+    #[inline(always)]
+    pub(crate) fn allocate_mutation_lsn_with_features(
+        &self,
+        features: usize,
+    ) -> (u64, Option<u64>) {
+        let lsn = self.next_lsn();
+        (lsn, Self::mutation_feature_aof(features).then_some(lsn))
     }
 
     /// Read the current LSN value (the next LSN to be assigned).
@@ -2368,8 +2457,13 @@ mod tests {
             handle.join().expect("watch worker should not panic");
         }
 
-        let live_watch_slots: usize = ks.watch_shards.iter().map(|shard| shard.read().len()).sum();
+        let live_watch_slots: usize = ks
+            .absent_watch_shards
+            .iter()
+            .map(|shard| shard.read().len())
+            .sum();
         assert_eq!(live_watch_slots, 0);
+        assert_eq!(ks.absent_watch_active.load(Ordering::Acquire), 0);
         assert_eq!(ks.watch_active.load(Ordering::Acquire), 0);
         assert!(!ks.watch_tracking_active());
     }
@@ -2797,14 +2891,15 @@ mod tests {
     #[test]
     fn active_expiry_uses_delete_slot_directly() {
         let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let deadline = 1_000_000;
 
-        // Insert 10 keys with TTL deadline = 1_000 (will be expired at now=2_000).
+        // Insert 10 keys with TTL deadline = 1 ms (will be expired at now=2 ms).
         for i in 0..10u64 {
             let key_bytes = format!("exp:{i}");
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
             let shard_idx = ks.shard_index(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
-                t.insert_with_ttl(key, VortexValue::from(i as i64), 1_000);
+                t.insert_with_ttl(key, VortexValue::from(i as i64), deadline);
             });
             ks.update_expiry_count(shard_idx, false, true);
         }
@@ -2817,7 +2912,8 @@ mod tests {
         let mut total_expired = 0usize;
         let num_shards = ks.num_shards();
         for shard_idx in 0..num_shards {
-            let (expired, _sampled) = ks.run_active_expiry_on_shard(shard_idx, 0, 256, 2_000);
+            let (expired, _sampled) =
+                ks.run_active_expiry_on_shard(shard_idx, 0, 256, deadline * 2);
             total_expired += expired;
         }
 
@@ -2830,6 +2926,7 @@ mod tests {
     #[test]
     fn active_expiry_skips_non_expired_and_no_ttl() {
         let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let deadline = 10_000_000;
 
         // 5 keys with no TTL (persistent).
         for i in 0..5u64 {
@@ -2846,17 +2943,17 @@ mod tests {
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
             let shard_idx = ks.shard_index(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
-                t.insert_with_ttl(key, VortexValue::from("later"), 10_000);
+                t.insert_with_ttl(key, VortexValue::from("later"), deadline);
             });
             ks.update_expiry_count(shard_idx, false, true);
         }
 
         assert_eq!(ks.dbsize(), 10);
 
-        // Run active expiry at now=5_000 — future keys are still alive.
+        // Run active expiry at now=5 ms — future keys are still alive.
         let mut total_expired = 0usize;
         for shard_idx in 0..ks.num_shards() {
-            let (expired, _) = ks.run_active_expiry_on_shard(shard_idx, 0, 256, 5_000);
+            let (expired, _) = ks.run_active_expiry_on_shard(shard_idx, 0, 256, 5_000_000);
             total_expired += expired;
         }
 

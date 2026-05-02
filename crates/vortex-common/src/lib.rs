@@ -9,7 +9,7 @@
 //!
 //! ## Key Types
 //!
-//! - [`VortexKey`] — Small-string-optimized key (inline ≤23 bytes)
+//! - [`VortexKey`] — Small-string-optimized key
 //! - [`VortexValue`] — Tagged enum for all value types
 //! - [`VortexError`] / [`VortexResult`] — Unified error handling
 //! - [`ShardId`] — Shard routing identifier

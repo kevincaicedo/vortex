@@ -969,26 +969,26 @@ mod tests {
         let h = new_harness();
         h.set(VortexKey::from("ea"), VortexValue::from("v"));
 
-        let unix_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let deadline = unix_now + 60;
+        let monotonic_now = NOW;
+        let unix_now_nanos = vortex_common::current_unix_time_nanos();
+        let deadline = unix_now_nanos / NS_PER_SEC + 60;
 
         // EXPIREAT ea unix_now + 60 seconds
-        let r = exec(
-            &h.keyspace,
-            cmd_expireat,
-            &[b"EXPIREAT", b"ea", deadline.to_string().as_bytes()],
-            NOW,
-        );
+        let data = make_resp(&[b"EXPIREAT", b"ea", deadline.to_string().as_bytes()]);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
+        let frame = tape.iter().next().unwrap();
+        let r =
+            cmd_expireat_with_clock(&h.keyspace, &frame, monotonic_now, unix_now_nanos).response;
         assert_static(r, RESP_ONE);
 
         // EXPIRETIME ea should report the original absolute deadline.
-        let r = exec(&h.keyspace, cmd_expiretime, &[b"EXPIRETIME", b"ea"], NOW);
+        let data = make_resp(&[b"EXPIRETIME", b"ea"]);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
+        let frame = tape.iter().next().unwrap();
+        let r = cmd_expiretime_with_clock(&h.keyspace, &frame, monotonic_now, unix_now_nanos);
         match r {
             CmdResult::Resp(RespFrame::Integer(actual)) => {
-                assert!(actual == deadline as i64 || actual == deadline as i64 - 1);
+                assert!((deadline as i64 - 1..=deadline as i64 + 1).contains(&actual));
             }
             CmdResult::Static(bytes) => panic!("expected integer response, got {bytes:?}"),
             other => panic!("expected integer response, got {other:?}"),
@@ -1348,18 +1348,18 @@ mod tests {
     #[test]
     fn lazy_expiry_get_cleans_up_expired_key() {
         let h = new_harness();
-        // Insert key with TTL deadline = 1000 ns.
-        h.set_with_ttl(VortexKey::from("ek"), VortexValue::from("val"), 1000);
+        // Insert key with TTL deadline = 1 ms.
+        h.set_with_ttl(VortexKey::from("ek"), VortexValue::from("val"), 1_000_000);
 
         // Before expiry: key exists.
         assert_eq!(h.keyspace.dbsize(), 1);
 
-        // GET at now=2000 → nil AND key removed from table.
+        // GET at now=2 ms → nil AND key removed from table.
         let r = exec(
             &h.keyspace,
             super::super::string::cmd_get,
             &[b"GET", b"ek"],
-            2000,
+            2_000_000,
         );
         assert_static(r, RESP_NIL);
 
@@ -1371,11 +1371,11 @@ mod tests {
     #[test]
     fn lazy_expiry_ttl_cleans_up_expired_key() {
         let h = new_harness();
-        h.set_with_ttl(VortexKey::from("tk"), VortexValue::from("val"), 1000);
+        h.set_with_ttl(VortexKey::from("tk"), VortexValue::from("val"), 1_000_000);
         assert_eq!(h.keyspace.dbsize(), 1);
 
-        // TTL at now=2000 → -2 (missing).
-        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], 2000);
+        // TTL at now=2 ms → -2 (missing).
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], 2_000_000);
         assert_static(r, RESP_NEG_TWO);
 
         // Key cleaned up.
@@ -1386,10 +1386,14 @@ mod tests {
     #[test]
     fn lazy_expiry_type_cleans_up_expired_key() {
         let h = new_harness();
-        h.set_with_ttl(VortexKey::from("typekey"), VortexValue::from("val"), 1000);
+        h.set_with_ttl(
+            VortexKey::from("typekey"),
+            VortexValue::from("val"),
+            1_000_000,
+        );
         assert_eq!(h.keyspace.dbsize(), 1);
 
-        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"typekey"], 2000);
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"typekey"], 2_000_000);
         match r {
             CmdResult::Resp(vortex_proto::RespFrame::SimpleString(s)) => assert_eq!(s, "none"),
             other => panic!("expected SimpleString(none), got {:?}", other),
@@ -1402,17 +1406,17 @@ mod tests {
     #[test]
     fn lazy_expiry_exists_cleans_up_expired_key() {
         let h = new_harness();
-        h.set_with_ttl(VortexKey::from("ex1"), VortexValue::from("v1"), 1000);
-        h.set_with_ttl(VortexKey::from("ex2"), VortexValue::from("v2"), 1000);
+        h.set_with_ttl(VortexKey::from("ex1"), VortexValue::from("v1"), 1_000_000);
+        h.set_with_ttl(VortexKey::from("ex2"), VortexValue::from("v2"), 1_000_000);
         h.set(VortexKey::from("live"), VortexValue::from("v3"));
         assert_eq!(h.keyspace.dbsize(), 3);
 
-        // EXISTS ex1 ex2 live at now=2000 → only "live" counted.
+        // EXISTS ex1 ex2 live at now=2 ms → only "live" counted.
         let r = exec(
             &h.keyspace,
             cmd_exists,
             &[b"EXISTS", b"ex1", b"ex2", b"live"],
-            2000,
+            2_000_000,
         );
         assert_integer(r, 1);
 

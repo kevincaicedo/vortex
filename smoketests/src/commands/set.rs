@@ -23,10 +23,17 @@ fn set_supports_nx_xx_and_get(ctx: &mut SmokeContext) -> Result<()> {
     Ok(())
 }
 
-fn set_supports_expiry_options(ctx: &mut SmokeContext) -> Result<()> {
+fn set_supports_relative_expiry_options(ctx: &mut SmokeContext) -> Result<()> {
     ctx.assert_ok(&["SET", "expiring", "v", "EX", "60"])?;
     let ttl = ctx.ttl("expiring")?;
     assert!(ttl > 0 && ttl <= 60);
+
+    ctx.assert_ok(&["SET", "expiring-ms", "v", "PX", "60000"])?;
+    let pttl = ctx.pttl("expiring-ms")?;
+    ensure!(
+        pttl > 0 && pttl <= 60_000,
+        "SET PX PTTL out of range: pttl={pttl}"
+    );
     Ok(())
 }
 
@@ -64,6 +71,17 @@ fn set_supports_keepttl(ctx: &mut SmokeContext) -> Result<()> {
     Ok(())
 }
 
+fn set_without_keepttl_clears_existing_expiry(ctx: &mut SmokeContext) -> Result<()> {
+    ctx.assert_ok(&["SET", "sticky-clear", "v1", "EX", "60"])?;
+    let before = ctx.ttl("sticky-clear")?;
+    assert!(before > 0 && before <= 60);
+
+    ctx.assert_ok(&["SET", "sticky-clear", "v2"])?;
+    assert_eq!(ctx.get("sticky-clear")?, Some("v2".to_string()));
+    assert_eq!(ctx.ttl("sticky-clear")?, -1);
+    Ok(())
+}
+
 pub fn spec() -> CommandSpec {
     CommandSpec::new("SET", CommandGroup::String, SupportLevel::Supported)
         .summary("Writes a string value with Redis-compatible option handling.")
@@ -73,9 +91,10 @@ pub fn spec() -> CommandSpec {
         .tested(&[
             "Basic write path",
             "NX / XX / GET option interaction",
-            "Relative EX expiry",
+            "Relative EX / PX expiry",
             "Absolute EXAT / PXAT expiry",
             "KEEPTTL preserves existing expiry",
+            "Plain SET clears an existing expiry",
         ])
         .not_tested(&[])
         .case(CaseDef::new(
@@ -89,9 +108,9 @@ pub fn spec() -> CommandSpec {
             set_supports_nx_xx_and_get,
         ))
         .case(CaseDef::new(
-            "supports ex ttl",
-            "SET EX should apply a positive TTL.",
-            set_supports_expiry_options,
+            "supports ex and px ttl",
+            "SET EX/PX should apply positive relative expirations.",
+            set_supports_relative_expiry_options,
         ))
         .case(CaseDef::new(
             "supports exat and pxat",
@@ -102,5 +121,10 @@ pub fn spec() -> CommandSpec {
             "supports keepttl",
             "SET KEEPTTL should preserve an existing expiration while replacing the value.",
             set_supports_keepttl,
+        ))
+        .case(CaseDef::new(
+            "plain set clears ttl",
+            "SET without KEEPTTL should drop any existing expiration metadata.",
+            set_without_keepttl_clears_existing_expiry,
         ))
 }

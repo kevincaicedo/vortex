@@ -29,7 +29,11 @@ pub fn absolute_unix_nanos_to_deadline_nanos(
     monotonic_now_nanos: u64,
     unix_now_nanos: u64,
 ) -> u64 {
-    monotonic_now_nanos.saturating_add(absolute_unix_nanos.saturating_sub(unix_now_nanos))
+    if absolute_unix_nanos >= unix_now_nanos {
+        monotonic_now_nanos.saturating_add(absolute_unix_nanos - unix_now_nanos)
+    } else {
+        monotonic_now_nanos.saturating_sub(unix_now_nanos - absolute_unix_nanos)
+    }
 }
 
 #[inline]
@@ -38,7 +42,11 @@ pub fn deadline_nanos_to_absolute_unix_nanos(
     monotonic_now_nanos: u64,
     unix_now_nanos: u64,
 ) -> u64 {
-    unix_now_nanos.saturating_add(deadline_nanos.saturating_sub(monotonic_now_nanos))
+    if deadline_nanos >= monotonic_now_nanos {
+        unix_now_nanos.saturating_add(deadline_nanos - monotonic_now_nanos)
+    } else {
+        unix_now_nanos.saturating_sub(monotonic_now_nanos - deadline_nanos)
+    }
 }
 
 impl Timestamp {
@@ -168,6 +176,19 @@ mod tests {
 
         let deadline = absolute_unix_nanos_to_deadline_nanos(absolute, mono_now, unix_now);
         assert_eq!(deadline, mono_now + 60 * NS_PER_SEC);
+
+        let round_trip = deadline_nanos_to_absolute_unix_nanos(deadline, mono_now, unix_now);
+        assert_eq!(round_trip, absolute);
+    }
+
+    #[test]
+    fn clock_domain_conversion_handles_past_deadlines() {
+        let unix_now = 1_750_000_000 * NS_PER_SEC;
+        let mono_now = 9_000 * NS_PER_SEC;
+        let absolute = unix_now - 60 * NS_PER_SEC;
+
+        let deadline = absolute_unix_nanos_to_deadline_nanos(absolute, mono_now, unix_now);
+        assert_eq!(deadline, mono_now - 60 * NS_PER_SEC);
 
         let round_trip = deadline_nanos_to_absolute_unix_nanos(deadline, mono_now, unix_now);
         assert_eq!(round_trip, absolute);

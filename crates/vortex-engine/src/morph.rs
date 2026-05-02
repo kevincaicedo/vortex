@@ -18,10 +18,10 @@
 //! 26-31   6    (reserved)    — future use
 //! ```
 //!
-//! Stored in `Entry::_pad0` (the existing 4-byte slack field) for **zero
-//! additional memory overhead** per key. Alpha WATCH/version tracking stays in
-//! `ConcurrentKeyspace` side tables, so do not repurpose `_pad0` without a
-//! fresh layout and benchmark review.
+//! Stored in `Entry::access_profile` for **zero additional memory overhead**
+//! per key. Entry-resident LSNs now live beside it in `Entry::lsn_version`,
+//! while WATCH only falls back to a cold `ConcurrentKeyspace` absent-key
+//! registry for keys that were missing when `WATCH` ran.
 
 use vortex_common::Encoding;
 
@@ -56,7 +56,7 @@ const INIT_COUNTER: u32 = 1 << COUNTER_SHIFT;
 ///
 /// All mutation methods are O(1) with saturating / wrapping arithmetic
 /// and zero allocations. The struct is `Copy` and can be stored directly
-/// in an `Entry`'s `_pad0` field.
+/// in an `Entry`'s `access_profile` field.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AccessProfile(u32);

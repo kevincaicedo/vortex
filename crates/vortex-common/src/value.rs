@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::encoding::Encoding;
+use crate::{MAX_INLINE_VALUE_LEN, encoding::Encoding};
 
 /// Returns the number of characters in the decimal representation of an i64.
 #[inline]
@@ -27,11 +27,11 @@ fn itoa_len(mut n: i64) -> usize {
 
 /// Tagged enum representing all VortexDB value types.
 ///
-/// Small values (≤23 bytes) are stored inline to avoid heap allocation.
+/// Small values (≤MAX_INLINE_VALUE_LEN bytes) are stored inline to avoid heap allocation.
 /// Integer values store `i64` inline — zero allocation for counters.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VortexValue {
-    /// Small string stored inline (≤23 bytes).
+    /// Small string stored inline (≤MAX_INLINE_VALUE_LEN bytes).
     InlineString(InlineBytes),
     /// Heap-allocated string.
     String(Bytes),
@@ -53,14 +53,17 @@ pub enum VortexValue {
 #[derive(Clone, PartialEq, Eq)]
 pub struct InlineBytes {
     len: u8,
-    data: [u8; 23],
+    data: [u8; MAX_INLINE_VALUE_LEN],
 }
 
 impl InlineBytes {
-    /// Creates inline bytes from a slice. Panics if slice exceeds 23 bytes.
+    /// Creates inline bytes from a slice. Panics if slice exceeds MAX_INLINE_VALUE_LEN bytes.
     pub fn from_slice(bytes: &[u8]) -> Self {
-        assert!(bytes.len() <= 23, "InlineBytes: slice exceeds 23 bytes");
-        let mut data = [0u8; 23];
+        assert!(
+            bytes.len() <= MAX_INLINE_VALUE_LEN,
+            "InlineBytes: slice exceeds MAX_INLINE_VALUE_LEN bytes"
+        );
+        let mut data = [0u8; MAX_INLINE_VALUE_LEN];
         data[..bytes.len()].copy_from_slice(bytes);
         Self {
             len: bytes.len() as u8,
@@ -87,13 +90,13 @@ impl InlineBytes {
     }
 
     /// Tries to append `extra` bytes in-place. Returns `true` if the combined
-    /// length fits within the 23-byte inline capacity, `false` otherwise
+    /// length fits within the inline capacity, `false` otherwise
     /// (contents unchanged on failure).
     #[inline]
     pub fn try_extend(&mut self, extra: &[u8]) -> bool {
         let old = self.len as usize;
         let new_len = old + extra.len();
-        if new_len > 23 {
+        if new_len > MAX_INLINE_VALUE_LEN {
             return false;
         }
         self.data[old..new_len].copy_from_slice(extra);
@@ -114,7 +117,7 @@ impl std::fmt::Debug for InlineBytes {
 // TODO: Placeholder types for container values.
 // Real implementations come in later phases.
 
-/// TODO: Placeholder list type. Real implementation in Phase 3 (AMS).
+/// TODO: Placeholder list type. Real implementation in Phase 4 (AMS).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VortexList {
     entries: Vec<Bytes>,
@@ -134,7 +137,7 @@ impl Default for VortexList {
     }
 }
 
-/// TODO: Placeholder hash type. Real implementation in Phase 3 (AMS).
+/// TODO: Placeholder hash type. Real implementation in Phase 4 (AMS).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VortexHash {
     entries: Vec<(Bytes, Bytes)>,
@@ -154,7 +157,7 @@ impl Default for VortexHash {
     }
 }
 
-/// TODO: Placeholder set type. Real implementation in Phase 3 (AMS).
+/// TODO: Placeholder set type. Real implementation in Phase 4 (AMS).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VortexSet {
     entries: Vec<Bytes>,
@@ -174,7 +177,7 @@ impl Default for VortexSet {
     }
 }
 
-/// TODO: Placeholder sorted set type. Real implementation in Phase 3 (AMS).
+/// TODO: Placeholder sorted set type. Real implementation in Phase 4 (AMS).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VortexSortedSet {
     entries: Vec<(f64, Bytes)>,
@@ -292,7 +295,7 @@ impl VortexValue {
     /// Creates a VortexValue from raw bytes, using inline storage when possible.
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        if bytes.len() <= 23 {
+        if bytes.len() <= MAX_INLINE_VALUE_LEN {
             Self::InlineString(InlineBytes::from_slice(bytes))
         } else {
             Self::String(Bytes::copy_from_slice(bytes))
@@ -346,7 +349,7 @@ impl From<i64> for VortexValue {
 
 impl From<&str> for VortexValue {
     fn from(s: &str) -> Self {
-        if s.len() <= 23 {
+        if s.len() <= MAX_INLINE_VALUE_LEN {
             Self::InlineString(InlineBytes::from_slice(s.as_bytes()))
         } else {
             Self::String(Bytes::copy_from_slice(s.as_bytes()))
@@ -356,7 +359,7 @@ impl From<&str> for VortexValue {
 
 impl From<Bytes> for VortexValue {
     fn from(b: Bytes) -> Self {
-        if b.len() <= 23 {
+        if b.len() <= MAX_INLINE_VALUE_LEN {
             Self::InlineString(InlineBytes::from_slice(&b))
         } else {
             Self::String(b)
@@ -377,7 +380,7 @@ mod tests {
 
     #[test]
     fn heap_string_value() {
-        let long = "a]".repeat(24);
+        let long = "a]".repeat(MAX_INLINE_VALUE_LEN + 1);
         let val = VortexValue::from(long.as_str());
         assert!(matches!(val, VortexValue::String(_)));
     }
@@ -404,26 +407,26 @@ mod proptests {
     use proptest::prelude::*;
 
     prop_compose! {
-        fn arb_short_string()(s in "[a-z]{0,23}") -> String {
+        fn arb_short_string()(s in "[a-z]{0,16}") -> String {
             s
         }
     }
 
     prop_compose! {
-        fn arb_long_string()(s in "[a-z]{24,128}") -> String {
+        fn arb_long_string()(s in "[a-z]{17,128}") -> String {
             s
         }
     }
 
     proptest! {
         #[test]
-        fn short_strings_are_inline(s in "[a-z]{0,23}") {
+        fn short_strings_are_inline(s in "[a-z]{0,16}") {
             let val = VortexValue::from(s.as_str());
             prop_assert!(matches!(val, VortexValue::InlineString(_)));
         }
 
         #[test]
-        fn long_strings_are_heap(s in "[a-z]{24,128}") {
+        fn long_strings_are_heap(s in "[a-z]{17,128}") {
             let val = VortexValue::from(s.as_str());
             prop_assert!(matches!(val, VortexValue::String(_)));
         }
@@ -442,10 +445,10 @@ mod proptests {
             let b = Bytes::from(data.clone());
             let val = VortexValue::from(b);
             match &val {
-                VortexValue::InlineString(ib) if data.len() <= 23 => {
+                VortexValue::InlineString(ib) if data.len() <= MAX_INLINE_VALUE_LEN => {
                     prop_assert_eq!(ib.as_bytes(), &data[..]);
                 }
-                VortexValue::String(s) if data.len() > 23 => {
+                VortexValue::String(s) if data.len() > MAX_INLINE_VALUE_LEN => {
                     prop_assert_eq!(s.as_ref(), &data[..]);
                 }
                 _ => prop_assert!(false, "unexpected variant for len={}", data.len()),

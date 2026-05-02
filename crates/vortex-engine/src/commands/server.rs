@@ -357,18 +357,6 @@ fn read_total_system_memory() -> usize {
     }
 }
 
-/// System page size.
-fn page_size() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        4096
-    }
-}
-
 /// Write a float with 2 decimal places.
 fn write_float(buf: &mut Vec<u8>, v: f64) {
     use std::fmt::Write as _;

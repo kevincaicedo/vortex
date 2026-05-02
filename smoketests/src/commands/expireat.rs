@@ -5,7 +5,8 @@ use crate::spec::{CaseDef, CommandGroup, CommandSpec, SupportLevel};
 
 fn stores_future_unix_seconds_deadline(ctx: &mut SmokeContext) -> Result<()> {
     ctx.set("session", "token")?;
-    let applied: i64 = ctx.exec(&["EXPIREAT", "session", "4102444800"])?;
+    let deadline = "4102444800";
+    let applied: i64 = ctx.exec(&["EXPIREAT", "session", deadline])?;
     assert_eq!(applied, 1);
     let deadline: i64 = ctx.exec(&["EXPIRETIME", "session"])?;
     assert_eq!(deadline, 4_102_444_800);

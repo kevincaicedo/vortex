@@ -5,10 +5,12 @@ use crate::spec::{CaseDef, CommandGroup, CommandSpec, SupportLevel};
 
 fn stores_future_unix_millis_deadline(ctx: &mut SmokeContext) -> Result<()> {
     ctx.set("session", "token")?;
-    let applied: i64 = ctx.exec(&["PEXPIREAT", "session", "4102444800000"])?;
+    let deadline = 4_102_444_800_000i64;
+    let deadline_str = deadline.to_string();
+    let applied: i64 = ctx.exec(&["PEXPIREAT", "session", &deadline_str])?;
     assert_eq!(applied, 1);
     let deadline: i64 = ctx.exec(&["PEXPIRETIME", "session"])?;
-    assert_eq!(deadline, 4_102_444_800_000);
+    assert_eq!(deadline, deadline_str.parse::<i64>()?);
     Ok(())
 }
 
