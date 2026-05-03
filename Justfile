@@ -9,8 +9,8 @@ build:
     cargo build --workspace
 
 # Run all tests
-test:
-    cargo test --workspace
+test *ARGS:
+    cargo test --workspace {{ARGS}}
 
 # Run smoke tests against a freshly spawned Vortex server
 smoke *ARGS:

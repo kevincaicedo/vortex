@@ -65,6 +65,7 @@ const HEAP_KEY_LEN_OFFSET: usize = PTR_BYTES;
 const HEAP_KEY_META_LEN: usize = PTR_BYTES + size_of::<u32>();
 const HEAP_VALUE_TAG: u8 = 0xFE;
 const INTEGER_VALUE_TAG: u8 = 0xFF;
+const MAX_STORED_LSN_VERSION: u64 = (1u64 << 48) - 1;
 
 /// Physical value view returned by [`Entry::read_value`].
 ///
@@ -199,7 +200,7 @@ impl Entry {
         self.ttl_deadline_nanos
     }
 
-    /// Read the 48-bit LSN/version from the entry.
+    /// Returns the stored 48-bit LSN/version.
     #[inline]
     pub fn lsn_version(&self) -> u64 {
         let mut buf = [0u8; 8];
@@ -207,13 +208,20 @@ impl Entry {
         u64::from_le_bytes(buf)
     }
 
-    /// Write a new 48-bit LSN/version to the entry.
+    /// Stores a new 48-bit LSN/version in the entry.
+    ///
+    /// # Panics
+    /// Panics if `lsn` exceeds the 48-bit storage budget of the slot layout.
     #[inline]
     pub fn set_lsn_version(&mut self, lsn: u64) {
+        assert!(lsn <= MAX_STORED_LSN_VERSION, "lsn exceeds 48-bit storage");
         self.lsn_version.copy_from_slice(&lsn.to_le_bytes()[..6]);
     }
 
-    /// Write an inline key + inline string value into this entry.
+    /// Writes an inline key and inline string value into this entry.
+    ///
+    /// # Panics
+    /// Panics if `key` or `value` exceed the inline storage limits of the slot.
     #[inline]
     pub fn write_inline_string(&mut self, h2: u8, key: &[u8], value: &[u8], ttl_deadline: u64) {
         assert!(
@@ -272,7 +280,10 @@ impl Entry {
         self.set_value_type(Self::value_type_for(value));
     }
 
-    /// Write an inline key + integer value into this entry.
+    /// Writes an inline key and integer value into this entry.
+    ///
+    /// # Panics
+    /// Panics if `key` exceeds the inline storage limit of the slot.
     #[inline]
     pub fn write_inline_integer(&mut self, h2: u8, key: &[u8], value: i64, ttl_deadline: u64) {
         assert!(
@@ -286,23 +297,37 @@ impl Entry {
         self.set_value_type(VTYPE_INTEGER);
     }
 
-    /// Read the key bytes, inline or heap-borrowed.
+    /// Returns the key bytes stored in an occupied entry.
+    ///
+    /// # Panics
+    /// Panics if the entry is empty or deleted.
     #[inline]
     pub fn read_key(&self) -> &[u8] {
+        self.assert_full("Entry::read_key");
+
         if self.has_flag(FLAG_INLINE_KEY) {
             &self.key_data[..self.key_len as usize]
         } else {
             let (ptr, len) = self.heap_key_parts();
+            assert!(!ptr.is_null(), "heap key pointer missing");
             // SAFETY: `write_borrowed` stores a valid borrowed key pointer + len.
             unsafe { slice::from_raw_parts(ptr, len) }
         }
     }
 
-    /// Read the entry value as either inline bytes, heap value, or integer.
+    /// Returns the value stored in an occupied entry.
+    ///
+    /// # Panics
+    /// Panics if the entry is empty or deleted, or if its value metadata is corrupt.
     #[inline]
     pub fn read_value(&self) -> EntryValue<'_> {
+        self.assert_full("Entry::read_value");
+
         if self.has_flag(FLAG_INTEGER_VALUE) {
-            debug_assert_eq!(self.value_tag, INTEGER_VALUE_TAG);
+            assert_eq!(
+                self.value_tag, INTEGER_VALUE_TAG,
+                "integer entry missing integer tag"
+            );
             return EntryValue::Integer(self.read_integer().expect("integer flag set"));
         }
 
@@ -314,23 +339,32 @@ impl Entry {
             return EntryValue::Inline(&self.value_data[..self.value_tag as usize]);
         }
 
-        debug_assert_eq!(self.value_tag, HEAP_VALUE_TAG);
+        assert_eq!(
+            self.value_tag, HEAP_VALUE_TAG,
+            "heap-backed entry missing heap tag"
+        );
         // SAFETY: `write_borrowed` stores a valid borrowed value pointer.
         EntryValue::Heap(unsafe { self.heap_value_ref() })
     }
 
-    /// Check if this entry's key matches the given key bytes.
+    /// Returns whether this occupied entry's key matches `key`.
     #[inline]
     pub fn matches_key(&self, key: &[u8]) -> bool {
+        if !self.is_full() {
+            return false;
+        }
+
         let stored = self.read_key();
         stored.len() == key.len() && stored == key
     }
 
+    /// Returns whether the entry has expired at `now_nanos`.
     #[inline]
     pub fn is_expired(&self, now_nanos: u64) -> bool {
         self.has_flag(FLAG_HAS_TTL) && now_nanos >= self.ttl_deadline()
     }
 
+    /// Sets the absolute TTL deadline, or clears TTL when `deadline_nanos` is zero.
     #[inline]
     pub fn set_ttl(&mut self, deadline_nanos: u64) {
         if deadline_nanos == 0 {
@@ -342,6 +376,7 @@ impl Entry {
         }
     }
 
+    /// Removes any TTL from the entry.
     #[inline]
     pub fn clear_ttl(&mut self) {
         self.set_ttl(0);
@@ -375,7 +410,12 @@ impl Entry {
         self.key_data = [0; vortex_common::MAX_INLINE_KEY_LEN];
         self.value_data = [0; vortex_common::MAX_INLINE_VALUE_LEN];
     }
+}
 
+/*
+* Internal helper methods for reading/writing entry payloads and metadata.
+*/
+impl Entry {
     #[inline]
     fn read_integer(&self) -> Option<i64> {
         if !self.has_flag(FLAG_INTEGER_VALUE) {
@@ -385,6 +425,12 @@ impl Entry {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.value_data[..8]);
         Some(i64::from_ne_bytes(buf))
+    }
+
+    #[inline]
+    #[track_caller]
+    fn assert_full(&self, operation: &str) {
+        assert!(self.is_full(), "{operation} requires an occupied entry");
     }
 
     #[inline]
@@ -421,6 +467,11 @@ impl Entry {
         self.key_data[..key.len()].copy_from_slice(key);
     }
 
+    /// Stores heap-key metadata for a borrowed key.
+    ///
+    /// # Safety
+    /// `key` must outlive every future read from this entry until the slot is
+    /// rewritten or deleted.
     #[inline]
     unsafe fn store_heap_key(&mut self, key: &[u8]) {
         debug_assert!(key.len() > vortex_common::MAX_INLINE_KEY_LEN);
@@ -440,6 +491,11 @@ impl Entry {
         self.value_data[..value.len()].copy_from_slice(value);
     }
 
+    /// Stores a borrowed pointer to a heap-backed value.
+    ///
+    /// # Safety
+    /// `value` must outlive every future read from this entry until the slot is
+    /// rewritten or deleted.
     #[inline]
     unsafe fn store_heap_value(&mut self, value: &VortexValue) {
         let ptr = value as *const VortexValue as usize;
@@ -478,11 +534,17 @@ impl Entry {
         )
     }
 
+    /// Reconstructs the borrowed heap-backed value reference stored in the slot.
+    ///
+    /// # Safety
+    /// The entry must still contain a valid pointer previously written by
+    /// [`Self::store_heap_value`], and that pointee must still be alive.
     #[inline]
     unsafe fn heap_value_ref(&self) -> &VortexValue {
         let mut ptr_buf = [0u8; PTR_BYTES];
         ptr_buf.copy_from_slice(&self.value_data[..PTR_BYTES]);
         let ptr = usize::from_ne_bytes(ptr_buf) as *const VortexValue;
+        assert!(!ptr.is_null(), "heap value pointer missing");
 
         // SAFETY: `write_borrowed` stored a valid borrowed pointer.
         unsafe { &*ptr }
@@ -510,6 +572,20 @@ mod tests {
     use vortex_common::value::{InlineBytes, VortexList};
 
     use super::*;
+
+    fn write_borrowed_for_test(
+        entry: &mut Entry,
+        h2: u8,
+        key: &VortexKey,
+        value: &VortexValue,
+        ttl_deadline: u64,
+    ) {
+        // SAFETY: each test keeps `key` and `value` alive until all reads from
+        // `entry` are complete.
+        unsafe {
+            entry.write_borrowed(h2, key, value, ttl_deadline);
+        }
+    }
 
     #[test]
     fn entry_size_and_alignment() {
@@ -541,7 +617,7 @@ mod tests {
         let mut e = Entry::empty();
         let value = VortexValue::from("world");
         let key = VortexKey::from("hello");
-        unsafe { e.write_borrowed(0x92, &key, &value, 0) };
+        write_borrowed_for_test(&mut e, 0x92, &key, &value, 0);
 
         assert!(e.is_full());
         assert_eq!(e.control, 0x92);
@@ -561,10 +637,7 @@ mod tests {
         let value = VortexValue::from("this value is much longer than twenty-one bytes");
         let deadline = 123_456_789;
 
-        // SAFETY: `key` and `value` live for the duration of the assertions.
-        unsafe {
-            e.write_borrowed(0x93, &key, &value, deadline);
-        }
+        write_borrowed_for_test(&mut e, 0x93, &key, &value, deadline);
 
         assert!(!e.has_flag(FLAG_INLINE_KEY));
         assert!(!e.has_flag(FLAG_INLINE_VALUE));
@@ -579,10 +652,7 @@ mod tests {
         let key = VortexKey::from("this:key:is:definitely:longer:than:23");
         let value = VortexValue::from("short-inline");
 
-        // SAFETY: `key` and `value` live for the duration of the assertions.
-        unsafe {
-            e.write_borrowed(0x91, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0x91, &key, &value, 0);
 
         assert!(!e.has_flag(FLAG_INLINE_KEY));
         assert!(e.has_flag(FLAG_INLINE_VALUE));
@@ -596,10 +666,7 @@ mod tests {
         let key = VortexKey::from("small-key");
         let value = VortexValue::List(Box::default());
 
-        // SAFETY: `key` and `value` live for the duration of the assertions.
-        unsafe {
-            e.write_borrowed(0x88, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0x88, &key, &value, 0);
 
         assert!(e.has_flag(FLAG_INLINE_KEY));
         assert!(!e.has_flag(FLAG_INLINE_VALUE));
@@ -616,9 +683,7 @@ mod tests {
         let mut e = Entry::empty();
         let value = VortexValue::Integer(42);
         let key = VortexKey::from("counter");
-        unsafe {
-            e.write_borrowed(0xA3, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0xA3, &key, &value, 0);
 
         assert!(e.is_full());
         assert_eq!(e.read_key(), key.as_bytes());
@@ -633,9 +698,7 @@ mod tests {
         let mut e = Entry::empty();
         let value = VortexValue::Integer(-999_999);
         let key = VortexKey::from("neg");
-        unsafe {
-            e.write_borrowed(0xB0, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0xB0, &key, &value, 0);
         assert_eq!(e.read_integer(), Some(-999_999));
     }
 
@@ -644,9 +707,7 @@ mod tests {
         let mut e = Entry::empty();
         let key = VortexKey::from("test_key");
         let value = VortexValue::from("val");
-        unsafe {
-            e.write_borrowed(0x92, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0x92, &key, &value, 0);
 
         assert!(e.matches_key(b"test_key"));
         assert!(e.control == 0x92);
@@ -658,9 +719,7 @@ mod tests {
         // Test larger key that doesn't fit inline.
         let long_key = VortexKey::from("this:is:a:long:key:that:exceeds:inline:limit");
         let long_value = VortexValue::from("some value");
-        unsafe {
-            e.write_borrowed(0x92, &long_key, &long_value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0x92, &long_key, &long_value, 0);
         assert!(e.matches_key(b"this:is:a:long:key:that:exceeds:inline:limit"));
         assert!(!e.matches_key(b"this:is:a:long:key:that:exceeds:inline:limi"));
     }
@@ -670,9 +729,7 @@ mod tests {
         let mut e = Entry::empty();
         let key = VortexKey::from("k");
         let value = VortexValue::from("v");
-        unsafe {
-            e.write_borrowed(0x92, &key, &value, 1_000_000);
-        }
+        write_borrowed_for_test(&mut e, 0x92, &key, &value, 1_000_000);
 
         assert!(e.has_flag(FLAG_HAS_TTL));
         assert_eq!(e.ttl_deadline(), 1_000_000);
@@ -696,15 +753,39 @@ mod tests {
         let mut e = Entry::empty();
         let key = VortexKey::from("secret");
         let value = VortexValue::from("data");
-        unsafe {
-            e.write_borrowed(0x92, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0x92, &key, &value, 0);
 
         e.mark_deleted();
         assert!(e.is_deleted());
         assert!(!e.is_full());
         assert_eq!(e.key_len, 0);
         assert_eq!(e.key_data, [0; vortex_common::MAX_INLINE_KEY_LEN]);
+    }
+
+    #[test]
+    fn matches_key_returns_false_for_deleted_entry() {
+        let mut entry = Entry::empty();
+        let key = VortexKey::from("secret");
+        let value = VortexValue::from("data");
+
+        write_borrowed_for_test(&mut entry, 0x92, &key, &value, 0);
+        entry.mark_deleted();
+
+        assert!(!entry.matches_key(key.as_bytes()));
+    }
+
+    #[test]
+    #[should_panic(expected = "Entry::read_key requires an occupied entry")]
+    fn read_key_panics_for_empty_entry() {
+        let entry = Entry::empty();
+        let _ = entry.read_key();
+    }
+
+    #[test]
+    #[should_panic(expected = "Entry::read_value requires an occupied entry")]
+    fn read_value_panics_for_empty_entry() {
+        let entry = Entry::empty();
+        let _ = entry.read_value();
     }
 
     #[test]
@@ -743,9 +824,7 @@ mod tests {
         let ttl_deadline = 1_000_000;
         let value = VortexValue::List(Box::new(VortexList::new()));
         let key = VortexKey::from("vortex");
-        unsafe {
-            e2.write_borrowed(0x24, &key, &value, ttl_deadline);
-        };
+        write_borrowed_for_test(&mut e2, 0x24, &key, &value, ttl_deadline);
         assert!(e2.has_flag(FLAG_INLINE_KEY));
         assert!(!e2.has_flag(FLAG_INLINE_VALUE));
         assert_eq!(e2.value_type(), VTYPE_LIST);
@@ -757,16 +836,19 @@ mod tests {
         let mut entry = Entry::empty();
         let key = VortexKey::from("k");
         let value = VortexValue::from("v");
-        unsafe {
-            entry.write_borrowed(0x81, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut entry, 0x81, &key, &value, 0);
         assert_eq!(entry.value_type(), VTYPE_INLINE_STRING);
         let list = VortexValue::List(Box::new(VortexList::new()));
-        // SAFETY: borrowed values stay alive for the duration of this test.
-        unsafe {
-            entry.write_borrowed(0x81, &VortexKey::from("k"), &list, 0);
-        }
+        let list_key = VortexKey::from("k");
+        write_borrowed_for_test(&mut entry, 0x81, &list_key, &list, 0);
         assert_eq!(entry.value_type(), VTYPE_LIST);
+    }
+
+    #[test]
+    #[should_panic(expected = "lsn exceeds 48-bit storage")]
+    fn set_lsn_version_panics_when_value_exceeds_48_bits() {
+        let mut entry = Entry::empty();
+        entry.set_lsn_version(MAX_STORED_LSN_VERSION + 1);
     }
 
     #[test]
@@ -786,9 +868,7 @@ mod tests {
         let mut e = Entry::empty();
         let key = VortexKey::from("");
         let value = VortexValue::InlineString(InlineBytes::from_slice(b""));
-        unsafe {
-            e.write_borrowed(0x82, &key, &value, 0);
-        }
+        write_borrowed_for_test(&mut e, 0x82, &key, &value, 0);
 
         assert!(e.is_full());
         assert_eq!(e.read_key(), b"");

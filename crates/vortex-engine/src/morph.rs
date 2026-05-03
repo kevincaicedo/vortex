@@ -95,7 +95,7 @@ impl AccessProfile {
         self.bump_counter();
     }
 
-    /// Record a write access. Same mechanics as [`record_read`].
+    /// Record a write access. Same mechanics as [`Self::record_read`].
     #[inline]
     pub fn record_write(&mut self) {
         let w = (self.0 & WRITE_MASK) >> WRITE_SHIFT;

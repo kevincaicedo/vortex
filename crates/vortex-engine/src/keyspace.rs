@@ -524,11 +524,10 @@ impl DerefMut for ShardWriteGuard<'_> {
 
 impl Drop for ShardWriteGuard<'_> {
     fn drop(&mut self) {
-        if self.strict_memory_accounting.load(Ordering::Relaxed) {
-            self.guard.flush_memory_drift_force(self.global_memory_used);
-        } else {
-            self.guard.flush_memory_drift(self.global_memory_used);
-        }
+        self.guard.flush_memory_drift_with(
+            self.global_memory_used,
+            self.strict_memory_accounting.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -1690,7 +1689,7 @@ impl ConcurrentKeyspace {
     fn publish_all_memory_drift(&self) {
         for shard in self.shards.iter() {
             let mut guard = shard.write();
-            guard.flush_memory_drift_force(&self.global_memory_used);
+            guard.flush_memory_drift_with(&self.global_memory_used, true);
         }
     }
 
@@ -2288,7 +2287,7 @@ impl ConcurrentKeyspace {
     pub fn memory_used(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.read().local_memory_used())
+            .map(|shard| shard.read().memory_used())
             .sum()
     }
 
@@ -2700,7 +2699,7 @@ mod tests {
 
         // SET with TTL
         ks.write(b"ttl_key", |t| {
-            t.insert_with_ttl(key.clone(), val, deadline);
+            t.insert_with(key.clone(), val, deadline, None);
         });
         ks.update_expiry_count(shard_idx, false, true);
 
@@ -2712,7 +2711,9 @@ mod tests {
 
         // GET with lazy expiry (now > deadline)
         let got = ks.write(b"ttl_key", |t| {
-            t.get_or_expire(&VortexKey::from_bytes(b"ttl_key"), 2_000_000_000)
+            let key = VortexKey::from_bytes(b"ttl_key");
+            let hash = t.hash_key_bytes(key.as_bytes());
+            t.get_or_expire_prehashed(key.as_bytes(), hash, 2_000_000_000)
                 .cloned()
         });
         assert!(got.is_none());
@@ -2899,7 +2900,7 @@ mod tests {
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
             let shard_idx = ks.shard_index(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
-                t.insert_with_ttl(key, VortexValue::from(i as i64), deadline);
+                t.insert_with(key, VortexValue::from(i as i64), deadline, None);
             });
             ks.update_expiry_count(shard_idx, false, true);
         }
@@ -2943,7 +2944,7 @@ mod tests {
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
             let shard_idx = ks.shard_index(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
-                t.insert_with_ttl(key, VortexValue::from("later"), deadline);
+                t.insert_with(key, VortexValue::from("later"), deadline, None);
             });
             ks.update_expiry_count(shard_idx, false, true);
         }

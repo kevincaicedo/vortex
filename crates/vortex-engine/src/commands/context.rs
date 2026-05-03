@@ -532,7 +532,7 @@ fn set_with_options_on_table(
     // an existence probe, previous value clone, or TTL carry-forward.
     if !options.nx && !options.xx && !options.get && !options.keepttl {
         if options.ttl_deadline != 0 {
-            table.insert_with_ttl(key, value, options.ttl_deadline);
+            table.insert_with(key, value, options.ttl_deadline, None);
         } else {
             table.insert(key, value);
         }
@@ -578,7 +578,7 @@ fn set_with_options_on_table(
     };
 
     let previous = if effective_ttl != 0 {
-        table.insert_with_ttl(key, value, effective_ttl)
+        table.insert_with(key, value, effective_ttl, None)
     } else {
         table.insert(key, value)
     };
@@ -700,7 +700,7 @@ fn increment_table_by_float(
     let mut buffer = ryu::Buffer::new();
     let text = buffer.format(result);
     let bytes = Bytes::copy_from_slice(text.as_bytes());
-    let _ = table.insert_and_lsn(key, VortexValue::from_bytes(bytes.as_ref()), lsn);
+    let _ = table.insert_with_lsn(key, VortexValue::from_bytes(bytes.as_ref()), Some(lsn));
     Ok(bytes)
 }
 
@@ -858,7 +858,7 @@ fn setrange_in_table(
     data[offset..offset + new_bytes.len()].copy_from_slice(new_bytes);
 
     let length = data.len();
-    let _ = table.insert_and_lsn(key, VortexValue::from_bytes(&data), lsn);
+    let _ = table.insert_with_lsn(key, VortexValue::from_bytes(&data), Some(lsn));
     Ok(length)
 }
 
@@ -891,7 +891,7 @@ fn rename_within_table(
         .expect("source key must exist after contains_key check");
     table.remove(&new_key);
     if ttl != 0 && ttl > now_nanos {
-        table.insert_with_ttl(new_key, value, ttl);
+        table.insert_with(new_key, value, ttl, None);
     } else {
         table.insert(new_key, value);
     }
@@ -922,7 +922,7 @@ fn copy_within_table(
     }
 
     if ttl != 0 && ttl > now_nanos {
-        table.insert_with_ttl(dst, value_clone, ttl);
+        table.insert_with(dst, value_clone, ttl, None);
     } else {
         table.insert(dst, value_clone);
     }
@@ -1109,7 +1109,7 @@ impl ConcurrentKeyspace {
         let had_ttl = ttl_present(guard.get_entry_ttl(&key));
         let watched_key = self.watch_tracking_active().then(|| key.clone());
         let (lsn, aof_lsn) = self.allocate_mutation_lsn();
-        let previous = guard.insert_with_ttl_and_lsn(key, value, ttl_deadline_nanos, lsn);
+        let previous = guard.insert_with(key, value, ttl_deadline_nanos, Some(lsn));
         self.update_expiry_count(shard_index, had_ttl, true);
         self.record_frequency_hash(table_hash);
         if let Some(key) = watched_key {
@@ -1976,7 +1976,7 @@ impl ConcurrentKeyspace {
         dst_table.remove(&new_key);
         let watched_new_key = self.watch_tracking_active().then(|| new_key.clone());
         if ttl != 0 && ttl > now_nanos {
-            dst_table.insert_with_ttl(new_key, value, ttl);
+            dst_table.insert_with(new_key, value, ttl, None);
         } else {
             dst_table.insert(new_key, value);
         }
@@ -2173,7 +2173,7 @@ impl ConcurrentKeyspace {
         let watched_dst = self.watch_tracking_active().then(|| dst.clone());
         let destination = dst.clone();
         if ttl != 0 && ttl > now_nanos {
-            dst_table.insert_with_ttl(dst, value_clone, ttl);
+            dst_table.insert_with(dst, value_clone, ttl, None);
         } else {
             dst_table.insert(dst, value_clone);
         }
