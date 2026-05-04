@@ -12,6 +12,7 @@ use vortex_common::value::InlineBytes;
 use vortex_common::{VortexKey, VortexValue};
 use vortex_proto::RespFrame;
 
+use crate::table::{BorrowedKey, MutationPolicy, RawValueBytes};
 use crate::SwissTable;
 use crate::entry::Entry;
 use crate::keyspace::{ConcurrentKeyspace, EvictedKeys, EvictionAdmissionError, MemoryReservation};
@@ -603,11 +604,11 @@ fn increment_table_by(
             if had_ttl && ttl <= now_nanos {
                 table.remove(&key);
                 let hash = table.hash_key_bytes(key.as_bytes());
-                let _ = table.insert_no_ttl_prehashed_and_lsn(
+                let _ = table.mutate_prehashed(
                     key,
                     VortexValue::Integer(delta),
                     hash,
-                    lsn,
+                    MutationPolicy::clear(Some(lsn)),
                 );
                 return Ok((
                     delta,
@@ -632,11 +633,11 @@ fn increment_table_by(
             let result = current.checked_add(delta).ok_or(ERR_OVERFLOW)?;
             let hash = table.hash_key_bytes(key.as_bytes());
             table
-                .replace_value_preserving_ttl_prehashed_and_lsn(
+                .replace_prehashed(
                     key.as_bytes(),
                     VortexValue::Integer(result),
                     hash,
-                    lsn,
+                    MutationPolicy::preserve_ttl(Some(lsn)),
                 )
                 .expect("live key must exist while replacing increment result");
             Ok((
@@ -649,8 +650,12 @@ fn increment_table_by(
         }
         None => {
             let hash = table.hash_key_bytes(key.as_bytes());
-            let _ =
-                table.insert_no_ttl_prehashed_and_lsn(key, VortexValue::Integer(delta), hash, lsn);
+            let _ = table.mutate_prehashed(
+                key,
+                VortexValue::Integer(delta),
+                hash,
+                MutationPolicy::clear(Some(lsn)),
+            );
             Ok((
                 delta,
                 ExpiryTransition {
@@ -767,7 +772,12 @@ fn append_to_table(
         }
     };
     table
-        .replace_value_preserving_ttl_prehashed_and_lsn(key.as_bytes(), new_value, hash, lsn)
+        .replace_prehashed(
+            key.as_bytes(),
+            new_value,
+            hash,
+            MutationPolicy::preserve_ttl(Some(lsn)),
+        )
         .expect("live key must exist while replacing append result");
     Ok(length)
 }
@@ -1154,11 +1164,23 @@ impl ConcurrentKeyspace {
         let (lsn, _aof_lsn) = self.allocate_mutation_lsn();
         let old_had_ttl = if value_bytes.len() <= vortex_common::MAX_INLINE_VALUE_LEN {
             let value = VortexValue::from_bytes(value_bytes);
-            let (_old, old_had_ttl) =
-                guard.insert_no_ttl_bytes_prehashed_and_lsn(key_bytes, value, table_hash, lsn);
-            old_had_ttl
+            guard
+                .mutate_prehashed(
+                    BorrowedKey(key_bytes),
+                    value,
+                    table_hash,
+                    MutationPolicy::clear(Some(lsn)),
+                )
+                .had_ttl()
         } else {
-            guard.insert_no_ttl_raw_value_prehashed_and_lsn(key_bytes, value_bytes, table_hash, lsn)
+            guard
+                .mutate_prehashed(
+                    BorrowedKey(key_bytes),
+                    RawValueBytes(value_bytes),
+                    table_hash,
+                    MutationPolicy::clear(Some(lsn)),
+                )
+                .had_ttl()
         };
         self.update_expiry_count(shard_index, old_had_ttl, false);
         Ok(MutationOutcome::new((), None))
@@ -1197,8 +1219,14 @@ impl ConcurrentKeyspace {
         let mut guard = self.write_shard_by_index(shard_index);
         let watched_key = ConcurrentKeyspace::mutation_feature_watch(features).then(|| key.clone());
         let (lsn, aof_lsn) = self.allocate_mutation_lsn_with_features(features);
-        let (_old, old_had_ttl) =
-            guard.insert_no_ttl_prehashed_and_lsn(key, value, table_hash, lsn);
+        let old_had_ttl = guard
+            .mutate_prehashed(
+                key,
+                value,
+                table_hash,
+                MutationPolicy::clear(Some(lsn)),
+            )
+            .had_ttl();
         self.update_expiry_count(shard_index, old_had_ttl, false);
         if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
             self.record_frequency_hash(table_hash);
@@ -1368,8 +1396,14 @@ impl ConcurrentKeyspace {
                 .take()
                 .expect("mset pair must be available exactly once");
             self.bump_watch_key(&key);
-            let (_previous, old_had_ttl) =
-                table.insert_no_ttl_prehashed_and_lsn(key, value, lookup.table_hash, lsn);
+            let old_had_ttl = table
+                .mutate_prehashed(
+                    key,
+                    value,
+                    lookup.table_hash,
+                    MutationPolicy::clear(Some(lsn)),
+                )
+                .had_ttl();
             self.update_expiry_count(lookup.shard_idx, old_had_ttl, false);
             self.record_frequency_hash(lookup.table_hash);
         }

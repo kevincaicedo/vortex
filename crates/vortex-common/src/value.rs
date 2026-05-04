@@ -302,6 +302,26 @@ impl VortexValue {
         }
     }
 
+    #[inline]
+    pub fn from_bytes_reusing(previous: VortexValue, bytes: &[u8]) -> VortexValue {
+        if bytes.len() <= MAX_INLINE_VALUE_LEN {
+            return VortexValue::from_bytes(bytes);
+        }
+
+        if let VortexValue::String(existing) = previous {
+            match existing.try_into_mut() {
+                Ok(mut buffer) if buffer.capacity() >= bytes.len() => {
+                    buffer.clear();
+                    buffer.extend_from_slice(bytes);
+                    return VortexValue::String(buffer.freeze());
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        VortexValue::from_bytes(bytes)
+    }
+
     /// Returns a rough estimate of memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
         match self {
