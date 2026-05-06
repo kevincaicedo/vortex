@@ -76,7 +76,36 @@ const MUTATION_FEATURE_AOF: usize = 1 << 2;
 /// 128-byte boundary so that adjacent shard locks never share a cache line.
 type Shard = CachePadded<RwLock<SwissTable>>;
 
+/// Best-effort jemalloc cache and arena purge after FLUSHDB/FLUSHALL.
+///
+/// Flushes the calling thread's tcache and then purges dirty pages in every
+/// arena. This reduces RSS after a large FLUSH without waiting for
+/// jemalloc's background decay.
+///
+/// # Platform assumptions
+///
+/// - The process is linked against tikv-jemalloc-sys (guaranteed by the
+///   crate dependency).
+/// - `mallctl` follows the jemalloc 5.x ABI for `thread.tcache.flush`,
+///   `arenas.narenas`, and `arena.<i>.purge`.
+/// - `CString::new` can only fail if the MIB name contains an interior NUL,
+///   which none of these names do; the `if let Ok` guard is defense-in-depth.
+///
+/// # Error handling
+///
+/// All `mallctl` return codes are intentionally ignored (`let _ = ...`).
+/// Purge failures are non-fatal: the allocator will reclaim pages through
+/// its normal background decay. Logging is omitted to avoid pulling I/O
+/// dependencies into the engine crate.
 fn purge_allocator_after_flush() {
+    // SAFETY: All `mallctl` calls use well-known jemalloc 5.x MIB names via
+    // valid null-terminated `CString` pointers. Pointer arguments are either
+    // null (no value exchange) or point to stack-local variables with correct
+    // size and alignment (`arena_count: c_uint`, `arena_len: usize`). The
+    // jemalloc ABI guarantees thread-safety for these calls — `mallctl` is
+    // internally synchronized. Return codes are ignored because purge is
+    // best-effort: failure leaves jemalloc to reclaim pages via background
+    // decay, which is the normal non-FLUSH path anyway.
     unsafe {
         if let Ok(name) = CString::new("thread.tcache.flush") {
             let _ = mallctl(
@@ -562,6 +591,256 @@ fn record_eviction_deletion(
 ) {
     *freed_bytes += deletion.freed_bytes;
     effects.absorb(deletion.effects);
+}
+
+// ─── Eviction sweep policy trait and implementations ────────────
+
+/// Action returned by a [`SweepPolicy`] for a single slot evaluation.
+///
+/// The generic sweep driver uses this to decide whether to delete the slot
+/// immediately, skip it, or let the policy accumulate it as a deferred
+/// candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotAction {
+    /// Skip this slot — the entry should not be evicted (e.g., its clock
+    /// counter was decremented but not yet zero).
+    Skip,
+    /// Delete this slot immediately.
+    Delete,
+    /// The policy recorded this slot as a deferred candidate (e.g., the
+    /// lowest-frequency or nearest-deadline entry seen so far). The driver
+    /// does not delete it now; the policy's `finalize` method may delete
+    /// it after the scan.
+    Accumulate,
+}
+
+/// Zero-cost eviction policy trait for the unified sweep driver.
+///
+/// Each implementor defines only the policy-specific candidate selection.
+/// The generic sweep driver (`run_sweep_driver`) handles the shared scan
+/// loop, volatile filtering, empty-slot skipping, expired-entry
+/// opportunistic deletion, and result assembly.
+///
+/// Implementations are used as generic type parameters so the compiler
+/// monomorphizes each policy's inner loop — no virtual dispatch.
+trait SweepPolicy {
+    /// Whether the driver should handle expired-entry deletion before
+    /// calling `evaluate_slot`. Policies that perform their own expiry
+    /// handling (e.g., volatile-TTL, which returns immediately on the
+    /// first expired entry) should return `true` so the driver reclaims
+    /// dead entries. Random eviction returns `false` because it deletes
+    /// any slot unconditionally.
+    fn handles_expiry(&self) -> bool;
+
+    /// Evaluate a live, non-expired slot. Returns the action the driver
+    /// should take for this slot.
+    fn evaluate_slot(
+        &mut self,
+        keyspace: &ConcurrentKeyspace,
+        table: &mut SwissTable,
+        slot: usize,
+        ttl: u64,
+        context: &EvictionSweepContext,
+    ) -> SlotAction;
+
+    /// Called after the scan loop completes. Policies that accumulate a
+    /// best-candidate during evaluation can delete it here if the scan
+    /// did not free enough bytes.
+    fn finalize(
+        &mut self,
+        _keyspace: &ConcurrentKeyspace,
+        _table: &mut SwissTable,
+        _context: &EvictionSweepContext,
+        _freed_bytes: &mut usize,
+        _effects: &mut EvictionEffects,
+    ) {
+        // Default: no deferred candidate.
+    }
+}
+
+/// LRU-ish clock sweep: decrement the entry's eviction counter; if it
+/// reaches zero, evict immediately.
+struct ClockPolicy;
+
+impl SweepPolicy for ClockPolicy {
+    #[inline(always)]
+    fn handles_expiry(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn evaluate_slot(
+        &mut self,
+        _keyspace: &ConcurrentKeyspace,
+        table: &mut SwissTable,
+        slot: usize,
+        _ttl: u64,
+        _context: &EvictionSweepContext,
+    ) -> SlotAction {
+        let Some(entry) = table.slot_entry(slot) else {
+            return SlotAction::Skip;
+        };
+        if entry.decrement_eviction_counter() {
+            SlotAction::Skip
+        } else {
+            SlotAction::Delete
+        }
+    }
+}
+
+/// LFU clock sweep: decrement the entry's eviction counter; if it reaches
+/// zero, record the entry as a candidate with its frequency estimate.
+/// After the scan, the lowest-frequency candidate is evicted.
+struct LfuClockPolicy {
+    best_candidate: Option<usize>,
+    best_frequency: u8,
+}
+
+impl LfuClockPolicy {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            best_candidate: None,
+            best_frequency: u8::MAX,
+        }
+    }
+}
+
+impl SweepPolicy for LfuClockPolicy {
+    #[inline(always)]
+    fn handles_expiry(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn evaluate_slot(
+        &mut self,
+        keyspace: &ConcurrentKeyspace,
+        table: &mut SwissTable,
+        slot: usize,
+        _ttl: u64,
+        _context: &EvictionSweepContext,
+    ) -> SlotAction {
+        let Some(entry) = table.slot_entry(slot) else {
+            return SlotAction::Skip;
+        };
+        if entry.decrement_eviction_counter() {
+            return SlotAction::Skip;
+        }
+
+        let Some((key, _)) = table.slot_key_value(slot) else {
+            return SlotAction::Skip;
+        };
+        let frequency = keyspace
+            .frequency_sketch
+            .estimate(table.hash_key_bytes(key.as_bytes()));
+        if self.best_candidate.is_none() || frequency < self.best_frequency {
+            self.best_candidate = Some(slot);
+            self.best_frequency = frequency;
+        }
+        SlotAction::Accumulate
+    }
+
+    fn finalize(
+        &mut self,
+        keyspace: &ConcurrentKeyspace,
+        table: &mut SwissTable,
+        context: &EvictionSweepContext,
+        freed_bytes: &mut usize,
+        effects: &mut EvictionEffects,
+    ) {
+        if *freed_bytes < context.bytes_needed {
+            if let Some(candidate) = self.best_candidate {
+                record_eviction_deletion(
+                    freed_bytes,
+                    effects,
+                    keyspace.delete_evictable_slot(context.shard_idx, table, candidate),
+                );
+            }
+        }
+    }
+}
+
+/// Random eviction: evict any live slot unconditionally.
+struct RandomPolicy;
+
+impl SweepPolicy for RandomPolicy {
+    #[inline(always)]
+    fn handles_expiry(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn evaluate_slot(
+        &mut self,
+        _keyspace: &ConcurrentKeyspace,
+        _table: &mut SwissTable,
+        _slot: usize,
+        _ttl: u64,
+        _context: &EvictionSweepContext,
+    ) -> SlotAction {
+        SlotAction::Delete
+    }
+}
+
+/// Volatile-TTL eviction: find the entry with the nearest TTL deadline.
+/// Expired entries are reclaimed opportunistically by the driver. If no
+/// expired entry was found, the nearest-deadline candidate is evicted.
+struct VolatileTtlPolicy {
+    best_slot: Option<usize>,
+    best_deadline: u64,
+}
+
+impl VolatileTtlPolicy {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            best_slot: None,
+            best_deadline: u64::MAX,
+        }
+    }
+}
+
+impl SweepPolicy for VolatileTtlPolicy {
+    #[inline(always)]
+    fn handles_expiry(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn evaluate_slot(
+        &mut self,
+        _keyspace: &ConcurrentKeyspace,
+        _table: &mut SwissTable,
+        slot: usize,
+        ttl: u64,
+        _context: &EvictionSweepContext,
+    ) -> SlotAction {
+        // Non-TTL slots are already filtered by the driver's volatile check.
+        // Among remaining volatile entries, track the one closest to expiry.
+        if ttl != 0 && ttl < self.best_deadline {
+            self.best_deadline = ttl;
+            self.best_slot = Some(slot);
+        }
+        SlotAction::Accumulate
+    }
+
+    fn finalize(
+        &mut self,
+        keyspace: &ConcurrentKeyspace,
+        table: &mut SwissTable,
+        context: &EvictionSweepContext,
+        freed_bytes: &mut usize,
+        effects: &mut EvictionEffects,
+    ) {
+        if let Some(candidate) = self.best_slot {
+            record_eviction_deletion(
+                freed_bytes,
+                effects,
+                keyspace.delete_evictable_slot(context.shard_idx, table, candidate),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1684,11 +1963,20 @@ impl ConcurrentKeyspace {
         };
         let sweep = match policy {
             EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => {
-                self.evict_random(&mut guard, context)
+                let random_start = (next_random_u64() as usize) & (total_slots - 1);
+                let adjusted = EvictionSweepContext {
+                    start_slot: (context.start_slot + random_start) % total_slots,
+                    ..context
+                };
+                self.run_sweep_driver(&mut guard, adjusted, RandomPolicy)
             }
-            EvictionPolicy::VolatileTtl => self.evict_volatile_ttl(&mut guard, context),
-            policy if policy.is_lfu() => self.evict_lfu_clock_sweep(&mut guard, context),
-            _ => self.evict_clock_sweep(&mut guard, context),
+            EvictionPolicy::VolatileTtl => {
+                self.run_sweep_driver(&mut guard, context, VolatileTtlPolicy::new())
+            }
+            policy if policy.is_lfu() => {
+                self.run_sweep_driver(&mut guard, context, LfuClockPolicy::new())
+            }
+            _ => self.run_sweep_driver(&mut guard, context, ClockPolicy),
         };
         report.slots_sampled += sweep.slots_sampled;
         self.set_clock_hand(shard_idx, sweep.next_slot);
@@ -1697,10 +1985,29 @@ impl ConcurrentKeyspace {
         freed_bytes
     }
 
-    fn evict_clock_sweep(
+    // ─── Unified eviction sweep driver ──────────────────────────────
+    //
+    // All eviction policies share the same scan loop: iterate slots up to
+    // `EVICTION_SWEEP_WINDOW`, skip empty/volatile-filtered slots, delete
+    // expired entries opportunistically, and then delegate non-expired live
+    // entries to the policy's `evaluate_slot` method. After the scan,
+    // `finalize` lets policies that accumulate candidates (LFU, volatile-TTL)
+    // perform a deferred eviction deletion.
+    //
+    // The driver is generic over `SweepPolicy`, so each policy's inner-loop
+    // code remains monomorphized — zero virtual dispatch overhead.
+
+    /// Run the shared eviction scan loop with a policy-specific evaluator.
+    ///
+    /// The driver handles: empty-table guard, slot iteration, volatile
+    /// filtering, empty-slot skipping, expired-entry opportunistic deletion,
+    /// effects collection, and result assembly. The policy only defines
+    /// candidate evaluation and optional post-loop finalization.
+    fn run_sweep_driver<P: SweepPolicy>(
         &self,
         table: &mut SwissTable,
         context: EvictionSweepContext,
+        mut policy: P,
     ) -> EvictionSweepResult {
         let total_slots = table.total_slots();
         if total_slots == 0 {
@@ -1719,15 +2026,20 @@ impl ConcurrentKeyspace {
             slots_sampled += 1;
 
             let ttl = table.slot_entry_ttl(current_slot);
+
+            // Volatile filter: skip non-TTL slots when policy targets volatile keys only.
             if ttl == 0 && context.volatile_only {
                 continue;
             }
 
-            let Some(entry) = table.slot_entry(current_slot) else {
+            // Skip empty/deleted slots.
+            if table.slot_entry(current_slot).is_none() {
                 continue;
-            };
+            }
 
-            if ttl != 0 && ttl <= context.now_nanos {
+            // Opportunistic expired-entry deletion: all policies benefit from
+            // reclaiming already-dead entries without charging the policy logic.
+            if policy.handles_expiry() && ttl != 0 && ttl <= context.now_nanos {
                 record_eviction_deletion(
                     &mut freed_bytes,
                     &mut effects,
@@ -1739,215 +2051,34 @@ impl ConcurrentKeyspace {
                 continue;
             }
 
-            if entry.decrement_eviction_counter() {
-                continue;
-            }
-
-            record_eviction_deletion(
-                &mut freed_bytes,
-                &mut effects,
-                self.delete_evictable_slot(context.shard_idx, table, current_slot),
-            );
-            if freed_bytes >= context.bytes_needed {
-                break;
-            }
-        }
-
-        EvictionSweepResult {
-            next_slot: slot,
-            freed_bytes,
-            slots_sampled,
-            effects,
-        }
-    }
-
-    fn evict_lfu_clock_sweep(
-        &self,
-        table: &mut SwissTable,
-        context: EvictionSweepContext,
-    ) -> EvictionSweepResult {
-        let total_slots = table.total_slots();
-        if total_slots == 0 {
-            return EvictionSweepResult::default();
-        }
-
-        let mut slot = context.start_slot % total_slots;
-        let mut freed_bytes = 0usize;
-        let mut effects = EvictionEffects::default();
-        let mut best_candidate = None;
-        let mut best_frequency = u8::MAX;
-        let mut slots_sampled = 0usize;
-        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
-
-        for _ in 0..sweep_len {
-            let current_slot = slot;
-            slot = (slot + 1) % total_slots;
-            slots_sampled += 1;
-
-            let ttl = table.slot_entry_ttl(current_slot);
-            if ttl == 0 && context.volatile_only {
-                continue;
-            }
-
-            let Some(entry) = table.slot_entry(current_slot) else {
-                continue;
-            };
-
-            if ttl != 0 && ttl <= context.now_nanos {
-                record_eviction_deletion(
-                    &mut freed_bytes,
-                    &mut effects,
-                    self.delete_evictable_slot(context.shard_idx, table, current_slot),
-                );
-                if freed_bytes >= context.bytes_needed {
-                    return EvictionSweepResult {
-                        next_slot: slot,
-                        freed_bytes,
-                        slots_sampled,
-                        effects,
-                    };
+            // Policy-specific candidate evaluation.
+            let action = policy.evaluate_slot(self, table, current_slot, ttl, &context);
+            match action {
+                SlotAction::Skip => {}
+                SlotAction::Delete => {
+                    record_eviction_deletion(
+                        &mut freed_bytes,
+                        &mut effects,
+                        self.delete_evictable_slot(context.shard_idx, table, current_slot),
+                    );
+                    if freed_bytes >= context.bytes_needed {
+                        break;
+                    }
                 }
-                continue;
-            }
-
-            if entry.decrement_eviction_counter() {
-                continue;
-            }
-
-            let Some((key, _)) = table.slot_key_value(current_slot) else {
-                continue;
-            };
-            let frequency = self
-                .frequency_sketch
-                .estimate(table.hash_key_bytes(key.as_bytes()));
-            if best_candidate.is_none() || frequency < best_frequency {
-                best_candidate = Some(current_slot);
-                best_frequency = frequency;
+                SlotAction::Accumulate => {
+                    // Policy tracks the candidate internally (e.g., best-frequency
+                    // or nearest-deadline). No deletion yet.
+                }
             }
         }
 
-        if freed_bytes < context.bytes_needed {
-            if let Some(candidate) = best_candidate {
-                record_eviction_deletion(
-                    &mut freed_bytes,
-                    &mut effects,
-                    self.delete_evictable_slot(context.shard_idx, table, candidate),
-                );
-            }
-        }
+        // Let the policy delete a deferred best-candidate if the scan did not
+        // free enough bytes.
+        policy.finalize(self, table, &context, &mut freed_bytes, &mut effects);
 
         EvictionSweepResult {
             next_slot: slot,
             freed_bytes,
-            slots_sampled,
-            effects,
-        }
-    }
-
-    fn evict_random(
-        &self,
-        table: &mut SwissTable,
-        context: EvictionSweepContext,
-    ) -> EvictionSweepResult {
-        let total_slots = table.total_slots();
-        if total_slots == 0 {
-            return EvictionSweepResult::default();
-        }
-
-        let random_start = (next_random_u64() as usize) & (total_slots - 1);
-        let mut slot = (context.start_slot + random_start) % total_slots;
-        let mut freed_bytes = 0usize;
-        let mut effects = EvictionEffects::default();
-        let mut slots_sampled = 0usize;
-        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
-
-        for _ in 0..sweep_len {
-            let current_slot = slot;
-            slot = (slot + 1) % total_slots;
-            slots_sampled += 1;
-
-            let ttl = table.slot_entry_ttl(current_slot);
-            if ttl == 0 && context.volatile_only {
-                continue;
-            }
-            if table.slot_entry(current_slot).is_none() {
-                continue;
-            }
-            let _ = context.now_nanos;
-            record_eviction_deletion(
-                &mut freed_bytes,
-                &mut effects,
-                self.delete_evictable_slot(context.shard_idx, table, current_slot),
-            );
-            if freed_bytes >= context.bytes_needed {
-                break;
-            }
-        }
-
-        EvictionSweepResult {
-            next_slot: slot,
-            freed_bytes,
-            slots_sampled,
-            effects,
-        }
-    }
-
-    fn evict_volatile_ttl(
-        &self,
-        table: &mut SwissTable,
-        context: EvictionSweepContext,
-    ) -> EvictionSweepResult {
-        let total_slots = table.total_slots();
-        if total_slots == 0 {
-            return EvictionSweepResult::default();
-        }
-
-        let mut slot = context.start_slot % total_slots;
-        let mut best_slot = None;
-        let mut best_deadline = u64::MAX;
-        let mut effects = EvictionEffects::default();
-        let mut slots_sampled = 0usize;
-        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
-
-        for _ in 0..sweep_len {
-            let current_slot = slot;
-            slot = (slot + 1) % total_slots;
-            slots_sampled += 1;
-            let ttl = table.slot_entry_ttl(current_slot);
-            if ttl == 0 {
-                continue;
-            }
-            if table.slot_entry(current_slot).is_none() {
-                continue;
-            }
-            if ttl <= context.now_nanos {
-                let deletion = self.delete_evictable_slot(context.shard_idx, table, current_slot);
-                let freed = deletion.freed_bytes;
-                effects.absorb(deletion.effects);
-                return EvictionSweepResult {
-                    next_slot: slot,
-                    freed_bytes: freed,
-                    slots_sampled,
-                    effects,
-                };
-            }
-            if ttl < best_deadline {
-                best_deadline = ttl;
-                best_slot = Some(current_slot);
-            }
-        }
-
-        let freed = best_slot
-            .map(|candidate| {
-                let deletion = self.delete_evictable_slot(context.shard_idx, table, candidate);
-                let freed = deletion.freed_bytes;
-                effects.absorb(deletion.effects);
-                freed
-            })
-            .unwrap_or(0);
-        EvictionSweepResult {
-            next_slot: slot,
-            freed_bytes: freed,
             slots_sampled,
             effects,
         }
@@ -2276,6 +2407,10 @@ impl ConcurrentKeyspace {
     }
 
     /// Acquire a read lock on a specific shard by index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= self.num_shards()`.
     #[inline(always)]
     pub fn read_shard_by_index(&self, idx: usize) -> RwLockReadGuard<'_, SwissTable> {
         self.try_read_shard_by_index(idx)
@@ -2283,6 +2418,10 @@ impl ConcurrentKeyspace {
     }
 
     /// Acquire a write lock on a specific shard by index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= self.num_shards()`.
     #[inline(always)]
     pub(crate) fn write_shard_by_index(&self, idx: usize) -> ShardWriteGuard<'_> {
         self.try_write_shard_by_index(idx)

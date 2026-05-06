@@ -833,6 +833,584 @@ fn bench_latency_distribution_set(c: &mut Criterion) {
     });
 }
 
+// ── KEYS-014 — Read-Side Eviction Metadata Contention ──────────────
+
+/// Baseline: hot-key GET with no eviction policy — no metadata writes.
+fn bench_hotkey_get_no_eviction(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let key = VortexKey::from(b"hotkey" as &[u8]);
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"hotvalue"));
+
+    let cmd = make_resp(&[b"GET", b"hotkey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("hotkey_get_no_eviction", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+/// LRU read tracking: hot-key GET with allkeys-lru — entry AtomicU8 morris
+/// counter write on every hit.
+fn bench_hotkey_get_allkeys_lru(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let key = VortexKey::from(b"hotkey" as &[u8]);
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"hotvalue"));
+    keyspace.configure_eviction(1 << 20, EvictionPolicy::AllKeysLru);
+
+    let cmd = make_resp(&[b"GET", b"hotkey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("hotkey_get_allkeys_lru", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+/// LFU read tracking: hot-key GET with allkeys-lfu — sampled frequency
+/// sketch update + entry AtomicU8 morris counter write.
+fn bench_hotkey_get_allkeys_lfu(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+    let key = VortexKey::from(b"hotkey" as &[u8]);
+    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"hotvalue"));
+    keyspace.configure_eviction(1 << 20, EvictionPolicy::AllKeysLfu);
+
+    let cmd = make_resp(&[b"GET", b"hotkey"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("hotkey_get_allkeys_lfu", |b| {
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+/// Latency distribution comparison: hot-key GET at p50/p99/p999 across
+/// no-eviction, allkeys-lru, and allkeys-lfu.
+///
+/// This is the core evidence benchmark for KEYS-014: it captures the
+/// tail-latency impact of read-side metadata mutations on a single hot key.
+fn bench_hotkey_latency_distribution(c: &mut Criterion) {
+    let sample_count = 10_000usize;
+
+    let policies: &[(&str, Option<EvictionPolicy>)] = &[
+        ("none", None),
+        ("lru", Some(EvictionPolicy::AllKeysLru)),
+        ("lfu", Some(EvictionPolicy::AllKeysLfu)),
+    ];
+
+    for &(label, policy) in policies {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        let key = VortexKey::from(b"hotkey" as &[u8]);
+        insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"hotvalue"));
+        if let Some(p) = policy {
+            keyspace.configure_eviction(1 << 20, p);
+        }
+
+        let cmd = make_resp(&[b"GET", b"hotkey"]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+        c.bench_function(&format!("hotkey_latency_{label}"), |b| {
+            b.iter(|| {
+                let mut hist = hdrhistogram::Histogram::<u64>::new(3).unwrap();
+                for _ in 0..sample_count {
+                    let start = std::time::Instant::now();
+                    let frame = tape.iter().next().unwrap();
+                    let r = execute_command(black_box(&keyspace), b"GET", &frame, 0);
+                    black_box(r);
+                    let elapsed = start.elapsed().as_nanos() as u64;
+                    let _ = hist.record(elapsed);
+                }
+                let p50 = hist.value_at_quantile(0.50);
+                let p99 = hist.value_at_quantile(0.99);
+                let p999 = hist.value_at_quantile(0.999);
+                black_box((p50, p99, p999));
+            });
+        });
+    }
+}
+
+/// Eviction admission benchmark — validates KEYS-013 sweep driver performance
+/// by measuring eviction-path SET commands under all policy variants.
+fn bench_eviction_admission_sweep_driver(c: &mut Criterion) {
+    let policies: &[(&str, EvictionPolicy)] = &[
+        ("lru", EvictionPolicy::AllKeysLru),
+        ("lfu", EvictionPolicy::AllKeysLfu),
+        ("random", EvictionPolicy::AllKeysRandom),
+    ];
+
+    for &(label, policy) in policies {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        let keys = same_shard_keys(&keyspace, 3);
+        let get_cmd = make_resp(&[b"GET", keys[0].as_slice()]);
+        let get_tape = RespTape::parse_pipeline(&get_cmd).unwrap();
+        let set_cmd = make_resp(&[b"SET", keys[2].as_slice(), b"evict-test"]);
+        let set_tape = RespTape::parse_pipeline(&set_cmd).unwrap();
+
+        c.bench_function(&format!("eviction_admission_{label}"), |b| {
+            b.iter_batched(
+                || {
+                    let ks = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+                    insert_keyspace_value(
+                        &ks,
+                        VortexKey::from(keys[0].as_slice()),
+                        VortexValue::from_bytes(b"warm"),
+                    );
+                    insert_keyspace_value(
+                        &ks,
+                        VortexKey::from(keys[1].as_slice()),
+                        VortexValue::from_bytes(b"cool"),
+                    );
+                    ks.configure_eviction(ks.memory_used(), policy);
+                    // Warm the LRU/LFU counters for key[0].
+                    for _ in 0..16 {
+                        let frame = get_tape.iter().next().unwrap();
+                        let _ = execute_command(&ks, b"GET", &frame, 0);
+                    }
+                    ks
+                },
+                |ks| {
+                    let frame = set_tape.iter().next().unwrap();
+                    let r = execute_command(black_box(&ks), b"SET", &frame, 0);
+                    black_box(r);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+// ── KEYS-014 — Multi-Thread Cache-Line Contention ──────────────────
+
+/// Multi-thread hot-key contention: N threads reading the same key with
+/// AllKeysLru. Measures throughput scaling degradation caused by
+/// AtomicU8 morris_cnt writes bouncing the cache line between cores.
+///
+/// Compared against the same workload with NoEviction (no metadata writes).
+fn bench_hotkey_concurrent_contention(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AO};
+
+    let thread_counts = [2, 4, 8];
+    let ops_per_thread = 50_000usize;
+
+    let policies: &[(&str, Option<EvictionPolicy>)] = &[
+        ("none", None),
+        ("lru", Some(EvictionPolicy::AllKeysLru)),
+        ("lfu", Some(EvictionPolicy::AllKeysLfu)),
+    ];
+
+    for &(label, policy) in policies {
+        for &n_threads in &thread_counts {
+            let name = format!("concurrent_hotkey_{label}_{n_threads}t");
+            c.bench_function(&name, |b| {
+                b.iter_batched(
+                    || {
+                        let keyspace = Arc::new(ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS));
+                        let key = VortexKey::from(b"hotkey" as &[u8]);
+                        // SAFETY: benchmark fixture seeding.
+                        unsafe {
+                            keyspace.benchmark_insert_unchecked(
+                                key,
+                                VortexValue::from_bytes(b"hotvalue"),
+                            );
+                        }
+                        if let Some(p) = policy {
+                            keyspace.configure_eviction(1 << 20, p);
+                        }
+                        keyspace
+                    },
+                    |keyspace| {
+                        let go = Arc::new(AtomicBool::new(false));
+                        let handles: Vec<_> = (0..n_threads)
+                            .map(|_| {
+                                let ks = Arc::clone(&keyspace);
+                                let go = Arc::clone(&go);
+                                std::thread::spawn(move || {
+                                    let cmd = make_resp(&[b"GET", b"hotkey"]);
+                                    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+                                    while !go.load(AO::Acquire) {
+                                        std::hint::spin_loop();
+                                    }
+                                    for _ in 0..ops_per_thread {
+                                        let frame = tape.iter().next().unwrap();
+                                        let r = execute_command(
+                                            black_box(&*ks),
+                                            b"GET",
+                                            &frame,
+                                            0,
+                                        );
+                                        black_box(r);
+                                    }
+                                })
+                            })
+                            .collect();
+                        go.store(true, AO::Release);
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+}
+
+// ── KEYS-015 — LFU Decay Tail Latency ─────────────────────────────
+
+/// Measures the tail-latency spike when FrequencySketch::try_decay fires.
+///
+/// Under AllKeysLfu, every `record_frequency_hash` call increments the
+/// sketch's `samples` counter. At every 65,536th sample, `try_decay()`
+/// runs on the caller thread — iterating all 8,192 AtomicU8 counters
+/// and halving each one.
+///
+/// This benchmark drives exactly enough SET commands to trigger multiple
+/// decay cycles and captures the latency distribution to quantify the
+/// spike caused by inline decay.
+fn bench_lfu_decay_latency(c: &mut Criterion) {
+    // We need enough samples to trigger decay. Each SET records one
+    // frequency hash, so we need 65536+ SETs for at least one decay.
+    // We'll drive 3 × 65536 = 196608 to capture multiple cycles.
+    let total_ops = 3 * 65_536usize;
+
+    c.bench_function("lfu_decay_latency_distribution", |b| {
+        b.iter_batched(
+            || {
+                let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+                let key = VortexKey::from(b"decay-probe" as &[u8]);
+                insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
+                keyspace.configure_eviction(1 << 20, EvictionPolicy::AllKeysLfu);
+                keyspace
+            },
+            |keyspace| {
+                let cmd = make_resp(&[b"SET", b"decay-probe", b"newval"]);
+                let tape = RespTape::parse_pipeline(&cmd).unwrap();
+                let mut hist = hdrhistogram::Histogram::<u64>::new(3).unwrap();
+                for _ in 0..total_ops {
+                    let start = std::time::Instant::now();
+                    let frame = tape.iter().next().unwrap();
+                    let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+                    black_box(r);
+                    let elapsed = start.elapsed().as_nanos() as u64;
+                    let _ = hist.record(elapsed);
+                }
+                let p50 = hist.value_at_quantile(0.50);
+                let p99 = hist.value_at_quantile(0.99);
+                let p999 = hist.value_at_quantile(0.999);
+                let max = hist.max();
+                black_box((p50, p99, p999, max));
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+}
+
+/// Comparative LFU decay benchmark: same workload under NoEviction (no
+/// sketch recording) vs AllKeysLfu (sketch + periodic decay). This
+/// isolates the decay cost from baseline SET overhead.
+fn bench_lfu_decay_vs_no_eviction(c: &mut Criterion) {
+    let batch_size = 65_536usize;
+
+    for &(label, policy) in &[
+        ("noeviction", EvictionPolicy::NoEviction),
+        ("allkeys_lfu", EvictionPolicy::AllKeysLfu),
+    ] {
+        c.bench_function(&format!("lfu_decay_batch_{label}"), |b| {
+            b.iter_batched(
+                || {
+                    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+                    let key = VortexKey::from(b"decay-probe" as &[u8]);
+                    insert_keyspace_value(&keyspace, key, VortexValue::from_bytes(b"val"));
+                    if policy != EvictionPolicy::NoEviction {
+                        keyspace.configure_eviction(1 << 20, policy);
+                    }
+                    keyspace
+                },
+                |keyspace| {
+                    let cmd = make_resp(&[b"SET", b"decay-probe", b"newval"]);
+                    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+                    for _ in 0..batch_size {
+                        let frame = tape.iter().next().unwrap();
+                        let r = execute_command(black_box(&keyspace), b"SET", &frame, 0);
+                        black_box(r);
+                    }
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+}
+
+// ── KEYS-016 — Transaction Gate Backoff ────────────────────────────
+
+/// Baseline: uncontended command gate entry/exit cost.
+/// This measures the hot-path overhead of `enter_command_gate_slot` when
+/// no transaction (EXEC) is active — the per-command cost of the gate.
+fn bench_gate_command_uncontended(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+
+    c.bench_function("gate_command_uncontended", |b| {
+        b.iter(|| {
+            let _guard = black_box(keyspace.enter_command_gate_slot(0));
+        });
+    });
+}
+
+/// Baseline: uncontended transaction gate entry/exit cost.
+/// This measures the EXEC-side cost of `enter_transaction_gate` when
+/// no concurrent command dispatches are active.
+fn bench_gate_transaction_uncontended(c: &mut Criterion) {
+    let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+
+    c.bench_function("gate_transaction_uncontended", |b| {
+        b.iter(|| {
+            let _guard = black_box(keyspace.enter_transaction_gate());
+        });
+    });
+}
+
+/// Command-gate contention under active transaction: measures the
+/// spin/yield backoff CPU cost when a transaction holds the gate.
+///
+/// One thread holds `enter_transaction_gate` for a fixed duration
+/// while N reader threads try to enter the command gate. We measure
+/// the total wall-clock time (including spin/yield wait).
+fn bench_gate_command_under_transaction(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AO};
+
+    let hold_durations_us = [10, 100, 1000]; // 10µs, 100µs, 1ms
+    let n_readers = 4;
+    let ops_per_reader = 1000usize;
+
+    for &hold_us in &hold_durations_us {
+        let name = format!("gate_cmd_under_tx_{hold_us}us_{n_readers}r");
+        c.bench_function(&name, |b| {
+            b.iter_batched(
+                || Arc::new(ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS)),
+                |keyspace| {
+                    let ready = Arc::new(AtomicBool::new(false));
+                    let done = Arc::new(AtomicBool::new(false));
+
+                    // Transaction holder thread: enters exclusive gate, sleeps, exits.
+                    let ks_tx = Arc::clone(&keyspace);
+                    let ready_tx = Arc::clone(&ready);
+                    let done_tx = Arc::clone(&done);
+                    let tx_handle = std::thread::spawn(move || {
+                        let _guard = ks_tx.enter_transaction_gate();
+                        ready_tx.store(true, AO::Release);
+                        // Hold the gate for the specified duration to simulate
+                        // a multi-command EXEC batch.
+                        std::thread::sleep(std::time::Duration::from_micros(hold_us));
+                        drop(_guard);
+                        done_tx.store(true, AO::Release);
+                    });
+
+                    // Wait for transaction gate to be acquired.
+                    while !ready.load(AO::Acquire) {
+                        std::hint::spin_loop();
+                    }
+
+                    // Reader threads: attempt command gate entry while tx is active.
+                    let reader_handles: Vec<_> = (0..n_readers)
+                        .map(|i| {
+                            let ks = Arc::clone(&keyspace);
+                            std::thread::spawn(move || {
+                                let mut completed = 0usize;
+                                for _ in 0..ops_per_reader {
+                                    let _guard = ks.enter_command_gate_slot(i);
+                                    completed += 1;
+                                    black_box(&_guard);
+                                }
+                                completed
+                            })
+                        })
+                        .collect();
+
+                    tx_handle.join().unwrap();
+                    let total: usize = reader_handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .sum();
+                    black_box(total);
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+}
+
+/// EXEC simulation under concurrent GET/SET load.
+///
+/// Multiple reader threads execute GET commands through the command gate,
+/// while one thread periodically enters the transaction gate (simulating
+/// EXEC). Measures total throughput degradation from gate serialization.
+fn bench_gate_exec_under_load(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
+
+    let n_workers = 4;
+    let ops_per_worker = 50_000usize;
+
+    let scenarios: &[(&str, bool)] = &[
+        ("no_tx", false),    // Baseline: no EXEC, just command gate
+        ("with_tx", true),   // With periodic EXEC interruptions
+    ];
+
+    for &(label, inject_tx) in scenarios {
+        let name = format!("gate_exec_load_{label}_{n_workers}w");
+        c.bench_function(&name, |b| {
+            b.iter_batched(
+                || {
+                    let ks = Arc::new(ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS));
+                    let key = VortexKey::from(b"gatekey" as &[u8]);
+                    insert_keyspace_value(&ks, key, VortexValue::from_bytes(b"val"));
+                    ks
+                },
+                |keyspace| {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let total_ops = Arc::new(AtomicU64::new(0));
+
+                    // Worker threads: GET with command gate.
+                    let worker_handles: Vec<_> = (0..n_workers)
+                        .map(|i| {
+                            let ks = Arc::clone(&keyspace);
+                            let stop = Arc::clone(&stop);
+                            let total = Arc::clone(&total_ops);
+                            std::thread::spawn(move || {
+                                let cmd = make_resp(&[b"GET", b"gatekey"]);
+                                let tape = RespTape::parse_pipeline(&cmd).unwrap();
+                                for n in 0..ops_per_worker {
+                                    if stop.load(AO::Relaxed) {
+                                        break;
+                                    }
+                                    let _gate = ks.enter_command_gate_slot(i);
+                                    let frame = tape.iter().next().unwrap();
+                                    let r = execute_command(
+                                        black_box(&*ks),
+                                        b"GET",
+                                        &frame,
+                                        0,
+                                    );
+                                    black_box(r);
+                                    total.fetch_add(1, AO::Relaxed);
+                                    let _ = n;
+                                }
+                            })
+                        })
+                        .collect();
+
+                    // Transaction thread: periodic EXEC gate entry/exit.
+                    let tx_handle = if inject_tx {
+                        let ks = Arc::clone(&keyspace);
+                        let stop = Arc::clone(&stop);
+                        Some(std::thread::spawn(move || {
+                            let mut tx_count = 0u64;
+                            while !stop.load(AO::Relaxed) {
+                                let _guard = ks.enter_transaction_gate();
+                                // Simulate a short EXEC batch: 10µs of work.
+                                std::thread::sleep(std::time::Duration::from_micros(10));
+                                drop(_guard);
+                                tx_count += 1;
+                                // Rate-limit EXEC to avoid starvation.
+                                std::thread::sleep(std::time::Duration::from_micros(100));
+                                if tx_count >= 100 {
+                                    break;
+                                }
+                            }
+                        }))
+                    } else {
+                        None
+                    };
+
+                    for h in worker_handles {
+                        h.join().unwrap();
+                    }
+                    stop.store(true, AO::Release);
+                    if let Some(h) = tx_handle {
+                        h.join().unwrap();
+                    }
+                    let completed = total_ops.load(AO::Relaxed);
+                    black_box(completed);
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+}
+
+/// Measures spin_or_yield CPU behavior: how quickly does the command gate
+/// unblock after the transaction gate releases?
+///
+/// One thread holds the transaction gate for exactly 100µs, then releases.
+/// N threads measuring command gate entry latency — the delta between
+/// actual entry time and the release time reveals the yield overhead.
+fn bench_gate_yield_latency(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
+
+    let n_threads = 4;
+
+    c.bench_function("gate_yield_wake_latency", |b| {
+        b.iter_batched(
+            || Arc::new(ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS)),
+            |keyspace| {
+                let released = Arc::new(AtomicU64::new(0));
+                let ready = Arc::new(AtomicBool::new(false));
+
+                let ks_tx = Arc::clone(&keyspace);
+                let released_tx = Arc::clone(&released);
+                let ready_tx = Arc::clone(&ready);
+
+                let tx_handle = std::thread::spawn(move || {
+                    let _guard = ks_tx.enter_transaction_gate();
+                    ready_tx.store(true, AO::Release);
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    released_tx.store(
+                        std::time::Instant::now().elapsed().as_nanos() as u64,
+                        AO::Release,
+                    );
+                });
+
+                while !ready.load(AO::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                // Readers start trying to enter while gate is held.
+                let reader_handles: Vec<_> = (0..n_threads)
+                    .map(|i| {
+                        let ks = Arc::clone(&keyspace);
+                        std::thread::spawn(move || {
+                            let start = std::time::Instant::now();
+                            let _guard = ks.enter_command_gate_slot(i);
+                            start.elapsed().as_nanos() as u64
+                        })
+                    })
+                    .collect();
+
+                tx_handle.join().unwrap();
+                let waits: Vec<u64> = reader_handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect();
+                let max_wait = waits.iter().copied().max().unwrap_or(0);
+                black_box(max_wait);
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_cmd_get_inline,
@@ -867,6 +1445,23 @@ criterion_group!(
     bench_throughput_get_set_mix,
     bench_throughput_get_set_1m,
     bench_latency_distribution_get,
-    bench_latency_distribution_set
+    bench_latency_distribution_set,
+    // KEYS-014: Read-side eviction metadata contention benchmarks
+    bench_hotkey_get_no_eviction,
+    bench_hotkey_get_allkeys_lru,
+    bench_hotkey_get_allkeys_lfu,
+    bench_hotkey_latency_distribution,
+    bench_hotkey_concurrent_contention,
+    // KEYS-013: Eviction admission sweep driver benchmarks
+    bench_eviction_admission_sweep_driver,
+    // KEYS-015: LFU decay latency benchmarks
+    bench_lfu_decay_latency,
+    bench_lfu_decay_vs_no_eviction,
+    // KEYS-016: Transaction gate backoff benchmarks
+    bench_gate_command_uncontended,
+    bench_gate_transaction_uncontended,
+    bench_gate_command_under_transaction,
+    bench_gate_exec_under_load,
+    bench_gate_yield_latency
 );
 criterion_main!(benches);

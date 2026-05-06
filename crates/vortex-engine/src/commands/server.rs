@@ -319,7 +319,8 @@ fn read_proc_rss_bytes() -> usize {
             let parts: Vec<&str> = statm.split_whitespace().collect();
             if parts.len() >= 2 {
                 if let Ok(rss_pages) = parts[1].parse::<usize>() {
-                    return rss_pages * page_size();
+                    return rss_pages;
+                    // * vortex_memory::page_size();
                 }
             }
         }
