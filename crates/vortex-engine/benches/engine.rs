@@ -21,9 +21,11 @@ fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
 }
 
 fn insert_keyspace_value(keyspace: &ConcurrentKeyspace, key: VortexKey, value: VortexValue) {
-    let shard_index = keyspace.shard_index(key.as_bytes());
-    let mut guard = keyspace.write_shard_by_index(shard_index);
-    guard.insert(key, value);
+    // SAFETY: benchmark fixtures use this only to seed data around the
+    // measured command path; command invariants are not being validated here.
+    unsafe {
+        keyspace.benchmark_insert_unchecked(key, value);
+    }
 }
 
 fn prefill_keyspace(n: usize) -> ConcurrentKeyspace {
@@ -440,6 +442,58 @@ fn bench_cmd_exists(c: &mut Criterion) {
     });
 }
 
+fn bench_cmd_del_small_batches(c: &mut Criterion) {
+    for size in [2usize, 4, 8, 16] {
+        let keyspace = prefill_keyspace(10_000);
+        let keys: Vec<Vec<u8>> = (0..size)
+            .map(|i| format!("key:{:08}", i * 17).into_bytes())
+            .collect();
+        let mut parts: Vec<Vec<u8>> = vec![b"DEL".to_vec()];
+        parts.extend(keys.iter().cloned());
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let cmd = make_resp(&refs);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+        let name = format!("cmd_del_{size}_keys");
+        c.bench_function(&name, |b| {
+            b.iter(|| {
+                for key_bytes in &keys {
+                    insert_keyspace_value(
+                        &keyspace,
+                        VortexKey::from(key_bytes.as_slice()),
+                        VortexValue::Integer(0),
+                    );
+                }
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&keyspace), b"DEL", &frame, 0);
+                black_box(r);
+            });
+        });
+    }
+}
+
+fn bench_cmd_exists_small_batches(c: &mut Criterion) {
+    for size in [2usize, 4, 8, 16] {
+        let keyspace = prefill_keyspace(10_000);
+        let mut parts: Vec<Vec<u8>> = vec![b"EXISTS".to_vec()];
+        for i in 0..size {
+            parts.push(format!("key:{:08}", i * 17).into_bytes());
+        }
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let cmd = make_resp(&refs);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+        let name = format!("cmd_exists_{size}_keys");
+        c.bench_function(&name, |b| {
+            b.iter(|| {
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&keyspace), b"EXISTS", &frame, 0);
+                black_box(r);
+            });
+        });
+    }
+}
+
 fn bench_cmd_expire(c: &mut Criterion) {
     let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
     let key = VortexKey::from(b"mykey" as &[u8]);
@@ -797,6 +851,8 @@ criterion_group!(
     bench_cmd_dbsize_10k,
     bench_cmd_del_inline,
     bench_cmd_exists,
+    bench_cmd_del_small_batches,
+    bench_cmd_exists_small_batches,
     bench_cmd_expire,
     bench_cmd_ttl,
     bench_active_expiry_empty_shard,

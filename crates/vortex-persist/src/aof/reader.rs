@@ -13,8 +13,8 @@
 //! ## Backward Compatibility
 //!
 //! v1 files (no LSN prefix) are supported during transition: records are
-//! assigned synthetic sequential LSNs (reactor_index × 2⁴⁸ + record_index).
-//! This preserves intra-file ordering.
+//! assigned synthetic ordering keys for the merge heap. Synthetic keys are not
+//! used to restore the engine's bounded global LSN counter.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -26,6 +26,7 @@ use std::time::Instant;
 use vortex_common::{Timestamp, current_unix_time_nanos};
 use vortex_engine::ConcurrentKeyspace;
 use vortex_engine::commands::{CmdResult, CommandClock, execute_command};
+use vortex_engine::keyspace::{AofLsn, LsnOverflow};
 use vortex_proto::{FrameRef, ParseError, RespFrame, RespParser, RespTape};
 
 use super::format::{AOF_HEADER_SIZE, AofHeader, LSN_SIZE};
@@ -63,7 +64,7 @@ struct ReplayRecordFailure {
     error: ParseError,
 }
 
-type MergeHeapItem = Reverse<(u64, usize, usize, usize, usize)>;
+type MergeHeapItem = Reverse<(u64, usize, usize, usize, usize, Option<AofLsn>)>;
 
 fn trim_resp_error(buf: &[u8]) -> String {
     let buf = buf.strip_prefix(b"-").unwrap_or(buf);
@@ -164,6 +165,52 @@ fn truncate_partial_tail(path: &Path, valid_len: u64) -> io::Result<()> {
     file.sync_all()
 }
 
+fn invalid_lsn_error(path: &Path, record_offset: usize, error: LsnOverflow) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "AOF replay error in {} at offset {}: lsn {} exceeds maximum entry LSN {}",
+            path.display(),
+            record_offset,
+            error.attempted,
+            error.max
+        ),
+    )
+}
+
+fn restore_lsn_after_replay(
+    keyspace: &ConcurrentKeyspace,
+    max_lsn: Option<AofLsn>,
+) -> io::Result<()> {
+    // SAFETY: AOF replay runs during startup recovery before reactors serve
+    // traffic for this keyspace.
+    unsafe {
+        keyspace.restore_lsn_after_replay(max_lsn).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AOF replay could not restore LSN after max replayed LSN {}",
+                    error.max_replayed_lsn
+                ),
+            )
+        })
+    }
+}
+
+fn cursor_restore_lsn(
+    cursor: &AofFileCursor,
+    lsn: u64,
+    record_offset: usize,
+) -> io::Result<Option<AofLsn>> {
+    if cursor.is_v2 {
+        AofLsn::try_from_raw(lsn)
+            .map(Some)
+            .map_err(|error| invalid_lsn_error(&cursor.path, record_offset, error))
+    } else {
+        Ok(None)
+    }
+}
+
 impl AofReader {
     /// Create a reader for the given AOF file path.
     pub fn new(path: &Path) -> Self {
@@ -223,7 +270,7 @@ impl AofReader {
         let _replay_guard = keyspace.enter_replay_mode();
         let mut offset = 0usize;
         let mut commands_replayed = 0u64;
-        let mut max_lsn = 0u64;
+        let mut max_lsn: Option<AofLsn> = None;
 
         while offset < data.len() {
             let record_offset = offset;
@@ -235,9 +282,9 @@ impl AofReader {
                     data[offset..offset + LSN_SIZE].try_into().expect("8 bytes"),
                 );
                 offset += LSN_SIZE;
-                if lsn > max_lsn {
-                    max_lsn = lsn;
-                }
+                let replay_lsn = AofLsn::try_from_raw(lsn)
+                    .map_err(|error| invalid_lsn_error(&self.path, record_offset, error))?;
+                max_lsn = Some(max_lsn.map_or(replay_lsn, |max| max.max(replay_lsn)));
                 Some(lsn)
             } else {
                 None
@@ -273,9 +320,7 @@ impl AofReader {
             offset = resp_end;
         }
 
-        if max_lsn > 0 {
-            keyspace.set_lsn(max_lsn + 1);
-        }
+        restore_lsn_after_replay(keyspace, max_lsn)?;
 
         let bytes_truncated = (data.len() - offset) as u64;
 
@@ -294,7 +339,7 @@ impl AofReader {
             duration_ms,
             reactor_id: header.reactor_id,
             created_at: header.created_at,
-            max_lsn,
+            max_lsn: max_lsn.map_or(0, AofLsn::get),
             files_merged: 1,
         })
     }
@@ -366,12 +411,20 @@ impl AofReader {
         let _replay_guard = keyspace.enter_replay_mode();
 
         // Seed the min-heap with the first record from each file.
-        // Heap elements: Reverse((lsn, cursor_idx, record_offset, resp_start, resp_len))
+        // Heap elements: Reverse((order_lsn, cursor_idx, record_offset, resp_start, resp_len, restore_lsn))
         let mut heap: BinaryHeap<MergeHeapItem> = BinaryHeap::new();
         for (ci, cursor) in cursors.iter_mut().enumerate() {
             match cursor.next_record() {
                 Ok(Some((lsn, record_offset, resp_start, resp_len))) => {
-                    heap.push(Reverse((lsn, ci, record_offset, resp_start, resp_len)));
+                    let restore_lsn = cursor_restore_lsn(cursor, lsn, record_offset)?;
+                    heap.push(Reverse((
+                        lsn,
+                        ci,
+                        record_offset,
+                        resp_start,
+                        resp_len,
+                        restore_lsn,
+                    )));
                 }
                 Ok(None) => {}
                 Err(failure) => {
@@ -387,12 +440,14 @@ impl AofReader {
 
         let mut commands_replayed = 0u64;
         let mut total_bytes = 0u64;
-        let mut max_lsn = 0u64;
+        let mut max_lsn: Option<AofLsn> = None;
 
         // K-Way merge: always pop the smallest LSN, execute, advance that cursor.
-        while let Some(Reverse((lsn, ci, record_offset, resp_start, resp_len))) = heap.pop() {
-            if lsn > max_lsn {
-                max_lsn = lsn;
+        while let Some(Reverse((lsn, ci, record_offset, resp_start, resp_len, restore_lsn))) =
+            heap.pop()
+        {
+            if let Some(replay_lsn) = restore_lsn {
+                max_lsn = Some(max_lsn.map_or(replay_lsn, |max| max.max(replay_lsn)));
             }
 
             // Parse and execute the RESP record.
@@ -423,12 +478,15 @@ impl AofReader {
             // Advance cursor and push next record to heap.
             match cursors[ci].next_record() {
                 Ok(Some((next_lsn, next_record_offset, next_start, next_len))) => {
+                    let restore_lsn =
+                        cursor_restore_lsn(&cursors[ci], next_lsn, next_record_offset)?;
                     heap.push(Reverse((
                         next_lsn,
                         ci,
                         next_record_offset,
                         next_start,
                         next_len,
+                        restore_lsn,
                     )));
                 }
                 Ok(None) => {}
@@ -443,10 +501,9 @@ impl AofReader {
             }
         }
 
-        // Restore global LSN counter to the next value after the highest replayed.
-        if max_lsn > 0 {
-            keyspace.set_lsn(max_lsn + 1);
-        }
+        // Restore global LSN counter to the next value after the highest replayed
+        // persisted LSN. v1 synthetic ordering keys are intentionally ignored.
+        restore_lsn_after_replay(keyspace, max_lsn)?;
 
         for cursor in &cursors {
             if let Some(valid_data_len) = cursor.valid_data_len() {
@@ -470,7 +527,7 @@ impl AofReader {
             duration_ms,
             reactor_id: 0,
             created_at: 0,
-            max_lsn,
+            max_lsn: max_lsn.map_or(0, AofLsn::get),
             files_merged: files_loaded,
         })
     }
@@ -490,7 +547,7 @@ struct AofFileCursor {
     /// Whether this file uses v2 format (LSN-prefixed records).
     is_v2: bool,
     /// Base for synthetic LSN generation (v1 files only).
-    /// Uses `reactor_idx << 48` to ensure non-overlapping ranges.
+    /// Used only for merge ordering, never for restoring the engine LSN.
     synthetic_lsn_base: u64,
     /// Number of records read so far (for synthetic LSN generation).
     record_count: u64,
@@ -579,6 +636,12 @@ mod tests {
     use vortex_engine::commands::{CmdResult, CommandClock, RESP_NIL, execute_command};
     use vortex_proto::frame::RespFrame;
 
+    struct RecordedCommand {
+        lsn: u64,
+        payload: Vec<u8>,
+        side_effects: Vec<(u64, Vec<u8>)>,
+    }
+
     /// Helper: run GET via execute_command and return true if key exists.
     fn key_exists(ks: &ConcurrentKeyspace, key: &[u8]) -> bool {
         get_value(ks, key).is_some()
@@ -638,12 +701,11 @@ mod tests {
         buf
     }
 
-    fn append_live_command(
-        writer: &mut AofFileWriter,
+    fn record_live_command(
         keyspace: &ConcurrentKeyspace,
         wire: &[u8],
         clock: CommandClock,
-    ) {
+    ) -> RecordedCommand {
         let tape = RespTape::parse_pipeline(wire).unwrap();
         let frame = tape.iter().next().unwrap();
         let name = frame.command_name().unwrap();
@@ -651,10 +713,12 @@ mod tests {
         let executed = execute_command(keyspace, name, &frame, clock).expect("command executes");
         keyspace.disable_aof_recording();
         let lsn = executed.aof_lsn().expect("mutation should allocate an LSN");
+
+        let mut side_effects = Vec::new();
         if let Some(records) = executed.aof_records {
             for record in records {
                 let payload = make_resp(&[b"DEL", record.key.as_bytes()]);
-                writer.append_with_lsn(record.lsn, &payload).unwrap();
+                side_effects.push((record.lsn, payload));
             }
         }
 
@@ -671,7 +735,29 @@ mod tests {
             scratch[..written].to_vec()
         };
 
-        writer.append_with_lsn(lsn, &payload).unwrap();
+        RecordedCommand {
+            lsn,
+            payload,
+            side_effects,
+        }
+    }
+
+    fn append_recorded_command(writer: &mut AofFileWriter, recorded: RecordedCommand) {
+        for (lsn, payload) in recorded.side_effects {
+            writer.append_with_lsn(lsn, &payload).unwrap();
+        }
+        writer
+            .append_with_lsn(recorded.lsn, &recorded.payload)
+            .unwrap();
+    }
+
+    fn append_live_command(
+        writer: &mut AofFileWriter,
+        keyspace: &ConcurrentKeyspace,
+        wire: &[u8],
+        clock: CommandClock,
+    ) {
+        append_recorded_command(writer, record_live_command(keyspace, wire, clock));
     }
 
     fn same_shard_keys(keyspace: &ConcurrentKeyspace, count: usize) -> Vec<Vec<u8>> {
@@ -724,6 +810,28 @@ mod tests {
         // Verify data restored via keyspace.
         assert!(key_exists(&ks, b"key1"));
         assert!(key_exists(&ks, b"key2"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_lsn_zero_only_file_restores_next_lsn_to_one() {
+        let path = temp_path("lsn-zero");
+        {
+            let mut writer = AofFileWriter::open(&path, 0, AofFsyncPolicy::No).unwrap();
+            writer
+                .append_with_lsn(0, b"*1\r\n$8\r\nFLUSHALL\r\n")
+                .unwrap();
+            writer.flush_buffer().unwrap();
+        }
+
+        let ks = make_keyspace();
+        let reader = AofReader::new(&path);
+        let stats = reader.replay_into_keyspace(&ks).unwrap();
+
+        assert_eq!(stats.commands_replayed, 1);
+        assert_eq!(stats.max_lsn, 0);
+        assert_eq!(ks.current_lsn(), 1);
 
         cleanup(&path);
     }
@@ -1176,6 +1284,49 @@ mod tests {
 
         let val = get_value(&ks, b"x").expect("key x should exist");
         assert_eq!(val, b"second");
+
+        cleanup(&path0);
+        cleanup(&path1);
+    }
+
+    #[test]
+    fn replay_merge_preserves_post_flush_write_ordering() {
+        let stale_key = b"stale";
+        let stale_value = b"before-flush";
+        let post_flush_key = b"survivor";
+        let post_flush_value = b"post-flush";
+
+        let path0 = temp_path("merge-flush-r0");
+        let path1 = temp_path("merge-flush-r1");
+        {
+            let mut writer0 = AofFileWriter::open(&path0, 0, AofFsyncPolicy::No).unwrap();
+            writer0
+                .append_with_lsn(1, &make_resp(&[b"SET", stale_key, stale_value]))
+                .unwrap();
+            writer0
+                .append_with_lsn(2, &make_resp(&[b"FLUSHALL"]))
+                .unwrap();
+            writer0.flush_buffer().unwrap();
+        }
+        {
+            let mut writer1 = AofFileWriter::open(&path1, 1, AofFsyncPolicy::No).unwrap();
+            writer1
+                .append_with_lsn(3, &make_resp(&[b"SET", post_flush_key, post_flush_value]))
+                .unwrap();
+            writer1.flush_buffer().unwrap();
+        }
+
+        let replayed = make_keyspace();
+        let stats = AofReader::replay_merge(&[path0.clone(), path1.clone()], &replayed).unwrap();
+
+        assert_eq!(stats.commands_replayed, 3);
+        assert_eq!(stats.files_merged, 2);
+        assert_eq!(get_value(&replayed, stale_key), None);
+        assert_eq!(
+            get_value(&replayed, post_flush_key).as_deref(),
+            Some(&post_flush_value[..])
+        );
+        assert_eq!(replayed.current_lsn(), stats.max_lsn + 1);
 
         cleanup(&path0);
         cleanup(&path1);

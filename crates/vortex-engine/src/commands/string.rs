@@ -23,6 +23,7 @@ use super::{
 };
 use crate::ConcurrentKeyspace;
 use crate::commands::context::{MutationOutcome, SetOptions, SetResult, TtlState};
+use crate::keyspace::ExpiryTransition;
 
 #[cfg(test)]
 use super::ERR_OVERFLOW;
@@ -58,7 +59,7 @@ pub fn cmd_get(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
             let mut wguard = keyspace.write_shard_by_index(shard_index);
             let had_ttl = matches!(wguard.get_entry_ttl(&key), Some(ttl) if ttl != 0);
             if super::context::remove_if_expired(&mut wguard, &key, now_nanos) {
-                keyspace.update_expiry_count(shard_index, had_ttl, false);
+                keyspace.apply_expiry_transition(shard_index, ExpiryTransition::remove(had_ttl));
                 keyspace.bump_watch_key(&key);
             }
             CmdResult::Static(RESP_NIL)
@@ -1993,5 +1994,19 @@ mod tests {
         // b should NOT be set.
         let b_key = VortexKey::from(b"b" as &[u8]);
         assert!(h.get(&b_key, 0).is_none());
+    }
+
+    #[test]
+    fn msetnx_duplicate_key_uses_last_value_without_panicking() {
+        let h = TestHarness::new();
+        let tape = make_tape(b"*5\r\n$6\r\nMSETNX\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_msetnx(&h.keyspace, &frame, 0);
+
+        assert_static(&result, super::super::RESP_ONE);
+        assert_eq!(
+            h.get(&VortexKey::from(b"a" as &[u8]), 0),
+            Some(VortexValue::Integer(2))
+        );
     }
 }

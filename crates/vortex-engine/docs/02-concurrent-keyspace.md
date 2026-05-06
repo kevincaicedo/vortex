@@ -136,26 +136,27 @@ Multi-key commands are where `ConcurrentKeyspace` earns its name.
 
 The core helpers are:
 
-- `sorted_shard_indices(keys)`
+- `ShardPlan::new(keyspace, keys)`
 - `multi_read(keys)`
 - `multi_write(keys)`
-- `guard_position(sorted_shards, shard_idx)`
 
-### `sorted_shard_indices`
+### `ShardPlan`
 
-For a slice of keys, the keyspace computes:
+For a slice of keys, the keyspace builds a `ShardPlan` with:
 
-- `per_key_shards`: one shard index per input key
-- `sorted_unique_shards`: deduplicated shard indices in ascending order
+- `per_key_shards`: one typed `ShardId` per input key
+- `sorted_shards`: deduplicated `ShardId`s in ascending lock order
+- `per_key_guard_indices`: one typed `GuardIndex` per input key
 
-This gives two views of the same operation:
+This gives three views of the same operation:
 
 - input-order mapping back to each key
 - lock-order list for acquisition
+- precomputed guard positions for command code
 
 ### Ordered Lock Acquisition
 
-`multi_read` and `multi_write` acquire locks in strictly ascending shard order.
+`multi_read` and `multi_write` return `(guards, plan)` and acquire locks in strictly ascending shard order.
 
 That total ordering prevents deadlocks. No thread can hold shard 25 and then wait for shard 10 while another thread does the opposite, because both threads are forced into the same order.
 
@@ -177,9 +178,9 @@ sequenceDiagram
 
 ### Mapping Keys Back To Guards
 
-Once the locks are held, the code uses `guard_position(sorted_shards, shard_idx)` to find the guard that corresponds to each input key.
+Once the locks are held, command code uses `plan.guard_index_for_key(key_index)` to find the guard that corresponds to each input key.
 
-Because `sorted_shards` is the deduplicated set of all `per_key_shards`, the lookup is guaranteed to succeed. The implementation uses `binary_search(...).unwrap_unchecked()` under that invariant.
+Because `ShardPlan` derives those guard positions from the same sorted shard set used for lock acquisition, callers do not repeat binary searches or carry raw shard-index tuples through mutation code.
 
 ### Transaction Locking
 
@@ -239,7 +240,7 @@ One caveat is worth documenting explicitly: `flush_all` is not a globally atomic
 
 This is a per-shard `AtomicUsize` array counting how many keys currently carry a TTL.
 
-Command helpers call `update_expiry_count(shard_idx, had_ttl, has_ttl)` whenever they change TTL state. This lets server-style metadata operations answer questions such as "how many expiring keys exist?" without scanning the full table.
+Command helpers return or build an `ExpiryTransition` whenever they change TTL state, then call `apply_expiry_transition`. The raw `(had_ttl, has_ttl)` counter update remains private to the keyspace. This lets server-style metadata operations answer questions such as "how many expiring keys exist?" without scanning the full table.
 
 ### `global_memory_used`
 

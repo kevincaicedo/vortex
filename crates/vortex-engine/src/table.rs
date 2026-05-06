@@ -654,12 +654,17 @@ impl SwissTable {
     }
 
     /// Deletes a live slot by index and returns its stored value.
-    /// 
+    ///
     /// Note: This is a low-level API that directly accesses the slot by index.
     /// If the slot is out of bounds or not live, it returns `None`.
     #[inline]
     pub fn delete_slot(&mut self, slot: usize) -> Option<VortexValue> {
         if slot >= self.raw.num_slots() {
+            return None;
+        }
+
+        let ctrl = self.raw.ctrl(slot);
+        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
             return None;
         }
 
@@ -1010,7 +1015,9 @@ impl TableMutationValue for RawValueBytes<'_> {
         ttl: u64,
         lsn: Option<u64>,
     ) -> Option<VortexValue> {
-        let previous = table.values[slot].take().expect("live slot must have value");
+        let previous = table.values[slot]
+            .take()
+            .expect("live slot must have value");
         table.values[slot] = Some(VortexValue::from_bytes_reusing(previous, self.0));
         table.rewrite_slot_entry(slot, h2, ttl, lsn);
         None
@@ -1477,7 +1484,12 @@ impl SwissTable {
 
     /// Updates the stored LSN/version for `key_bytes` when present.
     #[inline]
-    pub(crate) fn set_lsn_version_prehashed(&mut self, key_bytes: &[u8], hash: u64, lsn: u64) -> bool {
+    pub(crate) fn set_lsn_version_prehashed(
+        &mut self,
+        key_bytes: &[u8],
+        hash: u64,
+        lsn: u64,
+    ) -> bool {
         let Some(slot) = self.find_slot(key_bytes, hash) else {
             return false;
         };
@@ -1818,7 +1830,10 @@ mod tests {
         assert!(outcome.had_ttl());
         assert_eq!(table.get(&key), Some(&VortexValue::from("after")));
         assert_eq!(table.get_entry_ttl(&key), Some(0));
-        assert_eq!(table.get_lsn_version_prehashed(key.as_bytes(), hash), Some(99));
+        assert_eq!(
+            table.get_lsn_version_prehashed(key.as_bytes(), hash),
+            Some(99)
+        );
     }
 
     #[test]
@@ -1839,7 +1854,10 @@ mod tests {
         assert_eq!(previous, Some(VortexValue::from("before")));
         assert_eq!(table.get(&key), Some(&VortexValue::from("after")));
         assert_eq!(table.get_entry_ttl(&key), Some(456));
-        assert_eq!(table.get_lsn_version_prehashed(key.as_bytes(), hash), Some(12));
+        assert_eq!(
+            table.get_lsn_version_prehashed(key.as_bytes(), hash),
+            Some(12)
+        );
     }
 
     #[test]

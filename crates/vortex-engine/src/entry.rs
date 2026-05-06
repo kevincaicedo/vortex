@@ -65,7 +65,7 @@ const HEAP_KEY_LEN_OFFSET: usize = PTR_BYTES;
 const HEAP_KEY_META_LEN: usize = PTR_BYTES + size_of::<u32>();
 const HEAP_VALUE_TAG: u8 = 0xFE;
 const INTEGER_VALUE_TAG: u8 = 0xFF;
-const MAX_STORED_LSN_VERSION: u64 = (1u64 << 48) - 1;
+pub(crate) const MAX_STORED_LSN_VERSION: u64 = (1u64 << 48) - 1;
 
 /// Physical value view returned by [`Entry::read_value`].
 ///

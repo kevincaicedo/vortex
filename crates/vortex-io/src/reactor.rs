@@ -19,8 +19,7 @@ use vortex_common::{Timestamp, current_unix_time_nanos};
 use vortex_engine::commands::{
     CmdResult, CommandClock, arg_bytes, arg_count, execute_command, key_from_bytes,
 };
-use vortex_engine::keyspace::DEFAULT_SHARD_COUNT;
-use vortex_engine::keyspace::WatchKeyState;
+use vortex_engine::keyspace::{DEFAULT_SHARD_COUNT, WatchRegistration};
 use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_memory::{ArenaAllocator, BufferPool};
 use vortex_persist::aof::writer::AofFileWriter;
@@ -87,7 +86,7 @@ struct TransactionState {
     queueing: bool,
     dirty: bool,
     queued: Vec<Box<[u8]>>,
-    watched: Vec<WatchKeyState>,
+    watched: Vec<WatchRegistration>,
     watch_epoch: u64,
 }
 
@@ -102,7 +101,10 @@ impl TransactionState {
     #[inline]
     fn reset_all(&mut self) {
         self.reset_multi();
-        self.watched.clear();
+        debug_assert!(
+            self.watched.is_empty(),
+            "WATCH registrations must be released through clear_watches"
+        );
         self.watch_epoch = 0;
     }
 }
@@ -1297,7 +1299,7 @@ impl Reactor {
         let watched = std::mem::take(&mut self.transaction_states[conn_id].watched);
         self.transaction_states[conn_id].watch_epoch = 0;
         if !watched.is_empty() {
-            self.keyspace.unwatch_keys(&watched);
+            self.keyspace.unwatch_keys(watched);
         }
     }
 
