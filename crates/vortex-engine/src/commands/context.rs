@@ -18,7 +18,7 @@ use crate::SwissTable;
 use crate::entry::Entry;
 use crate::keyspace::{
     ConcurrentKeyspace, EvictedKey, EvictedKeys, EvictionAdmissionError, ExpiryTransition,
-    MemoryReservation, ShardWriteGuard,
+    MemoryReservation, PositiveDelta, ProjectedDelta, ShardWriteGuard,
 };
 use crate::table::{BorrowedKey, MutationPolicy, RawValueBytes};
 
@@ -205,42 +205,9 @@ fn ttl_present(ttl_deadline: Option<u64>) -> bool {
     matches!(ttl_deadline, Some(deadline) if deadline != 0)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct PositiveDelta(usize);
-
-impl PositiveDelta {
-    #[inline]
-    const fn zero() -> Self {
-        Self(0)
-    }
-
-    #[inline]
-    const fn from_bytes(bytes: usize) -> Self {
-        Self(bytes)
-    }
-
-    #[inline]
-    const fn bytes(self) -> usize {
-        self.0
-    }
-
-    #[inline]
-    const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-
-    #[inline]
-    fn sum<I>(deltas: I) -> Self
-    where
-        I: IntoIterator<Item = PositiveDelta>,
-    {
-        Self(deltas.into_iter().map(Self::bytes).sum())
-    }
-}
-
 #[inline]
 fn positive_delta(delta: isize) -> PositiveDelta {
-    PositiveDelta(delta.max(0) as usize)
+    ProjectedDelta::from_bytes(delta).positive()
 }
 
 #[inline]
@@ -1398,7 +1365,7 @@ impl ConcurrentKeyspace {
         now_nanos: u64,
     ) -> MutationResult<()> {
         let features = self.mutation_features();
-        if features != 0 {
+        if !features.is_empty() {
             return self.set_value_plain(
                 VortexKey::from(key_bytes),
                 VortexValue::from_bytes(value_bytes),
@@ -1447,7 +1414,7 @@ impl ConcurrentKeyspace {
         let table_hash = self.table_hash_key(key_bytes);
         let features = self.mutation_features();
         let eviction = self.eviction_config();
-        let (evicted, reservation) = if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
+        let (evicted, reservation) = if features.maxmemory() {
             let projected_delta = self
                 .read_shard_by_index(shard_index)
                 .projected_insert_delta_prehashed(&key, &value, table_hash);
@@ -1461,48 +1428,46 @@ impl ConcurrentKeyspace {
         } else {
             (None, MemoryReservation::new(self, 0))
         };
-        let (mut guard, state) = if ConcurrentKeyspace::mutation_feature_maxmemory(features)
-            && eviction.max_memory != 0
-            && !self.replay_mode_active()
-        {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "set_value_plain",
-                |table| {
-                    Ok(positive_delta(table.projected_insert_delta_prehashed(
-                        &key, &value, table_hash,
-                    )))
-                },
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
+        let (mut guard, state) =
+            if features.maxmemory() && eviction.max_memory != 0 && !self.replay_mode_active() {
+                acquire_single_shard_with_revalidated_reservation(
+                    self,
+                    shard_index,
+                    now_nanos,
+                    ReservationState {
+                        snapshot: eviction,
+                        reservation,
+                        evicted,
+                    },
+                    "set_value_plain",
+                    |table| {
+                        Ok(positive_delta(table.projected_insert_delta_prehashed(
+                            &key, &value, table_hash,
+                        )))
+                    },
+                )?
+            } else {
+                (
+                    self.write_shard_by_index(shard_index),
+                    ReservationState {
+                        snapshot: eviction,
+                        reservation,
+                        evicted,
+                    },
+                )
+            };
         let ReservationState {
             reservation,
             evicted,
             ..
         } = state;
-        let watched_key = ConcurrentKeyspace::mutation_feature_watch(features).then(|| key.clone());
+        let watched_key = features.watch().then(|| key.clone());
         let (lsn, aof_lsn) = self.allocate_mutation_lsn_with_features(features);
         let old_had_ttl = guard
             .mutate_prehashed(key, value, table_hash, MutationPolicy::clear(Some(lsn)))
             .had_ttl();
         self.apply_expiry_transition(shard_index, ExpiryTransition::remove(old_had_ttl));
-        if ConcurrentKeyspace::mutation_feature_maxmemory(features) {
+        if features.maxmemory() {
             self.record_frequency_hash(table_hash);
         }
         if let Some(key) = watched_key {

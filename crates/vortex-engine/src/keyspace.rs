@@ -27,25 +27,47 @@
 //! - `unsafe { get_unchecked }` on the shard array eliminates bounds checks on
 //!   the hot path — the mask guarantees `idx < shards.len()`.
 
-use std::collections::HashMap;
-use std::ffi::{CString, c_void};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use smallvec::SmallVec;
-use tikv_jemalloc_sys::mallctl;
 use vortex_common::{VortexKey, VortexValue};
-use vortex_sync::ShardedCounter;
 
-use crate::entry::MAX_STORED_LSN_VERSION;
 use crate::eviction::{
-    EVICTION_MAX_SHARDS_PER_ADMISSION, EVICTION_SWEEP_WINDOW, EvictionConfig, EvictionConfigState,
-    EvictionPolicy, FrequencySketch, next_random_u64, should_sample_lfu_read,
+    EvictionConfig, EvictionConfigState, EvictionPolicy, FrequencySketch, next_random_u64,
+    should_sample_lfu_read,
 };
 use crate::table::SwissTable;
+
+mod admin;
+mod eviction_sweep;
+mod expiry;
+mod features;
+mod gate;
+mod memory;
+mod metrics;
+mod persistence;
+mod shards;
+mod watch;
+
+pub(super) use eviction_sweep::EvictionScanReport;
+pub(crate) use eviction_sweep::{EvictedKey, EvictedKeys};
+pub(crate) use expiry::ExpiryTransition;
+pub(crate) use features::MutationFeatures;
+use gate::TransactionGate;
+pub use gate::{CommandGateGuard, TransactionGateGuard};
+pub(crate) use memory::{EvictionAdmissionError, MemoryReservation, PositiveDelta, ProjectedDelta};
+use metrics::{EvictionMetrics, RuntimeMetrics};
+pub use metrics::{EvictionMetricsSnapshot, RuntimeMetricsSnapshot};
+pub use persistence::{AofLsn, EntryLsn, Lsn, LsnOverflow, LsnRestoreError, ReplayModeGuard};
+use shards::{
+    MultiReadGuards, MultiWriteGuards, Shard, ShardId, ShardPlan, ShardReadGuards, ShardWriteGuards,
+};
+pub use shards::{ShardCount, ShardCountError};
+pub use watch::WatchRegistration;
+use watch::{AbsentWatchShard, make_absent_watch_shards};
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -66,987 +88,11 @@ const AHASH_SEED_2: u64 = 0x8fbc_2d2b_9e3a_6ee8;
 const AHASH_SEED_3: u64 = 0xcf41_41b0_ed82_a837;
 const ABSENT_WATCH_SHARD_COUNT: usize = 256;
 const TRANSACTION_GATE_COUNTERS: usize = 128;
-const MUTATION_FEATURE_MAXMEMORY: usize = 1 << 0;
-const MUTATION_FEATURE_WATCH: usize = 1 << 1;
-const MUTATION_FEATURE_AOF: usize = 1 << 2;
-
-// ─── Shard type alias ───────────────────────────────────────────────
-
-/// A single shard: a `SwissTable` behind a `RwLock`, padded to a full
-/// 128-byte boundary so that adjacent shard locks never share a cache line.
-type Shard = CachePadded<RwLock<SwissTable>>;
-
-/// Best-effort jemalloc cache and arena purge after FLUSHDB/FLUSHALL.
-///
-/// Flushes the calling thread's tcache and then purges dirty pages in every
-/// arena. This reduces RSS after a large FLUSH without waiting for
-/// jemalloc's background decay.
-///
-/// # Platform assumptions
-///
-/// - The process is linked against tikv-jemalloc-sys (guaranteed by the
-///   crate dependency).
-/// - `mallctl` follows the jemalloc 5.x ABI for `thread.tcache.flush`,
-///   `arenas.narenas`, and `arena.<i>.purge`.
-/// - `CString::new` can only fail if the MIB name contains an interior NUL,
-///   which none of these names do; the `if let Ok` guard is defense-in-depth.
-///
-/// # Error handling
-///
-/// All `mallctl` return codes are intentionally ignored (`let _ = ...`).
-/// Purge failures are non-fatal: the allocator will reclaim pages through
-/// its normal background decay. Logging is omitted to avoid pulling I/O
-/// dependencies into the engine crate.
-fn purge_allocator_after_flush() {
-    // SAFETY: All `mallctl` calls use well-known jemalloc 5.x MIB names via
-    // valid null-terminated `CString` pointers. Pointer arguments are either
-    // null (no value exchange) or point to stack-local variables with correct
-    // size and alignment (`arena_count: c_uint`, `arena_len: usize`). The
-    // jemalloc ABI guarantees thread-safety for these calls — `mallctl` is
-    // internally synchronized. Return codes are ignored because purge is
-    // best-effort: failure leaves jemalloc to reclaim pages via background
-    // decay, which is the normal non-FLUSH path anyway.
-    unsafe {
-        if let Ok(name) = CString::new("thread.tcache.flush") {
-            let _ = mallctl(
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            );
-        }
-
-        let mut arena_count: libc::c_uint = 0;
-        let mut arena_len = std::mem::size_of::<libc::c_uint>();
-        if let Ok(name) = CString::new("arenas.narenas") {
-            let rc = mallctl(
-                name.as_ptr(),
-                (&mut arena_count as *mut libc::c_uint).cast::<c_void>(),
-                &mut arena_len,
-                std::ptr::null_mut(),
-                0,
-            );
-            if rc == 0 {
-                for arena_idx in 0..arena_count {
-                    if let Ok(name) = CString::new(format!("arena.{arena_idx}.purge")) {
-                        let _ = mallctl(
-                            name.as_ptr(),
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            0,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Return type for multi-key read lock acquisition.
-/// `(guards_with_shard_id, shard_plan)`
-pub(crate) type MultiReadGuards<'a> = (ShardReadGuards<'a>, ShardPlan);
-
-/// Return type for multi-key write lock acquisition.
-/// `(guards_with_shard_id, shard_plan)`
-pub(crate) type MultiWriteGuards<'a> = (ShardWriteGuards<'a>, ShardPlan);
-
-type ShardReadGuards<'a> = SmallVec<[(usize, RwLockReadGuard<'a, SwissTable>); 16]>;
-type ShardWriteGuards<'a> = SmallVec<[(usize, ShardWriteGuard<'a>); 16]>;
-
-#[derive(Debug)]
-pub(crate) struct EvictedKey {
-    pub(crate) lsn: u64,
-    pub(crate) key: VortexKey,
-}
-
-pub(crate) type EvictedKeys = Option<Box<[EvictedKey]>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ShardId(usize);
-
-impl ShardId {
-    #[inline]
-    pub(crate) const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    pub(crate) const fn get(self) -> usize {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct GuardIndex(usize);
-
-impl GuardIndex {
-    #[inline]
-    pub(crate) const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    #[inline]
-    pub(crate) const fn get(self) -> usize {
-        self.0
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ShardPlan {
-    sorted_shards: SmallVec<[ShardId; 16]>,
-    per_key_shards: SmallVec<[ShardId; 16]>,
-    per_key_guard_indices: SmallVec<[GuardIndex; 16]>,
-}
-
-impl ShardPlan {
-    fn new(keyspace: &ConcurrentKeyspace, keys: &[&[u8]]) -> Self {
-        let mut per_key_shards = SmallVec::with_capacity(keys.len());
-        for &key in keys {
-            per_key_shards.push(ShardId::new(keyspace.shard_index(key)));
-        }
-
-        let mut sorted_shards = per_key_shards.clone();
-        sorted_shards.sort_unstable();
-        sorted_shards.dedup();
-
-        let mut per_key_guard_indices = SmallVec::with_capacity(per_key_shards.len());
-        for shard in &per_key_shards {
-            let guard_index = sorted_shards
-                .binary_search(shard)
-                .expect("planned shard must be present in sorted shard set");
-            per_key_guard_indices.push(GuardIndex::new(guard_index));
-        }
-
-        Self {
-            sorted_shards,
-            per_key_shards,
-            per_key_guard_indices,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn sorted_shards(&self) -> &[ShardId] {
-        &self.sorted_shards
-    }
-
-    #[inline]
-    pub(crate) fn shard_for_key(&self, key_index: usize) -> ShardId {
-        self.per_key_shards[key_index]
-    }
-
-    #[inline]
-    pub(crate) fn guard_index_for_key(&self, key_index: usize) -> GuardIndex {
-        self.per_key_guard_indices[key_index]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ExpiryTransition {
-    had_ttl: bool,
-    has_ttl_after: bool,
-}
-
-impl ExpiryTransition {
-    #[inline]
-    pub(crate) const fn new(had_ttl: bool, has_ttl_after: bool) -> Self {
-        Self {
-            had_ttl,
-            has_ttl_after,
-        }
-    }
-
-    #[inline]
-    pub(crate) const fn remove(had_ttl: bool) -> Self {
-        Self::new(had_ttl, false)
-    }
-
-    #[inline]
-    pub(crate) const fn ttl_removed() -> Self {
-        Self::new(true, false)
-    }
-}
-
-#[derive(Debug)]
-/// Cold WATCH metadata for keys that were absent when WATCH ran.
-struct AbsentWatchSlot {
-    version: u64,
-    refs: usize,
-}
-
-type AbsentWatchShard = CachePadded<RwLock<HashMap<VortexKey, AbsentWatchSlot>>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lsn(u64);
-
-impl Lsn {
-    #[inline]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntryLsn(u64);
-
-impl EntryLsn {
-    pub const MAX: u64 = MAX_STORED_LSN_VERSION;
-
-    #[inline]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn try_from_raw(lsn: u64) -> Result<Self, LsnOverflow> {
-        if lsn <= Self::MAX {
-            Ok(Self(lsn))
-        } else {
-            Err(LsnOverflow {
-                attempted: lsn,
-                max: Self::MAX,
-            })
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AofLsn(u64);
-
-impl AofLsn {
-    #[inline]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn try_from_raw(lsn: u64) -> Result<Self, LsnOverflow> {
-        EntryLsn::try_from_raw(lsn).map(|entry_lsn| Self(entry_lsn.get()))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LsnOverflow {
-    pub attempted: u64,
-    pub max: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LsnRestoreError {
-    pub max_replayed_lsn: u64,
-}
-
-#[derive(Debug)]
-struct WatchKeyState {
-    key: VortexKey,
-    shard_index: usize,
-    table_hash: u64,
-    version: u64,
-    present: bool,
-}
-
-impl WatchKeyState {
-    #[inline]
-    pub fn key(&self) -> &VortexKey {
-        &self.key
-    }
-}
-
-#[derive(Debug)]
-pub struct WatchRegistration {
-    state: WatchKeyState,
-}
-
-impl WatchRegistration {
-    #[inline]
-    pub fn key(&self) -> &VortexKey {
-        self.state.key()
-    }
-
-    #[inline]
-    fn state(&self) -> &WatchKeyState {
-        &self.state
-    }
-}
-
-#[derive(Debug)]
-struct TransactionGate {
-    active: AtomicBool,
-    readers: Box<[CachePadded<AtomicUsize>]>,
-}
-
-impl Default for TransactionGate {
-    fn default() -> Self {
-        let readers: Vec<CachePadded<AtomicUsize>> = (0..TRANSACTION_GATE_COUNTERS)
-            .map(|_| CachePadded::new(AtomicUsize::new(0)))
-            .collect();
-        Self {
-            active: AtomicBool::new(false),
-            readers: readers.into_boxed_slice(),
-        }
-    }
-}
-
-pub struct CommandGateGuard<'a> {
-    reader: &'a CachePadded<AtomicUsize>,
-}
-
-pub struct TransactionGateGuard<'a> {
-    gate: &'a TransactionGate,
-}
-
-/// RAII guard for a memory reservation. Automatically releases the reserved
-/// bytes from the global reservation counter on drop, preventing leaks on
-/// error paths. The caller must call `settle()` after mutation to adjust
-/// the reservation to the actual memory delta.
-pub(crate) struct MemoryReservation<'a> {
-    keyspace: &'a ConcurrentKeyspace,
-    reserved_bytes: usize,
-}
-
-impl std::fmt::Debug for MemoryReservation<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemoryReservation")
-            .field("reserved_bytes", &self.reserved_bytes)
-            .finish()
-    }
-}
-
-impl<'a> MemoryReservation<'a> {
-    #[inline]
-    pub(crate) fn new(keyspace: &'a ConcurrentKeyspace, reserved_bytes: usize) -> Self {
-        Self {
-            keyspace,
-            reserved_bytes,
-        }
-    }
-
-    #[inline]
-    pub(crate) const fn reserved_bytes(&self) -> usize {
-        self.reserved_bytes
-    }
-
-    #[inline]
-    pub(crate) fn absorb(&mut self, mut other: MemoryReservation<'a>) {
-        debug_assert!(std::ptr::eq(self.keyspace, other.keyspace));
-        self.reserved_bytes = self
-            .reserved_bytes
-            .checked_add(other.reserved_bytes)
-            .expect("reservation bytes should not overflow usize");
-        other.reserved_bytes = 0;
-    }
-
-    /// Settle the reservation: release the reserved bytes from the
-    /// reservation counter. Should be called after the mutation has
-    /// committed and the actual delta is reflected in `global_memory_used`.
-    #[inline]
-    pub(crate) fn settle(mut self) {
-        if self.reserved_bytes != 0 {
-            self.keyspace
-                .memory_reserved
-                .fetch_sub(self.reserved_bytes, Ordering::Release);
-            self.reserved_bytes = 0;
-        }
-    }
-}
-
-impl Drop for MemoryReservation<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.reserved_bytes != 0 {
-            self.keyspace
-                .memory_reserved
-                .fetch_sub(self.reserved_bytes, Ordering::Release);
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct EvictionAdmissionError {
-    pub(crate) response: &'static [u8],
-    pub(crate) evicted: EvictedKeys,
-}
-
-impl EvictionAdmissionError {
-    #[inline]
-    fn new(response: &'static [u8], evicted: EvictedKeys) -> Self {
-        Self { response, evicted }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EvictionMetricsSnapshot {
-    pub admissions: u64,
-    pub shards_scanned: u64,
-    pub slots_sampled: u64,
-    pub bytes_freed: u64,
-    pub oom_after_scan: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct RuntimeMetricsSnapshot {
-    pub reactor_slots: usize,
-    pub loop_iterations: u64,
-    pub accept_eagain_rearms: u64,
-    pub submit_sq_full_retries: u64,
-    pub submit_failures: u64,
-    pub completion_batch_count: u64,
-    pub completion_batch_total: u64,
-    pub completion_batch_max: u64,
-    pub completion_batch_avg: f64,
-    pub command_batch_count: u64,
-    pub command_batch_total: u64,
-    pub command_batch_max: u64,
-    pub command_batch_avg: f64,
-    pub active_expiry_runs: u64,
-    pub active_expiry_sampled: u64,
-    pub active_expiry_expired: u64,
-    pub eviction_admissions: u64,
-    pub eviction_shards_scanned: u64,
-    pub eviction_slots_sampled: u64,
-    pub eviction_bytes_freed: u64,
-    pub eviction_oom_after_scan: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct EvictionScanReport {
-    shards_scanned: usize,
-    slots_sampled: usize,
-    bytes_freed: usize,
-    oom_after_scan: bool,
-}
-
-#[derive(Debug, Default)]
-struct EvictionEffects {
-    expiry_transitions: SmallVec<[(usize, ExpiryTransition); 4]>,
-    watch_invalidations: SmallVec<[(VortexKey, u64); 4]>,
-    aof_records: SmallVec<[EvictedKey; 4]>,
-}
-
-impl EvictionEffects {
-    #[inline]
-    fn push_expiry_transition(&mut self, shard_idx: usize, transition: ExpiryTransition) {
-        self.expiry_transitions.push((shard_idx, transition));
-    }
-
-    #[inline]
-    fn push_watch_invalidation(&mut self, key: VortexKey, table_hash: u64) {
-        self.watch_invalidations.push((key, table_hash));
-    }
-
-    #[inline]
-    fn push_aof_record(&mut self, evicted: EvictedKey) {
-        self.aof_records.push(evicted);
-    }
-
-    #[inline]
-    fn absorb(&mut self, mut other: Self) {
-        self.expiry_transitions
-            .extend(other.expiry_transitions.drain(..));
-        self.watch_invalidations
-            .extend(other.watch_invalidations.drain(..));
-        self.aof_records.extend(other.aof_records.drain(..));
-    }
-
-    fn apply(self, keyspace: &ConcurrentKeyspace, evicted: &mut Vec<EvictedKey>) {
-        for (shard_idx, transition) in self.expiry_transitions {
-            keyspace.apply_expiry_transition(shard_idx, transition);
-        }
-        for (key, table_hash) in self.watch_invalidations {
-            keyspace.bump_watch_key_known_active(key.as_bytes(), table_hash);
-        }
-        evicted.extend(self.aof_records);
-    }
-}
-
-#[derive(Debug, Default)]
-struct EvictionDeletion {
-    freed_bytes: usize,
-    effects: EvictionEffects,
-}
-
-#[derive(Debug, Default)]
-struct EvictionSweepResult {
-    next_slot: usize,
-    freed_bytes: usize,
-    slots_sampled: usize,
-    effects: EvictionEffects,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EvictionSweepContext {
-    shard_idx: usize,
-    start_slot: usize,
-    bytes_needed: usize,
-    now_nanos: u64,
-    volatile_only: bool,
-}
-
-#[inline]
-fn record_eviction_deletion(
-    freed_bytes: &mut usize,
-    effects: &mut EvictionEffects,
-    deletion: EvictionDeletion,
-) {
-    *freed_bytes += deletion.freed_bytes;
-    effects.absorb(deletion.effects);
-}
-
-// ─── Eviction sweep policy trait and implementations ────────────
-
-/// Action returned by a [`SweepPolicy`] for a single slot evaluation.
-///
-/// The generic sweep driver uses this to decide whether to delete the slot
-/// immediately, skip it, or let the policy accumulate it as a deferred
-/// candidate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SlotAction {
-    /// Skip this slot — the entry should not be evicted (e.g., its clock
-    /// counter was decremented but not yet zero).
-    Skip,
-    /// Delete this slot immediately.
-    Delete,
-    /// The policy recorded this slot as a deferred candidate (e.g., the
-    /// lowest-frequency or nearest-deadline entry seen so far). The driver
-    /// does not delete it now; the policy's `finalize` method may delete
-    /// it after the scan.
-    Accumulate,
-}
-
-/// Zero-cost eviction policy trait for the unified sweep driver.
-///
-/// Each implementor defines only the policy-specific candidate selection.
-/// The generic sweep driver (`run_sweep_driver`) handles the shared scan
-/// loop, volatile filtering, empty-slot skipping, expired-entry
-/// opportunistic deletion, and result assembly.
-///
-/// Implementations are used as generic type parameters so the compiler
-/// monomorphizes each policy's inner loop — no virtual dispatch.
-trait SweepPolicy {
-    /// Whether the driver should handle expired-entry deletion before
-    /// calling `evaluate_slot`. Policies that perform their own expiry
-    /// handling (e.g., volatile-TTL, which returns immediately on the
-    /// first expired entry) should return `true` so the driver reclaims
-    /// dead entries. Random eviction returns `false` because it deletes
-    /// any slot unconditionally.
-    fn handles_expiry(&self) -> bool;
-
-    /// Evaluate a live, non-expired slot. Returns the action the driver
-    /// should take for this slot.
-    fn evaluate_slot(
-        &mut self,
-        keyspace: &ConcurrentKeyspace,
-        table: &mut SwissTable,
-        slot: usize,
-        ttl: u64,
-        context: &EvictionSweepContext,
-    ) -> SlotAction;
-
-    /// Called after the scan loop completes. Policies that accumulate a
-    /// best-candidate during evaluation can delete it here if the scan
-    /// did not free enough bytes.
-    fn finalize(
-        &mut self,
-        _keyspace: &ConcurrentKeyspace,
-        _table: &mut SwissTable,
-        _context: &EvictionSweepContext,
-        _freed_bytes: &mut usize,
-        _effects: &mut EvictionEffects,
-    ) {
-        // Default: no deferred candidate.
-    }
-}
-
-/// LRU-ish clock sweep: decrement the entry's eviction counter; if it
-/// reaches zero, evict immediately.
-struct ClockPolicy;
-
-impl SweepPolicy for ClockPolicy {
-    #[inline(always)]
-    fn handles_expiry(&self) -> bool {
-        true
-    }
-
-    #[inline(always)]
-    fn evaluate_slot(
-        &mut self,
-        _keyspace: &ConcurrentKeyspace,
-        table: &mut SwissTable,
-        slot: usize,
-        _ttl: u64,
-        _context: &EvictionSweepContext,
-    ) -> SlotAction {
-        let Some(entry) = table.slot_entry(slot) else {
-            return SlotAction::Skip;
-        };
-        if entry.decrement_eviction_counter() {
-            SlotAction::Skip
-        } else {
-            SlotAction::Delete
-        }
-    }
-}
-
-/// LFU clock sweep: decrement the entry's eviction counter; if it reaches
-/// zero, record the entry as a candidate with its frequency estimate.
-/// After the scan, the lowest-frequency candidate is evicted.
-struct LfuClockPolicy {
-    best_candidate: Option<usize>,
-    best_frequency: u8,
-}
-
-impl LfuClockPolicy {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            best_candidate: None,
-            best_frequency: u8::MAX,
-        }
-    }
-}
-
-impl SweepPolicy for LfuClockPolicy {
-    #[inline(always)]
-    fn handles_expiry(&self) -> bool {
-        true
-    }
-
-    #[inline(always)]
-    fn evaluate_slot(
-        &mut self,
-        keyspace: &ConcurrentKeyspace,
-        table: &mut SwissTable,
-        slot: usize,
-        _ttl: u64,
-        _context: &EvictionSweepContext,
-    ) -> SlotAction {
-        let Some(entry) = table.slot_entry(slot) else {
-            return SlotAction::Skip;
-        };
-        if entry.decrement_eviction_counter() {
-            return SlotAction::Skip;
-        }
-
-        let Some((key, _)) = table.slot_key_value(slot) else {
-            return SlotAction::Skip;
-        };
-        let frequency = keyspace
-            .frequency_sketch
-            .estimate(table.hash_key_bytes(key.as_bytes()));
-        if self.best_candidate.is_none() || frequency < self.best_frequency {
-            self.best_candidate = Some(slot);
-            self.best_frequency = frequency;
-        }
-        SlotAction::Accumulate
-    }
-
-    fn finalize(
-        &mut self,
-        keyspace: &ConcurrentKeyspace,
-        table: &mut SwissTable,
-        context: &EvictionSweepContext,
-        freed_bytes: &mut usize,
-        effects: &mut EvictionEffects,
-    ) {
-        if *freed_bytes < context.bytes_needed {
-            if let Some(candidate) = self.best_candidate {
-                record_eviction_deletion(
-                    freed_bytes,
-                    effects,
-                    keyspace.delete_evictable_slot(context.shard_idx, table, candidate),
-                );
-            }
-        }
-    }
-}
-
-/// Random eviction: evict any live slot unconditionally.
-struct RandomPolicy;
-
-impl SweepPolicy for RandomPolicy {
-    #[inline(always)]
-    fn handles_expiry(&self) -> bool {
-        false
-    }
-
-    #[inline(always)]
-    fn evaluate_slot(
-        &mut self,
-        _keyspace: &ConcurrentKeyspace,
-        _table: &mut SwissTable,
-        _slot: usize,
-        _ttl: u64,
-        _context: &EvictionSweepContext,
-    ) -> SlotAction {
-        SlotAction::Delete
-    }
-}
-
-/// Volatile-TTL eviction: find the entry with the nearest TTL deadline.
-/// Expired entries are reclaimed opportunistically by the driver. If no
-/// expired entry was found, the nearest-deadline candidate is evicted.
-struct VolatileTtlPolicy {
-    best_slot: Option<usize>,
-    best_deadline: u64,
-}
-
-impl VolatileTtlPolicy {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            best_slot: None,
-            best_deadline: u64::MAX,
-        }
-    }
-}
-
-impl SweepPolicy for VolatileTtlPolicy {
-    #[inline(always)]
-    fn handles_expiry(&self) -> bool {
-        true
-    }
-
-    #[inline(always)]
-    fn evaluate_slot(
-        &mut self,
-        _keyspace: &ConcurrentKeyspace,
-        _table: &mut SwissTable,
-        slot: usize,
-        ttl: u64,
-        _context: &EvictionSweepContext,
-    ) -> SlotAction {
-        // Non-TTL slots are already filtered by the driver's volatile check.
-        // Among remaining volatile entries, track the one closest to expiry.
-        if ttl != 0 && ttl < self.best_deadline {
-            self.best_deadline = ttl;
-            self.best_slot = Some(slot);
-        }
-        SlotAction::Accumulate
-    }
-
-    fn finalize(
-        &mut self,
-        keyspace: &ConcurrentKeyspace,
-        table: &mut SwissTable,
-        context: &EvictionSweepContext,
-        freed_bytes: &mut usize,
-        effects: &mut EvictionEffects,
-    ) {
-        if let Some(candidate) = self.best_slot {
-            record_eviction_deletion(
-                freed_bytes,
-                effects,
-                keyspace.delete_evictable_slot(context.shard_idx, table, candidate),
-            );
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct EvictionMetrics {
-    admissions: AtomicU64,
-    shards_scanned: AtomicU64,
-    slots_sampled: AtomicU64,
-    bytes_freed: AtomicU64,
-    oom_after_scan: AtomicU64,
-}
-
-impl EvictionMetrics {
-    #[inline]
-    fn record(&self, report: EvictionScanReport) {
-        self.admissions.fetch_add(1, Ordering::Relaxed);
-        self.shards_scanned
-            .fetch_add(report.shards_scanned as u64, Ordering::Relaxed);
-        self.slots_sampled
-            .fetch_add(report.slots_sampled as u64, Ordering::Relaxed);
-        self.bytes_freed
-            .fetch_add(report.bytes_freed as u64, Ordering::Relaxed);
-        if report.oom_after_scan {
-            self.oom_after_scan.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    fn snapshot(&self) -> EvictionMetricsSnapshot {
-        EvictionMetricsSnapshot {
-            admissions: self.admissions.load(Ordering::Relaxed),
-            shards_scanned: self.shards_scanned.load(Ordering::Relaxed),
-            slots_sampled: self.slots_sampled.load(Ordering::Relaxed),
-            bytes_freed: self.bytes_freed.load(Ordering::Relaxed),
-            oom_after_scan: self.oom_after_scan.load(Ordering::Relaxed),
-        }
-    }
-}
-
-struct RuntimeMetrics {
-    loop_iterations: ShardedCounter,
-    accept_eagain_rearms: ShardedCounter,
-    submit_sq_full_retries: ShardedCounter,
-    submit_failures: ShardedCounter,
-    completion_batch_count: ShardedCounter,
-    completion_batch_total: ShardedCounter,
-    command_batch_count: ShardedCounter,
-    command_batch_total: ShardedCounter,
-    active_expiry_runs: ShardedCounter,
-    active_expiry_sampled: ShardedCounter,
-    active_expiry_expired: ShardedCounter,
-    completion_batch_max: Box<[CachePadded<AtomicU64>]>,
-    command_batch_max: Box<[CachePadded<AtomicU64>]>,
-}
-
-impl RuntimeMetrics {
-    fn new(num_slots: usize) -> Self {
-        let slot_count = num_slots.max(1);
-        Self {
-            loop_iterations: ShardedCounter::new(slot_count),
-            accept_eagain_rearms: ShardedCounter::new(slot_count),
-            submit_sq_full_retries: ShardedCounter::new(slot_count),
-            submit_failures: ShardedCounter::new(slot_count),
-            completion_batch_count: ShardedCounter::new(slot_count),
-            completion_batch_total: ShardedCounter::new(slot_count),
-            command_batch_count: ShardedCounter::new(slot_count),
-            command_batch_total: ShardedCounter::new(slot_count),
-            active_expiry_runs: ShardedCounter::new(slot_count),
-            active_expiry_sampled: ShardedCounter::new(slot_count),
-            active_expiry_expired: ShardedCounter::new(slot_count),
-            completion_batch_max: make_runtime_max_slots(slot_count),
-            command_batch_max: make_runtime_max_slots(slot_count),
-        }
-    }
-
-    fn slot_count(&self) -> usize {
-        self.completion_batch_max.len()
-    }
-
-    #[inline(always)]
-    fn record_loop_iteration(&self, slot: usize) {
-        self.loop_iterations.increment(slot);
-    }
-
-    #[inline(always)]
-    fn record_accept_eagain_rearm(&self, slot: usize) {
-        self.accept_eagain_rearms.increment(slot);
-    }
-
-    #[inline(always)]
-    fn record_submit_sq_full_retry(&self, slot: usize) {
-        self.submit_sq_full_retries.increment(slot);
-    }
-
-    #[inline(always)]
-    fn record_submit_failure(&self, slot: usize) {
-        self.submit_failures.increment(slot);
-    }
-
-    #[inline(always)]
-    fn record_completion_batch(&self, slot: usize, width: usize) {
-        if width == 0 {
-            return;
-        }
-        self.completion_batch_count.increment(slot);
-        self.completion_batch_total.add(slot, width as u64);
-        update_runtime_slot_max(&self.completion_batch_max, slot, width as u64);
-    }
-
-    #[inline(always)]
-    fn record_command_batch(&self, slot: usize, width: usize) {
-        if width == 0 {
-            return;
-        }
-        self.command_batch_count.increment(slot);
-        self.command_batch_total.add(slot, width as u64);
-        update_runtime_slot_max(&self.command_batch_max, slot, width as u64);
-    }
-
-    #[inline(always)]
-    fn record_active_expiry(&self, slot: usize, sampled: usize, expired: usize) {
-        self.active_expiry_runs.increment(slot);
-        if sampled != 0 {
-            self.active_expiry_sampled.add(slot, sampled as u64);
-        }
-        if expired != 0 {
-            self.active_expiry_expired.add(slot, expired as u64);
-        }
-    }
-
-    fn snapshot(&self, eviction: EvictionMetricsSnapshot) -> RuntimeMetricsSnapshot {
-        let completion_batch_count = self.completion_batch_count.total();
-        let completion_batch_total = self.completion_batch_total.total();
-        let command_batch_count = self.command_batch_count.total();
-        let command_batch_total = self.command_batch_total.total();
-
-        RuntimeMetricsSnapshot {
-            reactor_slots: self.slot_count(),
-            loop_iterations: self.loop_iterations.total(),
-            accept_eagain_rearms: self.accept_eagain_rearms.total(),
-            submit_sq_full_retries: self.submit_sq_full_retries.total(),
-            submit_failures: self.submit_failures.total(),
-            completion_batch_count,
-            completion_batch_total,
-            completion_batch_max: runtime_slot_max(&self.completion_batch_max),
-            completion_batch_avg: avg_counter(completion_batch_total, completion_batch_count),
-            command_batch_count,
-            command_batch_total,
-            command_batch_max: runtime_slot_max(&self.command_batch_max),
-            command_batch_avg: avg_counter(command_batch_total, command_batch_count),
-            active_expiry_runs: self.active_expiry_runs.total(),
-            active_expiry_sampled: self.active_expiry_sampled.total(),
-            active_expiry_expired: self.active_expiry_expired.total(),
-            eviction_admissions: eviction.admissions,
-            eviction_shards_scanned: eviction.shards_scanned,
-            eviction_slots_sampled: eviction.slots_sampled,
-            eviction_bytes_freed: eviction.bytes_freed,
-            eviction_oom_after_scan: eviction.oom_after_scan,
-        }
-    }
-}
-
-fn make_runtime_max_slots(num_slots: usize) -> Box<[CachePadded<AtomicU64>]> {
-    (0..num_slots)
-        .map(|_| CachePadded::new(AtomicU64::new(0)))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-}
-
-/// Atomically update a per-slot max counter.
-///
-/// Uses `fetch_max` to guarantee that a larger value already stored by a
-/// concurrent reactor is never overwritten by a smaller value arriving on
-/// this thread. `Relaxed` ordering is correct because these counters are
-/// observability-only statistics read by INFO snapshots; they do not
-/// participate in any synchronization relationship with other shared data.
-#[inline(always)]
-fn update_runtime_slot_max(slots: &[CachePadded<AtomicU64>], slot: usize, value: u64) {
-    if let Some(current) = slots.get(slot) {
-        current.fetch_max(value, Ordering::Relaxed);
-    }
-}
-
-fn runtime_slot_max(slots: &[CachePadded<AtomicU64>]) -> u64 {
-    slots
-        .iter()
-        .map(|slot| slot.load(Ordering::Relaxed))
-        .max()
-        .unwrap_or(0)
-}
-
-fn avg_counter(total: u64, count: u64) -> f64 {
-    if count == 0 {
-        0.0
-    } else {
-        total as f64 / count as f64
-    }
-}
 
 pub(crate) struct ShardWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, SwissTable>,
     global_memory_used: &'a AtomicUsize,
     strict_memory_accounting: &'a AtomicBool,
-}
-
-pub struct ReplayModeGuard<'a> {
-    keyspace: &'a ConcurrentKeyspace,
 }
 
 impl Deref for ShardWriteGuard<'_> {
@@ -1069,26 +115,6 @@ impl Drop for ShardWriteGuard<'_> {
             self.global_memory_used,
             self.strict_memory_accounting.load(Ordering::Relaxed),
         );
-    }
-}
-
-impl Drop for ReplayModeGuard<'_> {
-    fn drop(&mut self) {
-        self.keyspace.replay_depth.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-impl Drop for CommandGateGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.reader.fetch_sub(1, Ordering::Release);
-    }
-}
-
-impl Drop for TransactionGateGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.gate.active.store(false, Ordering::Release);
     }
 }
 
@@ -1207,29 +233,12 @@ impl std::fmt::Debug for ConcurrentKeyspace {
     }
 }
 
-fn make_absent_watch_shards() -> Box<[AbsentWatchShard]> {
-    (0..ABSENT_WATCH_SHARD_COUNT)
-        .map(|_| CachePadded::new(RwLock::new(HashMap::new())))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-}
-
 #[inline]
 fn evicted_keys_to_box(evicted: Vec<EvictedKey>) -> EvictedKeys {
     if evicted.is_empty() {
         None
     } else {
         Some(evicted.into_boxed_slice())
-    }
-}
-
-#[inline]
-fn spin_or_yield(spins: &mut usize) {
-    if *spins < 64 {
-        *spins += 1;
-        std::hint::spin_loop();
-    } else {
-        std::thread::yield_now();
     }
 }
 
@@ -1247,14 +256,8 @@ impl ConcurrentKeyspace {
     /// Create a new keyspace with `num_shards` shards and `runtime_slots`
     /// contention-free runtime counter slots.
     pub fn new_with_runtime_slots(num_shards: usize, runtime_slots: usize) -> Self {
-        assert!(
-            num_shards > 0 && num_shards.is_power_of_two(),
-            "num_shards must be a power of two, got {num_shards}"
-        );
-        assert!(
-            (MIN_SHARD_COUNT..=MAX_SHARD_COUNT).contains(&num_shards),
-            "num_shards must be in [{MIN_SHARD_COUNT}, {MAX_SHARD_COUNT}], got {num_shards}"
-        );
+        let shard_count = ShardCount::try_new(num_shards).unwrap_or_else(|error| panic!("{error}"));
+        let num_shards = shard_count.get();
 
         let table_hasher = RandomState::new();
         let shards: Vec<Shard> = (0..num_shards)
@@ -1273,13 +276,13 @@ impl ConcurrentKeyspace {
             clock_hands: clock_hands.into_boxed_slice(),
             expiry_key_count: expiry_key_count.into_boxed_slice(),
             expiry_key_total: AtomicUsize::new(0),
-            mask: (num_shards - 1) as u64,
+            mask: shard_count.mask(),
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
             global_memory_used: AtomicUsize::new(0),
             memory_reserved: CachePadded::new(AtomicUsize::new(0)),
             strict_memory_accounting: AtomicBool::new(false),
-            mutation_features: AtomicUsize::new(0),
+            mutation_features: AtomicUsize::new(MutationFeatures::empty().bits()),
             replay_depth: AtomicUsize::new(0),
             global_lsn: AtomicU64::new(0),
             aof_recording_refs: AtomicUsize::new(0),
@@ -1295,182 +298,6 @@ impl ConcurrentKeyspace {
         }
     }
 
-    #[inline]
-    pub fn enter_replay_mode(&self) -> ReplayModeGuard<'_> {
-        self.replay_depth.fetch_add(1, Ordering::Relaxed);
-        ReplayModeGuard { keyspace: self }
-    }
-
-    #[inline]
-    pub(crate) fn replay_mode_active(&self) -> bool {
-        self.replay_depth.load(Ordering::Relaxed) != 0
-    }
-
-    #[inline]
-    pub fn enter_command_gate(&self) -> CommandGateGuard<'_> {
-        self.enter_command_gate_slot(0)
-    }
-
-    #[inline]
-    pub fn enter_command_gate_slot(&self, slot: usize) -> CommandGateGuard<'_> {
-        let gate = &self.transaction_gate;
-        let reader = &gate.readers[slot % gate.readers.len()];
-        let mut spins = 0usize;
-        loop {
-            while gate.active.load(Ordering::Acquire) {
-                spin_or_yield(&mut spins);
-            }
-
-            reader.fetch_add(1, Ordering::Acquire);
-            if !gate.active.load(Ordering::Acquire) {
-                return CommandGateGuard { reader };
-            }
-
-            reader.fetch_sub(1, Ordering::Release);
-            spin_or_yield(&mut spins);
-        }
-    }
-
-    #[inline]
-    pub fn enter_transaction_gate(&self) -> TransactionGateGuard<'_> {
-        let gate = &self.transaction_gate;
-        let mut spins = 0usize;
-        loop {
-            if gate
-                .active
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-            spin_or_yield(&mut spins);
-        }
-
-        for reader in gate.readers.iter() {
-            while reader.load(Ordering::Acquire) != 0 {
-                spin_or_yield(&mut spins);
-            }
-        }
-
-        TransactionGateGuard { gate }
-    }
-
-    #[inline]
-    pub fn current_watch_epoch(&self) -> u64 {
-        self.watch_epoch.load(Ordering::Acquire)
-    }
-
-    pub fn watch_key(&self, key: VortexKey) -> WatchRegistration {
-        self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
-        let key_bytes = key.as_bytes();
-        let shard_index = self.shard_index(key_bytes);
-        let table_hash = self.table_hash_key(key_bytes);
-
-        let (version, present) = match self
-            .read_shard_by_index(shard_index)
-            .get_lsn_version_prehashed(key_bytes, table_hash)
-        {
-            Some(version) => (version, true),
-            None => {
-                let _ = self.register_absent_watch_key(&key, table_hash);
-                match self
-                    .read_shard_by_index(shard_index)
-                    .get_lsn_version_prehashed(key_bytes, table_hash)
-                {
-                    Some(version) => {
-                        self.release_absent_watch_key(key_bytes, table_hash);
-                        (version, true)
-                    }
-                    None => (
-                        self.absent_watch_version(key_bytes, table_hash)
-                            .expect("absent watch must exist after registration"),
-                        false,
-                    ),
-                }
-            }
-        };
-
-        if self.watch_active.fetch_add(1, Ordering::Release) == 0 {
-            self.enable_mutation_feature(MUTATION_FEATURE_WATCH);
-        }
-        WatchRegistration {
-            state: WatchKeyState {
-                key,
-                shard_index,
-                table_hash,
-                version,
-                present,
-            },
-        }
-    }
-
-    #[inline]
-    fn release_watch_registration(&self, watched: WatchRegistration) {
-        let WatchRegistration {
-            state:
-                WatchKeyState {
-                    key,
-                    table_hash,
-                    present,
-                    ..
-                },
-        } = watched;
-
-        if !present {
-            self.release_absent_watch_key(key.as_bytes(), table_hash);
-        }
-
-        let previous = self
-            .watch_active
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |refs| {
-                (refs != 0).then_some(refs - 1)
-            })
-            .expect("WATCH registration release without active registration");
-        if previous == 1 {
-            self.disable_mutation_feature(MUTATION_FEATURE_WATCH);
-        }
-    }
-
-    pub fn unwatch_keys<I>(&self, keys: I)
-    where
-        I: IntoIterator<Item = WatchRegistration>,
-    {
-        for watched in keys {
-            self.release_watch_registration(watched);
-        }
-    }
-
-    pub fn watched_keys_changed(&self, epoch: u64, keys: &[WatchRegistration]) -> bool {
-        if self.current_watch_epoch() != epoch {
-            return true;
-        }
-
-        for watched in keys {
-            let watched = watched.state();
-            let key_bytes = watched.key.as_bytes();
-            let guard = self.read_shard_by_index(watched.shard_index);
-            let current_lsn = guard.get_lsn_version_prehashed(key_bytes, watched.table_hash);
-            drop(guard);
-
-            if watched.present {
-                if current_lsn != Some(watched.version) {
-                    return true;
-                }
-                continue;
-            }
-
-            if current_lsn.is_some() {
-                return true;
-            }
-
-            if self.absent_watch_version(key_bytes, watched.table_hash) != Some(watched.version) {
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Create a new keyspace pre-sized for `total_capacity` entries spread
     /// evenly across `num_shards` shards. Avoids early resize churn.
     ///
@@ -1478,14 +305,8 @@ impl ConcurrentKeyspace {
     ///
     /// Same as [`new`](Self::new).
     pub fn with_capacity(num_shards: usize, total_capacity: usize) -> Self {
-        assert!(
-            num_shards > 0 && num_shards.is_power_of_two(),
-            "num_shards must be a power of two, got {num_shards}"
-        );
-        assert!(
-            (MIN_SHARD_COUNT..=MAX_SHARD_COUNT).contains(&num_shards),
-            "num_shards must be in [{MIN_SHARD_COUNT}, {MAX_SHARD_COUNT}], got {num_shards}"
-        );
+        let shard_count = ShardCount::try_new(num_shards).unwrap_or_else(|error| panic!("{error}"));
+        let num_shards = shard_count.get();
 
         let per_shard = total_capacity.div_ceil(num_shards);
         let table_hasher = RandomState::new();
@@ -1510,13 +331,13 @@ impl ConcurrentKeyspace {
             clock_hands: clock_hands.into_boxed_slice(),
             expiry_key_count: expiry_key_count.into_boxed_slice(),
             expiry_key_total: AtomicUsize::new(0),
-            mask: (num_shards - 1) as u64,
+            mask: shard_count.mask(),
             hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
             table_hasher,
             global_memory_used: AtomicUsize::new(0),
             memory_reserved: CachePadded::new(AtomicUsize::new(0)),
             strict_memory_accounting: AtomicBool::new(false),
-            mutation_features: AtomicUsize::new(0),
+            mutation_features: AtomicUsize::new(MutationFeatures::empty().bits()),
             replay_depth: AtomicUsize::new(0),
             global_lsn: AtomicU64::new(0),
             aof_recording_refs: AtomicUsize::new(0),
@@ -1551,7 +372,7 @@ impl ConcurrentKeyspace {
     pub fn set_max_memory(&self, max_memory: usize) {
         let previous = self.max_memory();
         if previous == 0 && max_memory != 0 {
-            self.enable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+            self.enable_mutation_feature(MutationFeatures::MAXMEMORY);
             self.strict_memory_accounting.store(true, Ordering::Relaxed);
             self.publish_all_memory_drift();
         }
@@ -1561,7 +382,7 @@ impl ConcurrentKeyspace {
         if previous != 0 && max_memory == 0 {
             self.strict_memory_accounting
                 .store(false, Ordering::Relaxed);
-            self.disable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+            self.disable_mutation_feature(MutationFeatures::MAXMEMORY);
         }
     }
 
@@ -1574,7 +395,7 @@ impl ConcurrentKeyspace {
     pub fn configure_eviction(&self, max_memory: usize, policy: EvictionPolicy) {
         let previous = self.max_memory();
         if previous == 0 && max_memory != 0 {
-            self.enable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+            self.enable_mutation_feature(MutationFeatures::MAXMEMORY);
             self.strict_memory_accounting.store(true, Ordering::Relaxed);
             self.publish_all_memory_drift();
         }
@@ -1584,44 +405,36 @@ impl ConcurrentKeyspace {
         if previous != 0 && max_memory == 0 {
             self.strict_memory_accounting
                 .store(false, Ordering::Relaxed);
-            self.disable_mutation_feature(MUTATION_FEATURE_MAXMEMORY);
+            self.disable_mutation_feature(MutationFeatures::MAXMEMORY);
         }
     }
 
     #[inline(always)]
-    pub(crate) fn mutation_features(&self) -> usize {
-        self.mutation_features.load(Ordering::Acquire)
+    pub(crate) fn mutation_features(&self) -> MutationFeatures {
+        let mut bits = self.mutation_features.load(Ordering::Acquire);
+        if self.watch_active.load(Ordering::Acquire) == 0 {
+            bits &= !MutationFeatures::WATCH.bits();
+        } else {
+            bits |= MutationFeatures::WATCH.bits();
+        }
+        MutationFeatures::from_bits(bits)
     }
 
     #[inline(always)]
-    pub(crate) fn mutation_feature_maxmemory(features: usize) -> bool {
-        features & MUTATION_FEATURE_MAXMEMORY != 0
+    fn mutation_feature_active(&self, feature: MutationFeatures) -> bool {
+        self.mutation_features().bits() & feature.bits() != 0
     }
 
     #[inline(always)]
-    pub(crate) fn mutation_feature_watch(features: usize) -> bool {
-        features & MUTATION_FEATURE_WATCH != 0
-    }
-
-    #[inline(always)]
-    pub(crate) fn mutation_feature_aof(features: usize) -> bool {
-        features & MUTATION_FEATURE_AOF != 0
-    }
-
-    #[inline(always)]
-    fn mutation_feature_active(&self, feature: usize) -> bool {
-        self.mutation_features.load(Ordering::Acquire) & feature != 0
-    }
-
-    #[inline(always)]
-    fn enable_mutation_feature(&self, feature: usize) {
-        self.mutation_features.fetch_or(feature, Ordering::Release);
-    }
-
-    #[inline(always)]
-    fn disable_mutation_feature(&self, feature: usize) {
+    fn enable_mutation_feature(&self, feature: MutationFeatures) {
         self.mutation_features
-            .fetch_and(!feature, Ordering::Release);
+            .fetch_or(feature.bits(), Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn disable_mutation_feature(&self, feature: MutationFeatures) {
+        self.mutation_features
+            .fetch_and(!feature.bits(), Ordering::Release);
     }
 
     #[inline]
@@ -1657,115 +470,6 @@ impl ConcurrentKeyspace {
         if snapshot.max_memory != 0 && snapshot.policy.is_lfu() {
             self.frequency_sketch.record(hash);
         }
-    }
-
-    #[inline]
-    fn absent_watch_shard_index(&self, table_hash: u64) -> usize {
-        (table_hash as usize) & (ABSENT_WATCH_SHARD_COUNT - 1)
-    }
-
-    #[inline]
-    pub(crate) fn watch_tracking_active(&self) -> bool {
-        self.mutation_feature_active(MUTATION_FEATURE_WATCH)
-    }
-
-    #[inline]
-    pub(crate) fn bump_watch_key(&self, key: &VortexKey) {
-        if !self.watch_tracking_active() {
-            return;
-        }
-        self.bump_watch_key_known_active(key.as_bytes(), self.table_hash_key(key.as_bytes()));
-    }
-
-    #[inline]
-    pub(crate) fn bump_watch_key_known_active(&self, key_bytes: &[u8], table_hash: u64) {
-        if self.absent_watch_active.load(Ordering::Acquire) == 0 {
-            return;
-        }
-
-        let shard_idx = self.absent_watch_shard_index(table_hash);
-        let mut guard = self.absent_watch_shards[shard_idx].write();
-        if let Some(slot) = guard.get_mut(key_bytes) {
-            slot.version = slot.version.wrapping_add(1).max(1);
-        }
-    }
-
-    #[inline]
-    pub(crate) fn bump_watch_key_bytes(&self, key_bytes: &[u8]) {
-        if !self.watch_tracking_active() {
-            return;
-        }
-        self.bump_watch_key_known_active(key_bytes, self.table_hash_key(key_bytes));
-    }
-
-    #[inline]
-    pub(crate) fn bump_all_watches(&self) {
-        if self.watch_active.load(Ordering::Acquire) != 0 {
-            self.watch_epoch.fetch_add(1, Ordering::Release);
-        }
-    }
-
-    #[inline]
-    fn absent_watch_version(&self, key_bytes: &[u8], table_hash: u64) -> Option<u64> {
-        let shard_idx = self.absent_watch_shard_index(table_hash);
-        let guard = self.absent_watch_shards[shard_idx].read();
-        guard.get(key_bytes).map(|slot| slot.version)
-    }
-
-    #[inline]
-    fn register_absent_watch_key(&self, key: &VortexKey, table_hash: u64) -> u64 {
-        let shard_idx = self.absent_watch_shard_index(table_hash);
-        let mut guard = self.absent_watch_shards[shard_idx].write();
-        let slot = guard.entry(key.clone()).or_insert(AbsentWatchSlot {
-            version: 0,
-            refs: 0,
-        });
-        slot.refs += 1;
-        self.absent_watch_active.fetch_add(1, Ordering::Release);
-        slot.version
-    }
-
-    #[inline]
-    fn release_absent_watch_key(&self, key_bytes: &[u8], table_hash: u64) {
-        let shard_idx = self.absent_watch_shard_index(table_hash);
-        let mut guard = self.absent_watch_shards[shard_idx].write();
-        if let Some(slot) = guard.get_mut(key_bytes) {
-            if slot.refs > 1 {
-                slot.refs -= 1;
-            } else {
-                guard.remove(key_bytes);
-            }
-            self.absent_watch_active.fetch_sub(1, Ordering::Release);
-        }
-    }
-
-    /// Admit a mutation that will increase memory by `additional_bytes`.
-    ///
-    /// Returns `(EvictedKeys, MemoryReservation)` on success. The reservation
-    /// holds `additional_bytes` in the global reservation counter so that
-    /// concurrent writers see the pending allocation. The caller **must**
-    /// call `reservation.settle()` after the mutation commits and the shard
-    /// write guard drops (which publishes the actual delta to
-    /// `global_memory_used`).
-    ///
-    /// If admission fails (OOM / noeviction), the reservation is never created.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn ensure_memory_for(
-        &self,
-        preferred_shard: usize,
-        additional_bytes: usize,
-        now_nanos: u64,
-    ) -> Result<(EvictedKeys, MemoryReservation<'_>), EvictionAdmissionError> {
-        if self.replay_mode_active() {
-            return Ok((None, MemoryReservation::new(self, 0)));
-        }
-
-        if additional_bytes == 0 {
-            return Ok((None, MemoryReservation::new(self, 0)));
-        }
-
-        let snapshot = self.eviction_config();
-        self.ensure_memory_for_snapshot(preferred_shard, additional_bytes, now_nanos, snapshot)
     }
 
     /// Reservation-based admission against a pre-loaded eviction config snapshot.
@@ -1870,259 +574,6 @@ impl ConcurrentKeyspace {
             .saturating_add(self.memory_reserved.load(Ordering::Acquire))
     }
 
-    /// Returns the current outstanding reservation counter value.
-    /// Useful for testing and diagnostics.
-    #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn memory_reserved(&self) -> usize {
-        self.memory_reserved.load(Ordering::Relaxed)
-    }
-
-    fn evict_until_target(
-        &self,
-        preferred_shard: usize,
-        target_used: usize,
-        policy: EvictionPolicy,
-        now_nanos: u64,
-        report: &mut EvictionScanReport,
-        evicted: &mut Vec<EvictedKey>,
-    ) -> usize {
-        let shard_count = self.shards.len();
-        if shard_count == 0 {
-            return 0;
-        }
-
-        let start_shard = preferred_shard & (shard_count - 1);
-        let shard_budget = shard_count.min(EVICTION_MAX_SHARDS_PER_ADMISSION);
-        let initial_used = self.published_memory_used();
-        let mut current_used = initial_used;
-        let mut passes_without_progress = 0usize;
-
-        while current_used > target_used
-            && passes_without_progress < shard_count
-            && report.shards_scanned < shard_budget
-        {
-            let mut progress = false;
-
-            for offset in 0..shard_count {
-                if report.shards_scanned >= shard_budget {
-                    break;
-                }
-                let shard_idx = (start_shard + offset) & (shard_count - 1);
-                if policy.is_volatile_only() && !self.shard_has_expiring_keys(shard_idx) {
-                    continue;
-                }
-
-                report.shards_scanned += 1;
-                let remaining = current_used.saturating_sub(target_used);
-                let freed =
-                    self.evict_from_shard(shard_idx, policy, remaining, now_nanos, report, evicted);
-                if freed == 0 {
-                    continue;
-                }
-
-                current_used = current_used.saturating_sub(freed);
-                progress = true;
-                if current_used <= target_used {
-                    break;
-                }
-            }
-
-            if progress {
-                passes_without_progress = 0;
-            } else {
-                passes_without_progress += 1;
-            }
-        }
-
-        initial_used.saturating_sub(current_used)
-    }
-
-    fn evict_from_shard(
-        &self,
-        shard_idx: usize,
-        policy: EvictionPolicy,
-        bytes_needed: usize,
-        now_nanos: u64,
-        report: &mut EvictionScanReport,
-        evicted: &mut Vec<EvictedKey>,
-    ) -> usize {
-        let mut guard = self.write_shard_by_index(shard_idx);
-        let total_slots = guard.total_slots();
-        if total_slots == 0 {
-            return 0;
-        }
-
-        let start_slot = self.clock_hand(shard_idx) % total_slots;
-        let context = EvictionSweepContext {
-            shard_idx,
-            start_slot,
-            bytes_needed,
-            now_nanos,
-            volatile_only: policy.is_volatile_only(),
-        };
-        let sweep = match policy {
-            EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => {
-                let random_start = (next_random_u64() as usize) & (total_slots - 1);
-                let adjusted = EvictionSweepContext {
-                    start_slot: (context.start_slot + random_start) % total_slots,
-                    ..context
-                };
-                self.run_sweep_driver(&mut guard, adjusted, RandomPolicy)
-            }
-            EvictionPolicy::VolatileTtl => {
-                self.run_sweep_driver(&mut guard, context, VolatileTtlPolicy::new())
-            }
-            policy if policy.is_lfu() => {
-                self.run_sweep_driver(&mut guard, context, LfuClockPolicy::new())
-            }
-            _ => self.run_sweep_driver(&mut guard, context, ClockPolicy),
-        };
-        report.slots_sampled += sweep.slots_sampled;
-        self.set_clock_hand(shard_idx, sweep.next_slot);
-        let freed_bytes = sweep.freed_bytes;
-        sweep.effects.apply(self, evicted);
-        freed_bytes
-    }
-
-    // ─── Unified eviction sweep driver ──────────────────────────────
-    //
-    // All eviction policies share the same scan loop: iterate slots up to
-    // `EVICTION_SWEEP_WINDOW`, skip empty/volatile-filtered slots, delete
-    // expired entries opportunistically, and then delegate non-expired live
-    // entries to the policy's `evaluate_slot` method. After the scan,
-    // `finalize` lets policies that accumulate candidates (LFU, volatile-TTL)
-    // perform a deferred eviction deletion.
-    //
-    // The driver is generic over `SweepPolicy`, so each policy's inner-loop
-    // code remains monomorphized — zero virtual dispatch overhead.
-
-    /// Run the shared eviction scan loop with a policy-specific evaluator.
-    ///
-    /// The driver handles: empty-table guard, slot iteration, volatile
-    /// filtering, empty-slot skipping, expired-entry opportunistic deletion,
-    /// effects collection, and result assembly. The policy only defines
-    /// candidate evaluation and optional post-loop finalization.
-    fn run_sweep_driver<P: SweepPolicy>(
-        &self,
-        table: &mut SwissTable,
-        context: EvictionSweepContext,
-        mut policy: P,
-    ) -> EvictionSweepResult {
-        let total_slots = table.total_slots();
-        if total_slots == 0 {
-            return EvictionSweepResult::default();
-        }
-
-        let mut slot = context.start_slot % total_slots;
-        let mut freed_bytes = 0usize;
-        let mut effects = EvictionEffects::default();
-        let mut slots_sampled = 0usize;
-        let sweep_len = EVICTION_SWEEP_WINDOW.min(total_slots);
-
-        for _ in 0..sweep_len {
-            let current_slot = slot;
-            slot = (slot + 1) % total_slots;
-            slots_sampled += 1;
-
-            let ttl = table.slot_entry_ttl(current_slot);
-
-            // Volatile filter: skip non-TTL slots when policy targets volatile keys only.
-            if ttl == 0 && context.volatile_only {
-                continue;
-            }
-
-            // Skip empty/deleted slots.
-            if table.slot_entry(current_slot).is_none() {
-                continue;
-            }
-
-            // Opportunistic expired-entry deletion: all policies benefit from
-            // reclaiming already-dead entries without charging the policy logic.
-            if policy.handles_expiry() && ttl != 0 && ttl <= context.now_nanos {
-                record_eviction_deletion(
-                    &mut freed_bytes,
-                    &mut effects,
-                    self.delete_evictable_slot(context.shard_idx, table, current_slot),
-                );
-                if freed_bytes >= context.bytes_needed {
-                    break;
-                }
-                continue;
-            }
-
-            // Policy-specific candidate evaluation.
-            let action = policy.evaluate_slot(self, table, current_slot, ttl, &context);
-            match action {
-                SlotAction::Skip => {}
-                SlotAction::Delete => {
-                    record_eviction_deletion(
-                        &mut freed_bytes,
-                        &mut effects,
-                        self.delete_evictable_slot(context.shard_idx, table, current_slot),
-                    );
-                    if freed_bytes >= context.bytes_needed {
-                        break;
-                    }
-                }
-                SlotAction::Accumulate => {
-                    // Policy tracks the candidate internally (e.g., best-frequency
-                    // or nearest-deadline). No deletion yet.
-                }
-            }
-        }
-
-        // Let the policy delete a deferred best-candidate if the scan did not
-        // free enough bytes.
-        policy.finalize(self, table, &context, &mut freed_bytes, &mut effects);
-
-        EvictionSweepResult {
-            next_slot: slot,
-            freed_bytes,
-            slots_sampled,
-            effects,
-        }
-    }
-
-    fn delete_evictable_slot(
-        &self,
-        shard_idx: usize,
-        table: &mut SwissTable,
-        slot: usize,
-    ) -> EvictionDeletion {
-        let ttl = table.slot_entry_ttl(slot);
-        let bytes = table.slot_memory_bytes(slot);
-        if bytes == 0 {
-            return EvictionDeletion::default();
-        }
-        let features = self.mutation_features();
-        let record_aof = Self::mutation_feature_aof(features);
-        let track_watch = Self::mutation_feature_watch(features);
-        let Some((key, _)) = table.slot_key_value(slot) else {
-            return EvictionDeletion::default();
-        };
-        let key = (record_aof || track_watch).then(|| key.clone());
-        let aof_lsn = record_aof.then(|| self.next_lsn());
-
-        let _ = table.delete_slot(slot);
-        let mut effects = EvictionEffects::default();
-        if ttl != 0 {
-            effects.push_expiry_transition(shard_idx, ExpiryTransition::ttl_removed());
-        }
-        if let Some(key) = key {
-            if track_watch {
-                effects.push_watch_invalidation(key.clone(), self.table_hash_key(key.as_bytes()));
-            }
-            if let Some(lsn) = aof_lsn {
-                effects.push_aof_record(EvictedKey { lsn, key });
-            }
-        }
-        EvictionDeletion {
-            freed_bytes: bytes,
-            effects,
-        }
-    }
-
     #[inline(always)]
     fn tracked_write_guard<'a>(
         &'a self,
@@ -2147,98 +598,6 @@ impl ConcurrentKeyspace {
         self.global_memory_used.load(Ordering::Relaxed)
     }
 
-    #[inline(always)]
-    pub(crate) fn apply_expiry_transition(&self, shard_idx: usize, transition: ExpiryTransition) {
-        self.update_expiry_count(shard_idx, transition.had_ttl, transition.has_ttl_after);
-    }
-
-    #[inline(always)]
-    fn update_expiry_count(&self, shard_idx: usize, had_ttl: bool, has_ttl: bool) {
-        debug_assert!(shard_idx < self.expiry_key_count.len());
-        match (had_ttl, has_ttl) {
-            (false, true) => {
-                self.expiry_key_count[shard_idx].fetch_add(1, Ordering::Relaxed);
-                self.expiry_key_total.fetch_add(1, Ordering::Relaxed);
-            }
-            (true, false) => {
-                self.expiry_key_count[shard_idx].fetch_sub(1, Ordering::Relaxed);
-                self.expiry_key_total.fetch_sub(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-
-    #[inline]
-    pub(crate) fn total_expiry_keys(&self) -> usize {
-        self.expiry_key_total.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn approx_expiring_keys(&self) -> usize {
-        self.expiry_key_total.load(Ordering::Relaxed)
-    }
-
-    /// Cheap global check used by event loops to skip active-expiry work for
-    /// pure no-TTL workloads.
-    #[inline]
-    pub fn has_expiring_keys(&self) -> bool {
-        self.approx_expiring_keys() != 0
-    }
-
-    #[inline]
-    fn shard_has_expiring_keys(&self, shard_idx: usize) -> bool {
-        debug_assert!(shard_idx < self.expiry_key_count.len());
-        self.expiry_key_count[shard_idx].load(Ordering::Relaxed) != 0
-    }
-
-    #[inline]
-    pub fn eviction_metrics(&self) -> EvictionMetricsSnapshot {
-        self.eviction_metrics.snapshot()
-    }
-
-    #[inline]
-    pub fn runtime_metrics(&self) -> RuntimeMetricsSnapshot {
-        self.runtime_metrics
-            .snapshot(self.eviction_metrics.snapshot())
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_loop_iteration(&self, reactor_id: usize) {
-        self.runtime_metrics.record_loop_iteration(reactor_id);
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_accept_eagain_rearm(&self, reactor_id: usize) {
-        self.runtime_metrics.record_accept_eagain_rearm(reactor_id);
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_submit_sq_full_retry(&self, reactor_id: usize) {
-        self.runtime_metrics.record_submit_sq_full_retry(reactor_id);
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_submit_failure(&self, reactor_id: usize) {
-        self.runtime_metrics.record_submit_failure(reactor_id);
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_completion_batch(&self, reactor_id: usize, width: usize) {
-        self.runtime_metrics
-            .record_completion_batch(reactor_id, width);
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_command_batch(&self, reactor_id: usize, width: usize) {
-        self.runtime_metrics.record_command_batch(reactor_id, width);
-    }
-
-    #[inline(always)]
-    pub fn record_reactor_active_expiry(&self, reactor_id: usize, sampled: usize, expired: usize) {
-        self.runtime_metrics
-            .record_active_expiry(reactor_id, sampled, expired);
-    }
-
     #[inline]
     pub(crate) fn clock_hand(&self, shard_idx: usize) -> usize {
         debug_assert!(shard_idx < self.clock_hands.len());
@@ -2259,104 +618,10 @@ impl ConcurrentKeyspace {
         self.shards.len()
     }
 
-    // ─── Global LSN (Logical Sequence Number) ───────────────────────
-
-    /// Allocate the next LSN. **Must be called while holding a shard write lock**
-    /// to guarantee causal ordering: if Op₁ → Op₂ on the same key, then
-    /// LSN₁ < LSN₂.
-    ///
-    /// `Relaxed` ordering is correct because the shard `RwLock` provides the
-    /// necessary acquire/release synchronization. The atomic itself only needs
-    /// monotonicity, which `fetch_add` guarantees on all architectures.
-    #[inline(always)]
-    pub(crate) fn next_lsn(&self) -> u64 {
-        let raw = self.global_lsn.fetch_add(1, Ordering::Relaxed);
-        EntryLsn::try_from_raw(raw)
-            .expect("global LSN exceeds 48-bit entry version storage")
-            .get()
-    }
-
     #[inline]
-    pub fn enable_aof_recording(&self) {
-        if self.aof_recording_refs.fetch_add(1, Ordering::Release) == 0 {
-            self.enable_mutation_feature(MUTATION_FEATURE_AOF);
-        }
-    }
-
-    #[inline]
-    pub fn disable_aof_recording(&self) {
-        if let Ok(previous) =
-            self.aof_recording_refs
-                .fetch_update(Ordering::Release, Ordering::Relaxed, |refs| {
-                    (refs != 0).then_some(refs - 1)
-                })
-        {
-            if previous == 1 {
-                self.disable_mutation_feature(MUTATION_FEATURE_AOF);
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn aof_recording_enabled(&self) -> bool {
-        self.mutation_feature_active(MUTATION_FEATURE_AOF)
-    }
-
-    #[inline(always)]
-    pub(crate) fn next_aof_lsn(&self) -> Option<u64> {
-        self.aof_recording_enabled().then(|| self.next_lsn())
-    }
-
-    #[inline(always)]
-    pub(crate) fn allocate_mutation_lsn(&self) -> (u64, Option<u64>) {
-        let lsn = self.next_lsn();
-        (lsn, self.aof_recording_enabled().then_some(lsn))
-    }
-
-    #[inline(always)]
-    pub(crate) fn allocate_mutation_lsn_with_features(
-        &self,
-        features: usize,
-    ) -> (u64, Option<u64>) {
-        let lsn = self.next_lsn();
-        (lsn, Self::mutation_feature_aof(features).then_some(lsn))
-    }
-
-    /// Read the current LSN value (the next LSN to be assigned).
-    ///
-    /// Useful for snapshot points (BGREWRITEAOF) and restoring LSN state
-    /// after AOF replay.
-    #[inline]
-    pub fn current_lsn(&self) -> u64 {
-        self.global_lsn.load(Ordering::Relaxed)
-    }
-
-    /// Restore the global LSN after AOF replay by advancing it to one greater
-    /// than the highest persisted LSN.
-    ///
-    /// The counter is only moved forward; stale or duplicate restore attempts
-    /// cannot move it backward.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called during single-threaded replay/initialization
-    /// before reactors are spawned, or while all reactors are quiesced.
-    pub unsafe fn restore_lsn_after_replay(
-        &self,
-        max_replayed_lsn: Option<AofLsn>,
-    ) -> Result<(), LsnRestoreError> {
-        let Some(max_replayed_lsn) = max_replayed_lsn else {
-            return Ok(());
-        };
-
-        let next_lsn = max_replayed_lsn
-            .get()
-            .checked_add(1)
-            .ok_or(LsnRestoreError {
-                max_replayed_lsn: max_replayed_lsn.get(),
-            })?;
-        self.global_lsn.fetch_max(next_lsn, Ordering::Relaxed);
-        Ok(())
+    fn shard_count(&self) -> ShardCount {
+        debug_assert!(ShardCount::try_new(self.shards.len()).is_ok());
+        ShardCount::from_validated(self.shards.len())
     }
 
     /// Compute the shard index for a key using ahash + bitmask.
@@ -2365,7 +630,13 @@ impl ConcurrentKeyspace {
     /// ahash uses AES-NI on x86_64 / hardware crypto on ARM — ~2ns per hash.
     #[inline(always)]
     pub fn shard_index(&self, key: &[u8]) -> usize {
-        (self.hasher.hash_one(key) & self.mask) as usize
+        self.shard_id(key).get()
+    }
+
+    /// Compute the typed shard ID for a key using ahash + bitmask.
+    #[inline(always)]
+    pub(crate) fn shard_id(&self, key: &[u8]) -> ShardId {
+        ShardId::from_masked_index((self.hasher.hash_one(key) & self.mask) as usize)
     }
 
     /// Hash a key using the keyspace's hasher.
@@ -2394,18 +665,6 @@ impl ConcurrentKeyspace {
         unsafe { self.shards.get_unchecked(idx) }.read()
     }
 
-    /// Acquire a write lock on the shard containing `key`.
-    ///
-    /// Use for mutation operations: SET, DEL, INCR, EXPIRE, etc.
-    #[inline(always)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn write_shard(&self, key: &[u8]) -> ShardWriteGuard<'_> {
-        let idx = self.shard_index(key);
-        // SAFETY: idx is always < shards.len() because mask = num_shards - 1
-        // and num_shards is a power of 2.
-        self.tracked_write_guard(unsafe { self.shards.get_unchecked(idx) }.write())
-    }
-
     /// Acquire a read lock on a specific shard by index.
     ///
     /// # Panics
@@ -2432,16 +691,17 @@ impl ConcurrentKeyspace {
     /// when `idx` is out of range.
     #[inline(always)]
     pub fn try_read_shard_by_index(&self, idx: usize) -> Option<RwLockReadGuard<'_, SwissTable>> {
-        self.shards.get(idx).map(|shard| shard.read())
+        let shard = ShardId::try_new(idx, self.shard_count())?;
+        self.shards.get(shard.get()).map(|shard| shard.read())
     }
 
     /// Acquire a write lock on a specific shard by index, returning `None`
     /// when `idx` is out of range.
     #[inline(always)]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_write_shard_by_index(&self, idx: usize) -> Option<ShardWriteGuard<'_>> {
+        let shard_id = ShardId::try_new(idx, self.shard_count())?;
         self.shards
-            .get(idx)
+            .get(shard_id.get())
             .map(|shard| self.tracked_write_guard(shard.write()))
     }
 
@@ -2461,19 +721,6 @@ impl ConcurrentKeyspace {
     {
         let guard = self.read_shard(key);
         f(&guard)
-    }
-
-    /// Execute a mutation on the shard containing `key`.
-    ///
-    /// The closure receives an exclusive mutable reference to the `SwissTable`.
-    #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn write<F, R>(&self, key: &[u8], f: F) -> R
-    where
-        F: FnOnce(&mut SwissTable) -> R,
-    {
-        let mut guard = self.write_shard(key);
-        f(&mut guard)
     }
 
     /// Benchmark-only raw insert hook.
@@ -2543,22 +790,6 @@ impl ConcurrentKeyspace {
         (guards, plan)
     }
 
-    // ─── Transaction support ────────────────────────────────────────
-
-    /// Acquire write locks on all shards touched by `keys` for transaction
-    /// execution (MULTI/EXEC).
-    ///
-    /// Even GET operations within a transaction acquire write locks to ensure
-    /// the entire transaction is serializable — no interleaving from other
-    /// writers.
-    ///
-    /// Returns the same tuple as `multi_write`.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn exec_transaction_locks<'a>(&'a self, keys: &[&[u8]]) -> MultiWriteGuards<'a> {
-        self.multi_write(keys)
-    }
-
     // ─── Scan operations ────────────────────────────────────────────
 
     /// Execute a closure on each shard sequentially (for KEYS, SCAN, DBSIZE).
@@ -2579,81 +810,6 @@ impl ConcurrentKeyspace {
         results
     }
 
-    /// Execute a closure on a single shard by index with a write lock.
-    /// Used for per-shard active expiry sweeps.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn write_shard_scan<F, R>(&self, shard_idx: usize, f: F) -> R
-    where
-        F: FnOnce(&mut SwissTable) -> R,
-    {
-        debug_assert!(shard_idx < self.shards.len());
-        let mut guard = self.write_shard_by_index(shard_idx);
-        f(&mut guard)
-    }
-
-    /// Run one round of active expiry on a single shard by index.
-    ///
-    /// Acquires a write lock on the target shard, scans up to `max_effort`
-    /// occupied slots starting from `start_slot`, and removes entries whose
-    /// TTL deadline has passed. Returns `(expired_count, sampled_count)`.
-    ///
-    /// The caller should rotate `start_slot` across calls to ensure full
-    /// coverage over time (e.g. increment by `max_effort` each tick).
-    ///
-    /// # Mechanical sympathy
-    ///
-    /// - One write lock per call, not held across shards.
-    /// - Sequential slot access is prefetcher-friendly.
-    /// - Zero allocation: `delete_slot()` removes by slot index directly,
-    ///   avoiding the key clone + hash + re-probe overhead of `remove()`.
-    pub fn run_active_expiry_on_shard(
-        &self,
-        shard_idx: usize,
-        start_slot: usize,
-        max_effort: usize,
-        now_nanos: u64,
-    ) -> (usize, usize) {
-        debug_assert!(shard_idx < self.shards.len());
-        if !self.shard_has_expiring_keys(shard_idx) {
-            return (0, 0);
-        }
-        let mut guard = self.write_shard_by_index(shard_idx);
-        let total_slots = guard.total_slots();
-        if total_slots == 0 {
-            return (0, 0);
-        }
-
-        let mut expired = 0usize;
-        let mut sampled = 0usize;
-
-        for i in 0..max_effort {
-            let slot = (start_slot + i) % total_slots;
-            let deadline = guard.slot_entry_ttl(slot);
-            // deadline == 0 means empty/deleted or no TTL — skip.
-            if deadline == 0 {
-                continue;
-            }
-            sampled += 1;
-            if deadline <= now_nanos {
-                // Entry expired — delete directly by slot index (O(1), zero alloc).
-                let watched_key = if self.watch_active.load(Ordering::Acquire) != 0 {
-                    guard.slot_key_value(slot).map(|(key, _)| key.clone())
-                } else {
-                    None
-                };
-                guard.delete_slot(slot);
-                self.apply_expiry_transition(shard_idx, ExpiryTransition::ttl_removed());
-                if let Some(key) = watched_key {
-                    self.bump_watch_key(&key);
-                }
-                expired += 1;
-            }
-        }
-
-        (expired, sampled)
-    }
-
     // ─── Metadata ───────────────────────────────────────────────────
 
     /// Approximate total number of keys across all shards.
@@ -2663,99 +819,59 @@ impl ConcurrentKeyspace {
     pub fn dbsize(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
     }
+}
 
-    /// Exact live key and expiring-key counts from a consistent all-shard snapshot.
+#[cfg(test)]
+impl ConcurrentKeyspace {
+    /// Admit a test mutation that will increase memory by `additional_bytes`.
     ///
-    /// This administrative path acquires read locks for every shard and counts
-    /// only entries that are still live at `now_nanos`.
-    pub(crate) fn exact_keyspace_counts(&self, now_nanos: u64) -> (usize, usize) {
-        let guards: Vec<_> = self.shards.iter().map(|shard| shard.read()).collect();
-        let mut keys = 0usize;
-        let mut expires = 0usize;
-
-        for guard in &guards {
-            for entry in guard.iter_entries() {
-                if entry.is_expired(now_nanos) {
-                    continue;
-                }
-                keys += 1;
-                if entry.ttl_deadline() != 0 {
-                    expires += 1;
-                }
-            }
+    /// Tests use this to exercise reservation and eviction admission directly.
+    /// Command code should use the snapshot-based admission path so it can
+    /// reuse the eviction config already loaded for the mutation.
+    fn ensure_memory_for(
+        &self,
+        preferred_shard: usize,
+        additional_bytes: usize,
+        now_nanos: u64,
+    ) -> Result<(EvictedKeys, MemoryReservation<'_>), EvictionAdmissionError> {
+        if self.replay_mode_active() {
+            return Ok((None, MemoryReservation::new(self, 0)));
         }
 
-        (keys, expires)
+        if additional_bytes == 0 {
+            return Ok((None, MemoryReservation::new(self, 0)));
+        }
+
+        let snapshot = self.eviction_config();
+        self.ensure_memory_for_snapshot(preferred_shard, additional_bytes, now_nanos, snapshot)
     }
 
-    /// FLUSHDB / FLUSHALL: remove all keys from all shards.
-    ///
-    /// Acquires a write lock on each shard sequentially. Not atomic across
-    /// shards — concurrent reads may see partial results during flush.
-    ///
-    /// Outstanding memory reservations are intentionally left untouched. A
-    /// `MemoryReservation` is an owning token; only that token may release its
-    /// bytes from `memory_reserved`.
-    #[allow(dead_code)]
-    pub(crate) fn flush_all(&self) {
-        for shard in self.shards.iter() {
-            let mut guard = shard.write();
-            // Replace with a fresh empty table to release all memory.
-            *guard = SwissTable::with_hasher(self.table_hasher.clone());
-        }
-        for count in self.expiry_key_count.iter() {
-            count.store(0, Ordering::Relaxed);
-        }
-        self.expiry_key_total.store(0, Ordering::Relaxed);
-        self.global_memory_used.store(0, Ordering::Relaxed);
-        purge_allocator_after_flush();
-        self.bump_all_watches();
-    }
-
-    /// FLUSHDB / FLUSHALL with an optional AOF LSN allocated while all shard
-    /// write locks are held.
-    ///
-    /// Outstanding memory reservations are intentionally left untouched. A
-    /// `MemoryReservation` is an owning token; only that token may release its
-    /// bytes from `memory_reserved`.
-    pub(crate) fn flush_all_with_lsn(&self) -> Option<u64> {
-        let mut guards = Vec::with_capacity(self.shards.len());
-        for shard in self.shards.iter() {
-            guards.push(shard.write());
-        }
-
-        let had_entries = guards.iter().any(|guard| !guard.is_empty());
-        for guard in &mut guards {
-            **guard = SwissTable::with_hasher(self.table_hasher.clone());
-        }
-        for count in self.expiry_key_count.iter() {
-            count.store(0, Ordering::Relaxed);
-        }
-        self.expiry_key_total.store(0, Ordering::Relaxed);
-        self.global_memory_used.store(0, Ordering::Relaxed);
-        let aof_lsn = had_entries.then(|| self.next_aof_lsn()).flatten();
-        drop(guards);
-        purge_allocator_after_flush();
-        if had_entries {
-            self.bump_all_watches();
-        }
-
-        aof_lsn
-    }
-
-    /// Returns the exact memory usage across all shards.
-    pub fn memory_used(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.read().memory_used())
-            .sum()
-    }
-
-    /// Returns the approximate published memory counter used by OOM/eviction checks.
-    /// It is intentionally cheap and may lag exact shard-local memory briefly.
+    /// Returns the current outstanding reservation counter value.
     #[inline]
-    pub fn approx_memory_used(&self) -> usize {
-        self.global_memory_used.load(Ordering::Relaxed)
+    fn memory_reserved(&self) -> usize {
+        self.memory_reserved.load(Ordering::Relaxed)
+    }
+
+    /// Acquire a write lock on the shard containing `key`.
+    #[inline(always)]
+    fn write_shard(&self, key: &[u8]) -> ShardWriteGuard<'_> {
+        let idx = self.shard_index(key);
+        // SAFETY: idx is always < shards.len() because mask = num_shards - 1
+        // and num_shards is a power of 2.
+        self.tracked_write_guard(unsafe { self.shards.get_unchecked(idx) }.write())
+    }
+
+    /// Execute a raw table mutation on the shard containing `key`.
+    ///
+    /// This intentionally bypasses command-side protocols and is available
+    /// only to tests that set up internal table state directly.
+    #[inline]
+    pub(crate) fn write<F, R>(&self, key: &[u8], f: F) -> R
+    where
+        F: FnOnce(&mut SwissTable) -> R,
+    {
+        let mut guard = self.write_shard(key);
+        f(&mut guard)
     }
 }
 
@@ -2766,6 +882,7 @@ impl ConcurrentKeyspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::MAX_STORED_LSN_VERSION;
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -2795,6 +912,136 @@ mod tests {
         }
 
         panic!("failed to find keys for requested shards");
+    }
+
+    fn keys_for_same_shard(keyspace: &ConcurrentKeyspace, count: usize) -> (usize, Vec<Vec<u8>>) {
+        let target = keyspace.shard_index(b"same-shard-seed");
+        let mut keys = Vec::with_capacity(count);
+
+        for candidate in 0..200_000usize {
+            let key = format!("same-shard:{candidate:06}").into_bytes();
+            if keyspace.shard_index(&key) == target {
+                keys.push(key);
+                if keys.len() == count {
+                    return (target, keys);
+                }
+            }
+        }
+
+        panic!("failed to find {count} keys for shard {target}");
+    }
+
+    fn slot_for_key(table: &SwissTable, key: &VortexKey) -> usize {
+        for slot in 0..table.total_slots() {
+            if table
+                .slot_key_value(slot)
+                .is_some_and(|(slot_key, _)| slot_key == key)
+            {
+                return slot;
+            }
+        }
+
+        panic!("key not found in table slots: {key:?}");
+    }
+
+    #[test]
+    fn shard_count_rejects_invalid_counts() {
+        for invalid in [
+            0,
+            MIN_SHARD_COUNT - 1,
+            MIN_SHARD_COUNT + 1,
+            MAX_SHARD_COUNT + 1,
+        ] {
+            let error = ShardCount::try_new(invalid).expect_err("count should be rejected");
+            assert_eq!(error.attempted(), invalid);
+        }
+
+        assert_eq!(
+            ShardCount::try_new(MIN_SHARD_COUNT).unwrap().get(),
+            MIN_SHARD_COUNT
+        );
+        assert_eq!(
+            ShardCount::try_new(DEFAULT_SHARD_COUNT).unwrap().get(),
+            DEFAULT_SHARD_COUNT
+        );
+        assert_eq!(
+            ShardCount::try_new(MAX_SHARD_COUNT).unwrap().get(),
+            MAX_SHARD_COUNT
+        );
+    }
+
+    #[test]
+    fn shard_id_rejects_out_of_range_indexes() {
+        let count = ShardCount::try_new(TEST_SHARDS).unwrap();
+
+        assert_eq!(ShardId::try_new(0, count).unwrap().get(), 0);
+        assert_eq!(
+            ShardId::try_new(TEST_SHARDS - 1, count).unwrap().get(),
+            TEST_SHARDS - 1
+        );
+        assert!(ShardId::try_new(TEST_SHARDS, count).is_none());
+    }
+
+    #[test]
+    fn mutation_features_mask_unknown_bits_and_expose_named_flags() {
+        let features = MutationFeatures::from_bits(
+            MutationFeatures::MAXMEMORY.bits() | MutationFeatures::AOF.bits() | (1 << 31),
+        );
+
+        assert!(features.maxmemory());
+        assert!(!features.watch());
+        assert!(features.aof());
+        assert_eq!(
+            features.bits(),
+            MutationFeatures::MAXMEMORY.bits() | MutationFeatures::AOF.bits()
+        );
+        assert!(MutationFeatures::empty().is_empty());
+    }
+
+    #[test]
+    fn watch_feature_snapshot_follows_active_registration_count() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+
+        ks.enable_mutation_feature(MutationFeatures::WATCH);
+        assert!(!ks.watch_tracking_active());
+        assert!(!ks.mutation_features().watch());
+
+        let key = VortexKey::from_bytes(b"watch:feature-race");
+        let epoch = ks.current_watch_epoch();
+        let watched = ks.watch_key(key.clone());
+
+        ks.disable_mutation_feature(MutationFeatures::WATCH);
+        assert!(ks.watch_tracking_active());
+        assert!(ks.mutation_features().watch());
+
+        ks.bump_watch_key(&key);
+        assert!(ks.watched_keys_changed(epoch, std::slice::from_ref(&watched)));
+
+        ks.unwatch_keys(std::iter::once(watched));
+        assert!(!ks.watch_tracking_active());
+        assert!(!ks.mutation_features().watch());
+    }
+
+    #[test]
+    fn projected_delta_converts_only_positive_bytes() {
+        assert_eq!(
+            ProjectedDelta::from_bytes(-32).positive(),
+            PositiveDelta::zero()
+        );
+        assert_eq!(
+            ProjectedDelta::from_bytes(0).positive(),
+            PositiveDelta::zero()
+        );
+        assert_eq!(ProjectedDelta::from_bytes(42).positive().bytes(), 42);
+        assert_eq!(
+            PositiveDelta::sum([
+                PositiveDelta::from_bytes(10),
+                PositiveDelta::zero(),
+                PositiveDelta::from_bytes(5),
+            ])
+            .bytes(),
+            15
+        );
     }
 
     #[test]
@@ -3551,7 +1798,7 @@ mod tests {
         assert_eq!(plan.guard_index_for_key(0), plan.guard_index_for_key(2));
 
         for (idx, key) in keys.iter().enumerate() {
-            let shard = ShardId::new(ks.shard_index(key));
+            let shard = ShardId::from_masked_index(ks.shard_index(key));
             assert_eq!(plan.shard_for_key(idx), shard);
             assert_eq!(
                 plan.sorted_shards()[plan.guard_index_for_key(idx).get()],
@@ -3773,13 +2020,21 @@ mod tests {
         let shard_idx = ks.shard_index(key.as_bytes());
         let hash = ks.table_hash_key(key.as_bytes());
         let guard = ks.read_shard_by_index(shard_idx);
-        for _ in 0..128 {
+        let mut reads = 0usize;
+        while ks.frequency_sketch.estimate(hash) == 0 {
+            ks.record_access_prehashed(&guard, key.as_bytes(), hash);
+            reads += 1;
+            assert!(
+                reads <= 4096,
+                "LFU read sampling should eventually record with deterministic xorshift RNG"
+            );
+        }
+        for _ in reads..128 {
             ks.record_access_prehashed(&guard, key.as_bytes(), hash);
         }
         drop(guard);
 
         let sampled_reads = ks.frequency_sketch.estimate(hash);
-        assert!(sampled_reads > 0);
         assert!(sampled_reads < 64);
 
         let writes = ConcurrentKeyspace::new(TEST_SHARDS);
@@ -3867,6 +2122,63 @@ mod tests {
             );
             ks.unwatch_keys(std::iter::once(watched));
         }
+    }
+
+    #[test]
+    fn volatile_ttl_sweep_does_not_delete_deferred_candidate_after_expired_key_frees_enough() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let (shard_idx, keys) = keys_for_same_shard(&ks, 2);
+        let future_key = VortexKey::from_bytes(&keys[0]);
+        let expired_key = VortexKey::from_bytes(&keys[1]);
+        let now_nanos = 10_000;
+        let expired_deadline = now_nanos - 1;
+        let future_deadline = now_nanos + 1_000_000;
+
+        {
+            let mut guard = ks.write_shard_by_index(shard_idx);
+            guard.insert_with(
+                future_key.clone(),
+                VortexValue::from("future"),
+                future_deadline,
+                None,
+            );
+            guard.insert_with(
+                expired_key.clone(),
+                VortexValue::from("expired"),
+                expired_deadline,
+                None,
+            );
+        }
+        ks.apply_expiry_transition(shard_idx, ExpiryTransition::new(false, true));
+        ks.apply_expiry_transition(shard_idx, ExpiryTransition::new(false, true));
+
+        let future_slot = {
+            let guard = ks.read_shard_by_index(shard_idx);
+            slot_for_key(&guard, &future_key)
+        };
+        ks.set_clock_hand(shard_idx, future_slot);
+
+        let mut report = EvictionScanReport::default();
+        let mut evicted = Vec::new();
+        let freed = ks.evict_from_shard(
+            shard_idx,
+            EvictionPolicy::VolatileTtl,
+            1,
+            now_nanos,
+            &mut report,
+            &mut evicted,
+        );
+
+        assert!(freed > 0);
+        let guard = ks.read_shard_by_index(shard_idx);
+        assert!(
+            guard.get(&future_key).is_some(),
+            "future TTL candidate must survive once the expired key satisfies the sweep"
+        );
+        assert!(guard.get(&expired_key).is_none());
+        drop(guard);
+        assert_eq!(ks.dbsize(), 1);
+        assert_eq!(ks.approx_expiring_keys(), 1);
     }
 
     #[test]

@@ -1042,12 +1042,7 @@ fn bench_hotkey_concurrent_contention(c: &mut Criterion) {
                                     }
                                     for _ in 0..ops_per_thread {
                                         let frame = tape.iter().next().unwrap();
-                                        let r = execute_command(
-                                            black_box(&*ks),
-                                            b"GET",
-                                            &frame,
-                                            0,
-                                        );
+                                        let r = execute_command(black_box(&*ks), b"GET", &frame, 0);
                                         black_box(r);
                                     }
                                 })
@@ -1111,6 +1106,30 @@ fn bench_lfu_decay_latency(c: &mut Criterion) {
                 black_box((p50, p99, p999, max));
             },
             criterion::BatchSize::PerIteration,
+        );
+    });
+}
+
+/// Isolates the single caller-thread operation that crosses an LFU decay
+/// boundary. Setup primes a fresh sketch to one sample before decay; the
+/// measured closure records the next sample and therefore pays `try_decay()`.
+fn bench_lfu_decay_single_trigger(c: &mut Criterion) {
+    use vortex_engine::eviction::FrequencySketch;
+
+    c.bench_function("lfu_decay_single_trigger", |b| {
+        b.iter_batched(
+            || {
+                let sketch = FrequencySketch::new();
+                let hash = 0xA076_1D64_78BD_642F;
+                for _ in 0..65_535 {
+                    sketch.record(hash);
+                }
+                (sketch, hash)
+            },
+            |(sketch, hash)| {
+                sketch.record(black_box(hash));
+            },
+            criterion::BatchSize::SmallInput,
         );
     });
 }
@@ -1238,10 +1257,7 @@ fn bench_gate_command_under_transaction(c: &mut Criterion) {
                         .collect();
 
                     tx_handle.join().unwrap();
-                    let total: usize = reader_handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap())
-                        .sum();
+                    let total: usize = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
                     black_box(total);
                 },
                 criterion::BatchSize::PerIteration,
@@ -1263,8 +1279,8 @@ fn bench_gate_exec_under_load(c: &mut Criterion) {
     let ops_per_worker = 50_000usize;
 
     let scenarios: &[(&str, bool)] = &[
-        ("no_tx", false),    // Baseline: no EXEC, just command gate
-        ("with_tx", true),   // With periodic EXEC interruptions
+        ("no_tx", false),  // Baseline: no EXEC, just command gate
+        ("with_tx", true), // With periodic EXEC interruptions
     ];
 
     for &(label, inject_tx) in scenarios {
@@ -1296,12 +1312,7 @@ fn bench_gate_exec_under_load(c: &mut Criterion) {
                                     }
                                     let _gate = ks.enter_command_gate_slot(i);
                                     let frame = tape.iter().next().unwrap();
-                                    let r = execute_command(
-                                        black_box(&*ks),
-                                        b"GET",
-                                        &frame,
-                                        0,
-                                    );
+                                    let r = execute_command(black_box(&*ks), b"GET", &frame, 0);
                                     black_box(r);
                                     total.fetch_add(1, AO::Relaxed);
                                     let _ = n;
@@ -1358,6 +1369,7 @@ fn bench_gate_exec_under_load(c: &mut Criterion) {
 fn bench_gate_yield_latency(c: &mut Criterion) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
+    use std::time::Instant;
 
     let n_threads = 4;
 
@@ -1367,19 +1379,18 @@ fn bench_gate_yield_latency(c: &mut Criterion) {
             |keyspace| {
                 let released = Arc::new(AtomicU64::new(0));
                 let ready = Arc::new(AtomicBool::new(false));
+                let epoch = Instant::now();
 
                 let ks_tx = Arc::clone(&keyspace);
                 let released_tx = Arc::clone(&released);
                 let ready_tx = Arc::clone(&ready);
 
                 let tx_handle = std::thread::spawn(move || {
-                    let _guard = ks_tx.enter_transaction_gate();
+                    let guard = ks_tx.enter_transaction_gate();
                     ready_tx.store(true, AO::Release);
                     std::thread::sleep(std::time::Duration::from_micros(100));
-                    released_tx.store(
-                        std::time::Instant::now().elapsed().as_nanos() as u64,
-                        AO::Release,
-                    );
+                    drop(guard);
+                    released_tx.store(epoch.elapsed().as_nanos() as u64, AO::Release);
                 });
 
                 while !ready.load(AO::Acquire) {
@@ -1390,10 +1401,18 @@ fn bench_gate_yield_latency(c: &mut Criterion) {
                 let reader_handles: Vec<_> = (0..n_threads)
                     .map(|i| {
                         let ks = Arc::clone(&keyspace);
+                        let released = Arc::clone(&released);
                         std::thread::spawn(move || {
-                            let start = std::time::Instant::now();
                             let _guard = ks.enter_command_gate_slot(i);
-                            start.elapsed().as_nanos() as u64
+                            let entered = epoch.elapsed().as_nanos() as u64;
+                            let release = loop {
+                                let release = released.load(AO::Acquire);
+                                if release != 0 {
+                                    break release;
+                                }
+                                std::hint::spin_loop();
+                            };
+                            entered.saturating_sub(release)
                         })
                     })
                     .collect();
@@ -1456,6 +1475,7 @@ criterion_group!(
     bench_eviction_admission_sweep_driver,
     // KEYS-015: LFU decay latency benchmarks
     bench_lfu_decay_latency,
+    bench_lfu_decay_single_trigger,
     bench_lfu_decay_vs_no_eviction,
     // KEYS-016: Transaction gate backoff benchmarks
     bench_gate_command_uncontended,
