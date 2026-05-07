@@ -13,6 +13,25 @@ run_cachegrind() {
     header "Cachegrind"
     warn "Cachegrind runs under Valgrind (20-100x slowdown). Using --threads 1 is recommended."
 
+    if profiling_target_is_engine; then
+        info "Running: valgrind --tool=cachegrind"
+        valgrind --tool=cachegrind \
+            --cachegrind-out-file="${session}/cachegrind.out" \
+            "$PROFILING_BINARY" \
+            "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/engine-cachegrind.log" 2>&1 || true
+
+        if [[ -f "${session}/cachegrind.out" ]]; then
+            ok "Cachegrind data: ${session}/cachegrind.out"
+            if has_cmd cg_annotate; then
+                cg_annotate "${session}/cachegrind.out" 2>/dev/null \
+                    | head -80 > "${session}/cachegrind-summary.txt" || true
+                info "Cachegrind summary: ${session}/cachegrind-summary.txt"
+            fi
+        fi
+        return 0
+    fi
+
     local extra_args=()
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
@@ -61,6 +80,27 @@ run_callgrind() {
 
     header "Callgrind"
     warn "Callgrind runs under Valgrind (20-100x slowdown). Using --threads 1 is recommended."
+
+    if profiling_target_is_engine; then
+        info "Running: valgrind --tool=callgrind --simulate-cache=yes --collect-jumps=yes"
+        valgrind --tool=callgrind \
+            --callgrind-out-file="${session}/callgrind.out" \
+            --simulate-cache=yes \
+            --collect-jumps=yes \
+            "$PROFILING_BINARY" \
+            "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/engine-callgrind.log" 2>&1 || true
+
+        if [[ -f "${session}/callgrind.out" ]]; then
+            ok "Callgrind data: ${session}/callgrind.out"
+            if has_cmd callgrind_annotate; then
+                callgrind_annotate "${session}/callgrind.out" 2>/dev/null \
+                    | head -80 > "${session}/callgrind-summary.txt" || true
+                info "Callgrind summary: ${session}/callgrind-summary.txt"
+            fi
+        fi
+        return 0
+    fi
 
     local extra_args=()
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")

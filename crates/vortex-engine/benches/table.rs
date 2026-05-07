@@ -1,8 +1,67 @@
-use std::mem::size_of;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use vortex_common::{VortexKey, VortexValue};
-use vortex_engine::{Entry, SwissTable};
+use vortex_common::{MAX_INLINE_KEY_LEN, MAX_INLINE_VALUE_LEN, VortexKey, VortexValue};
+use vortex_engine::{ConcurrentKeyspace, Entry, SwissTable};
+
+const TABLE_MEMORY_REQUESTED_CAPACITY: usize = 16_384;
+const KEYSPACE_MEMORY_TOTAL_CAPACITY: usize = 65_536;
+const INLINE_LAYOUT_TARGET_MULTIPLIER: f64 = 0.75;
+const LOAD_FACTORS_BPS: &[usize] = &[250, 500, 750, 875];
+const KEYSPACE_SHARD_COUNTS: &[usize] = &[64, 128, 256, 512];
+
+static TABLE_MEMORY_ARTIFACTS_WRITTEN: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct DatasetSpec {
+    scenario: &'static str,
+    key_layout: &'static str,
+    value_layout: &'static str,
+    target_multiplier: Option<f64>,
+    make_key: fn(usize) -> VortexKey,
+    make_value: fn(usize) -> VortexValue,
+}
+
+struct TableMemoryRecord {
+    kind: &'static str,
+    scenario: &'static str,
+    key_layout: &'static str,
+    value_layout: &'static str,
+    requested_capacity: usize,
+    shard_count: usize,
+    target_load_factor: Option<f64>,
+    actual_load_factor: f64,
+    total_slots: usize,
+    live_keys: usize,
+    deleted_keys: usize,
+    allocated_bytes: usize,
+    logical_bytes: usize,
+    bytes_per_live_key: Option<f64>,
+    target_bytes_per_live_key: Option<f64>,
+    notes: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct TableRecordSpec {
+    scenario: &'static str,
+    key_layout: &'static str,
+    value_layout: &'static str,
+    requested_capacity: usize,
+    shard_count: usize,
+    target_load_factor: Option<f64>,
+    deleted_keys: usize,
+    target_multiplier: Option<f64>,
+    notes: &'static str,
+}
+
+struct TableMemoryReport {
+    generated_at_unix_seconds: u64,
+    records: Vec<TableMemoryRecord>,
+}
 
 // ── 0.3.2 — Swiss Table Benchmarks ─────────────────────────────────
 
@@ -402,30 +461,499 @@ fn bench_entry_read_integer(c: &mut Criterion) {
 
 // ── 3.10.5 — Memory Efficiency ─────────────────────────────────────
 
-fn bench_memory_per_entry(c: &mut Criterion) {
-    c.bench_function("memory_per_entry_1m", |b| {
-        b.iter_batched(
-            || (),
-            |()| {
-                let n = 1_000_000usize;
-                let mut table = SwissTable::with_capacity(n);
-                for i in 0..n {
-                    let key = VortexKey::from(format!("k:{i:07}").as_bytes());
-                    table.insert(key, VortexValue::from_bytes(b"v:12345678"));
-                }
+fn dataset_specs() -> [DatasetSpec; 4] {
+    [
+        DatasetSpec {
+            scenario: "inline-key-integer",
+            key_layout: "inline",
+            value_layout: "integer",
+            target_multiplier: Some(INLINE_LAYOUT_TARGET_MULTIPLIER),
+            make_key: make_inline_key,
+            make_value: make_integer_value,
+        },
+        DatasetSpec {
+            scenario: "inline-key-inline-string",
+            key_layout: "inline",
+            value_layout: "inline-string",
+            target_multiplier: Some(INLINE_LAYOUT_TARGET_MULTIPLIER),
+            make_key: make_inline_key,
+            make_value: make_inline_string_value,
+        },
+        DatasetSpec {
+            scenario: "inline-key-heap-string",
+            key_layout: "inline",
+            value_layout: "heap-string",
+            target_multiplier: None,
+            make_key: make_inline_key,
+            make_value: make_heap_string_value,
+        },
+        DatasetSpec {
+            scenario: "heap-key-heap-string",
+            key_layout: "heap",
+            value_layout: "heap-string",
+            target_multiplier: None,
+            make_key: make_heap_key,
+            make_value: make_heap_string_value,
+        },
+    ]
+}
 
-                let total_slots = table.total_slots();
-                let entry_bytes = total_slots * 64;
-                let ctrl_bytes = total_slots + 16;
-                let key_vec_bytes = total_slots * size_of::<Option<VortexKey>>();
-                let value_vec_bytes = total_slots * size_of::<Option<VortexValue>>();
-                let total = entry_bytes + ctrl_bytes + key_vec_bytes + value_vec_bytes;
-                let per_entry = total / n;
-                black_box(per_entry)
-            },
-            criterion::BatchSize::LargeInput,
-        );
+fn bench_table_memory_report_generation(c: &mut Criterion) {
+    ensure_table_memory_artifacts();
+
+    let mut group = c.benchmark_group("table_memory_report_generation");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.bench_function("all_scenarios", |b| {
+        b.iter(|| {
+            let report = collect_table_memory_report();
+            black_box(report.records.len())
+        });
     });
+    group.finish();
+}
+
+fn ensure_table_memory_artifacts() {
+    TABLE_MEMORY_ARTIFACTS_WRITTEN.get_or_init(|| {
+        let report = collect_table_memory_report();
+        write_table_memory_artifacts(&report).expect("table memory sidecar artifact generation");
+    });
+}
+
+fn collect_table_memory_report() -> TableMemoryReport {
+    let mut records = Vec::new();
+
+    records.push(measure_empty_pre_sized_table());
+
+    for spec in dataset_specs() {
+        for &load_factor_bps in LOAD_FACTORS_BPS {
+            records.push(measure_table_load_factor(spec, load_factor_bps));
+        }
+    }
+
+    records.extend(measure_tombstone_heavy_table());
+
+    for &shard_count in KEYSPACE_SHARD_COUNTS {
+        records.push(measure_pre_sized_keyspace(shard_count));
+    }
+
+    TableMemoryReport {
+        generated_at_unix_seconds: unix_timestamp_now(),
+        records,
+    }
+}
+
+fn measure_empty_pre_sized_table() -> TableMemoryRecord {
+    let table = SwissTable::with_capacity(TABLE_MEMORY_REQUESTED_CAPACITY);
+    let total_slots = table.total_slots();
+
+    TableMemoryRecord {
+        kind: "table",
+        scenario: "empty-pre-sized",
+        key_layout: "none",
+        value_layout: "none",
+        requested_capacity: TABLE_MEMORY_REQUESTED_CAPACITY,
+        shard_count: 1,
+        target_load_factor: None,
+        actual_load_factor: 0.0,
+        total_slots,
+        live_keys: 0,
+        deleted_keys: 0,
+        allocated_bytes: table.allocated_bytes(),
+        logical_bytes: table.memory_used(),
+        bytes_per_live_key: None,
+        target_bytes_per_live_key: None,
+        notes: "allocation-baseline",
+    }
+}
+
+fn measure_table_load_factor(spec: DatasetSpec, load_factor_bps: usize) -> TableMemoryRecord {
+    let mut table = SwissTable::with_capacity(TABLE_MEMORY_REQUESTED_CAPACITY);
+    let total_slots = table.total_slots();
+    let live_keys = total_slots * load_factor_bps / 1000;
+
+    for index in 0..live_keys {
+        table.insert((spec.make_key)(index), (spec.make_value)(index));
+    }
+
+    build_table_record(
+        TableRecordSpec {
+            scenario: spec.scenario,
+            key_layout: spec.key_layout,
+            value_layout: spec.value_layout,
+            requested_capacity: TABLE_MEMORY_REQUESTED_CAPACITY,
+            shard_count: 1,
+            target_load_factor: Some(load_factor_bps as f64 / 1000.0),
+            deleted_keys: 0,
+            target_multiplier: spec.target_multiplier,
+            notes: if spec.target_multiplier.is_some() {
+                "inline-baseline-25pct-target"
+            } else {
+                "layout-baseline"
+            },
+        },
+        &table,
+    )
+}
+
+fn measure_tombstone_heavy_table() -> [TableMemoryRecord; 2] {
+    let mut table = SwissTable::with_capacity(TABLE_MEMORY_REQUESTED_CAPACITY);
+    let seed_keys = table.total_slots() * 3 / 4;
+    let mut keys = Vec::with_capacity(seed_keys);
+
+    for index in 0..seed_keys {
+        let key = make_inline_key(index);
+        table.insert(key.clone(), make_inline_string_value(index));
+        keys.push(key);
+    }
+
+    let mut deleted_keys = 0usize;
+    for key in keys.iter().step_by(2) {
+        if table.remove(key).is_some() {
+            deleted_keys += 1;
+        }
+    }
+
+    let before_resize = build_table_record(
+        TableRecordSpec {
+            scenario: "tombstone-heavy-before-resize",
+            key_layout: "inline",
+            value_layout: "inline-string",
+            requested_capacity: TABLE_MEMORY_REQUESTED_CAPACITY,
+            shard_count: 1,
+            target_load_factor: None,
+            deleted_keys,
+            target_multiplier: None,
+            notes: "delete-heavy-before-resize",
+        },
+        &table,
+    );
+
+    let slots_before_resize = table.total_slots();
+    let mut next_index = seed_keys + 1_000_000;
+    while table.total_slots() == slots_before_resize {
+        table.insert(
+            make_inline_key(next_index),
+            make_inline_string_value(next_index),
+        );
+        next_index += 1;
+    }
+
+    let after_resize = build_table_record(
+        TableRecordSpec {
+            scenario: "tombstone-heavy-after-resize",
+            key_layout: "inline",
+            value_layout: "inline-string",
+            requested_capacity: TABLE_MEMORY_REQUESTED_CAPACITY,
+            shard_count: 1,
+            target_load_factor: None,
+            deleted_keys: 0,
+            target_multiplier: None,
+            notes: "resize-clears-tombstones",
+        },
+        &table,
+    );
+
+    [before_resize, after_resize]
+}
+
+fn measure_pre_sized_keyspace(shard_count: usize) -> TableMemoryRecord {
+    let keyspace = ConcurrentKeyspace::with_capacity(shard_count, KEYSPACE_MEMORY_TOTAL_CAPACITY);
+    let mut total_slots = 0usize;
+    let mut allocated_bytes = 0usize;
+    let mut logical_bytes = 0usize;
+
+    for (slots, allocated, logical) in keyspace.scan_all_shards(|_, table| {
+        (
+            table.total_slots(),
+            table.allocated_bytes(),
+            table.memory_used(),
+        )
+    }) {
+        total_slots += slots;
+        allocated_bytes += allocated;
+        logical_bytes += logical;
+    }
+
+    TableMemoryRecord {
+        kind: "keyspace",
+        scenario: "pre-sized-shards",
+        key_layout: "none",
+        value_layout: "none",
+        requested_capacity: KEYSPACE_MEMORY_TOTAL_CAPACITY,
+        shard_count,
+        target_load_factor: None,
+        actual_load_factor: 0.0,
+        total_slots,
+        live_keys: 0,
+        deleted_keys: 0,
+        allocated_bytes,
+        logical_bytes,
+        bytes_per_live_key: None,
+        target_bytes_per_live_key: None,
+        notes: "empty-keyspace-shard-overhead",
+    }
+}
+
+fn build_table_record(spec: TableRecordSpec, table: &SwissTable) -> TableMemoryRecord {
+    let live_keys = table.len();
+    let bytes_per_live_key = bytes_per_live_key(table.allocated_bytes(), live_keys);
+
+    TableMemoryRecord {
+        kind: "table",
+        scenario: spec.scenario,
+        key_layout: spec.key_layout,
+        value_layout: spec.value_layout,
+        requested_capacity: spec.requested_capacity,
+        shard_count: spec.shard_count,
+        target_load_factor: spec.target_load_factor,
+        actual_load_factor: actual_load_factor(live_keys, table.total_slots()),
+        total_slots: table.total_slots(),
+        live_keys,
+        deleted_keys: spec.deleted_keys,
+        allocated_bytes: table.allocated_bytes(),
+        logical_bytes: table.memory_used(),
+        bytes_per_live_key,
+        target_bytes_per_live_key: bytes_per_live_key
+            .zip(spec.target_multiplier)
+            .map(|(value, multiplier)| value * multiplier),
+        notes: spec.notes,
+    }
+}
+
+fn bytes_per_live_key(allocated_bytes: usize, live_keys: usize) -> Option<f64> {
+    if live_keys == 0 {
+        None
+    } else {
+        Some(allocated_bytes as f64 / live_keys as f64)
+    }
+}
+
+fn actual_load_factor(live_keys: usize, total_slots: usize) -> f64 {
+    if total_slots == 0 {
+        0.0
+    } else {
+        live_keys as f64 / total_slots as f64
+    }
+}
+
+fn make_inline_key(index: usize) -> VortexKey {
+    VortexKey::from(format!("k:{index:08}").as_bytes())
+}
+
+fn make_heap_key(index: usize) -> VortexKey {
+    let mut bytes = format!("heap-key:{index:08}:").into_bytes();
+    bytes.resize(MAX_INLINE_KEY_LEN + 8, b'k');
+    VortexKey::from(bytes.as_slice())
+}
+
+fn make_integer_value(index: usize) -> VortexValue {
+    VortexValue::Integer(index as i64)
+}
+
+fn make_inline_string_value(index: usize) -> VortexValue {
+    let mut bytes = format!("v:{index:08}").into_bytes();
+    bytes.truncate(MAX_INLINE_VALUE_LEN);
+    VortexValue::from_bytes(bytes.as_slice())
+}
+
+fn make_heap_string_value(index: usize) -> VortexValue {
+    let mut bytes = format!("value:{index:08}:").into_bytes();
+    bytes.resize(MAX_INLINE_VALUE_LEN + 24, b'v');
+    VortexValue::from_bytes(bytes.as_slice())
+}
+
+fn write_table_memory_artifacts(report: &TableMemoryReport) -> std::io::Result<()> {
+    let artifact_dir = table_memory_artifact_dir();
+    fs::create_dir_all(&artifact_dir)?;
+    fs::write(
+        artifact_dir.join("table-memory-report.json"),
+        render_table_memory_report_json(report),
+    )?;
+    fs::write(
+        artifact_dir.join("table-memory-report.csv"),
+        render_table_memory_report_csv(report),
+    )?;
+    Ok(())
+}
+
+fn table_memory_artifact_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(".artifacts/benchmarks/table-memory/latest")
+}
+
+fn unix_timestamp_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn render_table_memory_report_json(report: &TableMemoryReport) -> String {
+    let mut json = String::new();
+    let _ = writeln!(&mut json, "{{");
+    let _ = writeln!(
+        &mut json,
+        "  \"generated_at_unix_seconds\": {},",
+        report.generated_at_unix_seconds
+    );
+    let _ = writeln!(&mut json, "  \"records\": [");
+
+    for (index, record) in report.records.iter().enumerate() {
+        let trailing = if index + 1 == report.records.len() {
+            ""
+        } else {
+            ","
+        };
+        let _ = writeln!(&mut json, "    {{");
+        let _ = writeln!(&mut json, "      \"kind\": \"{}\",", record.kind);
+        let _ = writeln!(&mut json, "      \"scenario\": \"{}\",", record.scenario);
+        let _ = writeln!(
+            &mut json,
+            "      \"key_layout\": \"{}\",",
+            record.key_layout
+        );
+        let _ = writeln!(
+            &mut json,
+            "      \"value_layout\": \"{}\",",
+            record.value_layout
+        );
+        let _ = writeln!(
+            &mut json,
+            "      \"requested_capacity\": {},",
+            record.requested_capacity
+        );
+        let _ = writeln!(&mut json, "      \"shard_count\": {},", record.shard_count);
+        write_json_option_f64(
+            &mut json,
+            "target_load_factor",
+            record.target_load_factor,
+            true,
+            6,
+        );
+        let _ = writeln!(
+            &mut json,
+            "      \"actual_load_factor\": {:.6},",
+            record.actual_load_factor
+        );
+        let _ = writeln!(&mut json, "      \"total_slots\": {},", record.total_slots);
+        let _ = writeln!(&mut json, "      \"live_keys\": {},", record.live_keys);
+        let _ = writeln!(
+            &mut json,
+            "      \"deleted_keys\": {},",
+            record.deleted_keys
+        );
+        let _ = writeln!(
+            &mut json,
+            "      \"allocated_bytes\": {},",
+            record.allocated_bytes
+        );
+        let _ = writeln!(
+            &mut json,
+            "      \"logical_bytes\": {},",
+            record.logical_bytes
+        );
+        write_json_option_f64(
+            &mut json,
+            "bytes_per_live_key",
+            record.bytes_per_live_key,
+            true,
+            4,
+        );
+        write_json_option_f64(
+            &mut json,
+            "target_bytes_per_live_key",
+            record.target_bytes_per_live_key,
+            true,
+            4,
+        );
+        let _ = writeln!(
+            &mut json,
+            "      \"notes\": \"{}\"",
+            escape_json(record.notes)
+        );
+        let _ = writeln!(&mut json, "    }}{trailing}");
+    }
+
+    let _ = writeln!(&mut json, "  ]");
+    let _ = writeln!(&mut json, "}}");
+    json
+}
+
+fn render_table_memory_report_csv(report: &TableMemoryReport) -> String {
+    let mut csv = String::from(
+        "kind,scenario,key_layout,value_layout,requested_capacity,shard_count,target_load_factor,actual_load_factor,total_slots,live_keys,deleted_keys,allocated_bytes,logical_bytes,bytes_per_live_key,target_bytes_per_live_key,notes\n",
+    );
+
+    for record in &report.records {
+        let _ = writeln!(
+            &mut csv,
+            "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{}",
+            record.kind,
+            record.scenario,
+            record.key_layout,
+            record.value_layout,
+            record.requested_capacity,
+            record.shard_count,
+            csv_option_f64(record.target_load_factor, 6),
+            record.actual_load_factor,
+            record.total_slots,
+            record.live_keys,
+            record.deleted_keys,
+            record.allocated_bytes,
+            record.logical_bytes,
+            csv_option_f64(record.bytes_per_live_key, 4),
+            csv_option_f64(record.target_bytes_per_live_key, 4),
+            record.notes,
+        );
+    }
+
+    csv
+}
+
+fn write_json_option_f64(
+    buf: &mut String,
+    name: &str,
+    value: Option<f64>,
+    trailing_comma: bool,
+    precision: usize,
+) {
+    let trailing = if trailing_comma { "," } else { "" };
+    match value {
+        Some(value) => {
+            let _ = writeln!(
+                buf,
+                "      \"{}\": {:.*}{}",
+                name, precision, value, trailing
+            );
+        }
+        None => {
+            let _ = writeln!(buf, "      \"{}\": null{}", name, trailing);
+        }
+    }
+}
+
+fn csv_option_f64(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(value) => format!("{value:.precision$}"),
+        None => String::new(),
+    }
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 // ── 3.10.4 — Latency Distribution ─────────────────────────────────
@@ -451,6 +979,6 @@ criterion_group!(
     bench_entry_read_integer,
     bench_table_batch_100_1m_prefetch,
     bench_table_batch_100_1m_no_prefetch,
-    bench_memory_per_entry,
+    bench_table_memory_report_generation,
 );
 criterion_main!(benches);

@@ -4,7 +4,7 @@ use vortex_common::VortexKey;
 use crate::eviction::{
     EVICTION_MAX_SHARDS_PER_ADMISSION, EVICTION_SWEEP_WINDOW, EvictionPolicy, next_random_u64,
 };
-use crate::table::SwissTable;
+use crate::table::{SwissTable, TableHash};
 
 use super::{ConcurrentKeyspace, ExpiryTransition, MutationFeatures};
 
@@ -27,7 +27,7 @@ pub(crate) struct EvictionScanReport {
 #[derive(Debug, Default)]
 struct EvictionEffects {
     expiry_transitions: SmallVec<[(usize, ExpiryTransition); 4]>,
-    watch_invalidations: SmallVec<[(VortexKey, u64); 4]>,
+    watch_invalidations: SmallVec<[(VortexKey, TableHash); 4]>,
     aof_records: SmallVec<[EvictedKey; 4]>,
 }
 
@@ -38,7 +38,7 @@ impl EvictionEffects {
     }
 
     #[inline]
-    fn push_watch_invalidation(&mut self, key: VortexKey, table_hash: u64) {
+    fn push_watch_invalidation(&mut self, key: VortexKey, table_hash: TableHash) {
         self.watch_invalidations.push((key, table_hash));
     }
 

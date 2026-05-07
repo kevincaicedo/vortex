@@ -39,7 +39,7 @@ use crate::eviction::{
     EvictionConfig, EvictionConfigState, EvictionPolicy, FrequencySketch, next_random_u64,
     should_sample_lfu_read,
 };
-use crate::table::SwissTable;
+use crate::table::{SwissTable, TableHash};
 
 mod admin;
 mod eviction_sweep;
@@ -62,10 +62,9 @@ pub(crate) use memory::{EvictionAdmissionError, MemoryReservation, PositiveDelta
 use metrics::{EvictionMetrics, RuntimeMetrics};
 pub use metrics::{EvictionMetricsSnapshot, RuntimeMetricsSnapshot};
 pub use persistence::{AofLsn, EntryLsn, Lsn, LsnOverflow, LsnRestoreError, ReplayModeGuard};
-use shards::{
-    MultiReadGuards, MultiWriteGuards, Shard, ShardId, ShardPlan, ShardReadGuards, ShardWriteGuards,
-};
+use shards::{MultiReadGuards, MultiWriteGuards, Shard, ShardId, ShardReadGuards};
 pub use shards::{ShardCount, ShardCountError};
+pub(crate) use shards::{ShardPlan, ShardWriteGuards};
 pub use watch::WatchRegistration;
 use watch::{AbsentWatchShard, make_absent_watch_shards};
 
@@ -438,7 +437,12 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    pub(crate) fn record_access_prehashed(&self, table: &SwissTable, key_bytes: &[u8], hash: u64) {
+    pub(crate) fn record_access_prehashed(
+        &self,
+        table: &SwissTable,
+        key_bytes: &[u8],
+        hash: TableHash,
+    ) {
         let snapshot = self.eviction_config();
         if snapshot.max_memory == 0 {
             return;
@@ -448,7 +452,7 @@ impl ConcurrentKeyspace {
             EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
                 let access_random = next_random_u64();
                 if should_sample_lfu_read(access_random) {
-                    self.frequency_sketch.record(hash);
+                    self.frequency_sketch.record(hash.get());
                 }
                 let _ = table.record_access_prehashed(key_bytes, hash, access_random);
             }
@@ -460,15 +464,15 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    pub(crate) fn record_frequency_hash(&self, hash: u64) {
+    pub(crate) fn record_frequency_hash(&self, hash: TableHash) {
         let snapshot = self.eviction_config();
         self.record_frequency_hash_snapshot(hash, snapshot);
     }
 
     #[inline]
-    pub(crate) fn record_frequency_hash_snapshot(&self, hash: u64, snapshot: EvictionConfig) {
+    pub(crate) fn record_frequency_hash_snapshot(&self, hash: TableHash, snapshot: EvictionConfig) {
         if snapshot.max_memory != 0 && snapshot.policy.is_lfu() {
-            self.frequency_sketch.record(hash);
+            self.frequency_sketch.record(hash.get());
         }
     }
 
@@ -648,8 +652,8 @@ impl ConcurrentKeyspace {
 
     /// Hash a key using the shared SwissTable hasher for this keyspace.
     #[inline(always)]
-    pub(crate) fn table_hash_key(&self, key: &[u8]) -> u64 {
-        self.table_hasher.hash_one(key)
+    pub(crate) fn table_hash_key(&self, key: &[u8]) -> TableHash {
+        TableHash::from_u64(self.table_hasher.hash_one(key))
     }
 
     // ─── Single-key lock acquisition ────────────────────────────────
@@ -1291,7 +1295,7 @@ mod tests {
         let (writer_tx, writer_rx) = mpsc::channel();
         let writer_handle = thread::spawn(move || {
             let mut guard = writer_ks.write_shard_by_index(0);
-            let (lsn, _) = writer_ks.allocate_mutation_lsn();
+            let lsn = writer_ks.next_lsn();
             guard.insert_with_lsn(
                 VortexKey::from_bytes(&writer_key),
                 VortexValue::from("after-flush"),
@@ -1696,7 +1700,7 @@ mod tests {
         // GET with lazy expiry (now > deadline)
         let got = ks.write(b"ttl_key", |t| {
             let key = VortexKey::from_bytes(b"ttl_key");
-            let hash = t.hash_key_bytes(key.as_bytes());
+            let hash = t.table_hash_key_bytes(key.as_bytes());
             t.get_or_expire_prehashed(key.as_bytes(), hash, 2_000_000_000)
                 .cloned()
         });
@@ -2021,7 +2025,7 @@ mod tests {
         let hash = ks.table_hash_key(key.as_bytes());
         let guard = ks.read_shard_by_index(shard_idx);
         let mut reads = 0usize;
-        while ks.frequency_sketch.estimate(hash) == 0 {
+        while ks.frequency_sketch.estimate(hash.get()) == 0 {
             ks.record_access_prehashed(&guard, key.as_bytes(), hash);
             reads += 1;
             assert!(
@@ -2034,7 +2038,7 @@ mod tests {
         }
         drop(guard);
 
-        let sampled_reads = ks.frequency_sketch.estimate(hash);
+        let sampled_reads = ks.frequency_sketch.estimate(hash.get());
         assert!(sampled_reads < 64);
 
         let writes = ConcurrentKeyspace::new(TEST_SHARDS);
@@ -2042,7 +2046,7 @@ mod tests {
         for _ in 0..128 {
             writes.record_frequency_hash(hash);
         }
-        let write_updates = writes.frequency_sketch.estimate(hash);
+        let write_updates = writes.frequency_sketch.estimate(hash.get());
         assert_eq!(write_updates, 128);
         assert!(sampled_reads < write_updates);
     }

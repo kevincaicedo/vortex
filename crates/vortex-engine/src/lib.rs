@@ -15,6 +15,7 @@
 //! - [`Entry`] — 64-byte cache-line-aligned hash table entry (Phase 3.2)
 
 pub mod commands;
+pub(crate) mod engine;
 pub mod entry;
 pub mod eviction;
 pub mod keyspace;

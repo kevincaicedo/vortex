@@ -5,6 +5,8 @@ use crossbeam_utils::CachePadded;
 use parking_lot::RwLock;
 use vortex_common::VortexKey;
 
+use crate::table::TableHash;
+
 use super::{ABSENT_WATCH_SHARD_COUNT, ConcurrentKeyspace};
 
 #[derive(Debug)]
@@ -20,7 +22,7 @@ pub(super) type AbsentWatchShard = CachePadded<RwLock<HashMap<VortexKey, AbsentW
 struct WatchKeyState {
     key: VortexKey,
     shard_index: usize,
-    table_hash: u64,
+    table_hash: TableHash,
     version: u64,
     present: bool,
 }
@@ -166,8 +168,8 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    fn absent_watch_shard_index(&self, table_hash: u64) -> usize {
-        (table_hash as usize) & (ABSENT_WATCH_SHARD_COUNT - 1)
+    fn absent_watch_shard_index(&self, table_hash: TableHash) -> usize {
+        (table_hash.get() as usize) & (ABSENT_WATCH_SHARD_COUNT - 1)
     }
 
     #[inline]
@@ -184,7 +186,7 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    pub(crate) fn bump_watch_key_known_active(&self, key_bytes: &[u8], table_hash: u64) {
+    pub(crate) fn bump_watch_key_known_active(&self, key_bytes: &[u8], table_hash: TableHash) {
         if self.absent_watch_active.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -212,14 +214,14 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    fn absent_watch_version(&self, key_bytes: &[u8], table_hash: u64) -> Option<u64> {
+    fn absent_watch_version(&self, key_bytes: &[u8], table_hash: TableHash) -> Option<u64> {
         let shard_idx = self.absent_watch_shard_index(table_hash);
         let guard = self.absent_watch_shards[shard_idx].read();
         guard.get(key_bytes).map(|slot| slot.version)
     }
 
     #[inline]
-    fn register_absent_watch_key(&self, key: &VortexKey, table_hash: u64) -> u64 {
+    fn register_absent_watch_key(&self, key: &VortexKey, table_hash: TableHash) -> u64 {
         let shard_idx = self.absent_watch_shard_index(table_hash);
         let owned_key = key.clone();
         let mut guard = self.absent_watch_shards[shard_idx].write();
@@ -236,7 +238,7 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
-    fn release_absent_watch_key(&self, key_bytes: &[u8], table_hash: u64) {
+    fn release_absent_watch_key(&self, key_bytes: &[u8], table_hash: TableHash) {
         let shard_idx = self.absent_watch_shard_index(table_hash);
         let mut guard = self.absent_watch_shards[shard_idx].write();
         if let Some(slot) = guard.get_mut(key_bytes) {

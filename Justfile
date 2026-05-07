@@ -69,6 +69,10 @@ benchmark-local *ARGS:
 profiler *ARGS:
     bash scripts/profiler.sh {{ARGS}}
 
+# Profiling tool manager for engine-only targets such as engine_probe
+profiler-engine *ARGS:
+    bash scripts/profiler.sh --engine-example engine_probe {{ARGS}}
+
 
 # Run the RESP parser fuzzer for 60 seconds
 fuzz duration="60":

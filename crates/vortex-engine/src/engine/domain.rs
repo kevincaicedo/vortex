@@ -1,8 +1,10 @@
-//! Keyspace command helpers — lock-topology and table-level operations.
+//! Engine-domain operations for command handlers.
 //!
-//! After P1.9 cleanup, command handlers call methods directly on
-//! `ConcurrentKeyspace` (defined here via `impl ConcurrentKeyspace`).
-//! No trait indirection, no dynamic dispatch.
+//! Command modules parse RESP frames and shape replies. This module owns the
+//! zero-cost mutation/read coordination over `ConcurrentKeyspace`: shard locks,
+//! memory admission, TTL transitions, WATCH invalidation, eviction effects, AOF
+//! LSN stamping, and table-level mutation helpers. It uses only inherent impls
+//! and free functions, so there is no trait-object or boxed-operation overhead.
 
 use core::mem::size_of;
 use std::collections::HashMap;
@@ -11,21 +13,19 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use vortex_common::value::InlineBytes;
 use vortex_common::{VortexKey, VortexValue};
-use vortex_proto::RespFrame;
 
 use crate::EvictionConfig;
 use crate::SwissTable;
 use crate::entry::Entry;
 use crate::keyspace::{
     ConcurrentKeyspace, EvictedKey, EvictedKeys, EvictionAdmissionError, ExpiryTransition,
-    MemoryReservation, PositiveDelta, ProjectedDelta, ShardWriteGuard,
+    MemoryReservation, PositiveDelta, ProjectedDelta, ShardPlan, ShardWriteGuard, ShardWriteGuards,
 };
 use crate::table::{BorrowedKey, MutationPolicy, RawValueBytes, TableHash};
 
-use super::pattern::glob_match;
-use super::{
-    AofRecord, AofRecords, CmdResult, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_OVERFLOW, ERR_WRONG_TYPE,
-    ExecutedCommand,
+use crate::commands::pattern::glob_match;
+use crate::commands::{
+    AofRecord, AofRecords, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_OVERFLOW, ERR_WRONG_TYPE,
 };
 
 const SCAN_CURSOR_SHARD_SHIFT: u32 = 32;
@@ -36,6 +36,146 @@ pub(crate) enum TtlState {
     Missing,
     Persistent,
     Deadline(u64),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExpireOptions {
+    pub(crate) nx: bool,
+    pub(crate) xx: bool,
+    pub(crate) gt: bool,
+    pub(crate) lt: bool,
+}
+
+impl ExpireOptions {
+    #[inline(always)]
+    fn permits(self, current_ttl: u64, deadline_nanos: u64) -> bool {
+        if self.nx && current_ttl != 0 {
+            return false;
+        }
+        if self.xx && current_ttl == 0 {
+            return false;
+        }
+        if self.gt && current_ttl != 0 && deadline_nanos <= current_ttl {
+            return false;
+        }
+        if self.lt && current_ttl != 0 && deadline_nanos >= current_ttl {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GetExOption {
+    None,
+    ExpireAt(u64),
+    Persist,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AofEffect {
+    lsn: Option<u64>,
+}
+
+impl AofEffect {
+    #[inline(always)]
+    const fn none() -> Self {
+        Self { lsn: None }
+    }
+
+    #[inline(always)]
+    const fn lsn(lsn: Option<u64>) -> Self {
+        Self { lsn }
+    }
+
+    #[inline(always)]
+    const fn into_lsn(self) -> Option<u64> {
+        self.lsn
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TtlEffect {
+    shard_index: usize,
+    transition: ExpiryTransition,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WatchEffect<'a> {
+    #[default]
+    None,
+    Key(&'a VortexKey),
+    KeyBytes(&'a [u8]),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MutationEffects<'a> {
+    ttl: Option<TtlEffect>,
+    watch: WatchEffect<'a>,
+    frequency: Option<TableHash>,
+    aof: AofEffect,
+}
+
+impl<'a> MutationEffects<'a> {
+    #[inline(always)]
+    const fn none() -> Self {
+        Self {
+            ttl: None,
+            watch: WatchEffect::None,
+            frequency: None,
+            aof: AofEffect::none(),
+        }
+    }
+
+    #[inline(always)]
+    const fn with_ttl(mut self, shard_index: usize, transition: ExpiryTransition) -> Self {
+        self.ttl = Some(TtlEffect {
+            shard_index,
+            transition,
+        });
+        self
+    }
+
+    #[inline(always)]
+    const fn with_watch_key(mut self, key: &'a VortexKey) -> Self {
+        self.watch = WatchEffect::Key(key);
+        self
+    }
+
+    #[inline(always)]
+    const fn with_watch_key_bytes(mut self, key_bytes: &'a [u8]) -> Self {
+        self.watch = WatchEffect::KeyBytes(key_bytes);
+        self
+    }
+
+    #[inline(always)]
+    fn with_watch_key_if(self, condition: bool, key: &'a VortexKey) -> Self {
+        if condition {
+            self.with_watch_key(key)
+        } else {
+            self
+        }
+    }
+
+    #[inline(always)]
+    fn with_optional_watch_key(self, key: Option<&'a VortexKey>) -> Self {
+        match key {
+            Some(key) => self.with_watch_key(key),
+            None => self,
+        }
+    }
+
+    #[inline(always)]
+    const fn with_frequency(mut self, hash: TableHash) -> Self {
+        self.frequency = Some(hash);
+        self
+    }
+
+    #[inline(always)]
+    const fn with_aof_lsn(mut self, lsn: Option<u64>) -> Self {
+        self.aof = AofEffect::lsn(lsn);
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -107,11 +247,6 @@ impl MutationError {
             aof_records: evicted_keys_to_aof_records(evicted),
         }
     }
-
-    #[inline]
-    pub(crate) fn into_executed(self) -> ExecutedCommand {
-        ExecutedCommand::with_aof_records(CmdResult::Static(self.response), self.aof_records, None)
-    }
 }
 
 impl From<&'static [u8]> for MutationError {
@@ -174,6 +309,11 @@ pub(crate) enum SetResult {
     NotSetGet(Option<VortexValue>),
 }
 
+pub(crate) struct FloatIncrementResult {
+    pub(crate) value: Bytes,
+    pub(crate) ttl_after: TtlState,
+}
+
 /// Options for SET-style writes.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SetOptions {
@@ -182,22 +322,6 @@ pub(crate) struct SetOptions {
     pub(crate) xx: bool,
     pub(crate) get: bool,
     pub(crate) keepttl: bool,
-}
-
-#[inline]
-fn mget_value_to_frame(value: &VortexValue) -> RespFrame {
-    match value {
-        VortexValue::InlineString(inline) => {
-            RespFrame::bulk_string(Bytes::copy_from_slice(inline.as_bytes()))
-        }
-        VortexValue::String(bytes) => RespFrame::bulk_string(bytes.clone()),
-        VortexValue::Integer(number) => {
-            let mut buffer = itoa::Buffer::new();
-            let text = buffer.format(*number);
-            RespFrame::bulk_string(Bytes::copy_from_slice(text.as_bytes()))
-        }
-        _ => RespFrame::null_bulk_string(),
-    }
 }
 
 #[inline]
@@ -279,57 +403,209 @@ struct ReservationState<'a> {
     evicted: EvictedKeys,
 }
 
-#[inline]
-fn acquire_single_shard_with_revalidated_reservation<'a, F>(
+#[derive(Clone, Copy)]
+struct ReservationCoordinator<'a> {
     keyspace: &'a ConcurrentKeyspace,
-    shard_index: usize,
     now_nanos: u64,
-    state: ReservationState<'a>,
-    hook_label: &'static str,
-    mut required_delta: F,
-) -> Result<(ShardWriteGuard<'a>, ReservationState<'a>), MutationError>
-where
-    F: FnMut(&SwissTable) -> Result<PositiveDelta, &'static [u8]>,
-{
-    let ReservationState {
-        snapshot,
-        mut reservation,
-        mut evicted,
-    } = state;
+}
 
-    maybe_pause_after_projection(hook_label);
+impl<'a> ReservationCoordinator<'a> {
+    #[inline(always)]
+    const fn new(keyspace: &'a ConcurrentKeyspace, now_nanos: u64) -> Self {
+        Self {
+            keyspace,
+            now_nanos,
+        }
+    }
 
-    loop {
-        let guard = keyspace.write_shard_by_index(shard_index);
-        let required = match required_delta(&guard) {
-            Ok(required) => required,
-            Err(response) => return Err(MutationError::with_evictions(response, evicted)),
-        };
+    #[inline]
+    fn reserve(
+        self,
+        preferred_shard: usize,
+        additional_bytes: PositiveDelta,
+        snapshot: EvictionConfig,
+    ) -> Result<ReservationState<'a>, EvictionAdmissionError> {
+        let (evicted, reservation) = reserve_memory_from_snapshot(
+            self.keyspace,
+            preferred_shard,
+            additional_bytes,
+            self.now_nanos,
+            snapshot,
+        )?;
+        Ok(ReservationState {
+            snapshot,
+            reservation,
+            evicted,
+        })
+    }
 
-        if required.bytes() <= reservation.reserved_bytes() {
-            return Ok((
-                guard,
-                ReservationState {
-                    snapshot,
-                    reservation,
-                    evicted,
-                },
-            ));
+    #[inline]
+    fn admission_revalidation_active(self, snapshot: EvictionConfig) -> bool {
+        admission_revalidation_active(self.keyspace, snapshot)
+    }
+
+    #[inline]
+    fn acquire_single_shard<F>(
+        self,
+        shard_index: usize,
+        state: ReservationState<'a>,
+        hook_label: &'static str,
+        admission_active: bool,
+        required_delta: F,
+    ) -> Result<(ShardWriteGuard<'a>, ReservationState<'a>), MutationError>
+    where
+        F: FnMut(&SwissTable) -> Result<PositiveDelta, &'static [u8]>,
+    {
+        if !admission_active {
+            return Ok((self.keyspace.write_shard_by_index(shard_index), state));
         }
 
-        let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
-        drop(guard);
+        self.acquire_single_shard_revalidated(shard_index, state, hook_label, required_delta)
+    }
 
-        let (additional_evicted, additional_reservation) =
-            match reserve_memory_from_snapshot(keyspace, shard_index, extra, now_nanos, snapshot) {
+    #[inline]
+    fn acquire_single_shard_revalidated<F>(
+        self,
+        shard_index: usize,
+        state: ReservationState<'a>,
+        hook_label: &'static str,
+        mut required_delta: F,
+    ) -> Result<(ShardWriteGuard<'a>, ReservationState<'a>), MutationError>
+    where
+        F: FnMut(&SwissTable) -> Result<PositiveDelta, &'static [u8]>,
+    {
+        let ReservationState {
+            snapshot,
+            mut reservation,
+            mut evicted,
+        } = state;
+
+        maybe_pause_after_projection(hook_label);
+
+        loop {
+            let guard = self.keyspace.write_shard_by_index(shard_index);
+            let required = match required_delta(&guard) {
+                Ok(required) => required,
+                Err(response) => return Err(MutationError::with_evictions(response, evicted)),
+            };
+
+            if required.bytes() <= reservation.reserved_bytes() {
+                return Ok((
+                    guard,
+                    ReservationState {
+                        snapshot,
+                        reservation,
+                        evicted,
+                    },
+                ));
+            }
+
+            let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
+            drop(guard);
+
+            let (additional_evicted, additional_reservation) = match reserve_memory_from_snapshot(
+                self.keyspace,
+                shard_index,
+                extra,
+                self.now_nanos,
+                snapshot,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     merge_evicted_keys(&mut evicted, error.evicted);
                     return Err(MutationError::with_evictions(error.response, evicted));
                 }
             };
-        merge_evicted_keys(&mut evicted, additional_evicted);
-        reservation.absorb(additional_reservation);
+            merge_evicted_keys(&mut evicted, additional_evicted);
+            reservation.absorb(additional_reservation);
+        }
+    }
+
+    #[inline]
+    fn acquire_multi_write<F>(
+        self,
+        key_refs: &[&[u8]],
+        preferred_shard: usize,
+        state: ReservationState<'a>,
+        hook_label: &'static str,
+        admission_active: bool,
+        required_delta: F,
+    ) -> Result<(ShardWriteGuards<'a>, ShardPlan, ReservationState<'a>), MutationError>
+    where
+        F: FnMut(&mut ShardWriteGuards<'a>, &ShardPlan) -> Result<PositiveDelta, &'static [u8]>,
+    {
+        if !admission_active {
+            let (guards, plan) = self.keyspace.multi_write(key_refs);
+            return Ok((guards, plan, state));
+        }
+
+        self.acquire_multi_write_revalidated(
+            key_refs,
+            preferred_shard,
+            state,
+            hook_label,
+            required_delta,
+        )
+    }
+
+    #[inline]
+    fn acquire_multi_write_revalidated<F>(
+        self,
+        key_refs: &[&[u8]],
+        preferred_shard: usize,
+        state: ReservationState<'a>,
+        hook_label: &'static str,
+        mut required_delta: F,
+    ) -> Result<(ShardWriteGuards<'a>, ShardPlan, ReservationState<'a>), MutationError>
+    where
+        F: FnMut(&mut ShardWriteGuards<'a>, &ShardPlan) -> Result<PositiveDelta, &'static [u8]>,
+    {
+        let ReservationState {
+            snapshot,
+            mut reservation,
+            mut evicted,
+        } = state;
+
+        maybe_pause_after_projection(hook_label);
+
+        loop {
+            let (mut guards, plan) = self.keyspace.multi_write(key_refs);
+            let required = match required_delta(&mut guards, &plan) {
+                Ok(required) => required,
+                Err(response) => return Err(MutationError::with_evictions(response, evicted)),
+            };
+
+            if required.bytes() <= reservation.reserved_bytes() {
+                return Ok((
+                    guards,
+                    plan,
+                    ReservationState {
+                        snapshot,
+                        reservation,
+                        evicted,
+                    },
+                ));
+            }
+
+            let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
+            drop((guards, plan));
+
+            let (additional_evicted, additional_reservation) = match reserve_memory_from_snapshot(
+                self.keyspace,
+                preferred_shard,
+                extra,
+                self.now_nanos,
+                snapshot,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    merge_evicted_keys(&mut evicted, error.evicted);
+                    return Err(MutationError::with_evictions(error.response, evicted));
+                }
+            };
+            merge_evicted_keys(&mut evicted, additional_evicted);
+            reservation.absorb(additional_reservation);
+        }
     }
 }
 
@@ -656,6 +932,52 @@ fn build_multi_write_lookups<'a>(
     lookups.sort_unstable_by_key(|lookup| (lookup.shard_idx, lookup.pair_index));
 
     (key_refs, lookups)
+}
+
+fn msetnx_all_absent_locked(
+    keyspace: &ConcurrentKeyspace,
+    guards: &mut ShardWriteGuards<'_>,
+    plan: &ShardPlan,
+    pairs: &[(VortexKey, VortexValue)],
+    lookups: &[MultiWriteLookup],
+    now_nanos: u64,
+) -> bool {
+    for lookup in lookups {
+        let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
+        let table = &mut *guards[guard_pos].1;
+        let key_bytes = pairs[lookup.pair_index].0.as_bytes();
+        let _ = keyspace.cleanup_expired_prehashed(
+            lookup.shard_idx,
+            table,
+            key_bytes,
+            lookup.table_hash,
+            now_nanos,
+        );
+        if table.contains_key_prehashed(key_bytes, lookup.table_hash) {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn distinct_guard_tables_mut<'g>(
+    guards: &'g mut ShardWriteGuards<'_>,
+    first_position: usize,
+    second_position: usize,
+) -> (&'g mut SwissTable, &'g mut SwissTable) {
+    debug_assert_ne!(
+        first_position, second_position,
+        "same-shard operations must use the single-shard path"
+    );
+
+    if first_position < second_position {
+        let (left, right) = guards.split_at_mut(second_position);
+        (&mut *left[first_position].1, &mut *right[0].1)
+    } else {
+        let (left, right) = guards.split_at_mut(first_position);
+        (&mut *right[0].1, &mut *left[second_position].1)
+    }
 }
 
 pub(crate) fn remove_if_expired(table: &mut SwissTable, key: &VortexKey, now_nanos: u64) -> bool {
@@ -1218,6 +1540,57 @@ fn decode_scan_cursor(cursor: u64) -> (usize, usize) {
 // ── ConcurrentKeyspace command methods ─────────────────────────────────
 
 impl ConcurrentKeyspace {
+    #[inline(always)]
+    fn commit_effects(&self, effects: MutationEffects<'_>) -> AofEffect {
+        if let Some(ttl) = effects.ttl {
+            self.apply_expiry_transition(ttl.shard_index, ttl.transition);
+        }
+        if let Some(hash) = effects.frequency {
+            self.record_frequency_hash(hash);
+        }
+        match effects.watch {
+            WatchEffect::None => {}
+            WatchEffect::Key(key) => self.bump_watch_key(key),
+            WatchEffect::KeyBytes(key_bytes) => self.bump_watch_key_bytes(key_bytes),
+        }
+        effects.aof
+    }
+
+    /// Read a string value and perform lazy expiry cleanup for GET-style commands.
+    ///
+    /// The caller-provided encoder runs while the read guard is held so command
+    /// code can build a borrowed response without cloning `VortexValue`.
+    #[inline]
+    pub(crate) fn read_value_with<R, F>(&self, key_bytes: &[u8], now_nanos: u64, encode: F) -> R
+    where
+        F: FnOnce(Option<&VortexValue>) -> R,
+    {
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let guard = self.read_shard_by_index(shard_index);
+        match guard.get_with_ttl_prehashed(key_bytes, table_hash) {
+            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
+                self.record_access_prehashed(&guard, key_bytes, table_hash);
+                encode(Some(value))
+            }
+            Some(_) => {
+                drop(guard);
+                let key = VortexKey::from_bytes(key_bytes);
+                let mut wguard = self.write_shard_by_index(shard_index);
+                let had_ttl = matches!(wguard.get_entry_ttl(&key), Some(ttl) if ttl != 0);
+                if remove_if_expired(&mut wguard, &key, now_nanos) {
+                    self.commit_effects(
+                        MutationEffects::none()
+                            .with_ttl(shard_index, ExpiryTransition::remove(had_ttl))
+                            .with_watch_key(&key),
+                    );
+                }
+                encode(None)
+            }
+            None => encode(None),
+        }
+    }
+
     #[inline]
     fn cleanup_expired_key(
         &self,
@@ -1229,8 +1602,11 @@ impl ConcurrentKeyspace {
         let had_ttl = ttl_present(table.get_entry_ttl(key));
         let removed = remove_if_expired(table, key, now_nanos);
         if removed {
-            self.apply_expiry_transition(shard_index, ExpiryTransition::remove(had_ttl));
-            self.bump_watch_key(key);
+            self.commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, ExpiryTransition::remove(had_ttl))
+                    .with_watch_key(key),
+            );
         }
         removed
     }
@@ -1257,8 +1633,11 @@ impl ConcurrentKeyspace {
             table.get_with_ttl_prehashed(key_bytes, hash),
             Some((_, ttl)) if ttl != 0
         );
-        self.apply_expiry_transition(shard_index, ExpiryTransition::new(true, has_ttl));
-        self.bump_watch_key_bytes(key_bytes);
+        self.commit_effects(
+            MutationEffects::none()
+                .with_ttl(shard_index, ExpiryTransition::new(true, has_ttl))
+                .with_watch_key_bytes(key_bytes),
+        );
         true
     }
 
@@ -1282,6 +1661,78 @@ impl ConcurrentKeyspace {
         }
     }
 
+    pub(crate) fn get_value_with_expiry_option(
+        &self,
+        key: &VortexKey,
+        option: GetExOption,
+        now_nanos: u64,
+    ) -> MutationOutcome<Option<VortexValue>> {
+        if option == GetExOption::None {
+            return MutationOutcome::new(self.get_value(key, now_nanos), None);
+        }
+
+        let key_bytes = key.as_bytes();
+        let shard_index = self.shard_index(key_bytes);
+        let table_hash = self.table_hash_key(key_bytes);
+        let mut guard = self.write_shard_by_index(shard_index);
+        let Some((value, ttl_deadline)) = guard.get_with_ttl(key) else {
+            return MutationOutcome::new(None, None);
+        };
+        let had_ttl = ttl_deadline != 0;
+        if had_ttl && ttl_deadline <= now_nanos {
+            let removed = remove_if_expired(&mut guard, key, now_nanos);
+            debug_assert!(removed, "expired GETEX key must be removable");
+            self.commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, ExpiryTransition::ttl_removed())
+                    .with_watch_key(key),
+            );
+            return MutationOutcome::new(None, None);
+        }
+
+        let value = value.clone();
+        self.record_access_prehashed(&guard, key_bytes, table_hash);
+
+        let (changed, transition) = match option {
+            GetExOption::None => unreachable!("GETEX none exits through get_value"),
+            GetExOption::ExpireAt(deadline) if deadline <= now_nanos => {
+                let removed = guard.remove(key).is_some();
+                debug_assert!(removed, "live GETEX key must be removable");
+                (removed, ExpiryTransition::remove(had_ttl))
+            }
+            GetExOption::ExpireAt(deadline) => {
+                let updated = guard.set_entry_ttl(key, deadline);
+                (updated, ExpiryTransition::new(had_ttl, updated))
+            }
+            GetExOption::Persist => {
+                let updated = guard.clear_entry_ttl(key);
+                (updated, ExpiryTransition::remove(had_ttl))
+            }
+        };
+
+        let aof_lsn = if changed {
+            match option {
+                GetExOption::ExpireAt(deadline) if deadline <= now_nanos => self.next_aof_lsn(),
+                _ => {
+                    let (lsn, aof_lsn) = self.allocate_mutation_lsn();
+                    stamp_entry_lsn(&mut guard, key_bytes, table_hash, lsn);
+                    aof_lsn
+                }
+            }
+        } else {
+            None
+        };
+        let aof_lsn = self
+            .commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, transition)
+                    .with_watch_key_if(changed, key)
+                    .with_aof_lsn(aof_lsn),
+            )
+            .into_lsn();
+        MutationOutcome::new(Some(value), aof_lsn)
+    }
+
     pub(crate) fn set_value_with_ttl(
         &self,
         key: VortexKey,
@@ -1296,36 +1747,15 @@ impl ConcurrentKeyspace {
         let projected_delta = self
             .read_shard_by_index(shard_index)
             .projected_insert_delta(&key, &value);
-        let (evicted, reservation) = reserve_memory_from_snapshot(
-            self,
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(shard_index, positive_delta(projected_delta), eviction)?;
+        let (mut guard, state) = coordinator.acquire_single_shard(
             shard_index,
-            positive_delta(projected_delta),
-            now_nanos,
-            eviction,
+            state,
+            "set_value_with_ttl",
+            coordinator.admission_revalidation_active(eviction),
+            |table| Ok(positive_delta(table.projected_insert_delta(&key, &value))),
         )?;
-        let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "set_value_with_ttl",
-                |table| Ok(positive_delta(table.projected_insert_delta(&key, &value))),
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
         let ReservationState {
             reservation,
             evicted,
@@ -1335,11 +1765,12 @@ impl ConcurrentKeyspace {
         let watched_key = self.watch_tracking_active().then(|| key.clone());
         let (lsn, aof_lsn) = self.allocate_mutation_lsn();
         let previous = guard.insert_with(key, value, ttl_deadline_nanos, Some(lsn));
-        self.apply_expiry_transition(shard_index, ExpiryTransition::new(had_ttl, true));
-        self.record_frequency_hash(table_hash);
-        if let Some(key) = watched_key {
-            self.bump_watch_key(&key);
-        }
+        self.commit_effects(
+            MutationEffects::none()
+                .with_ttl(shard_index, ExpiryTransition::new(had_ttl, true))
+                .with_frequency(table_hash)
+                .with_optional_watch_key(watched_key.as_ref()),
+        );
         drop(guard);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(previous, aof_lsn, evicted))
@@ -1397,7 +1828,9 @@ impl ConcurrentKeyspace {
                 )
                 .had_ttl()
         };
-        self.apply_expiry_transition(shard_index, ExpiryTransition::remove(old_had_ttl));
+        self.commit_effects(
+            MutationEffects::none().with_ttl(shard_index, ExpiryTransition::remove(old_had_ttl)),
+        );
         Ok(MutationOutcome::new((), None))
     }
 
@@ -1414,48 +1847,30 @@ impl ConcurrentKeyspace {
         let table_hash = self.table_hash_key(key_bytes);
         let features = self.mutation_features();
         let eviction = self.eviction_config();
-        let (evicted, reservation) = if features.maxmemory() {
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = if features.maxmemory() {
             let projected_delta = self
                 .read_shard_by_index(shard_index)
                 .projected_insert_delta_prehashed(&key, &value, table_hash);
-            reserve_memory_from_snapshot(
-                self,
-                shard_index,
-                positive_delta(projected_delta),
-                now_nanos,
-                eviction,
-            )?
+            coordinator.reserve(shard_index, positive_delta(projected_delta), eviction)?
         } else {
-            (None, MemoryReservation::new(self, 0))
+            ReservationState {
+                snapshot: eviction,
+                reservation: MemoryReservation::new(self, 0),
+                evicted: None,
+            }
         };
-        let (mut guard, state) =
-            if features.maxmemory() && eviction.max_memory != 0 && !self.replay_mode_active() {
-                acquire_single_shard_with_revalidated_reservation(
-                    self,
-                    shard_index,
-                    now_nanos,
-                    ReservationState {
-                        snapshot: eviction,
-                        reservation,
-                        evicted,
-                    },
-                    "set_value_plain",
-                    |table| {
-                        Ok(positive_delta(table.projected_insert_delta_prehashed(
-                            &key, &value, table_hash,
-                        )))
-                    },
-                )?
-            } else {
-                (
-                    self.write_shard_by_index(shard_index),
-                    ReservationState {
-                        snapshot: eviction,
-                        reservation,
-                        evicted,
-                    },
-                )
-            };
+        let (mut guard, state) = coordinator.acquire_single_shard(
+            shard_index,
+            state,
+            "set_value_plain",
+            features.maxmemory() && coordinator.admission_revalidation_active(eviction),
+            |table| {
+                Ok(positive_delta(table.projected_insert_delta_prehashed(
+                    &key, &value, table_hash,
+                )))
+            },
+        )?;
         let ReservationState {
             reservation,
             evicted,
@@ -1466,13 +1881,14 @@ impl ConcurrentKeyspace {
         let old_had_ttl = guard
             .mutate_prehashed(key, value, table_hash, MutationPolicy::clear(Some(lsn)))
             .had_ttl();
-        self.apply_expiry_transition(shard_index, ExpiryTransition::remove(old_had_ttl));
+        let mut effects = MutationEffects::none()
+            .with_ttl(shard_index, ExpiryTransition::remove(old_had_ttl))
+            .with_aof_lsn(aof_lsn)
+            .with_optional_watch_key(watched_key.as_ref());
         if features.maxmemory() {
-            self.record_frequency_hash(table_hash);
+            effects = effects.with_frequency(table_hash);
         }
-        if let Some(key) = watched_key {
-            self.bump_watch_key(&key);
-        }
+        let aof_lsn = self.commit_effects(effects).into_lsn();
         drop(guard);
         reservation.settle();
         Ok(mutation_outcome_with_evictions((), aof_lsn, evicted))
@@ -1493,35 +1909,19 @@ impl ConcurrentKeyspace {
             options,
             now_nanos,
         );
-        let (evicted, reservation) =
-            reserve_memory_from_snapshot(self, shard_index, projected_delta, now_nanos, eviction)?;
-        let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "set_value_with_options",
-                |table| {
-                    Ok(projected_set_write_delta(
-                        table, &key, &value, options, now_nanos,
-                    ))
-                },
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(shard_index, projected_delta, eviction)?;
+        let (mut guard, state) = coordinator.acquire_single_shard(
+            shard_index,
+            state,
+            "set_value_with_options",
+            coordinator.admission_revalidation_active(eviction),
+            |table| {
+                Ok(projected_set_write_delta(
+                    table, &key, &value, options, now_nanos,
+                ))
+            },
+        )?;
         let ReservationState {
             reservation,
             evicted,
@@ -1529,27 +1929,39 @@ impl ConcurrentKeyspace {
         } = state;
         let (result, transition) =
             set_with_options_on_table(&mut guard, key.clone(), value, options, now_nanos);
-        self.apply_expiry_transition(shard_index, transition);
         let changed = matches!(&result, SetResult::Ok | SetResult::OkGet(_));
+        let table_hash = self.table_hash_key(key.as_bytes());
         let aof_lsn = if changed {
             let key_bytes = key.as_bytes();
-            let table_hash = self.table_hash_key(key_bytes);
             let (lsn, aof_lsn) = self.allocate_mutation_lsn();
             stamp_entry_lsn(&mut guard, key_bytes, table_hash, lsn);
             aof_lsn
         } else {
             None
         };
+        let mut effects = MutationEffects::none()
+            .with_ttl(shard_index, transition)
+            .with_aof_lsn(aof_lsn);
         if changed {
-            self.record_frequency_hash(self.table_hash_key(key.as_bytes()));
-            self.bump_watch_key(&key);
+            effects = effects.with_frequency(table_hash).with_watch_key(&key);
         }
+        let aof_lsn = self.commit_effects(effects).into_lsn();
         drop(guard);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(result, aof_lsn, evicted))
     }
 
-    pub(crate) fn mget_frames(&self, keys: &[&[u8]], now_nanos: u64) -> Vec<RespFrame> {
+    pub(crate) fn mget_values_with<R, F, N>(
+        &self,
+        keys: &[&[u8]],
+        now_nanos: u64,
+        mut encode: F,
+        mut nil: N,
+    ) -> Vec<R>
+    where
+        F: FnMut(&VortexValue) -> R,
+        N: FnMut() -> R,
+    {
         if keys.is_empty() {
             return Vec::new();
         }
@@ -1571,8 +1983,8 @@ impl ConcurrentKeyspace {
         }
         lookups.sort_unstable_by_key(|lookup| lookup.shard_idx);
 
-        let mut frames = Vec::with_capacity(keys.len());
-        frames.resize_with(keys.len(), RespFrame::null_bulk_string);
+        let mut values = Vec::with_capacity(keys.len());
+        values.resize_with(keys.len(), || None);
         let mut expired: SmallVec<[KeyLookup; 8]> = SmallVec::new();
 
         // Process one shard at a time so the hot path avoids the extra vectors,
@@ -1595,7 +2007,7 @@ impl ConcurrentKeyspace {
                 match guard.get_with_ttl_prehashed(key_bytes, lookup.hash) {
                     Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
                         self.record_access_prehashed(&guard, key_bytes, lookup.hash);
-                        frames[lookup.output_idx] = mget_value_to_frame(value);
+                        values[lookup.output_idx] = Some(encode(value));
                     }
                     Some(_) => {
                         expired.push(*lookup);
@@ -1624,7 +2036,13 @@ impl ConcurrentKeyspace {
             }
         }
 
-        frames
+        values
+            .into_iter()
+            .map(|value| match value {
+                Some(value) => value,
+                None => nil(),
+            })
+            .collect()
     }
 
     pub(crate) fn mset_values(
@@ -1636,32 +2054,30 @@ impl ConcurrentKeyspace {
             return Ok(MutationOutcome::new((), None));
         }
 
-        let preferred_shard = self.shard_index(pairs[0].0.as_bytes());
         let eviction = self.eviction_config();
+        let pairs = if admission_revalidation_active(self, eviction) {
+            deduplicate_last_write_pairs(pairs)
+        } else {
+            pairs
+        };
+        let preferred_shard = self.shard_index(pairs[0].0.as_bytes());
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
         let projected_delta = PositiveDelta::sum(pairs.iter().map(|(key, value)| {
             let shard_index = self.shard_index(key.as_bytes());
             let guard = self.read_shard_by_index(shard_index);
             positive_delta(guard.projected_insert_delta(key, value))
         }));
-        let admission_active = admission_revalidation_active(self, eviction);
-        let (mut evicted, mut reservation) = reserve_memory_from_snapshot(
-            self,
-            preferred_shard,
-            projected_delta,
-            now_nanos,
-            eviction,
-        )?;
+        let state = coordinator.reserve(preferred_shard, projected_delta, eviction)?;
 
         let (key_refs, lookups) = build_multi_write_lookups(self, &pairs);
-        maybe_pause_after_projection("mset_values");
-        let (mut guards, plan) = loop {
-            let attempt = self.multi_write(&key_refs);
-            if !admission_active {
-                break attempt;
-            }
-            let required = {
-                let (guards, plan) = &attempt;
-                PositiveDelta::sum(lookups.iter().map(|lookup| {
+        let (mut guards, plan, state) = coordinator.acquire_multi_write(
+            &key_refs,
+            preferred_shard,
+            state,
+            "mset_values",
+            coordinator.admission_revalidation_active(eviction),
+            |guards, plan| {
+                Ok(PositiveDelta::sum(lookups.iter().map(|lookup| {
                     let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
                     let table = &*guards[guard_pos].1;
                     let (key, value) = &pairs[lookup.pair_index];
@@ -1670,30 +2086,14 @@ impl ConcurrentKeyspace {
                         value,
                         lookup.table_hash,
                     ))
-                }))
-            };
-            if required.bytes() <= reservation.reserved_bytes() {
-                break attempt;
-            }
-
-            drop(attempt);
-            let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
-            let (additional_evicted, additional_reservation) = match reserve_memory_from_snapshot(
-                self,
-                preferred_shard,
-                extra,
-                now_nanos,
-                eviction,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    merge_evicted_keys(&mut evicted, error.evicted);
-                    return Err(MutationError::with_evictions(error.response, evicted));
-                }
-            };
-            merge_evicted_keys(&mut evicted, additional_evicted);
-            reservation.absorb(additional_reservation);
-        };
+                })))
+            },
+        )?;
+        let ReservationState {
+            reservation,
+            evicted,
+            ..
+        } = state;
         drop(key_refs);
         let mut pairs = pairs.into_iter().map(Some).collect::<Vec<_>>();
         let (lsn, aof_lsn) = self.allocate_mutation_lsn();
@@ -1704,7 +2104,7 @@ impl ConcurrentKeyspace {
             let (key, value) = pairs[lookup.pair_index]
                 .take()
                 .expect("mset pair must be available exactly once");
-            self.bump_watch_key(&key);
+            let watched_key = self.watch_tracking_active().then(|| key.clone());
             let old_had_ttl = table
                 .mutate_prehashed(
                     key,
@@ -1713,8 +2113,12 @@ impl ConcurrentKeyspace {
                     MutationPolicy::clear(Some(lsn)),
                 )
                 .had_ttl();
-            self.apply_expiry_transition(lookup.shard_idx, ExpiryTransition::remove(old_had_ttl));
-            self.record_frequency_hash(lookup.table_hash);
+            self.commit_effects(
+                MutationEffects::none()
+                    .with_ttl(lookup.shard_idx, ExpiryTransition::remove(old_had_ttl))
+                    .with_frequency(lookup.table_hash)
+                    .with_optional_watch_key(watched_key.as_ref()),
+            );
         }
         drop(guards);
         reservation.settle();
@@ -1744,56 +2148,26 @@ impl ConcurrentKeyspace {
 
         let preferred_shard = self.shard_index(pairs[0].0.as_bytes());
         let eviction = self.eviction_config();
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
         let projected_delta = PositiveDelta::sum(pairs.iter().map(|(key, value)| {
             let shard_index = self.shard_index(key.as_bytes());
             let guard = self.read_shard_by_index(shard_index);
             positive_delta(guard.projected_insert_delta(key, value))
         }));
-        let (mut evicted, mut reservation) = reserve_memory_from_snapshot(
-            self,
-            preferred_shard,
-            projected_delta,
-            now_nanos,
-            eviction,
-        )?;
-        let admission_active = admission_revalidation_active(self, eviction);
+        let state = coordinator.reserve(preferred_shard, projected_delta, eviction)?;
 
         let (key_refs, lookups) = build_multi_write_lookups(self, &pairs);
-        maybe_pause_after_projection("msetnx_values");
-        let (mut guards, plan) = loop {
-            let mut attempt = self.multi_write(&key_refs);
-            let mut all_absent = true;
-
-            for lookup in &lookups {
-                let guard_pos = attempt.1.guard_index_for_key(lookup.pair_index).get();
-                let table = &mut *attempt.0[guard_pos].1;
-                let key_bytes = pairs[lookup.pair_index].0.as_bytes();
-                let _ = self.cleanup_expired_prehashed(
-                    lookup.shard_idx,
-                    table,
-                    key_bytes,
-                    lookup.table_hash,
-                    now_nanos,
-                );
-                if table.contains_key_prehashed(key_bytes, lookup.table_hash) {
-                    all_absent = false;
-                    break;
+        let (mut guards, plan, state) = coordinator.acquire_multi_write(
+            &key_refs,
+            preferred_shard,
+            state,
+            "msetnx_values",
+            coordinator.admission_revalidation_active(eviction),
+            |guards, plan| {
+                if !msetnx_all_absent_locked(self, guards, plan, &pairs, &lookups, now_nanos) {
+                    return Ok(PositiveDelta::zero());
                 }
-            }
-
-            if !all_absent {
-                drop(attempt);
-                reservation.settle();
-                return Ok(mutation_outcome_with_evictions(false, None, evicted));
-            }
-
-            if !admission_active {
-                break attempt;
-            }
-
-            let required = {
-                let (guards, plan) = &attempt;
-                PositiveDelta::sum(lookups.iter().map(|lookup| {
+                Ok(PositiveDelta::sum(lookups.iter().map(|lookup| {
                     let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
                     let table = &*guards[guard_pos].1;
                     let (key, value) = &pairs[lookup.pair_index];
@@ -1802,30 +2176,19 @@ impl ConcurrentKeyspace {
                         value,
                         lookup.table_hash,
                     ))
-                }))
-            };
-            if required.bytes() <= reservation.reserved_bytes() {
-                break attempt;
-            }
-
-            drop(attempt);
-            let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
-            let (additional_evicted, additional_reservation) = match reserve_memory_from_snapshot(
-                self,
-                preferred_shard,
-                extra,
-                now_nanos,
-                eviction,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    merge_evicted_keys(&mut evicted, error.evicted);
-                    return Err(MutationError::with_evictions(error.response, evicted));
-                }
-            };
-            merge_evicted_keys(&mut evicted, additional_evicted);
-            reservation.absorb(additional_reservation);
-        };
+                })))
+            },
+        )?;
+        let ReservationState {
+            reservation,
+            evicted,
+            ..
+        } = state;
+        if !msetnx_all_absent_locked(self, &mut guards, &plan, &pairs, &lookups, now_nanos) {
+            drop(guards);
+            reservation.settle();
+            return Ok(mutation_outcome_with_evictions(false, None, evicted));
+        }
         drop(key_refs);
 
         let mut pairs = pairs.into_iter().map(Some).collect::<Vec<_>>();
@@ -1836,9 +2199,13 @@ impl ConcurrentKeyspace {
             let (key, value) = pairs[lookup.pair_index]
                 .take()
                 .expect("msetnx pair must be available exactly once");
-            self.bump_watch_key(&key);
+            let watched_key = self.watch_tracking_active().then(|| key.clone());
             table.insert_new_prehashed_and_lsn(key, value, lookup.table_hash, lsn);
-            self.record_frequency_hash(lookup.table_hash);
+            self.commit_effects(
+                MutationEffects::none()
+                    .with_frequency(lookup.table_hash)
+                    .with_optional_watch_key(watched_key.as_ref()),
+            );
         }
         drop(guards);
         reservation.settle();
@@ -1854,12 +2221,17 @@ impl ConcurrentKeyspace {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
         let (removed, transition) = take_live_value(&mut guard, key, now_nanos);
-        self.apply_expiry_transition(shard_index, transition);
         let changed = removed.is_some();
-        if changed {
-            self.bump_watch_key(key);
-        }
-        MutationOutcome::new(removed, changed.then(|| self.next_aof_lsn()).flatten())
+        let aof_lsn = changed.then(|| self.next_aof_lsn()).flatten();
+        let aof_lsn = self
+            .commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, transition)
+                    .with_watch_key_if(changed, key)
+                    .with_aof_lsn(aof_lsn),
+            )
+            .into_lsn();
+        MutationOutcome::new(removed, aof_lsn)
     }
 
     pub(crate) fn delete_key_bytes(
@@ -1872,11 +2244,15 @@ impl ConcurrentKeyspace {
         let mut guard = self.write_shard_by_index(shard_index);
         let (deleted, transition) =
             delete_live_key_bytes(&mut guard, key_bytes, table_hash, now_nanos);
-        self.apply_expiry_transition(shard_index, transition);
+        let aof_lsn = deleted.then(|| self.next_aof_lsn()).flatten();
+        let mut effects = MutationEffects::none()
+            .with_ttl(shard_index, transition)
+            .with_aof_lsn(aof_lsn);
         if deleted {
-            self.bump_watch_key_bytes(key_bytes);
+            effects = effects.with_watch_key_bytes(key_bytes);
         }
-        MutationOutcome::new(deleted, deleted.then(|| self.next_aof_lsn()).flatten())
+        let aof_lsn = self.commit_effects(effects).into_lsn();
+        MutationOutcome::new(deleted, aof_lsn)
     }
 
     pub(crate) fn increment_by(
@@ -1892,31 +2268,15 @@ impl ConcurrentKeyspace {
         let read_guard = self.read_shard_by_index(shard_index);
         let projected_delta = projected_increment_delta(&read_guard, &key, delta, now_nanos)?;
         drop(read_guard);
-        let (evicted, reservation) =
-            reserve_memory_from_snapshot(self, shard_index, projected_delta, now_nanos, eviction)?;
-        let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "increment_by",
-                |table| projected_increment_delta(table, &key, delta, now_nanos),
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(shard_index, projected_delta, eviction)?;
+        let (mut guard, state) = coordinator.acquire_single_shard(
+            shard_index,
+            state,
+            "increment_by",
+            coordinator.admission_revalidation_active(eviction),
+            |table| projected_increment_delta(table, &key, delta, now_nanos),
+        )?;
         let ReservationState {
             reservation,
             evicted,
@@ -1929,11 +2289,12 @@ impl ConcurrentKeyspace {
             Ok(result) => result,
             Err(err) => return Err(MutationError::with_evictions(err, evicted)),
         };
-        self.apply_expiry_transition(shard_index, transition);
-        self.record_frequency_hash(table_hash);
-        if let Some(key) = watched_key {
-            self.bump_watch_key(&key);
-        }
+        self.commit_effects(
+            MutationEffects::none()
+                .with_ttl(shard_index, transition)
+                .with_frequency(table_hash)
+                .with_optional_watch_key(watched_key.as_ref()),
+        );
         drop(guard);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(result, aof_lsn, evicted))
@@ -1944,7 +2305,7 @@ impl ConcurrentKeyspace {
         key: VortexKey,
         increment: f64,
         now_nanos: u64,
-    ) -> MutationResult<Bytes> {
+    ) -> MutationResult<FloatIncrementResult> {
         let key_bytes = key.as_bytes();
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
@@ -1953,31 +2314,15 @@ impl ConcurrentKeyspace {
         let projected_delta =
             projected_increment_by_float_delta(&read_guard, &key, increment, now_nanos)?;
         drop(read_guard);
-        let (evicted, reservation) =
-            reserve_memory_from_snapshot(self, shard_index, projected_delta, now_nanos, eviction)?;
-        let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "increment_by_float",
-                |table| projected_increment_by_float_delta(table, &key, increment, now_nanos),
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(shard_index, projected_delta, eviction)?;
+        let (mut guard, state) = coordinator.acquire_single_shard(
+            shard_index,
+            state,
+            "increment_by_float",
+            coordinator.admission_revalidation_active(eviction),
+            |table| projected_increment_by_float_delta(table, &key, increment, now_nanos),
+        )?;
         let ReservationState {
             reservation,
             evicted,
@@ -1990,20 +2335,33 @@ impl ConcurrentKeyspace {
             Ok(result) => result,
             Err(err) => return Err(MutationError::with_evictions(err, evicted)),
         };
-        self.apply_expiry_transition(
-            shard_index,
-            ExpiryTransition::new(
-                ttl_present(ttl_deadline),
-                matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
-            ),
-        );
-        self.record_frequency_hash(table_hash);
-        if let Some(key) = watched_key {
-            self.bump_watch_key(&key);
+        let ttl_after = match ttl_deadline {
+            Some(deadline) if deadline > now_nanos => TtlState::Deadline(deadline),
+            _ => TtlState::Persistent,
+        };
+        let mut effects = MutationEffects::none()
+            .with_ttl(
+                shard_index,
+                ExpiryTransition::new(
+                    ttl_present(ttl_deadline),
+                    matches!(ttl_after, TtlState::Deadline(_)),
+                ),
+            )
+            .with_frequency(table_hash);
+        if let Some(key) = watched_key.as_ref() {
+            effects = effects.with_watch_key(key);
         }
+        self.commit_effects(effects);
         drop(guard);
         reservation.settle();
-        Ok(mutation_outcome_with_evictions(result, aof_lsn, evicted))
+        Ok(mutation_outcome_with_evictions(
+            FloatIncrementResult {
+                value: result,
+                ttl_after,
+            },
+            aof_lsn,
+            evicted,
+        ))
     }
 
     pub(crate) fn append_value(
@@ -2019,31 +2377,15 @@ impl ConcurrentKeyspace {
         let read_guard = self.read_shard_by_index(shard_index);
         let projected_delta = projected_append_delta(&read_guard, &key, append_bytes, now_nanos)?;
         drop(read_guard);
-        let (evicted, reservation) =
-            reserve_memory_from_snapshot(self, shard_index, projected_delta, now_nanos, eviction)?;
-        let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "append_value",
-                |table| projected_append_delta(table, &key, append_bytes, now_nanos),
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(shard_index, projected_delta, eviction)?;
+        let (mut guard, state) = coordinator.acquire_single_shard(
+            shard_index,
+            state,
+            "append_value",
+            coordinator.admission_revalidation_active(eviction),
+            |table| projected_append_delta(table, &key, append_bytes, now_nanos),
+        )?;
         let ReservationState {
             reservation,
             evicted,
@@ -2056,17 +2398,18 @@ impl ConcurrentKeyspace {
             Ok(length) => length,
             Err(err) => return Err(MutationError::with_evictions(err, evicted)),
         };
-        self.apply_expiry_transition(
-            shard_index,
-            ExpiryTransition::new(
-                ttl_present(ttl_deadline),
-                matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
-            ),
+        self.commit_effects(
+            MutationEffects::none()
+                .with_ttl(
+                    shard_index,
+                    ExpiryTransition::new(
+                        ttl_present(ttl_deadline),
+                        matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
+                    ),
+                )
+                .with_frequency(table_hash)
+                .with_optional_watch_key(watched_key.as_ref()),
         );
-        self.record_frequency_hash(table_hash);
-        if let Some(key) = watched_key {
-            self.bump_watch_key(&key);
-        }
         drop(guard);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(length, aof_lsn, evicted))
@@ -2140,31 +2483,15 @@ impl ConcurrentKeyspace {
         let projected_delta =
             projected_setrange_delta(&read_guard, &key, offset, new_bytes, now_nanos)?;
         drop(read_guard);
-        let (evicted, reservation) =
-            reserve_memory_from_snapshot(self, shard_index, projected_delta, now_nanos, eviction)?;
-        let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-            acquire_single_shard_with_revalidated_reservation(
-                self,
-                shard_index,
-                now_nanos,
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-                "setrange_value",
-                |table| projected_setrange_delta(table, &key, offset, new_bytes, now_nanos),
-            )?
-        } else {
-            (
-                self.write_shard_by_index(shard_index),
-                ReservationState {
-                    snapshot: eviction,
-                    reservation,
-                    evicted,
-                },
-            )
-        };
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(shard_index, projected_delta, eviction)?;
+        let (mut guard, state) = coordinator.acquire_single_shard(
+            shard_index,
+            state,
+            "setrange_value",
+            coordinator.admission_revalidation_active(eviction),
+            |table| projected_setrange_delta(table, &key, offset, new_bytes, now_nanos),
+        )?;
         let ReservationState {
             reservation,
             evicted,
@@ -2179,11 +2506,12 @@ impl ConcurrentKeyspace {
             Err(err) => return Err(MutationError::with_evictions(err, evicted)),
         };
         let has_ttl_after = ttl_present(guard.get_entry_ttl(&ttl_probe_key));
-        self.apply_expiry_transition(shard_index, ExpiryTransition::new(had_ttl, has_ttl_after));
-        self.record_frequency_hash(table_hash);
-        if let Some(key) = watched_key {
-            self.bump_watch_key(&key);
-        }
+        self.commit_effects(
+            MutationEffects::none()
+                .with_ttl(shard_index, ExpiryTransition::new(had_ttl, has_ttl_after))
+                .with_frequency(table_hash)
+                .with_optional_watch_key(watched_key.as_ref()),
+        );
         drop(guard);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(length, aof_lsn, evicted))
@@ -2208,11 +2536,15 @@ impl ConcurrentKeyspace {
             let position = plan.guard_index_for_key(idx).get();
             let table = &mut *guards[position].1;
             let (removed, transition) = take_live_value(table, key, now_nanos);
+            let changed = removed.is_some();
             if removed.is_some() {
                 deleted += 1;
-                self.bump_watch_key(key);
             }
-            self.apply_expiry_transition(shard_index, transition);
+            self.commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, transition)
+                    .with_watch_key_if(changed, key),
+            );
         }
 
         MutationOutcome::new(
@@ -2282,37 +2614,85 @@ impl ConcurrentKeyspace {
         count
     }
 
-    pub(crate) fn expire_key(
+    pub(crate) fn expire_key_with_options(
         &self,
         key: &VortexKey,
         deadline_nanos: u64,
         now_nanos: u64,
+        options: ExpireOptions,
     ) -> MutationOutcome<bool> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
+
         let _ = self.cleanup_expired_key(shard_index, &mut guard, key, now_nanos);
-        let had_ttl = ttl_present(guard.get_entry_ttl(key));
+        let current_ttl = match guard.get_entry_ttl(key) {
+            Some(deadline) => deadline,
+            None => return MutationOutcome::new(false, None),
+        };
+        if !options.permits(current_ttl, deadline_nanos) {
+            return MutationOutcome::new(false, None);
+        }
+
+        if deadline_nanos <= now_nanos {
+            let (removed, transition) = take_live_value(&mut guard, key, now_nanos);
+            let changed = removed.is_some();
+            let aof_lsn = changed.then(|| self.next_aof_lsn()).flatten();
+            let aof_lsn = self
+                .commit_effects(
+                    MutationEffects::none()
+                        .with_ttl(shard_index, transition)
+                        .with_watch_key_if(changed, key)
+                        .with_aof_lsn(aof_lsn),
+                )
+                .into_lsn();
+            return MutationOutcome::new(changed, aof_lsn);
+        }
+
+        let had_ttl = current_ttl != 0;
+        let key_bytes = key.as_bytes();
+        let table_hash = self.table_hash_key(key_bytes);
         let updated = guard.set_entry_ttl(key, deadline_nanos);
         let aof_lsn = if updated {
-            let key_bytes = key.as_bytes();
-            let table_hash = self.table_hash_key(key_bytes);
             let (lsn, aof_lsn) = self.allocate_mutation_lsn();
             stamp_entry_lsn(&mut guard, key_bytes, table_hash, lsn);
             aof_lsn
         } else {
             None
         };
-        self.apply_expiry_transition(shard_index, ExpiryTransition::new(had_ttl, updated));
-        if updated {
-            self.bump_watch_key(key);
-        }
+        let aof_lsn = self
+            .commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, ExpiryTransition::new(had_ttl, updated))
+                    .with_watch_key_if(updated, key)
+                    .with_aof_lsn(aof_lsn),
+            )
+            .into_lsn();
         MutationOutcome::new(updated, aof_lsn)
     }
 
-    pub(crate) fn persist_key(&self, key: &VortexKey) -> MutationOutcome<bool> {
+    pub(crate) fn persist_key(&self, key: &VortexKey, now_nanos: u64) -> MutationOutcome<bool> {
         let shard_index = self.shard_index(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
-        let had_ttl = ttl_present(guard.get_entry_ttl(key));
+
+        let Some(ttl_deadline) = guard.get_entry_ttl(key) else {
+            return MutationOutcome::new(false, None);
+        };
+        if ttl_deadline != 0 && ttl_deadline <= now_nanos {
+            let removed = remove_if_expired(&mut guard, key, now_nanos);
+            debug_assert!(removed, "expired PERSIST key must be removable");
+            self.commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, ExpiryTransition::ttl_removed())
+                    .with_watch_key(key),
+            );
+            return MutationOutcome::new(false, None);
+        }
+
+        let had_ttl = ttl_deadline != 0;
+        if !had_ttl {
+            return MutationOutcome::new(false, None);
+        }
+
         let updated = guard.clear_entry_ttl(key);
         let aof_lsn = if updated {
             let key_bytes = key.as_bytes();
@@ -2323,15 +2703,15 @@ impl ConcurrentKeyspace {
         } else {
             None
         };
-        self.apply_expiry_transition(shard_index, ExpiryTransition::remove(had_ttl));
-        if updated {
-            self.bump_watch_key(key);
-        }
+        let aof_lsn = self
+            .commit_effects(
+                MutationEffects::none()
+                    .with_ttl(shard_index, ExpiryTransition::remove(had_ttl))
+                    .with_watch_key_if(updated, key)
+                    .with_aof_lsn(aof_lsn),
+            )
+            .into_lsn();
         MutationOutcome::new(updated, aof_lsn)
-    }
-
-    pub(crate) fn ttl_state(&self, key: &VortexKey, now_nanos: u64) -> TtlState {
-        self.ttl_state_bytes(key.as_bytes(), now_nanos)
     }
 
     pub(crate) fn ttl_state_bytes(&self, key_bytes: &[u8], now_nanos: u64) -> TtlState {
@@ -2395,7 +2775,31 @@ impl ConcurrentKeyspace {
 
         if source_shard == destination_shard {
             let destination = new_key.clone();
-            let mut guard = self.write_shard_by_index(source_shard);
+            let eviction = self.eviction_config();
+            let read_guard = self.read_shard_by_index(source_shard);
+            let projected_delta = projected_rename_delta(
+                &read_guard,
+                old_key,
+                &read_guard,
+                &destination,
+                now_nanos,
+                nx,
+            )?;
+            drop(read_guard);
+            let coordinator = ReservationCoordinator::new(self, now_nanos);
+            let state = coordinator.reserve(destination_shard, projected_delta, eviction)?;
+            let (mut guard, state) = coordinator.acquire_single_shard(
+                source_shard,
+                state,
+                "rename_key",
+                coordinator.admission_revalidation_active(eviction),
+                |table| projected_rename_delta(table, old_key, table, &destination, now_nanos, nx),
+            )?;
+            let ReservationState {
+                reservation,
+                evicted,
+                ..
+            } = state;
             let _ = self.cleanup_expired_key(source_shard, &mut guard, old_key, now_nanos);
             if old_key != &destination {
                 let _ = self.cleanup_expired_key(source_shard, &mut guard, &destination, now_nanos);
@@ -2406,17 +2810,20 @@ impl ConcurrentKeyspace {
             let renamed = rename_within_table(&mut guard, old_key, new_key, now_nanos, nx);
             let old_has_ttl = ttl_present(guard.get_entry_ttl(old_key));
             let new_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
-            self.apply_expiry_transition(
+            self.commit_effects(MutationEffects::none().with_ttl(
                 source_shard,
                 ExpiryTransition::new(old_had_ttl, old_has_ttl),
-            );
+            ));
             if !same_key {
-                self.apply_expiry_transition(
+                self.commit_effects(MutationEffects::none().with_ttl(
                     source_shard,
                     ExpiryTransition::new(new_had_ttl, new_has_ttl),
-                );
+                ));
             }
-            let renamed = renamed?;
+            let renamed = match renamed {
+                Ok(renamed) => renamed,
+                Err(response) => return Err(MutationError::with_evictions(response, evicted)),
+            };
             let changed = renamed && !same_key;
             let aof_lsn = if changed {
                 let (lsn, aof_lsn) = self.allocate_mutation_lsn();
@@ -2426,11 +2833,17 @@ impl ConcurrentKeyspace {
                 None
             };
             if changed {
-                self.record_frequency_hash(new_hash);
-                self.bump_watch_key(old_key);
-                self.bump_watch_key(&destination);
+                self.commit_effects(
+                    MutationEffects::none()
+                        .with_frequency(new_hash)
+                        .with_watch_key(old_key)
+                        .with_aof_lsn(aof_lsn),
+                );
+                self.commit_effects(MutationEffects::none().with_watch_key(&destination));
             }
-            return Ok(MutationOutcome::new(renamed, aof_lsn));
+            drop(guard);
+            reservation.settle();
+            return Ok(mutation_outcome_with_evictions(renamed, aof_lsn, evicted));
         }
 
         let key_refs = [old_key.as_bytes(), new_key.as_bytes()];
@@ -2447,71 +2860,35 @@ impl ConcurrentKeyspace {
             nx,
         )?;
         drop(read_guards);
-        let (mut evicted, mut reservation) = reserve_memory_from_snapshot(
-            self,
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(destination_shard, projected_delta, eviction)?;
+        let (mut guards, plan, state) = coordinator.acquire_multi_write(
+            &key_refs,
             destination_shard,
-            projected_delta,
-            now_nanos,
-            eviction,
+            state,
+            "rename_key",
+            coordinator.admission_revalidation_active(eviction),
+            |guards, plan| {
+                let src_position = plan.guard_index_for_key(0).get();
+                let dst_position = plan.guard_index_for_key(1).get();
+                let (src_table, dst_table) =
+                    distinct_guard_tables_mut(guards, src_position, dst_position);
+
+                let _ = self.cleanup_expired_key(source_shard, src_table, old_key, now_nanos);
+                let _ = self.cleanup_expired_key(destination_shard, dst_table, &new_key, now_nanos);
+                projected_rename_delta(src_table, old_key, dst_table, &new_key, now_nanos, nx)
+            },
         )?;
-        let admission_active = admission_revalidation_active(self, eviction);
-
-        maybe_pause_after_projection("rename_key");
-
-        let (mut guards, plan) = loop {
-            let mut attempt = self.multi_write(&key_refs);
-            let src_position = attempt.1.guard_index_for_key(0).get();
-            let dst_position = attempt.1.guard_index_for_key(1).get();
-
-            let (src_table, dst_table) = if src_position < dst_position {
-                let (left, right) = attempt.0.split_at_mut(dst_position);
-                (&mut *left[src_position].1, &mut *right[0].1)
-            } else {
-                let (left, right) = attempt.0.split_at_mut(src_position);
-                (&mut *right[0].1, &mut *left[dst_position].1)
-            };
-
-            let _ = self.cleanup_expired_key(source_shard, src_table, old_key, now_nanos);
-            let _ = self.cleanup_expired_key(destination_shard, dst_table, &new_key, now_nanos);
-            let required = match projected_rename_delta(
-                src_table, old_key, dst_table, &new_key, now_nanos, nx,
-            ) {
-                Ok(required) => required,
-                Err(response) => return Err(MutationError::with_evictions(response, evicted)),
-            };
-
-            if !admission_active || required.bytes() <= reservation.reserved_bytes() {
-                break attempt;
-            }
-
-            drop(attempt);
-            let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
-            let (additional_evicted, additional_reservation) = match reserve_memory_from_snapshot(
-                self,
-                destination_shard,
-                extra,
-                now_nanos,
-                eviction,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    merge_evicted_keys(&mut evicted, error.evicted);
-                    return Err(MutationError::with_evictions(error.response, evicted));
-                }
-            };
-            merge_evicted_keys(&mut evicted, additional_evicted);
-            reservation.absorb(additional_reservation);
-        };
+        let ReservationState {
+            reservation,
+            evicted,
+            ..
+        } = state;
         let src_position = plan.guard_index_for_key(0).get();
         let dst_position = plan.guard_index_for_key(1).get();
 
-        let (src_table, dst_table) = if src_position < dst_position {
-            let (left, right) = guards.split_at_mut(dst_position);
-            (&mut *left[src_position].1, &mut *right[0].1)
-        } else {
-            let (left, right) = guards.split_at_mut(src_position);
-            (&mut *right[0].1, &mut *left[dst_position].1)
-        };
+        let (src_table, dst_table) =
+            distinct_guard_tables_mut(&mut guards, src_position, dst_position);
 
         let _ = self.cleanup_expired_key(source_shard, src_table, old_key, now_nanos);
         let _ = self.cleanup_expired_key(destination_shard, dst_table, &new_key, now_nanos);
@@ -2542,15 +2919,21 @@ impl ConcurrentKeyspace {
         }
         let (lsn, aof_lsn) = self.allocate_mutation_lsn();
         stamp_entry_lsn(dst_table, destination_key.as_bytes(), new_hash, lsn);
-        self.apply_expiry_transition(source_shard, ExpiryTransition::remove(old_had_ttl));
-        self.apply_expiry_transition(
+        self.commit_effects(
+            MutationEffects::none().with_ttl(source_shard, ExpiryTransition::remove(old_had_ttl)),
+        );
+        self.commit_effects(MutationEffects::none().with_ttl(
             destination_shard,
             ExpiryTransition::new(new_had_ttl, ttl != 0 && ttl > now_nanos),
+        ));
+        self.commit_effects(
+            MutationEffects::none()
+                .with_frequency(new_hash)
+                .with_watch_key(old_key)
+                .with_aof_lsn(aof_lsn),
         );
-        self.record_frequency_hash(new_hash);
-        self.bump_watch_key(old_key);
         if let Some(key) = watched_new_key {
-            self.bump_watch_key(&key);
+            self.commit_effects(MutationEffects::none().with_watch_key(&key));
         }
         drop(guards);
         reservation.settle();
@@ -2654,49 +3037,28 @@ impl ConcurrentKeyspace {
             let projected_delta =
                 projected_copy_delta(source_value, &read_guard, &dst, replace, now_nanos);
             drop(read_guard);
-            let (evicted, reservation) = reserve_memory_from_snapshot(
-                self,
-                destination_shard,
-                projected_delta,
-                now_nanos,
-                eviction,
-            )?;
             let destination = dst.clone();
-            let (mut guard, state) = if eviction.max_memory != 0 && !self.replay_mode_active() {
-                acquire_single_shard_with_revalidated_reservation(
-                    self,
-                    source_shard,
-                    now_nanos,
-                    ReservationState {
-                        snapshot: eviction,
-                        reservation,
-                        evicted,
-                    },
-                    "copy_key",
-                    |table| {
-                        let source_value = match table.get_with_ttl(src) {
-                            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
-                            _ => None,
-                        };
-                        Ok(projected_copy_delta(
-                            source_value,
-                            table,
-                            &dst,
-                            replace,
-                            now_nanos,
-                        ))
-                    },
-                )?
-            } else {
-                (
-                    self.write_shard_by_index(source_shard),
-                    ReservationState {
-                        snapshot: eviction,
-                        reservation,
-                        evicted,
-                    },
-                )
-            };
+            let coordinator = ReservationCoordinator::new(self, now_nanos);
+            let state = coordinator.reserve(destination_shard, projected_delta, eviction)?;
+            let (mut guard, state) = coordinator.acquire_single_shard(
+                source_shard,
+                state,
+                "copy_key",
+                coordinator.admission_revalidation_active(eviction),
+                |table| {
+                    let source_value = match table.get_with_ttl(src) {
+                        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+                        _ => None,
+                    };
+                    Ok(projected_copy_delta(
+                        source_value,
+                        table,
+                        &dst,
+                        replace,
+                        now_nanos,
+                    ))
+                },
+            )?;
             let ReservationState {
                 reservation,
                 evicted,
@@ -2709,10 +3071,10 @@ impl ConcurrentKeyspace {
             let dst_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
             let copied = copy_within_table(&mut guard, src, dst, replace, now_nanos);
             let dst_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
-            self.apply_expiry_transition(
+            self.commit_effects(MutationEffects::none().with_ttl(
                 source_shard,
                 ExpiryTransition::new(dst_had_ttl, dst_has_ttl),
-            );
+            ));
             let aof_lsn = if copied {
                 let (lsn, aof_lsn) = self.allocate_mutation_lsn();
                 stamp_entry_lsn(&mut guard, destination.as_bytes(), dst_hash, lsn);
@@ -2721,8 +3083,12 @@ impl ConcurrentKeyspace {
                 None
             };
             if copied {
-                self.record_frequency_hash(dst_hash);
-                self.bump_watch_key(&destination);
+                self.commit_effects(
+                    MutationEffects::none()
+                        .with_frequency(dst_hash)
+                        .with_watch_key(&destination)
+                        .with_aof_lsn(aof_lsn),
+                );
             }
             drop(guard);
             reservation.settle();
@@ -2746,70 +3112,45 @@ impl ConcurrentKeyspace {
             now_nanos,
         );
         drop(read_guards);
-        let (mut evicted, mut reservation) = reserve_memory_from_snapshot(
-            self,
+        let coordinator = ReservationCoordinator::new(self, now_nanos);
+        let state = coordinator.reserve(destination_shard, projected_delta, eviction)?;
+        let (mut guards, plan, state) = coordinator.acquire_multi_write(
+            &key_refs,
             destination_shard,
-            projected_delta,
-            now_nanos,
-            eviction,
+            state,
+            "copy_key",
+            coordinator.admission_revalidation_active(eviction),
+            |guards, plan| {
+                let src_position = plan.guard_index_for_key(0).get();
+                let dst_position = plan.guard_index_for_key(1).get();
+                let (src_table, dst_table) =
+                    distinct_guard_tables_mut(guards, src_position, dst_position);
+
+                let _ = self.cleanup_expired_key(source_shard, src_table, src, now_nanos);
+                let _ = self.cleanup_expired_key(destination_shard, dst_table, &dst, now_nanos);
+                let source_value = match src_table.get_with_ttl(src) {
+                    Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
+                    _ => None,
+                };
+                Ok(projected_copy_delta(
+                    source_value,
+                    dst_table,
+                    &dst,
+                    replace,
+                    now_nanos,
+                ))
+            },
         )?;
-        let admission_active = admission_revalidation_active(self, eviction);
-
-        maybe_pause_after_projection("copy_key");
-
-        let (mut guards, plan) = loop {
-            let mut attempt = self.multi_write(&key_refs);
-            let src_position = attempt.1.guard_index_for_key(0).get();
-            let dst_position = attempt.1.guard_index_for_key(1).get();
-
-            let (src_table, dst_table) = if src_position < dst_position {
-                let (left, right) = attempt.0.split_at_mut(dst_position);
-                (&mut *left[src_position].1, &mut *right[0].1)
-            } else {
-                let (left, right) = attempt.0.split_at_mut(src_position);
-                (&mut *right[0].1, &mut *left[dst_position].1)
-            };
-
-            let _ = self.cleanup_expired_key(source_shard, src_table, src, now_nanos);
-            let _ = self.cleanup_expired_key(destination_shard, dst_table, &dst, now_nanos);
-            let source_value = match src_table.get_with_ttl(src) {
-                Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
-                _ => None,
-            };
-            let required = projected_copy_delta(source_value, dst_table, &dst, replace, now_nanos);
-
-            if !admission_active || required.bytes() <= reservation.reserved_bytes() {
-                break attempt;
-            }
-
-            drop(attempt);
-            let extra = PositiveDelta::from_bytes(required.bytes() - reservation.reserved_bytes());
-            let (additional_evicted, additional_reservation) = match reserve_memory_from_snapshot(
-                self,
-                destination_shard,
-                extra,
-                now_nanos,
-                eviction,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    merge_evicted_keys(&mut evicted, error.evicted);
-                    return Err(MutationError::with_evictions(error.response, evicted));
-                }
-            };
-            merge_evicted_keys(&mut evicted, additional_evicted);
-            reservation.absorb(additional_reservation);
-        };
+        let ReservationState {
+            reservation,
+            evicted,
+            ..
+        } = state;
         let src_position = plan.guard_index_for_key(0).get();
         let dst_position = plan.guard_index_for_key(1).get();
 
-        let (src_table, dst_table) = if src_position < dst_position {
-            let (left, right) = guards.split_at_mut(dst_position);
-            (&mut *left[src_position].1, &mut *right[0].1)
-        } else {
-            let (left, right) = guards.split_at_mut(src_position);
-            (&mut *right[0].1, &mut *left[dst_position].1)
-        };
+        let (src_table, dst_table) =
+            distinct_guard_tables_mut(&mut guards, src_position, dst_position);
 
         let _ = self.cleanup_expired_key(source_shard, src_table, src, now_nanos);
         let _ = self.cleanup_expired_key(destination_shard, dst_table, &dst, now_nanos);
@@ -2839,14 +3180,17 @@ impl ConcurrentKeyspace {
         }
         let (lsn, aof_lsn) = self.allocate_mutation_lsn();
         stamp_entry_lsn(dst_table, destination.as_bytes(), dst_hash, lsn);
-        self.apply_expiry_transition(
-            destination_shard,
-            ExpiryTransition::new(dst_had_ttl, ttl != 0 && ttl > now_nanos),
-        );
-        self.record_frequency_hash(dst_hash);
-        if let Some(key) = watched_dst {
-            self.bump_watch_key(&key);
+        let mut effects = MutationEffects::none()
+            .with_ttl(
+                destination_shard,
+                ExpiryTransition::new(dst_had_ttl, ttl != 0 && ttl > now_nanos),
+            )
+            .with_frequency(dst_hash)
+            .with_aof_lsn(aof_lsn);
+        if let Some(key) = watched_dst.as_ref() {
+            effects = effects.with_watch_key(key);
         }
+        self.commit_effects(effects);
         drop(guards);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(true, aof_lsn, evicted))
@@ -3141,6 +3485,36 @@ mod tests {
     }
 
     #[test]
+    fn mset_values_deduplicates_before_memory_admission() {
+        let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+        let key = fixed_key("mset-duplicate", 0);
+        let first_value = value_of_len(32, b'1');
+        let second_value = value_of_len(32, b'2');
+        let projected_delta = {
+            let shard_index = keyspace.shard_index(key.as_bytes());
+            let guard = keyspace.read_shard_by_index(shard_index);
+            positive_delta(guard.projected_insert_delta(&key, &second_value)).bytes()
+        };
+        keyspace.configure_eviction(
+            keyspace.memory_used() + projected_delta,
+            EvictionPolicy::NoEviction,
+        );
+
+        let outcome = keyspace
+            .mset_values(
+                vec![
+                    (key.clone(), first_value),
+                    (key.clone(), second_value.clone()),
+                ],
+                0,
+            )
+            .expect("deduplicated MSET should fit maxmemory");
+
+        assert_eq!(outcome.value, ());
+        assert_eq!(keyspace.get_value(&key, 0), Some(second_value));
+    }
+
+    #[test]
     fn rename_key_revalidates_after_destination_delete_and_fill() {
         let keyspace = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
         let old_key = key_for_shard_with_len(&keyspace, 0, 20, "rename-old");
@@ -3171,6 +3545,23 @@ mod tests {
         assert!(keyspace.get_value(&old_key, 0).is_some());
         assert!(keyspace.get_value(&new_key, 0).is_none());
         assert!(keyspace.get_value(&filler_key, 0).is_some());
+    }
+
+    #[test]
+    fn rename_key_same_shard_respects_memory_admission() {
+        let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+        let old_key = key_for_shard_with_len(&keyspace, 0, 32, "rename-same-old");
+        let new_key = key_for_shard_with_len(&keyspace, 0, 56, "rename-same-new");
+        let value = value_of_len(16, b's');
+
+        insert_raw(&keyspace, old_key.clone(), value.clone());
+        configure_noeviction_at_current_usage(&keyspace);
+
+        let result = keyspace.rename_key(&old_key, new_key.clone(), 0, false);
+
+        assert_oom(result);
+        assert_eq!(keyspace.get_value(&old_key, 0), Some(value));
+        assert!(keyspace.get_value(&new_key, 0).is_none());
     }
 
     #[test]

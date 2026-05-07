@@ -46,6 +46,94 @@ const MIN_GROUPS: usize = 1;
 /// Per-shard flush threshold for global memory accounting.
 pub(crate) const MEMORY_ACCOUNTING_FLUSH_THRESHOLD: usize = 16 * 1024;
 
+/// Slot index known to be within this table's slot range.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotIndex(usize);
+
+impl SlotIndex {
+    #[inline]
+    fn checked(slot: usize, slots: usize) -> Option<Self> {
+        (slot < slots).then_some(Self(slot))
+    }
+
+    #[inline]
+    const fn from_group_offset(group: GroupIndex, offset: usize) -> Self {
+        Self(group.get() * GROUP_SIZE + offset)
+    }
+
+    #[inline]
+    const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Probe group index known to be within this table's primary group range.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GroupIndex(usize);
+
+impl GroupIndex {
+    #[inline]
+    const fn masked(hash_h1: usize, mask: usize) -> Self {
+        Self(hash_h1 & mask)
+    }
+
+    #[inline]
+    const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Hash computed with the SwissTable hasher that owns the target table.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TableHash(u64);
+
+impl TableHash {
+    #[inline]
+    pub(crate) const fn from_u64(hash: u64) -> Self {
+        Self(hash)
+    }
+
+    #[inline]
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn h1(self) -> usize {
+        h1_from_hash(self.0)
+    }
+
+    #[inline(always)]
+    fn h2(self) -> u8 {
+        h2_from_hash(self.0)
+    }
+}
+
+/// Slot index proven live by observing a non-empty, non-deleted control byte.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveSlot(SlotIndex);
+
+impl LiveSlot {
+    #[inline]
+    const fn new(slot: SlotIndex) -> Self {
+        Self(slot)
+    }
+
+    #[inline]
+    const fn index(self) -> SlotIndex {
+        self.0
+    }
+
+    #[inline]
+    const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
 /// Extract the 7-bit H₂ fingerprint from a 64-bit hash.
 ///
 /// Result is in `0x81..=0xFE` — never `EMPTY` (0xFF) or `DELETED` (0x80).
@@ -164,7 +252,7 @@ impl Group {
 /// With power-of-two groups this visits every group before cycling.
 /// Maintains the current probe position and step size.
 struct ProbeSeq {
-    pos: usize,
+    pos: GroupIndex,
     stride: usize,
     mask: usize,
 }
@@ -173,7 +261,7 @@ impl ProbeSeq {
     #[inline]
     fn new(h1: usize, mask: usize) -> Self {
         Self {
-            pos: h1 & mask,
+            pos: GroupIndex::masked(h1, mask),
             stride: 0,
             mask,
         }
@@ -182,7 +270,7 @@ impl ProbeSeq {
     #[inline]
     fn advance(&mut self) {
         self.stride += 1;
-        self.pos = (self.pos + self.stride) & self.mask;
+        self.pos = GroupIndex((self.pos.get() + self.stride) & self.mask);
     }
 }
 
@@ -257,59 +345,69 @@ impl RawTable {
     }
 
     #[inline]
-    fn ctrl_group(&self, group_idx: usize) -> *const u8 {
-        debug_assert!(group_idx <= self.num_groups);
+    fn ctrl_group(&self, group_idx: GroupIndex) -> *const u8 {
+        debug_assert!(group_idx.get() <= self.num_groups);
 
         // SAFETY: `group_idx <= num_groups` includes the sentinel group, and each
         // group starts within the control-byte allocation.
-        unsafe { self.ctrl.add(group_idx * GROUP_SIZE) }
+        unsafe { self.ctrl.add(group_idx.get() * GROUP_SIZE) }
     }
 
     #[inline]
-    fn ctrl(&self, slot: usize) -> u8 {
-        debug_assert!(slot < self.num_slots());
+    fn ctrl(&self, slot: SlotIndex) -> u8 {
+        debug_assert!(slot.get() < self.num_slots());
 
         // SAFETY: live slots are within the primary control-byte array.
-        unsafe { *self.ctrl.add(slot) }
+        unsafe { *self.ctrl.add(slot.get()) }
     }
 
     #[inline]
-    fn entry(&self, slot: usize) -> &Entry {
-        debug_assert!(slot < self.num_slots());
+    fn entry(&self, slot: LiveSlot) -> &Entry {
+        debug_assert!(slot.get() < self.num_slots());
 
         // SAFETY: `slot < num_slots`, so the element lies within the entry array.
-        unsafe { &*self.entries.add(slot) }
+        unsafe { &*self.entries.add(slot.get()) }
     }
 
     #[inline]
-    fn entry_mut(&mut self, slot: usize) -> &mut Entry {
-        debug_assert!(slot < self.num_slots());
+    fn entry_mut(&mut self, slot: LiveSlot) -> &mut Entry {
+        debug_assert!(slot.get() < self.num_slots());
 
         // SAFETY: `slot < num_slots` and `&mut self` guarantees exclusive access.
-        unsafe { &mut *self.entries.add(slot) }
+        unsafe { &mut *self.entries.add(slot.get()) }
     }
 
     #[inline]
-    fn entry_ptr(&self, slot: usize) -> *const Entry {
-        debug_assert!(slot < self.num_slots());
+    fn entry_mut_for_publish(&mut self, slot: SlotIndex) -> &mut Entry {
+        debug_assert!(slot.get() < self.num_slots());
+
+        // SAFETY: `slot < num_slots` and `&mut self` guarantees exclusive access.
+        // This path is used while publishing a new slot or rewriting a slot whose
+        // key/value owners are already installed.
+        unsafe { &mut *self.entries.add(slot.get()) }
+    }
+
+    #[inline]
+    fn entry_ptr(&self, slot: SlotIndex) -> *const Entry {
+        debug_assert!(slot.get() < self.num_slots());
 
         // SAFETY: `slot < num_slots`, so the computed pointer stays within the
         // entry array.
-        unsafe { self.entries.add(slot) }
+        unsafe { self.entries.add(slot.get()) }
     }
 
     /// Set a control byte + update the sentinel mirror for group 0.
     #[inline]
-    fn set_ctrl(&self, slot: usize, ctrl: u8) {
-        debug_assert!(slot < self.num_slots());
+    fn set_ctrl(&self, slot: SlotIndex, ctrl: u8) {
+        debug_assert!(slot.get() < self.num_slots());
 
         // SAFETY: `slot < num_slots`, and the mirrored sentinel slot also lies within
         // the control-byte allocation.
         unsafe {
-            *self.ctrl.add(slot) = ctrl;
+            *self.ctrl.add(slot.get()) = ctrl;
             // Mirror: if this slot is in the first group, also write to sentinel.
-            if slot < GROUP_SIZE {
-                let mirror = self.num_groups * GROUP_SIZE + slot;
+            if slot.get() < GROUP_SIZE {
+                let mirror = self.num_groups * GROUP_SIZE + slot.get();
                 *self.ctrl.add(mirror) = ctrl;
             }
         }
@@ -444,10 +542,9 @@ impl SwissTable {
     pub fn iter(&self) -> impl Iterator<Item = (&VortexKey, &VortexValue)> {
         let num_slots = self.raw.num_slots();
         (0..num_slots).filter_map(move |slot| {
-            let ctrl = self.raw.ctrl(slot);
-            if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-                return None;
-            }
+            let slot = SlotIndex(slot);
+            let live_slot = self.live_slot(slot)?;
+            let slot = live_slot.get();
             let key = self.keys[slot].as_ref()?;
             let value = self.values[slot].as_ref()?;
             Some((key, value))
@@ -461,17 +558,22 @@ impl SwissTable {
     pub fn iter_entries(&self) -> impl Iterator<Item = &Entry> {
         let num_slots = self.raw.num_slots();
         (0..num_slots).filter_map(move |slot| {
-            let ctrl = self.raw.ctrl(slot);
-            if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-                return None;
-            }
-            Some(self.raw.entry(slot))
+            let slot = SlotIndex(slot);
+            let live_slot = self.live_slot(slot)?;
+            Some(self.raw.entry(live_slot))
         })
     }
 
     #[inline]
     pub fn memory_used(&self) -> usize {
         self.memory_used
+    }
+
+    #[inline]
+    pub fn allocated_bytes(&self) -> usize {
+        self.raw.alloc_size
+            + self.keys.capacity() * size_of::<Option<VortexKey>>()
+            + self.values.capacity() * size_of::<Option<VortexValue>>()
     }
 
     #[inline]
@@ -552,7 +654,7 @@ impl SwissTable {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
         let slot = self.find_slot(key_bytes, hash)?;
-        self.values[slot].as_ref()
+        self.values[slot.get()].as_ref()
     }
 
     /// Remove a key and return its value.
@@ -572,7 +674,7 @@ impl SwissTable {
         let key_bytes = key.as_bytes();
         let hash = self.hash_key(key_bytes);
         let slot = self.find_slot(key_bytes, hash)?;
-        self.delete_slot(slot)
+        self.delete_live_slot(slot)
     }
 
     /// Returns `true` if the key exists.
@@ -619,17 +721,11 @@ impl SwissTable {
     /// The caller must ensure that `slot` is within bounds (0 ≤ slot < total_slots()).
     #[inline]
     pub fn slot_key_value(&self, slot: usize) -> Option<(&VortexKey, &VortexValue)> {
-        if slot >= self.raw.num_slots() {
-            return None;
-        }
-
-        let ctrl = self.raw.ctrl(slot);
-        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-            return None;
-        }
-
-        let key = self.keys[slot].as_ref()?;
-        let value = self.values[slot].as_ref()?;
+        let slot = self.slot_index(slot)?;
+        let live_slot = self.live_slot(slot)?;
+        let slot_idx = live_slot.get();
+        let key = self.keys[slot_idx].as_ref()?;
+        let value = self.values[slot_idx].as_ref()?;
         Some((key, value))
     }
 
@@ -641,16 +737,9 @@ impl SwissTable {
     /// `slot` is within bounds (0 ≤ slot < total_slots()).
     #[inline]
     pub fn slot_entry(&self, slot: usize) -> Option<&Entry> {
-        if slot >= self.raw.num_slots() {
-            return None;
-        }
-
-        let ctrl = self.raw.ctrl(slot);
-        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-            return None;
-        }
-
-        Some(self.raw.entry(slot))
+        let slot = self.slot_index(slot)?;
+        let live_slot = self.live_slot(slot)?;
+        Some(self.raw.entry(live_slot))
     }
 
     /// Deletes a live slot by index and returns its stored value.
@@ -659,24 +748,24 @@ impl SwissTable {
     /// If the slot is out of bounds or not live, it returns `None`.
     #[inline]
     pub fn delete_slot(&mut self, slot: usize) -> Option<VortexValue> {
-        if slot >= self.raw.num_slots() {
-            return None;
-        }
+        let slot = self.slot_index(slot)?;
+        let live_slot = self.live_slot(slot)?;
+        self.delete_live_slot(live_slot)
+    }
 
-        let ctrl = self.raw.ctrl(slot);
-        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-            return None;
-        }
-
-        let bytes = self.slot_memory_usage(slot);
-        let entry = self.raw.entry_mut(slot);
+    #[inline]
+    fn delete_live_slot(&mut self, live_slot: LiveSlot) -> Option<VortexValue> {
+        let slot = live_slot.index();
+        let bytes = self.slot_memory_usage(live_slot);
+        let entry = self.raw.entry_mut(live_slot);
         entry.mark_deleted();
         self.raw.set_ctrl(slot, CTRL_DELETED);
 
         self.len -= 1;
         self.record_memory_delta(-(bytes as isize));
-        self.keys[slot] = None;
-        self.values[slot].take()
+        let slot_idx = slot.get();
+        self.keys[slot_idx] = None;
+        self.values[slot_idx].take()
     }
 
     /// Returns the memory usage of `slot`, or `0` when the slot is not live.
@@ -686,22 +775,21 @@ impl SwissTable {
     /// calculates the memory usage of the key and value stored in the slot.
     #[inline]
     pub fn slot_memory_bytes(&self, slot: usize) -> usize {
-        if slot >= self.raw.num_slots() {
-            return 0;
-        }
-
-        let ctrl = self.raw.ctrl(slot);
-        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-            return 0;
-        }
-
-        self.slot_memory_usage(slot)
+        self.slot_index(slot)
+            .and_then(|slot| self.live_slot(slot))
+            .map_or(0, |slot| self.slot_memory_usage(slot))
     }
 
     /// Expose the hash function for external callers (e.g. ExpiryWheel).
     #[inline]
     pub fn hash_key_bytes(&self, key: &[u8]) -> u64 {
-        self.hasher.hash_one(key)
+        self.hash_key(key).get()
+    }
+
+    /// Hash key bytes with this table's hasher for crate-internal prehashed APIs.
+    #[inline]
+    pub(crate) fn table_hash_key_bytes(&self, key: &[u8]) -> TableHash {
+        self.hash_key(key)
     }
 
     /// Estimates the local-memory delta of inserting or replacing `key` with `value`.
@@ -751,16 +839,9 @@ impl SwissTable {
     /// the slot is empty/deleted or has no TTL.
     #[inline]
     pub fn slot_entry_ttl(&self, slot: usize) -> u64 {
-        if slot >= self.raw.num_slots() {
-            return 0;
-        }
-
-        let ctrl = self.raw.ctrl(slot);
-        if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
-            return 0;
-        }
-
-        self.raw.entry(slot).ttl_deadline()
+        self.slot_index(slot)
+            .and_then(|slot| self.live_slot(slot))
+            .map_or(0, |slot| self.raw.entry(slot).ttl_deadline())
     }
 
     /// Remove a key and return `(value, ttl_deadline)`.
@@ -806,7 +887,7 @@ impl SwissTable {
         let hash = self.hash_key(key_bytes);
         let slot = self.find_slot(key_bytes, hash)?;
         let ttl = self.raw.entry(slot).ttl_deadline();
-        let value = self.values[slot].as_ref()?;
+        let value = self.values[slot.get()].as_ref()?;
         Some((value, ttl))
     }
 
@@ -921,7 +1002,7 @@ pub(crate) struct RawValueBytes<'a>(pub(crate) &'a [u8]);
 
 pub(crate) trait TableMutationKey {
     fn as_bytes(&self) -> &[u8];
-    fn replace_existing(self, table: &mut SwissTable, slot: usize);
+    fn replace_existing(self, table: &mut SwissTable, slot: LiveSlot);
     fn into_owned(self) -> VortexKey;
 }
 
@@ -932,8 +1013,8 @@ impl TableMutationKey for VortexKey {
     }
 
     #[inline]
-    fn replace_existing(self, table: &mut SwissTable, slot: usize) {
-        table.keys[slot] = Some(self);
+    fn replace_existing(self, table: &mut SwissTable, slot: LiveSlot) {
+        table.keys[slot.get()] = Some(self);
     }
 
     #[inline]
@@ -949,7 +1030,7 @@ impl TableMutationKey for BorrowedKey<'_> {
     }
 
     #[inline]
-    fn replace_existing(self, _table: &mut SwissTable, _slot: usize) {}
+    fn replace_existing(self, _table: &mut SwissTable, _slot: LiveSlot) {}
 
     #[inline]
     fn into_owned(self) -> VortexKey {
@@ -961,7 +1042,7 @@ pub(crate) trait TableMutationValue {
     fn replace_existing(
         self,
         table: &mut SwissTable,
-        slot: usize,
+        slot: LiveSlot,
         h2: u8,
         ttl: u64,
         lsn: Option<u64>,
@@ -970,7 +1051,7 @@ pub(crate) trait TableMutationValue {
     fn insert_new(
         self,
         table: &mut SwissTable,
-        slot: usize,
+        slot: SlotIndex,
         h2: u8,
         key: VortexKey,
         ttl: u64,
@@ -983,7 +1064,7 @@ impl TableMutationValue for VortexValue {
     fn replace_existing(
         self,
         table: &mut SwissTable,
-        slot: usize,
+        slot: LiveSlot,
         h2: u8,
         ttl: u64,
         lsn: Option<u64>,
@@ -995,7 +1076,7 @@ impl TableMutationValue for VortexValue {
     fn insert_new(
         self,
         table: &mut SwissTable,
-        slot: usize,
+        slot: SlotIndex,
         h2: u8,
         key: VortexKey,
         ttl: u64,
@@ -1010,16 +1091,17 @@ impl TableMutationValue for RawValueBytes<'_> {
     fn replace_existing(
         self,
         table: &mut SwissTable,
-        slot: usize,
+        slot: LiveSlot,
         h2: u8,
         ttl: u64,
         lsn: Option<u64>,
     ) -> Option<VortexValue> {
-        let previous = table.values[slot]
+        let slot_idx = slot.get();
+        let previous = table.values[slot_idx]
             .take()
             .expect("live slot must have value");
-        table.values[slot] = Some(VortexValue::from_bytes_reusing(previous, self.0));
-        table.rewrite_slot_entry(slot, h2, ttl, lsn);
+        table.values[slot_idx] = Some(VortexValue::from_bytes_reusing(previous, self.0));
+        table.rewrite_slot_entry(slot.index(), h2, ttl, lsn);
         None
     }
 
@@ -1027,7 +1109,7 @@ impl TableMutationValue for RawValueBytes<'_> {
     fn insert_new(
         self,
         table: &mut SwissTable,
-        slot: usize,
+        slot: SlotIndex,
         h2: u8,
         key: VortexKey,
         ttl: u64,
@@ -1085,6 +1167,17 @@ impl SwissTable {
     }
 
     #[inline]
+    fn slot_index(&self, slot: usize) -> Option<SlotIndex> {
+        SlotIndex::checked(slot, self.capacity())
+    }
+
+    #[inline]
+    fn live_slot(&self, slot: SlotIndex) -> Option<LiveSlot> {
+        let ctrl = self.raw.ctrl(slot);
+        (ctrl != CTRL_EMPTY && ctrl != CTRL_DELETED).then_some(LiveSlot::new(slot))
+    }
+
+    #[inline]
     const fn growth_limit(&self) -> usize {
         self.capacity() * LOAD_FACTOR_N / LOAD_FACTOR_D
     }
@@ -1095,9 +1188,12 @@ impl SwissTable {
     }
 
     #[inline]
-    fn slot_memory_usage(&self, slot: usize) -> usize {
-        let key = self.keys[slot].as_ref().expect("live slot must have key");
-        let value = self.values[slot]
+    fn slot_memory_usage(&self, slot: LiveSlot) -> usize {
+        let slot_idx = slot.get();
+        let key = self.keys[slot_idx]
+            .as_ref()
+            .expect("live slot must have key");
+        let value = self.values[slot_idx]
             .as_ref()
             .expect("live slot must have value");
         Self::entry_memory_usage(key, value)
@@ -1111,22 +1207,26 @@ impl SwissTable {
     }
 
     #[inline(always)]
-    fn finish_new_slot_insert(&mut self, slot: usize, was_empty: bool) {
+    fn finish_new_slot_insert(&mut self, slot: SlotIndex, was_empty: bool) {
         self.len += 1;
         if was_empty {
             self.occupied += 1;
         }
-        self.record_memory_delta(self.slot_memory_usage(slot) as isize);
+        let live_slot = self.live_slot(slot).expect("new slot must be live");
+        self.record_memory_delta(self.slot_memory_usage(live_slot) as isize);
     }
 
     #[inline(always)]
-    fn rewrite_slot_entry(&mut self, slot: usize, h2: u8, ttl: u64, lsn: Option<u64>) {
-        let key = self.keys[slot].as_ref().expect("live slot must have key");
-        let value = self.values[slot]
+    fn rewrite_slot_entry(&mut self, slot: SlotIndex, h2: u8, ttl: u64, lsn: Option<u64>) {
+        let slot_idx = slot.get();
+        let key = self.keys[slot_idx]
+            .as_ref()
+            .expect("live slot must have key");
+        let value = self.values[slot_idx]
             .as_ref()
             .expect("live slot must have value");
 
-        let entry = self.raw.entry_mut(slot);
+        let entry = self.raw.entry_mut_for_publish(slot);
         Self::write_entry(entry, h2, key, value, ttl);
         if let Some(lsn) = lsn {
             entry.set_lsn_version(lsn);
@@ -1137,29 +1237,31 @@ impl SwissTable {
     #[inline(always)]
     fn write_new_slot(
         &mut self,
-        slot: usize,
+        slot: SlotIndex,
         h2: u8,
         key: VortexKey,
         value: VortexValue,
         ttl: u64,
         lsn: Option<u64>,
     ) {
-        self.keys[slot] = Some(key);
-        self.values[slot] = Some(value);
+        let slot_idx = slot.get();
+        self.keys[slot_idx] = Some(key);
+        self.values[slot_idx] = Some(value);
         self.rewrite_slot_entry(slot, h2, ttl, lsn);
     }
 
     #[inline(always)]
     fn replace_slot_value(
         &mut self,
-        slot: usize,
+        slot: LiveSlot,
         h2: u8,
         value: VortexValue,
         ttl: u64,
         lsn: Option<u64>,
     ) -> Option<VortexValue> {
-        let previous = self.values[slot].replace(value);
-        self.rewrite_slot_entry(slot, h2, ttl, lsn);
+        let slot_idx = slot.get();
+        let previous = self.values[slot_idx].replace(value);
+        self.rewrite_slot_entry(slot.index(), h2, ttl, lsn);
         previous
     }
 
@@ -1168,7 +1270,7 @@ impl SwissTable {
         &mut self,
         key: K,
         value: V,
-        hash: u64,
+        hash: TableHash,
         policy: MutationPolicy,
     ) -> UpsertOutcome
     where
@@ -1177,7 +1279,7 @@ impl SwissTable {
     {
         self.ensure_capacity_for_insert();
 
-        let h2 = h2_from_hash(hash);
+        let h2 = hash.h2();
 
         if let Some(slot) = self.find_slot(key.as_bytes(), hash) {
             let old_ttl = self.raw.entry(slot).ttl_deadline();
@@ -1206,15 +1308,15 @@ impl SwissTable {
 
     /// Hash key bytes using ahash.
     #[inline]
-    fn hash_key(&self, key: &[u8]) -> u64 {
-        self.hasher.hash_one(key)
+    fn hash_key(&self, key: &[u8]) -> TableHash {
+        TableHash(self.hasher.hash_one(key))
     }
 
     /// Find the slot of an existing key, or `None`.
     #[inline]
-    fn find_slot(&self, key_bytes: &[u8], hash: u64) -> Option<usize> {
-        let h2 = h2_from_hash(hash);
-        let h1 = h1_from_hash(hash);
+    fn find_slot(&self, key_bytes: &[u8], hash: TableHash) -> Option<LiveSlot> {
+        let h2 = hash.h2();
+        let h1 = hash.h1();
         let mask = self.group_mask();
         let mut probe = ProbeSeq::new(h1, mask);
 
@@ -1223,10 +1325,11 @@ impl SwissTable {
             let matches = Group::match_h2(ctrl_ptr, h2);
 
             for bit in matches {
-                let slot = probe.pos * GROUP_SIZE + bit;
-                let entry = self.raw.entry(slot);
+                let slot = SlotIndex::from_group_offset(probe.pos, bit);
+                let live_slot = LiveSlot::new(slot);
+                let entry = self.raw.entry(live_slot);
                 if entry.matches_key(key_bytes) {
-                    return Some(slot);
+                    return Some(live_slot);
                 }
             }
 
@@ -1241,13 +1344,13 @@ impl SwissTable {
 
     /// Find the first EMPTY or DELETED slot along the probe chain.
     #[inline]
-    fn find_insert_slot(&self, hash: u64) -> usize {
+    fn find_insert_slot(&self, hash: TableHash) -> SlotIndex {
         debug_assert!(
             self.occupied < self.capacity(),
             "find_insert_slot requires at least one available slot"
         );
 
-        let h1 = h1_from_hash(hash);
+        let h1 = hash.h1();
         let mask = self.group_mask();
         let mut probe = ProbeSeq::new(h1, mask);
 
@@ -1255,7 +1358,7 @@ impl SwissTable {
             let ctrl_ptr = self.raw.ctrl_group(probe.pos);
             let candidates = Group::match_empty_or_deleted(ctrl_ptr);
             if let Some(bit) = candidates.lowest() {
-                return probe.pos * GROUP_SIZE + bit;
+                return SlotIndex::from_group_offset(probe.pos, bit);
             }
             probe.advance();
         }
@@ -1273,12 +1376,12 @@ impl SwissTable {
         let mut new_values: Vec<Option<VortexValue>> = vec![None; new_num_slots];
 
         for slot in 0..old_num_slots {
-            let ctrl = self.raw.ctrl(slot);
-            if ctrl == CTRL_EMPTY || ctrl == CTRL_DELETED {
+            let slot_index = SlotIndex(slot);
+            let Some(live_slot) = self.live_slot(slot_index) else {
                 continue;
-            }
+            };
 
-            let old_entry = self.raw.entry(slot);
+            let old_entry = self.raw.entry(live_slot);
             let ttl = old_entry.ttl_deadline();
             let lsn = old_entry.lsn_version();
             let key_bytes = self.keys[slot]
@@ -1286,8 +1389,8 @@ impl SwissTable {
                 .expect("live slot must have key")
                 .as_bytes();
             let hash = self.hash_key(key_bytes);
-            let h2 = h2_from_hash(hash);
-            let h1 = h1_from_hash(hash);
+            let h2 = hash.h2();
+            let h1 = hash.h1();
 
             // Find empty slot in new table.
             let mut probe = ProbeSeq::new(h1, new_mask);
@@ -1295,22 +1398,23 @@ impl SwissTable {
                 let gctrl = new_raw.ctrl_group(probe.pos);
                 let empties = Group::match_empty(gctrl);
                 if let Some(bit) = empties.lowest() {
-                    break probe.pos * GROUP_SIZE + bit;
+                    break SlotIndex::from_group_offset(probe.pos, bit);
                 }
                 probe.advance();
             };
 
-            new_keys[new_slot] = self.keys[slot].take();
-            new_values[new_slot] = self.values[slot].take();
+            let new_slot_idx = new_slot.get();
+            new_keys[new_slot_idx] = self.keys[slot].take();
+            new_values[new_slot_idx] = self.values[slot].take();
 
-            let key = new_keys[new_slot]
+            let key = new_keys[new_slot_idx]
                 .as_ref()
                 .expect("rehash slot must have key");
-            let value = new_values[new_slot]
+            let value = new_values[new_slot_idx]
                 .as_ref()
                 .expect("rehash slot must have value");
 
-            let entry = new_raw.entry_mut(new_slot);
+            let entry = new_raw.entry_mut_for_publish(new_slot);
             Self::write_entry(entry, h2, key, value, ttl);
             entry.set_lsn_version(lsn);
             new_raw.set_ctrl(new_slot, h2);
@@ -1332,18 +1436,19 @@ impl SwissTable {
 
     /// Records an access against a live slot index.
     #[inline]
-    fn record_access_slot(&self, slot: usize, random: u64) -> bool {
-        let Some(entry) = self.slot_entry(slot) else {
-            return false;
-        };
+    fn record_access_slot(&self, slot: LiveSlot, random: u64) {
+        let entry = self.raw.entry(slot);
         entry.record_access(random);
-        true
     }
 }
 
 /**
  * Prehashed operations are used by batch pipelines to reduce redundant hashing
  * and key materialization.
+ *
+ * These APIs accept [`TableHash`] rather than a bare `u64`. The hash must come
+ * from this table's hasher, or from the shared table hasher owned by
+ * `ConcurrentKeyspace`; shard-routing hashes are a different contract.
  */
 impl SwissTable {
     /// Estimates the local-memory delta of inserting or replacing `key` using `hash`.
@@ -1352,7 +1457,7 @@ impl SwissTable {
         &self,
         key: &VortexKey,
         value: &VortexValue,
-        hash: u64,
+        hash: TableHash,
     ) -> isize {
         let new_bytes = Self::entry_memory_usage(key, value) as isize;
         match self.find_slot(key.as_bytes(), hash) {
@@ -1366,7 +1471,7 @@ impl SwissTable {
         &mut self,
         key: K,
         value: V,
-        hash: u64,
+        hash: TableHash,
         policy: MutationPolicy,
     ) -> UpsertOutcome
     where
@@ -1381,7 +1486,7 @@ impl SwissTable {
         &mut self,
         key_bytes: &[u8],
         value: V,
-        hash: u64,
+        hash: TableHash,
         policy: MutationPolicy,
     ) -> Option<VortexValue>
     where
@@ -1389,7 +1494,7 @@ impl SwissTable {
     {
         let slot = self.find_slot(key_bytes, hash)?;
         let ttl = policy.ttl_for_existing(self.raw.entry(slot).ttl_deadline());
-        let h2 = h2_from_hash(hash);
+        let h2 = hash.h2();
         let old_bytes = self.slot_memory_usage(slot);
         let previous = value.replace_existing(self, slot, h2, ttl, policy.lsn);
         let new_bytes = self.slot_memory_usage(slot);
@@ -1402,13 +1507,13 @@ impl SwissTable {
         &mut self,
         key: VortexKey,
         value: VortexValue,
-        hash: u64,
+        hash: TableHash,
         lsn: u64,
     ) {
         self.ensure_capacity_for_insert();
 
         debug_assert_eq!(
-            self.hash_key_bytes(key.as_bytes()),
+            self.table_hash_key_bytes(key.as_bytes()),
             hash,
             "insert_new_prehashed_and_lsn requires a hash computed for `key`"
         );
@@ -1417,7 +1522,7 @@ impl SwissTable {
             "insert_new_prehashed_and_lsn requires an absent key"
         );
 
-        let h2 = h2_from_hash(hash);
+        let h2 = hash.h2();
         let slot = self.find_insert_slot(hash);
         let was_empty = self.raw.ctrl(slot) == CTRL_EMPTY;
 
@@ -1432,13 +1537,13 @@ impl SwissTable {
     pub(crate) fn remove_with_ttl_prehashed(
         &mut self,
         key_bytes: &[u8],
-        hash: u64,
+        hash: TableHash,
     ) -> Option<(VortexValue, u64)> {
         let slot = self.find_slot(key_bytes, hash)?;
 
         let ttl = self.raw.entry(slot).ttl_deadline();
 
-        let value = self.delete_slot(slot)?;
+        let value = self.delete_live_slot(slot)?;
         Some((value, ttl))
     }
 
@@ -1449,11 +1554,11 @@ impl SwissTable {
     pub(crate) fn get_with_ttl_prehashed(
         &self,
         key_bytes: &[u8],
-        hash: u64,
+        hash: TableHash,
     ) -> Option<(&VortexValue, u64)> {
         let slot = self.find_slot(key_bytes, hash)?;
         let ttl = self.raw.entry(slot).ttl_deadline();
-        let value = self.values[slot].as_ref()?;
+        let value = self.values[slot.get()].as_ref()?;
         Some((value, ttl))
     }
 
@@ -1461,23 +1566,27 @@ impl SwissTable {
     pub(crate) fn get_or_expire_prehashed(
         &mut self,
         key_bytes: &[u8],
-        hash: u64,
+        hash: TableHash,
         now_nanos: u64,
     ) -> Option<&VortexValue> {
         let slot = self.find_slot(key_bytes, hash)?;
 
         let entry = self.raw.entry(slot);
         if entry.is_expired(now_nanos) {
-            let _ = self.delete_slot(slot);
+            let _ = self.delete_live_slot(slot);
             return None;
         }
 
-        self.values[slot].as_ref()
+        self.values[slot.get()].as_ref()
     }
 
     /// Returns the stored LSN/version for `key_bytes` when present.
     #[inline]
-    pub(crate) fn get_lsn_version_prehashed(&self, key_bytes: &[u8], hash: u64) -> Option<u64> {
+    pub(crate) fn get_lsn_version_prehashed(
+        &self,
+        key_bytes: &[u8],
+        hash: TableHash,
+    ) -> Option<u64> {
         let slot = self.find_slot(key_bytes, hash)?;
         Some(self.raw.entry(slot).lsn_version())
     }
@@ -1487,7 +1596,7 @@ impl SwissTable {
     pub(crate) fn set_lsn_version_prehashed(
         &mut self,
         key_bytes: &[u8],
-        hash: u64,
+        hash: TableHash,
         lsn: u64,
     ) -> bool {
         let Some(slot) = self.find_slot(key_bytes, hash) else {
@@ -1500,17 +1609,23 @@ impl SwissTable {
 
     /// Check existence with a pre-computed hash (no rehashing).
     #[inline]
-    pub(crate) fn contains_key_prehashed(&self, key_bytes: &[u8], hash: u64) -> bool {
+    pub(crate) fn contains_key_prehashed(&self, key_bytes: &[u8], hash: TableHash) -> bool {
         self.find_slot(key_bytes, hash).is_some()
     }
 
     /// Records an access on a known slot identified by a precomputed hash.
     #[inline]
-    pub(crate) fn record_access_prehashed(&self, key_bytes: &[u8], hash: u64, random: u64) -> bool {
+    pub(crate) fn record_access_prehashed(
+        &self,
+        key_bytes: &[u8],
+        hash: TableHash,
+        random: u64,
+    ) -> bool {
         let Some(slot) = self.find_slot(key_bytes, hash) else {
             return false;
         };
-        self.record_access_slot(slot, random)
+        self.record_access_slot(slot, random);
+        true
     }
 }
 
@@ -1530,13 +1645,15 @@ impl SwissTable {
     /// ```
     #[inline]
     pub fn prefetch_group(&self, hash: u64) {
-        let h1 = h1_from_hash(hash);
-        let group_idx = h1 & self.group_mask();
+        let hash = TableHash::from_u64(hash);
+        let group_idx = GroupIndex::masked(hash.h1(), self.group_mask());
         // Prefetch the 16-byte control array for this group.
         let ctrl_ptr = self.raw.ctrl_group(group_idx);
         crate::prefetch::prefetch_read(ctrl_ptr);
         // Prefetch the first entry slot in the group (64-byte cache line).
-        let entry_ptr = self.raw.entry_ptr(group_idx * GROUP_SIZE);
+        let entry_ptr = self
+            .raw
+            .entry_ptr(SlotIndex::from_group_offset(group_idx, 0));
         crate::prefetch::prefetch_read(entry_ptr);
     }
 
@@ -1552,11 +1669,13 @@ impl SwissTable {
     /// ```
     #[inline]
     pub fn prefetch_group_write(&self, hash: u64) {
-        let h1 = h1_from_hash(hash);
-        let group_idx = h1 & self.group_mask();
+        let hash = TableHash::from_u64(hash);
+        let group_idx = GroupIndex::masked(hash.h1(), self.group_mask());
         let ctrl_ptr = self.raw.ctrl_group(group_idx);
         crate::prefetch::prefetch_write(ctrl_ptr);
-        let entry_ptr = self.raw.entry_ptr(group_idx * GROUP_SIZE);
+        let entry_ptr = self
+            .raw
+            .entry_ptr(SlotIndex::from_group_offset(group_idx, 0));
         crate::prefetch::prefetch_write(entry_ptr);
     }
 }
@@ -1640,6 +1759,14 @@ mod tests {
 
         table.remove(&key);
         assert_eq!(table.memory_used(), 0);
+    }
+
+    #[test]
+    fn allocated_bytes_include_slot_storage() {
+        let table = SwissTable::with_capacity(128);
+
+        assert!(table.allocated_bytes() > 0);
+        assert!(table.allocated_bytes() >= table.memory_used());
     }
 
     #[test]
@@ -1796,7 +1923,7 @@ mod tests {
     fn replace_value_updates_entry_metadata() {
         let mut table = SwissTable::new();
         let key = VortexKey::from("x");
-        let hash = table.hash_key_bytes(key.as_bytes());
+        let hash = table.table_hash_key_bytes(key.as_bytes());
         table.insert_with(key.clone(), VortexValue::Integer(10), 123, None);
 
         table
@@ -1816,7 +1943,7 @@ mod tests {
     fn mutate_prehashed_clear_policy_clears_ttl_and_updates_lsn() {
         let mut table = SwissTable::new();
         let key = VortexKey::from("clear-ttl");
-        let hash = table.hash_key_bytes(key.as_bytes());
+        let hash = table.table_hash_key_bytes(key.as_bytes());
 
         table.insert_with(key.clone(), VortexValue::from("before"), 123, Some(7));
 
@@ -1840,7 +1967,7 @@ mod tests {
     fn replace_prehashed_preserve_policy_keeps_ttl() {
         let mut table = SwissTable::new();
         let key = VortexKey::from("preserve-ttl");
-        let hash = table.hash_key_bytes(key.as_bytes());
+        let hash = table.table_hash_key_bytes(key.as_bytes());
 
         table.insert_with(key.clone(), VortexValue::from("before"), 456, Some(11));
 
@@ -1864,7 +1991,7 @@ mod tests {
     fn mutate_prehashed_raw_bytes_reports_old_ttl() {
         let mut table = SwissTable::new();
         let key = VortexKey::from("raw-bytes");
-        let hash = table.hash_key_bytes(key.as_bytes());
+        let hash = table.table_hash_key_bytes(key.as_bytes());
 
         table.insert_with(key.clone(), VortexValue::from("before"), 789, Some(1));
 
@@ -1918,7 +2045,7 @@ mod tests {
     fn resize_preserves_entry_lsn_versions() {
         let mut table = SwissTable::with_capacity(1);
         let watched = VortexKey::from("watched");
-        let watched_hash = table.hash_key_bytes(watched.as_bytes());
+        let watched_hash = table.table_hash_key_bytes(watched.as_bytes());
 
         let _ = table.mutate_prehashed(
             watched.clone(),
@@ -1936,7 +2063,7 @@ mod tests {
             table.insert(key, VortexValue::Integer(i));
         }
 
-        let watched_hash = table.hash_key_bytes(watched.as_bytes());
+        let watched_hash = table.table_hash_key_bytes(watched.as_bytes());
         assert_eq!(
             table.get_lsn_version_prehashed(watched.as_bytes(), watched_hash),
             Some(42)

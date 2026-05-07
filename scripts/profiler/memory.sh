@@ -12,6 +12,27 @@ run_heaptrack() {
 
     header "Heaptrack"
 
+    if profiling_target_is_engine; then
+        info "Running: heaptrack engine target"
+        heaptrack -o "${session}/heaptrack" \
+            "$PROFILING_BINARY" \
+            "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/engine-heaptrack.log" 2>&1 || true
+
+        local ht_file
+        ht_file="$(ls -t "${session}"/heaptrack*.zst "${session}"/heaptrack*.gz 2>/dev/null | head -1 || true)"
+        if [[ -n "$ht_file" ]]; then
+            ok "Heaptrack data: ${ht_file}"
+            if has_cmd heaptrack_print; then
+                heaptrack_print "$ht_file" 2>/dev/null | head -80 > "${session}/heaptrack-summary.txt" || true
+                info "Heaptrack summary: ${session}/heaptrack-summary.txt"
+            fi
+        else
+            warn "Heaptrack data was not generated"
+        fi
+        return 0
+    fi
+
     local extra_args=()
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
@@ -61,6 +82,24 @@ run_massif() {
 
     header "Massif"
 
+    if profiling_target_is_engine; then
+        info "Running: valgrind --tool=massif"
+        valgrind --tool=massif \
+            --massif-out-file="${session}/massif.out" \
+            "$PROFILING_BINARY" \
+            "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/engine-massif.log" 2>&1 || true
+
+        if [[ -f "${session}/massif.out" ]]; then
+            ok "Massif data: ${session}/massif.out"
+            if has_cmd ms_print; then
+                ms_print "${session}/massif.out" 2>/dev/null | head -60 > "${session}/massif-summary.txt" || true
+                info "Massif summary: ${session}/massif-summary.txt"
+            fi
+        fi
+        return 0
+    fi
+
     local extra_args=()
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
@@ -108,6 +147,42 @@ run_instruments_memory() {
     ensure_macos_debuggable_binary "$PROFILING_BINARY"
 
     local templates=("Allocations" "Leaks")
+
+    if profiling_target_is_engine; then
+        for template in "${templates[@]}"; do
+            info "Setting up for template: ${template}"
+            local suffix_name="${template// /-}"
+            suffix_name="$(echo "$suffix_name" | tr '[:upper:]' '[:lower:]')"
+            local trace_log="${session}/instruments-${suffix_name}.log"
+
+            (cd "$REPO_ROOT" && exec xcrun xctrace record \
+                --template "${template}" \
+                --output "${session}/${suffix_name}.trace" \
+                --launch -- "$PROFILING_BINARY" \
+                "${ENGINE_TARGET_ARGS[@]}" \
+                >"${trace_log}" 2>&1) || true
+
+            if [[ -d "${session}/${suffix_name}.trace" ]]; then
+                ok "Instruments trace: ${session}/${suffix_name}.trace"
+                xcrun xctrace export --input "${session}/${suffix_name}.trace" --toc --output "${session}/${suffix_name}-toc.xml" >/dev/null 2>&1 || true
+                if [[ "${template}" == "Allocations" ]]; then
+                    xcrun xctrace export --input "${session}/${suffix_name}.trace" \
+                        --xpath '/trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Allocations List"]' \
+                        --output "${session}/${suffix_name}-data.xml" >/dev/null 2>&1 || true
+                    xcrun xctrace export --input "${session}/${suffix_name}.trace" \
+                        --xpath '/trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]' \
+                        --output "${session}/${suffix_name}-stats.xml" >/dev/null 2>&1 || true
+                else
+                    xcrun xctrace export --input "${session}/${suffix_name}.trace" \
+                        --xpath '/trace-toc/run[@number="1"]/tracks/track[@name="Leaks"]/details/detail[@name="Leaks"]' \
+                        --output "${session}/${suffix_name}-data.xml" >/dev/null 2>&1 || true
+                fi
+            else
+                warn "Instruments trace was not generated for ${template}. See ${trace_log}"
+            fi
+        done
+        return 0
+    fi
 
     for template in "${templates[@]}"; do
         info "Setting up for template: ${template}"

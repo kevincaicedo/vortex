@@ -79,30 +79,38 @@ pub enum EntryValue<'a> {
 }
 
 /// The 64-byte, cache-line-aligned entry stored in every Swiss Table slot.
+///
+/// Raw representation fields are private so safe downstream code cannot forge
+/// heap-backed pointer metadata and then call safe readers.
+///
+/// ```compile_fail
+/// let mut entry = vortex_engine::Entry::empty();
+/// entry.control = 0x92;
+/// ```
 #[repr(C, align(64))]
 pub struct Entry {
     /// H₂ fingerprint for SIMD probing. EMPTY = 0xFF, DELETED = 0x80.
-    pub control: u8,
+    control: u8,
     /// Inline key length. Heap keys encode their length in `key_data`.
-    pub key_len: u8,
+    key_len: u8,
     /// Entry flags (type tag, heap indicators, TTL).
-    pub flags: u8,
+    flags: u8,
     /// Morris counter for probabilistic eviction (0..=255, saturating).
-    pub morris_cnt: AtomicU8,
+    morris_cnt: AtomicU8,
     /// Access-profile payload. Lock-free tracking.
-    pub access_profile: AtomicU32,
+    access_profile: AtomicU32,
     /// Absolute monotonic TTL deadline in nanoseconds.
-    pub ttl_deadline_nanos: u64,
+    ttl_deadline_nanos: u64,
     /// 48-bit monotonic version / LSN.
-    pub lsn_version: [u8; 6],
+    lsn_version: [u8; 6],
     /// Inline value length, or HEAP / INTEGER sentinel.
-    pub value_tag: u8,
+    value_tag: u8,
     /// Explicit pad so `key_data` starts on an 8-byte boundary.
-    pub _reserved: u8,
+    _reserved: u8,
     /// Inline key bytes, or heap key metadata (ptr + len).
-    pub key_data: [u8; vortex_common::MAX_INLINE_KEY_LEN],
+    key_data: [u8; vortex_common::MAX_INLINE_KEY_LEN],
     /// Inline value bytes, integer bytes, or heap value pointer.
-    pub value_data: [u8; vortex_common::MAX_INLINE_VALUE_LEN],
+    value_data: [u8; vortex_common::MAX_INLINE_VALUE_LEN],
 }
 
 const _: () = assert!(size_of::<Entry>() == 64);
@@ -178,10 +186,12 @@ impl Entry {
             return;
         }
 
-        let mask = if counter == 0 {
-            0
-        } else {
-            (1u64 << counter) - 1
+        let mask = match counter {
+            0 => 0,
+            1..=63 => (1u64 << counter) - 1,
+            // Beyond 63, use the strongest representable 64-bit sampling gate:
+            // only an all-zero random sample increments the counter.
+            _ => u64::MAX,
         };
 
         if random & mask != 0 {
@@ -435,12 +445,15 @@ impl Entry {
 
     #[inline]
     fn reset(&mut self, h2: u8, ttl_deadline: u64) {
+        let old_morris_cnt = self.morris_cnt.load(Ordering::Relaxed);
+        let old_access_profile = self.access_profile.load(Ordering::Relaxed);
         let old_lsn = self.lsn_version;
         self.control = h2;
         self.key_len = 0;
         self.store_flags(0);
-        self.morris_cnt.store(0, Ordering::Relaxed);
-        self.access_profile.store(0, Ordering::Relaxed);
+        self.morris_cnt.store(old_morris_cnt, Ordering::Relaxed);
+        self.access_profile
+            .store(old_access_profile, Ordering::Relaxed);
         self.ttl_deadline_nanos = 0;
         self.lsn_version = old_lsn;
         self.value_tag = 0;
@@ -789,6 +802,47 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "heap key pointer missing")]
+    fn read_key_panics_for_corrupt_heap_key_metadata() {
+        let mut entry = Entry::empty();
+        let key = VortexKey::from("k");
+        let value = VortexValue::from("v");
+        write_borrowed_for_test(&mut entry, 0x82, &key, &value, 0);
+
+        entry.store_flags(entry.flags() & !FLAG_INLINE_KEY);
+        entry.key_len = 0;
+        entry.key_data = [0; vortex_common::MAX_INLINE_KEY_LEN];
+
+        let _ = entry.read_key();
+    }
+
+    #[test]
+    #[should_panic(expected = "inline value tag exceeds MAX_INLINE_VALUE_LEN")]
+    fn read_value_panics_for_corrupt_inline_value_tag() {
+        let mut entry = Entry::empty();
+        let key = VortexKey::from("k");
+        let value = VortexValue::from("v");
+        write_borrowed_for_test(&mut entry, 0x82, &key, &value, 0);
+
+        entry.value_tag = vortex_common::MAX_INLINE_VALUE_LEN as u8 + 1;
+
+        let _ = entry.read_value();
+    }
+
+    #[test]
+    #[should_panic(expected = "heap value pointer missing")]
+    fn read_value_panics_for_corrupt_heap_value_metadata() {
+        let mut entry = Entry::empty();
+        let key = VortexKey::from("k");
+        let value = VortexValue::List(Box::default());
+        write_borrowed_for_test(&mut entry, 0x82, &key, &value, 0);
+
+        entry.value_data = [0; vortex_common::MAX_INLINE_VALUE_LEN];
+
+        let _ = entry.read_value();
+    }
+
+    #[test]
     fn eviction_counter() {
         let e = Entry::empty();
         assert_eq!(e.morris_counter(), 0);
@@ -803,6 +857,43 @@ mod tests {
         assert_eq!(e.morris_counter(), EVICTION_COUNTER_MAX);
         assert!(e.decrement_eviction_counter());
         assert_eq!(e.morris_counter(), EVICTION_COUNTER_MAX - 1);
+    }
+
+    #[test]
+    fn record_access_counter_boundaries_are_defined() {
+        let entry = Entry::empty();
+
+        entry.set_morris_counter(0);
+        entry.record_access(u64::MAX);
+        assert_eq!(entry.morris_counter(), 1);
+
+        entry.set_morris_counter(1);
+        entry.record_access(1);
+        assert_eq!(entry.morris_counter(), 1);
+        entry.record_access(0);
+        assert_eq!(entry.morris_counter(), 2);
+
+        entry.set_morris_counter(63);
+        entry.record_access(1);
+        assert_eq!(entry.morris_counter(), 63);
+        entry.record_access(1u64 << 63);
+        assert_eq!(entry.morris_counter(), 64);
+
+        entry.set_morris_counter(64);
+        entry.record_access(1);
+        assert_eq!(entry.morris_counter(), 64);
+        entry.record_access(0);
+        assert_eq!(entry.morris_counter(), 65);
+
+        entry.set_morris_counter(254);
+        entry.record_access(1);
+        assert_eq!(entry.morris_counter(), 254);
+        entry.record_access(0);
+        assert_eq!(entry.morris_counter(), 255);
+
+        entry.set_morris_counter(255);
+        entry.record_access(0);
+        assert_eq!(entry.morris_counter(), 255);
     }
 
     #[test]

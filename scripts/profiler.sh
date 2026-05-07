@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Vortex Profiler — profiling tool manager for vortex-server
+# Vortex Profiler — profiling tool manager for vortex-server and engine targets
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Self-contained orchestrator: detects OS, builds the profiling binary,
-# starts vortex-server, runs native profilers, generates load internally,
+# Self-contained orchestrator: detects OS, builds the profiling target,
+# starts vortex-server or a standalone engine binary, runs native profilers,
+# generates load internally when needed,
 # and collects all artifacts into a timestamped session directory.
 #
 # Usage:  just profiler [mode flags] [options]
@@ -32,7 +33,7 @@ source "${SCRIPTS_DIR}/profiler/check.sh"
 # ── Usage ────────────────────────────────────────────────────────────────────
 usage() {
     cat <<'EOF'
-Vortex Profiler — profiling tool manager for vortex-server
+Vortex Profiler — profiling tool manager for vortex-server and engine targets
 
 Usage: just profiler [mode flags] [options]
 
@@ -83,6 +84,12 @@ Server configuration:
   --port PORT        Bind port (default: 16379)
   --bin PATH         Use pre-built binary instead of building
 
+Engine target:
+    --engine-example NAME  Cargo example in vortex-engine to profile (for example: engine_probe)
+    --engine-bin PATH      Use a pre-built engine binary instead of building an example
+    --engine-args ARGS     Shell-quoted argument string forwarded to the engine binary
+    --                    Treat the remaining arguments as engine-target arguments
+
 Profiler tuning:
   --frequency N      Sampling frequency for perf/flamegraph (default: 99)
 
@@ -106,6 +113,7 @@ Examples:
   just profiler --callgrind --command SET --threads 1
   just profiler --all --command SET,GET
   just profiler --manifest scripts/profiler/manifests/cpu-set-heavy.yaml
+    just profiler-engine --memory -- --workload set-inline-string --keys 1000000 --value-size 16 --shards 64
   just profiler --criterion --filter cmd_get_inline
   just profiler --check
 EOF
@@ -154,6 +162,13 @@ RING_SIZE=""
 FIXED_BUFFERS=""
 SQPOLL_IDLE_MS=""
 BIN_OVERRIDE=""
+
+# Target selection
+PROFILER_TARGET_KIND="server"
+ENGINE_EXAMPLE=""
+ENGINE_BIN_OVERRIDE=""
+ENGINE_ARGS_RAW=""
+ENGINE_TARGET_ARGS=()
 
 # Profiler tuning
 FREQUENCY=99
@@ -210,6 +225,9 @@ while [[ $# -gt 0 ]]; do
         --fixed-buffers) FIXED_BUFFERS="$2";     shift 2 ;;
         --sqpoll-idle-ms) SQPOLL_IDLE_MS="$2";   shift 2 ;;
         --bin)          BIN_OVERRIDE="$2";       shift 2 ;;
+        --engine-example) PROFILER_TARGET_KIND="engine"; ENGINE_EXAMPLE="$2"; shift 2 ;;
+        --engine-bin)   PROFILER_TARGET_KIND="engine"; ENGINE_BIN_OVERRIDE="$2"; shift 2 ;;
+        --engine-args)  PROFILER_TARGET_KIND="engine"; ENGINE_ARGS_RAW="$2"; shift 2 ;;
 
         # Profiler tuning
         --frequency)    FREQUENCY="$2";          shift 2 ;;
@@ -221,6 +239,15 @@ while [[ $# -gt 0 ]]; do
 
         # Help
         -h|--help)      usage ;;
+
+        --)
+            shift
+            if profiling_target_is_engine; then
+                ENGINE_TARGET_ARGS=("$@")
+                break
+            fi
+            fatal "Bare '--' is only supported for engine targets"
+            ;;
 
         *)
             fatal "Unknown option: $1. Run 'just profiler --help' for usage."
@@ -292,7 +319,7 @@ has_any_mode() {
 }
 
 if ! has_any_mode; then
-    if [[ -n "$COMMAND" ]] || benchmark_bridge_enabled; then
+    if profiling_target_is_engine || [[ -n "$COMMAND" ]] || benchmark_bridge_enabled; then
         TOOL_FLAMEGRAPH=true
         info "No mode specified, defaulting to --flamegraph"
     else
@@ -314,6 +341,63 @@ shell_join() {
         printf -v rendered '%s%q ' "$rendered" "$arg"
     done
     printf '%s' "${rendered% }"
+}
+
+profiling_target_is_engine() {
+    [[ "$PROFILER_TARGET_KIND" == "engine" ]]
+}
+
+parse_engine_args_string() {
+    local raw="$1"
+    has_cmd python3 || fatal "python3 is required to parse --engine-args"
+    python3 - "$raw" <<'PY'
+from __future__ import annotations
+
+import shlex
+import sys
+
+for arg in shlex.split(sys.argv[1]):
+    print(arg)
+PY
+}
+
+engine_target_args_contain_flag() {
+    local flag="$1"
+    local arg
+
+    for arg in "${ENGINE_TARGET_ARGS[@]}"; do
+        if [[ "$arg" == "$flag" || "$arg" == "${flag}="* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+materialize_engine_target_args() {
+    local session_dir="$1"
+    local parsed=()
+    local arg
+
+    if ! profiling_target_is_engine; then
+        return 0
+    fi
+
+    if [[ ${#ENGINE_TARGET_ARGS[@]} -eq 0 && -n "$ENGINE_ARGS_RAW" ]]; then
+        while IFS= read -r arg; do
+            [[ -z "$arg" ]] && continue
+            parsed+=("$arg")
+        done < <(parse_engine_args_string "$ENGINE_ARGS_RAW")
+        ENGINE_TARGET_ARGS=("${parsed[@]}")
+    fi
+
+    if [[ ${#ENGINE_TARGET_ARGS[@]} -eq 0 ]]; then
+        fatal "Engine targets require arguments after '--' or via --engine-args"
+    fi
+
+    if ! engine_target_args_contain_flag "--json"; then
+        ENGINE_TARGET_ARGS+=(--json "${session_dir}/engine-target-summary.json")
+    fi
 }
 
 resolve_requested_tools() {
@@ -339,6 +423,10 @@ resolve_requested_tools() {
 }
 
 resolve_workload_source() {
+    if profiling_target_is_engine; then
+        printf '%s' "engine-target"
+        return 0
+    fi
     if benchmark_bridge_enabled; then
         printf '%s' "$(benchmark_workload_source_label)"
         return 0
@@ -355,6 +443,10 @@ resolve_workload_source() {
 }
 
 describe_workload() {
+    if profiling_target_is_engine; then
+        printf '%s' "engine=$(basename "${PROFILING_BINARY:-${ENGINE_EXAMPLE:-engine_probe}}"); args=$(shell_join "${ENGINE_TARGET_ARGS[@]}")"
+        return 0
+    fi
     if benchmark_bridge_enabled; then
         printf '%s' "$(benchmark_workload_description_text)"
         return 0
@@ -382,7 +474,11 @@ prepare_session_contract_context() {
     SESSION_COMMAND_LINE="$(shell_join "$0" "${ORIGINAL_ARGS[@]}")"
     SESSION_WORKLOAD_SOURCE="$(resolve_workload_source)"
     SESSION_WORKLOAD_DESCRIPTION="$(describe_workload)"
-    SESSION_WORKLOAD_COMMAND="$COMMAND"
+    if profiling_target_is_engine; then
+        SESSION_WORKLOAD_COMMAND="$(shell_join "${ENGINE_TARGET_ARGS[@]}")"
+    else
+        SESSION_WORKLOAD_COMMAND="$COMMAND"
+    fi
     SESSION_WORKLOAD_DURATION="$DURATION"
     SESSION_WORKLOAD_CLIENTS="$CLIENTS"
     if benchmark_bridge_enabled; then
@@ -410,6 +506,9 @@ fi
 
 # ── Criterion mode (no server, no build of vortex-server) ────────────────────
 if $MODE_CRITERION; then
+    if profiling_target_is_engine; then
+        fatal "--criterion cannot be combined with engine target profiling"
+    fi
     if benchmark_bridge_enabled; then
         fatal "--bench-manifest and --bench-request are only supported for server-based profiler sessions"
     fi
@@ -437,16 +536,25 @@ if $MODE_CRITERION; then
     exit 0
 fi
 
-# ── Server-based profiling ───────────────────────────────────────────────────
+# ── Target-based profiling ───────────────────────────────────────────────────
 SESSION_DIR="$(make_session_dir profiling)"
 register_cleanup
 resolve_benchmark_bridge "$SESSION_DIR"
+if profiling_target_is_engine && benchmark_bridge_enabled; then
+    fatal "--bench-manifest and --bench-request are only supported for server-based profiler sessions"
+fi
 if benchmark_bridge_enabled && [[ "$DURATION_SET_BY_CLI" != "true" ]] && [[ -n "$BENCH_EFFECTIVE_DURATION_SECONDS" ]]; then
     DURATION="$BENCH_EFFECTIVE_DURATION_SECONDS"
 fi
 
+if profiling_target_is_engine; then
+    HOST=""
+    PORT=""
+fi
+
 # Build the binary (unless --bin was provided)
 build_profiling_binary "$BIN_OVERRIDE"
+materialize_engine_target_args "$SESSION_DIR"
 prepare_session_contract_context "profiling" "$PROFILING_CARGO_PROFILE" "$PROFILING_BINARY"
 initialize_session_contract "$SESSION_DIR"
 start_host_sampler_pack "$SESSION_DIR" "$HOST" "$PORT"
@@ -457,9 +565,15 @@ printf "${C_BOLD}${C_BLUE}║        Vortex Profiler — Session               �
 printf "${C_BOLD}${C_BLUE}╚═══════════════════════════════════════════════╝${C_RESET}\n\n"
 printf "  OS:        %s (%s)\n" "$OS" "$(uname -m)"
 printf "  Binary:    %s\n" "$PROFILING_BINARY"
-printf "  Bind:      %s:%s\n" "$HOST" "$PORT"
-printf "  Threads:   %s\n" "$THREADS"
-printf "  Command:   %s\n" "${COMMAND:-<none — no load>}"
+if profiling_target_is_engine; then
+    printf "  Target:    engine\n"
+    if [[ -n "$ENGINE_EXAMPLE" ]]; then printf "  Example:   %s\n" "$ENGINE_EXAMPLE"; fi
+    printf "  Args:      %s\n" "$(shell_join "${ENGINE_TARGET_ARGS[@]}")"
+else
+    printf "  Bind:      %s:%s\n" "$HOST" "$PORT"
+    printf "  Threads:   %s\n" "$THREADS"
+    printf "  Command:   %s\n" "${COMMAND:-<none — no load>}"
+fi
 printf "  Duration:  %ss\n" "$DURATION"
 printf "  Frequency: %s Hz\n" "$FREQUENCY"
 printf "  Session:   %s\n" "$SESSION_DIR"

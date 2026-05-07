@@ -14,6 +14,36 @@ run_flamegraph() {
 
     header "Flamegraph"
 
+    if profiling_target_is_engine; then
+        if [[ -n "${ENGINE_BIN_OVERRIDE:-}" ]]; then
+            fatal "--flamegraph requires --engine-example because cargo flamegraph profiles Cargo targets"
+        fi
+
+        if [[ "$OS" == "linux" || "$OS" == "macos" ]]; then
+            info "cargo flamegraph requires sudo on ${OS}. Requesting privileges..."
+            ensure_sudo_access "sudo access required for Flamegraph on ${OS}"
+        fi
+
+        local example_name="${ENGINE_EXAMPLE:-engine_probe}"
+        info "Running: cargo flamegraph --profile profiling -p vortex-engine --example ${example_name} -F ${frequency}"
+        (cd "$REPO_ROOT" && exec cargo flamegraph \
+            --profile profiling \
+            -p vortex-engine \
+            --example "$example_name" \
+            --root \
+            -F "$frequency" \
+            -o "${session}/flamegraph.svg" \
+            -- "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/engine-flamegraph.log" 2>&1)
+
+        if [[ -f "${session}/flamegraph.svg" ]]; then
+            ok "Flamegraph: ${session}/flamegraph.svg"
+        else
+            warn "Flamegraph SVG was not generated"
+        fi
+        return 0
+    fi
+
     local extra_args=("--bind" "${host}:${port}" "--threads" "$threads")
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
     [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
@@ -92,6 +122,24 @@ run_perf_record() {
 
     header "perf record"
 
+    if profiling_target_is_engine; then
+        info "Running: perf record -F ${frequency} -g --call-graph fp"
+        perf record \
+            -F "$frequency" \
+            -g --call-graph fp \
+            -o "${session}/perf.data" \
+            -- "$PROFILING_BINARY" "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/perf-record.log" 2>&1 || true
+
+        if [[ -f "${session}/perf.data" ]]; then
+            ok "perf data: ${session}/perf.data"
+            perf report -i "${session}/perf.data" --stdio --no-children 2>/dev/null \
+                | head -80 > "${session}/perf-report.txt" || true
+            info "perf report summary: ${session}/perf-report.txt"
+        fi
+        return 0
+    fi
+
     start_server "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction" "${session}/server-perf.log"
     generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-perf.log"
 
@@ -129,6 +177,19 @@ run_perf_stat() {
 
     header "perf stat"
 
+    if profiling_target_is_engine; then
+        info "Running: perf stat -d"
+        perf stat -d \
+            -o "${session}/perf-stat.txt" \
+            -- "$PROFILING_BINARY" "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/perf-stat.log" 2>&1 || true
+
+        if [[ -f "${session}/perf-stat.txt" ]]; then
+            ok "perf stat: ${session}/perf-stat.txt"
+        fi
+        return 0
+    fi
+
     start_server "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction" "${session}/server-perf-stat.log"
     generate_load "$host" "$port" "$command" "$duration" "$clients" "${session}/load-perf-stat.log"
 
@@ -160,6 +221,20 @@ run_samply() {
     require_cmd samply
 
     header "samply"
+
+    if profiling_target_is_engine; then
+        info "Running: samply record"
+        (cd "$REPO_ROOT" && exec samply record --save-only \
+            -o "${session}/samply-profile.json" \
+            -- "$PROFILING_BINARY" \
+            "${ENGINE_TARGET_ARGS[@]}" \
+            >"${session}/engine-samply.log" 2>&1)
+
+        if [[ -f "${session}/samply-profile.json" ]]; then
+            ok "samply profile: ${session}/samply-profile.json"
+        fi
+        return 0
+    fi
 
     local extra_args=("--bind" "${host}:${port}" "--threads" "$threads")
     [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
@@ -212,6 +287,35 @@ run_instruments() {
     header "Instruments CPU Profiling (xctrace)"
 
     local templates=("Time Profiler" "System Trace")
+
+    if profiling_target_is_engine; then
+        ensure_macos_debuggable_binary "$PROFILING_BINARY"
+
+        for template in "${templates[@]}"; do
+            info "Setting up for template: ${template}"
+            local suffix_name="${template// /-}"
+            suffix_name="$(echo "$suffix_name" | tr '[:upper:]' '[:lower:]')"
+
+            info "Running: xcrun xctrace record --template '${template}' --launch -- ${PROFILING_BINARY}"
+            (cd "$REPO_ROOT" && exec xcrun xctrace record \
+                --template "${template}" \
+                --output "${session}/${suffix_name}.trace" \
+                --launch -- "$PROFILING_BINARY" \
+                "${ENGINE_TARGET_ARGS[@]}" \
+                >"${session}/instruments-${suffix_name}.log" 2>&1) || true
+
+            if [[ -d "${session}/${suffix_name}.trace" ]]; then
+                ok "Instruments trace: ${session}/${suffix_name}.trace"
+                xcrun xctrace export --input "${session}/${suffix_name}.trace" --toc --output "${session}/${suffix_name}-toc.xml" >/dev/null 2>&1 || true
+                if [[ "${template}" == "Time Profiler" ]]; then
+                    xcrun xctrace export --input "${session}/${suffix_name}.trace" \
+                        --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
+                        --output "${session}/${suffix_name}-data.xml" >/dev/null 2>&1 || true
+                fi
+            fi
+        done
+        return 0
+    fi
 
     for template in "${templates[@]}"; do
         info "Setting up for template: ${template}"

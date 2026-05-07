@@ -30,7 +30,12 @@ _sample_socket_summary() {
     local host="$1" port="$2"
 
     printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf 'target=%s:%s\n' "$host" "$port"
+    if [[ -n "$host" && -n "$port" ]]; then
+        printf 'target=%s:%s\n' "$host" "$port"
+    else
+        printf 'target=none\n'
+        return 0
+    fi
 
     if [[ "$OS" == "linux" ]]; then
         if has_cmd ss; then
@@ -48,13 +53,19 @@ _sample_socket_summary() {
 }
 
 _sample_process_probe() {
-    local host="$1" port="$2"
-    local pid=""
+    local host="$1" port="$2" explicit_pid="${3:-}"
+    local pid="$explicit_pid"
 
-    pid="$(discover_pid_by_port "$port")"
+    if [[ -z "$pid" && -n "$port" ]]; then
+        pid="$(discover_pid_by_port "$port")"
+    fi
 
     printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf 'target=%s:%s\n' "$host" "$port"
+    if [[ -n "$host" && -n "$port" ]]; then
+        printf 'target=%s:%s\n' "$host" "$port"
+    else
+        printf 'target=none\n'
+    fi
     printf 'pid=%s\n' "${pid:-none}"
 
     if [[ -z "$pid" ]]; then
@@ -74,7 +85,7 @@ _sample_process_probe() {
 }
 
 start_host_sampler_pack() {
-    local session_dir="$1" host="$2" port="$3"
+    local session_dir="$1" host="${2:-}" port="${3:-}" pid="${4:-0}"
     local session_label
 
     if [[ ${#HOST_SAMPLER_PIDS[@]} -gt 0 ]]; then
@@ -89,21 +100,28 @@ start_host_sampler_pack() {
     HOST_TELEMETRY_SUMMARY_PATH="${HOST_SAMPLER_DIR}/${session_label}-host-telemetry-summary.json"
 
     if has_cmd python3; then
-        python3 "${PROFILER_SCRIPT_DIR}/host_telemetry_runner.py" \
-            --output-dir "$HOST_SAMPLER_DIR" \
-            --label "$session_label" \
-            --host "$host" \
-            --port "$port" \
-            --pid "${SERVER_PID:-0}" \
-            --interval-seconds "$HOST_SAMPLER_INTERVAL_SECONDS" \
-            >"${HOST_SAMPLER_DIR}/host-telemetry.log" 2>&1 &
+        local args=(
+            python3 "${PROFILER_SCRIPT_DIR}/host_telemetry_runner.py"
+            --output-dir "$HOST_SAMPLER_DIR"
+            --label "$session_label"
+            --pid "$pid"
+            --interval-seconds "$HOST_SAMPLER_INTERVAL_SECONDS"
+        )
+        if [[ -n "$host" ]]; then
+            args+=(--host "$host")
+        fi
+        if [[ -n "$port" ]]; then
+            args+=(--port "$port")
+        fi
+
+        "${args[@]}" >"${HOST_SAMPLER_DIR}/host-telemetry.log" 2>&1 &
         HOST_SAMPLER_PIDS+=("$!")
     else
         warn "python3 not found; skipping machine-readable host telemetry capture"
     fi
 
     _start_host_sampler_process "${HOST_SAMPLER_DIR}/socket-summary.log" _sample_socket_summary "$host" "$port"
-    _start_host_sampler_process "${HOST_SAMPLER_DIR}/process-probe.log" _sample_process_probe "$host" "$port"
+    _start_host_sampler_process "${HOST_SAMPLER_DIR}/process-probe.log" _sample_process_probe "$host" "$port" "$pid"
 }
 
 stop_host_sampler_pack() {
