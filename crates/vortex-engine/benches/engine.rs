@@ -325,6 +325,32 @@ fn bench_cmd_mset_100(c: &mut Criterion) {
     });
 }
 
+fn bench_cmd_mset_duplicate_100_noeviction(c: &mut Criterion) {
+    let mut parts: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+    for i in 0..50 {
+        let key = format!("dup-key:{i:04}").into_bytes();
+        parts.push(key.clone());
+        parts.push(format!("stale:{i:04}").into_bytes());
+        parts.push(key);
+        parts.push(format!("final:{i:04}").into_bytes());
+    }
+
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let cmd = make_resp(&refs);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_mset_duplicate_100_noeviction", |b| {
+        let keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, 50);
+        keyspace.configure_eviction(1 << 30, EvictionPolicy::NoEviction);
+
+        b.iter(|| {
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"MSET", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
 fn bench_cmd_append_inline(c: &mut Criterion) {
     let cmd = make_resp(&[b"APPEND", b"mykey", b"abc"]);
     let tape = RespTape::parse_pipeline(&cmd).unwrap();
@@ -1444,6 +1470,7 @@ criterion_group!(
     bench_cmd_incr,
     bench_cmd_mget_100,
     bench_cmd_mset_100,
+    bench_cmd_mset_duplicate_100_noeviction,
     bench_cmd_append_inline,
     bench_cmd_dbsize_10k,
     bench_cmd_del_inline,

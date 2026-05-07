@@ -10,14 +10,14 @@
 use vortex_common::VortexKey;
 use vortex_proto::{FrameRef, RespFrame};
 
-use super::context::TtlState;
 use super::{
-    CmdResult, CommandArgs, ExecutedCommand, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE, RESP_NEG_TWO,
-    RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos, arg_bytes,
-    deadline_nanos_to_absolute_unix_nanos, encode_aof_pexpireat, int_resp, key_from_bytes,
+    CmdResult, CommandArgs, ExecutedCommand, MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE,
+    RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos,
+    arg_bytes, deadline_nanos_to_absolute_unix_nanos, encode_aof_pexpireat, int_resp,
+    key_from_bytes,
 };
 use crate::ConcurrentKeyspace;
-use crate::commands::context::MutationOutcome;
+use crate::engine::domain::{ExpireOptions, MutationOutcome, TtlState};
 
 // ── Error constants ─────────────────────────────────────────────────
 
@@ -224,7 +224,7 @@ pub(crate) fn cmd_pexpireat_with_clock(
 pub fn cmd_persist(
     keyspace: &ConcurrentKeyspace,
     frame: &FrameRef<'_>,
-    _now_nanos: u64,
+    now_nanos: u64,
 ) -> ExecutedCommand {
     let Some(args) = CommandArgs::collect(frame) else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
@@ -233,7 +233,7 @@ pub fn cmd_persist(
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let key = key_from_bytes(kb);
-    let outcome = keyspace.persist_key(&key);
+    let outcome = keyspace.persist_key(&key, now_nanos);
     let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
@@ -273,20 +273,17 @@ fn expire_generic(
     };
 
     // Parse optional flags (NX, XX, GT, LT).
-    let mut nx = false;
-    let mut xx = false;
-    let mut gt = false;
-    let mut lt = false;
+    let mut options = ExpireOptions::default();
     for i in 3..argc {
         if let Some(flag) = args.get(i) {
             match flag.len() {
                 2 => {
                     let upper = [flag[0] | 0x20, flag[1] | 0x20];
                     match &upper {
-                        b"nx" => nx = true,
-                        b"xx" => xx = true,
-                        b"gt" => gt = true,
-                        b"lt" => lt = true,
+                        b"nx" => options.nx = true,
+                        b"xx" => options.xx = true,
+                        b"gt" => options.gt = true,
+                        b"lt" => options.lt = true,
                         _ => return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX)),
                     }
                 }
@@ -299,90 +296,33 @@ fn expire_generic(
     let deadline_nanos = match mode {
         ExpireMode::RelativeSeconds => {
             if time_val <= 0 {
-                let key = key_from_bytes(kb);
-                let outcome = keyspace.remove_value(&key, now_nanos);
-                let response = if outcome.value.is_some() {
-                    CmdResult::Static(RESP_ONE)
-                } else {
-                    CmdResult::Static(RESP_ZERO)
-                };
-                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
+                0
+            } else {
+                now_nanos + (time_val as u64) * NS_PER_SEC
             }
-            now_nanos + (time_val as u64) * NS_PER_SEC
         }
         ExpireMode::RelativeMillis => {
             if time_val <= 0 {
-                let key = key_from_bytes(kb);
-                let outcome = keyspace.remove_value(&key, now_nanos);
-                let response = if outcome.value.is_some() {
-                    CmdResult::Static(RESP_ONE)
-                } else {
-                    CmdResult::Static(RESP_ZERO)
-                };
-                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
+                0
+            } else {
+                now_nanos + (time_val as u64) * NS_PER_MS
             }
-            now_nanos + (time_val as u64) * NS_PER_MS
         }
-        ExpireMode::AbsoluteSeconds => {
-            let deadline = absolute_unix_nanos_to_deadline_nanos(
-                (time_val as u64) * NS_PER_SEC,
-                now_nanos,
-                unix_now_nanos,
-            );
-            if deadline <= now_nanos {
-                let key = key_from_bytes(kb);
-                let outcome = keyspace.remove_value(&key, now_nanos);
-                let response = if outcome.value.is_some() {
-                    CmdResult::Static(RESP_ONE)
-                } else {
-                    CmdResult::Static(RESP_ZERO)
-                };
-                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
-            }
-            deadline
-        }
-        ExpireMode::AbsoluteMillis => {
-            let deadline = absolute_unix_nanos_to_deadline_nanos(
-                (time_val as u64) * NS_PER_MS,
-                now_nanos,
-                unix_now_nanos,
-            );
-            if deadline <= now_nanos {
-                let key = key_from_bytes(kb);
-                let outcome = keyspace.remove_value(&key, now_nanos);
-                let response = if outcome.value.is_some() {
-                    CmdResult::Static(RESP_ONE)
-                } else {
-                    CmdResult::Static(RESP_ZERO)
-                };
-                return ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn);
-            }
-            deadline
-        }
+        ExpireMode::AbsoluteSeconds => absolute_unix_nanos_to_deadline_nanos(
+            (time_val as u64) * NS_PER_SEC,
+            now_nanos,
+            unix_now_nanos,
+        ),
+        ExpireMode::AbsoluteMillis => absolute_unix_nanos_to_deadline_nanos(
+            (time_val as u64) * NS_PER_MS,
+            now_nanos,
+            unix_now_nanos,
+        ),
     };
 
     let key = key_from_bytes(kb);
 
-    let current_ttl = match keyspace.ttl_state(&key, now_nanos) {
-        TtlState::Missing => return ExecutedCommand::from(CmdResult::Static(RESP_ZERO)),
-        TtlState::Persistent => 0,
-        TtlState::Deadline(deadline) => deadline,
-    };
-
-    if nx && current_ttl != 0 {
-        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
-    }
-    if xx && current_ttl == 0 {
-        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
-    }
-    if gt && current_ttl != 0 && deadline_nanos <= current_ttl {
-        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
-    }
-    if lt && current_ttl != 0 && deadline_nanos >= current_ttl {
-        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
-    }
-
-    let outcome = keyspace.expire_key(&key, deadline_nanos, now_nanos);
+    let outcome = keyspace.expire_key_with_options(&key, deadline_nanos, now_nanos, options);
     let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
@@ -945,6 +885,44 @@ mod tests {
 
         let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], NOW);
         assert_static(r, RESP_NEG_ONE); // No TTL.
+    }
+
+    #[test]
+    fn persist_expired_key_does_not_resurrect() {
+        let h = new_harness();
+        h.set_with_ttl(
+            VortexKey::from("expired-persist"),
+            VortexValue::from("tv"),
+            NOW - 1,
+        );
+
+        let r = exec(
+            &h.keyspace,
+            cmd_persist,
+            &[b"PERSIST", b"expired-persist"],
+            NOW,
+        );
+        assert_static(r, RESP_ZERO);
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"expired-persist"], NOW);
+        assert_static(r, RESP_NEG_TWO);
+    }
+
+    #[test]
+    fn expire_zero_honors_xx_condition_under_domain_lock() {
+        let h = new_harness();
+        h.set(VortexKey::from("persistent"), VortexValue::from("tv"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_expire,
+            &[b"EXPIRE", b"persistent", b"0", b"XX"],
+            NOW,
+        );
+        assert_static(r, RESP_ZERO);
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"persistent"], NOW);
+        assert_static(r, RESP_NEG_ONE);
     }
 
     #[test]

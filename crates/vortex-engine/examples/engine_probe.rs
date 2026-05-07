@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
+use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ const EVICTION_PREHEAT_READS: usize = 32;
 enum Workload {
     SetInlineInt,
     SetInlineString,
+    SetInlineStringCommand,
+    SetInlineStringTtl,
     SetHeapString,
     GetHit,
     GetMiss,
@@ -92,6 +95,9 @@ struct Args {
 
     #[arg(long, default_value_t = DEFAULT_EVICTION_HEADROOM_BYTES)]
     eviction_headroom_bytes: usize,
+
+    #[arg(long, default_value_t = false)]
+    aof_recording: bool,
 
     #[arg(long)]
     json: Option<PathBuf>,
@@ -169,8 +175,11 @@ struct ProbeSummary {
     keys_requested: usize,
     value_size_bytes: usize,
     shards: usize,
+    aof_recording: bool,
     live_keys: usize,
     expiring_keys: usize,
+    table_total_slots: usize,
+    capacity_slack_slots: usize,
     table_logical_bytes: usize,
     table_allocated_bytes: usize,
     bytes_per_live_key: Option<f64>,
@@ -242,6 +251,8 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
     match args.workload {
         Workload::SetInlineInt => run_set_inline_int(args),
         Workload::SetInlineString => run_set_inline_string(args),
+        Workload::SetInlineStringCommand => run_set_inline_string_command(args),
+        Workload::SetInlineStringTtl => run_set_inline_string_ttl(args),
         Workload::SetHeapString => run_set_heap_string(args),
         Workload::GetHit => run_get_hit(args),
         Workload::GetMiss => run_get_miss(args),
@@ -255,7 +266,7 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
 }
 
 fn run_set_inline_int(args: &Args) -> Result<ProbeSummary, String> {
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = Instant::now();
 
@@ -282,7 +293,7 @@ fn run_set_inline_int(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_set_inline_string(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = Instant::now();
 
@@ -307,9 +318,68 @@ fn run_set_inline_string(args: &Args) -> Result<ProbeSummary, String> {
     ))
 }
 
+fn run_set_inline_string_command(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let keyspace = new_keyspace(args, args.keys);
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = Instant::now();
+
+    for index in 0..args.keys {
+        let key = make_key(index);
+        let value = make_value_bytes(index, value_size);
+        let parts = [b"SET".as_slice(), key.as_slice(), value.as_slice()];
+        let op_started = Instant::now();
+        execute_parts(&keyspace, b"SET", &parts, 0u64.into())?;
+        latency.record(index as u64, op_started);
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        args.keys as u64,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_set_inline_string_ttl(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let keyspace = new_keyspace(args, args.keys);
+    let ttl_text = args.ttl_ms.to_string();
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = Instant::now();
+
+    for index in 0..args.keys {
+        let key = make_key(index);
+        let value = make_value_bytes(index, value_size);
+        let parts = [
+            b"SET".as_slice(),
+            key.as_slice(),
+            value.as_slice(),
+            b"PX".as_slice(),
+            ttl_text.as_bytes(),
+        ];
+        let op_started = Instant::now();
+        execute_parts(&keyspace, b"SET", &parts, 1u64.into())?;
+        latency.record(index as u64, op_started);
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        args.keys as u64,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
 fn run_set_heap_string(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.max(MAX_INLINE_VALUE_LEN + 1);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = Instant::now();
 
@@ -336,7 +406,7 @@ fn run_set_heap_string(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_get_hit(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -388,7 +458,7 @@ fn run_get_hit(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_get_miss(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -441,7 +511,7 @@ fn run_get_miss(args: &Args) -> Result<ProbeSummary, String> {
 fn run_mget(args: &Args) -> Result<ProbeSummary, String> {
     let width = args.multi_key_width.min(args.keys).max(1);
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -484,7 +554,7 @@ fn run_mget(args: &Args) -> Result<ProbeSummary, String> {
 fn run_mset(args: &Args) -> Result<ProbeSummary, String> {
     let width = args.multi_key_width.min(args.keys).max(1);
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -526,7 +596,7 @@ fn run_mset(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -553,7 +623,7 @@ fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_ttl_expire(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys);
+    let keyspace = new_keyspace(args, args.keys);
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let ttl_text = args.ttl_ms.to_string();
@@ -599,7 +669,7 @@ fn run_ttl_expire(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_eviction_headroom(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys.saturating_mul(2));
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2));
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let estimated_growth = args.keys.saturating_mul(estimate_insert_bytes(value_size));
@@ -634,7 +704,7 @@ fn run_eviction_headroom(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_eviction_pressure(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.keys.saturating_mul(2));
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2));
     prefill_inline_strings(&keyspace, args.keys, value_size);
     keyspace.configure_eviction(keyspace.memory_used(), args.eviction_policy.into_engine());
     preheat_eviction_candidates(&keyspace, args.keys)?;
@@ -660,6 +730,14 @@ fn run_eviction_pressure(args: &Args) -> Result<ProbeSummary, String> {
         latency.summarize(),
         value_size,
     ))
+}
+
+fn new_keyspace(args: &Args, capacity: usize) -> ConcurrentKeyspace {
+    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, capacity);
+    if args.aof_recording {
+        keyspace.enable_aof_recording();
+    }
+    keyspace
 }
 
 fn benchmark_insert(keyspace: &ConcurrentKeyspace, key: VortexKey, value: VortexValue) {
@@ -767,11 +845,20 @@ fn finalize_summary(
     value_size_bytes: usize,
 ) -> ProbeSummary {
     let table_logical_bytes = keyspace.memory_used();
-    let table_allocated_bytes: usize = keyspace
-        .scan_all_shards(|_, table| table.allocated_bytes())
+    let (table_total_slots, table_allocated_bytes) = keyspace
+        .scan_all_shards(|_, table| (table.total_slots(), table.allocated_bytes()))
         .into_iter()
-        .sum();
+        .fold(
+            (0usize, 0usize),
+            |(slots_sum, bytes_sum), (slots, bytes)| {
+                (
+                    slots_sum.saturating_add(slots),
+                    bytes_sum.saturating_add(bytes),
+                )
+            },
+        );
     let live_keys = keyspace.dbsize();
+    let capacity_slack_slots = table_total_slots.saturating_sub(live_keys);
     let bytes_per_live_key = if live_keys == 0 {
         None
     } else {
@@ -795,8 +882,11 @@ fn finalize_summary(
         keys_requested: args.keys,
         value_size_bytes,
         shards: args.shards,
+        aof_recording: args.aof_recording,
         live_keys,
         expiring_keys: keyspace.approx_expiring_keys(),
+        table_total_slots,
+        capacity_slack_slots,
         table_logical_bytes,
         table_allocated_bytes,
         bytes_per_live_key,
@@ -832,6 +922,54 @@ fn read_allocator_stats() -> AllocatorStats {
 }
 
 fn current_process_rss_bytes() -> Option<usize> {
+    current_process_rss_bytes_procfs()
+        .or_else(current_process_peak_rss_bytes)
+        .or_else(current_process_rss_bytes_ps)
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_rss_bytes_procfs() -> Option<usize> {
+    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<usize>().ok()?;
+    // SAFETY: sysconf reads the process page-size setting and does not mutate Rust memory.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    resident_pages.checked_mul(page_size as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_process_rss_bytes_procfs() -> Option<usize> {
+    None
+}
+
+fn current_process_peak_rss_bytes() -> Option<usize> {
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes `usage` when it returns 0 for RUSAGE_SELF.
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+
+    // SAFETY: status 0 means libc initialized the rusage structure.
+    let max_rss = unsafe { usage.assume_init() }.ru_maxrss;
+    if max_rss <= 0 {
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Some(max_rss as usize)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        (max_rss as usize).checked_mul(1024)
+    }
+}
+
+fn current_process_rss_bytes_ps() -> Option<usize> {
     let pid = std::process::id().to_string();
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", pid.as_str()])
@@ -910,8 +1048,16 @@ impl ProbeSummary {
         write_json_usize_field(&mut json, "keys_requested", self.keys_requested, true);
         write_json_usize_field(&mut json, "value_size_bytes", self.value_size_bytes, true);
         write_json_usize_field(&mut json, "shards", self.shards, true);
+        write_json_bool_field(&mut json, "aof_recording", self.aof_recording, true);
         write_json_usize_field(&mut json, "live_keys", self.live_keys, true);
         write_json_usize_field(&mut json, "expiring_keys", self.expiring_keys, true);
+        write_json_usize_field(&mut json, "table_total_slots", self.table_total_slots, true);
+        write_json_usize_field(
+            &mut json,
+            "capacity_slack_slots",
+            self.capacity_slack_slots,
+            true,
+        );
         write_json_usize_field(
             &mut json,
             "table_logical_bytes",
@@ -1023,6 +1169,8 @@ fn workload_name(workload: Workload) -> &'static str {
     match workload {
         Workload::SetInlineInt => "set-inline-int",
         Workload::SetInlineString => "set-inline-string",
+        Workload::SetInlineStringCommand => "set-inline-string-command",
+        Workload::SetInlineStringTtl => "set-inline-string-ttl",
         Workload::SetHeapString => "set-heap-string",
         Workload::GetHit => "get-hit",
         Workload::GetMiss => "get-miss",
@@ -1050,6 +1198,10 @@ fn write_json_usize_field(buf: &mut String, name: &str, value: usize, trailing_c
 }
 
 fn write_json_u64_field(buf: &mut String, name: &str, value: u64, trailing_comma: bool) {
+    let _ = writeln!(buf, "  \"{}\": {}{}", name, value, comma(trailing_comma));
+}
+
+fn write_json_bool_field(buf: &mut String, name: &str, value: bool, trailing_comma: bool) {
     let _ = writeln!(buf, "  \"{}\": {}{}", name, value, comma(trailing_comma));
 }
 

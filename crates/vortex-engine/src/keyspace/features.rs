@@ -44,6 +44,11 @@ impl MutationFeatures {
     }
 
     #[inline]
+    pub(crate) const fn entry_lsn_observed(self) -> bool {
+        self.watch() || self.aof()
+    }
+
+    #[inline]
     const fn contains(self, feature: Self) -> bool {
         self.0 & feature.0 != 0
     }

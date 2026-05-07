@@ -4,26 +4,23 @@
 //! MGET, GETSET, GETDEL, GETEX, GETRANGE, SETRANGE, APPEND, INCR, INCRBY,
 //! INCRBYFLOAT, DECR, DECRBY, STRLEN.
 
+use bytes::Bytes;
 use smallvec::SmallVec;
 use vortex_proto::{FrameRef, RespFrame};
 
 #[cfg(test)]
-use bytes::Bytes;
-#[cfg(test)]
 use vortex_common::VortexKey;
-#[cfg(test)]
 use vortex_common::VortexValue;
 
 use super::{
-    CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand, NS_PER_MS,
-    NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos, arg_bytes,
-    deadline_nanos_to_absolute_unix_nanos, encode_aof_persist, encode_aof_pexpireat,
-    encode_aof_set, encode_aof_set_pxat, int_resp, key_from_bytes, owned_value_to_resp,
-    value_from_bytes, value_to_resp,
+    CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand,
+    MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO,
+    absolute_unix_nanos_to_deadline_nanos, arg_bytes, deadline_nanos_to_absolute_unix_nanos,
+    encode_aof_persist, encode_aof_pexpireat, encode_aof_set, encode_aof_set_pxat, int_resp,
+    key_from_bytes, owned_value_to_resp, value_from_bytes, value_to_resp,
 };
 use crate::ConcurrentKeyspace;
-use crate::commands::context::{MutationOutcome, SetOptions, SetResult, TtlState};
-use crate::keyspace::ExpiryTransition;
+use crate::engine::domain::{GetExOption, MutationOutcome, SetOptions, SetResult, TtlState};
 
 #[cfg(test)]
 use super::ERR_OVERFLOW;
@@ -42,30 +39,10 @@ pub fn cmd_get(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u
         Some(b) => b,
         None => return CmdResult::Static(RESP_NIL),
     };
-    let shard_index = keyspace.shard_index(key_bytes);
-    // Pre-hash for the table BEFORE acquiring the read lock.
-    let table_hash = keyspace.table_hash_key(key_bytes);
-    let guard = keyspace.read_shard_by_index(shard_index);
-    match guard.get_with_ttl_prehashed(key_bytes, table_hash) {
-        Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
-            keyspace.record_access_prehashed(&guard, key_bytes, table_hash);
-            // Hot path: format RESP from &VortexValue while read lock is held.
-            value_to_resp(value)
-        }
-        Some(_) => {
-            // Expired — double-checked locking cleanup.
-            drop(guard);
-            let key = key_from_bytes(key_bytes);
-            let mut wguard = keyspace.write_shard_by_index(shard_index);
-            let had_ttl = matches!(wguard.get_entry_ttl(&key), Some(ttl) if ttl != 0);
-            if super::context::remove_if_expired(&mut wguard, &key, now_nanos) {
-                keyspace.apply_expiry_transition(shard_index, ExpiryTransition::remove(had_ttl));
-                keyspace.bump_watch_key(&key);
-            }
-            CmdResult::Static(RESP_NIL)
-        }
+    keyspace.read_value_with(key_bytes, now_nanos, |value| match value {
+        Some(value) => value_to_resp(value),
         None => CmdResult::Static(RESP_NIL),
-    }
+    })
 }
 
 // ── SET ─────────────────────────────────────────────────────────────────────
@@ -421,6 +398,22 @@ pub(crate) fn cmd_psetex_with_clock(
 
 // ── MGET ────────────────────────────────────────────────────────────────────
 
+#[inline]
+fn mget_value_to_frame(value: &VortexValue) -> RespFrame {
+    match value {
+        VortexValue::InlineString(inline) => {
+            RespFrame::bulk_string(Bytes::copy_from_slice(inline.as_bytes()))
+        }
+        VortexValue::String(bytes) => RespFrame::bulk_string(bytes.clone()),
+        VortexValue::Integer(number) => {
+            let mut buffer = itoa::Buffer::new();
+            let text = buffer.format(*number);
+            RespFrame::bulk_string(Bytes::copy_from_slice(text.as_bytes()))
+        }
+        _ => RespFrame::null_bulk_string(),
+    }
+}
+
 /// MGET key [key ...] — Returns values of all specified keys.
 pub fn cmd_mget(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
     let Some(args) = CommandArgs::collect(frame) else {
@@ -433,9 +426,12 @@ pub fn cmd_mget(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
     let mut keys: SmallVec<[&[u8]; 16]> = SmallVec::with_capacity(argc - 1);
     keys.extend(args.iter_from(1));
 
-    CmdResult::Resp(RespFrame::Array(Some(
-        keyspace.mget_frames(&keys, now_nanos),
-    )))
+    CmdResult::Resp(RespFrame::Array(Some(keyspace.mget_values_with(
+        &keys,
+        now_nanos,
+        mget_value_to_frame,
+        RespFrame::null_bulk_string,
+    ))))
 }
 
 // ── MSET ────────────────────────────────────────────────────────────────────
@@ -627,50 +623,53 @@ pub(crate) fn cmd_getex_with_clock(
     let key = key_from_bytes(key_bytes);
     let argc = args.len();
 
-    // First, get the value.
-    let val = match keyspace.get_value(&key, now_nanos) {
-        Some(v) => v,
-        None => return ExecutedCommand::from(CmdResult::Static(RESP_NIL)),
-    };
-
-    // Then apply TTL modification if specified.
-    let mut aof_lsn = None;
     let mut aof_payload = None;
-    if argc >= 3 {
+    let option = if argc == 2 {
+        GetExOption::None
+    } else if argc >= 3 {
         let opt = match args.get(2) {
             Some(b) => b,
             None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
         };
         match opt_upper(opt) {
             OptToken::EX => {
+                if argc != 4 {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+                }
                 let secs = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 let deadline = now_nanos + secs * NS_PER_SEC;
-                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
-                if aof_lsn.is_some() && unix_now_nanos != 0 {
+                if unix_now_nanos != 0 {
                     let absolute_deadline_ms =
                         deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
                             / NS_PER_MS;
                     aof_payload = Some(encode_aof_pexpireat(key_bytes, absolute_deadline_ms));
                 }
+                GetExOption::ExpireAt(deadline)
             }
             OptToken::PX => {
+                if argc != 4 {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+                }
                 let ms = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
                 let deadline = now_nanos + ms * NS_PER_MS;
-                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
-                if aof_lsn.is_some() && unix_now_nanos != 0 {
+                if unix_now_nanos != 0 {
                     let absolute_deadline_ms =
                         deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
                             / NS_PER_MS;
                     aof_payload = Some(encode_aof_pexpireat(key_bytes, absolute_deadline_ms));
                 }
+                GetExOption::ExpireAt(deadline)
             }
             OptToken::EXAT => {
+                if argc != 4 {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+                }
                 let secs = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
@@ -680,12 +679,13 @@ pub(crate) fn cmd_getex_with_clock(
                     now_nanos,
                     unix_now_nanos,
                 );
-                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
-                if aof_lsn.is_some() {
-                    aof_payload = Some(encode_aof_pexpireat(key_bytes, secs * 1_000));
-                }
+                aof_payload = Some(encode_aof_pexpireat(key_bytes, secs * 1_000));
+                GetExOption::ExpireAt(deadline)
             }
             OptToken::PXAT => {
+                if argc != 4 {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+                }
                 let ms = match args.i64(3) {
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
@@ -695,27 +695,33 @@ pub(crate) fn cmd_getex_with_clock(
                     now_nanos,
                     unix_now_nanos,
                 );
-                aof_lsn = keyspace.expire_key(&key, deadline, now_nanos).aof_lsn;
-                if aof_lsn.is_some() {
-                    aof_payload = Some(encode_aof_pexpireat(key_bytes, ms));
-                }
+                aof_payload = Some(encode_aof_pexpireat(key_bytes, ms));
+                GetExOption::ExpireAt(deadline)
             }
-            OptToken::KEEPTTL => { /* PERSIST alias in GETEX context */ }
             _ => {
                 // Check for "PERSIST" keyword.
                 if eq_ci(opt, b"PERSIST") {
-                    aof_lsn = keyspace.persist_key(&key).aof_lsn;
-                    if aof_lsn.is_some() {
-                        aof_payload = Some(encode_aof_persist(key_bytes));
+                    if argc != 3 {
+                        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
                     }
+                    aof_payload = Some(encode_aof_persist(key_bytes));
+                    GetExOption::Persist
                 } else {
                     return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
                 }
             }
         }
-    }
+    } else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    };
 
-    ExecutedCommand::with_optional_aof_payload(owned_value_to_resp(val), aof_lsn, aof_payload)
+    let outcome = keyspace.get_value_with_expiry_option(&key, option, now_nanos);
+    let response = match outcome.value {
+        Some(value) => owned_value_to_resp(value),
+        None => CmdResult::Static(RESP_NIL),
+    };
+    let aof_payload = outcome.aof_lsn.and(aof_payload);
+    ExecutedCommand::with_optional_aof_payload(response, outcome.aof_lsn, aof_payload)
 }
 
 // ── INCR / INCRBY / DECR / DECRBY ──────────────────────────────────────────
@@ -865,9 +871,12 @@ pub(crate) fn cmd_incrbyfloat_with_clock(
             aof_records,
             aof_lsn,
         }) => {
+            let response_value = value.value;
             let aof_payload = if aof_lsn.is_some() {
-                match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
-                    TtlState::Persistent => Some(encode_aof_set(key_bytes, value.as_ref())),
+                match value.ttl_after {
+                    TtlState::Persistent => {
+                        Some(encode_aof_set(key_bytes, response_value.as_ref()))
+                    }
                     TtlState::Deadline(deadline) if unix_now_nanos != 0 => {
                         let absolute_deadline_ms = deadline_nanos_to_absolute_unix_nanos(
                             deadline,
@@ -876,7 +885,7 @@ pub(crate) fn cmd_incrbyfloat_with_clock(
                         ) / NS_PER_MS;
                         Some(encode_aof_set_pxat(
                             key_bytes,
-                            value.as_ref(),
+                            response_value.as_ref(),
                             absolute_deadline_ms,
                         ))
                     }
@@ -887,7 +896,7 @@ pub(crate) fn cmd_incrbyfloat_with_clock(
             };
 
             ExecutedCommand::with_optional_aof_payload_and_records(
-                CmdResult::Resp(RespFrame::bulk_string(value)),
+                CmdResult::Resp(RespFrame::bulk_string(response_value)),
                 aof_records,
                 aof_lsn,
                 aof_payload,
@@ -1188,6 +1197,24 @@ mod tests {
             }
         }
         panic!("failed to find {count} keys on shard {target}");
+    }
+
+    fn distinct_shard_keys(keyspace: &ConcurrentKeyspace, count: usize) -> Vec<Vec<u8>> {
+        let mut keys = Vec::with_capacity(count);
+        let mut shards = Vec::with_capacity(count);
+        for index in 0..200_000usize {
+            let key = format!("cross:{index:06}").into_bytes();
+            let shard = keyspace.shard_index(&key);
+            if shards.contains(&shard) {
+                continue;
+            }
+            shards.push(shard);
+            keys.push(key);
+            if keys.len() == count {
+                return keys;
+            }
+        }
+        panic!("failed to find {count} keys on distinct shards");
     }
 
     // ── Option parsing ──
@@ -1808,6 +1835,71 @@ mod tests {
         assert!(h.get(&c, 0).is_some());
     }
 
+    #[test]
+    fn mset_duplicate_key_uses_last_value_under_tight_noeviction() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"a" as &[u8]);
+        let final_value = VortexValue::Integer(2);
+        let projected_delta = {
+            let shard_index = h.keyspace.shard_index(key.as_bytes());
+            let guard = h.keyspace.read_shard_by_index(shard_index);
+            guard.projected_insert_delta(&key, &final_value) as usize
+        };
+        h.keyspace.configure_eviction(
+            h.keyspace.memory_used() + projected_delta,
+            EvictionPolicy::NoEviction,
+        );
+
+        let tape = make_tape(b"*7\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\na\r\n$1\r\n2\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_mset(&h.keyspace, &frame, 0);
+
+        assert_static(&result, RESP_OK);
+        assert_eq!(h.get(&key, 0), Some(final_value));
+    }
+
+    #[test]
+    fn mset_duplicate_cross_shard_keys_use_final_projection_under_tight_noeviction() {
+        let h = TestHarness::new();
+        let keys = distinct_shard_keys(&h.keyspace, 2);
+        let first_key = VortexKey::from(keys[0].as_slice());
+        let second_key = VortexKey::from(keys[1].as_slice());
+        let final_first = VortexValue::from_bytes(b"final-a");
+        let final_second = VortexValue::from_bytes(b"final-b");
+        let projected_delta = [(&first_key, &final_first), (&second_key, &final_second)]
+            .into_iter()
+            .map(|(key, value)| {
+                let shard_index = h.keyspace.shard_index(key.as_bytes());
+                let guard = h.keyspace.read_shard_by_index(shard_index);
+                guard.projected_insert_delta(key, value) as usize
+            })
+            .sum::<usize>();
+        h.keyspace.configure_eviction(
+            h.keyspace.memory_used() + projected_delta,
+            EvictionPolicy::NoEviction,
+        );
+
+        let oversized = vec![b'x'; projected_delta + 4096];
+        let cmd = make_resp(&[
+            b"MSET",
+            keys[0].as_slice(),
+            oversized.as_slice(),
+            keys[1].as_slice(),
+            oversized.as_slice(),
+            keys[0].as_slice(),
+            b"final-a",
+            keys[1].as_slice(),
+            b"final-b",
+        ]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_mset(&h.keyspace, &frame, 0);
+
+        assert_static(&result, RESP_OK);
+        assert_eq!(h.get(&first_key, 0), Some(final_first));
+        assert_eq!(h.get(&second_key, 0), Some(final_second));
+    }
+
     // ── GETSET ──
 
     #[test]
@@ -1837,6 +1929,53 @@ mod tests {
 
         // Should be gone.
         assert!(h.get(&key, 0).is_none());
+    }
+
+    // ── GETEX ──
+
+    #[test]
+    fn getex_persist_returns_value_and_clears_ttl() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"gxp" as &[u8]);
+        h.set_with_ttl(key.clone(), VortexValue::from_bytes(b"val"), 10);
+
+        let tape = make_tape(b"*3\r\n$5\r\nGETEX\r\n$3\r\ngxp\r\n$7\r\nPERSIST\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_getex(&h.keyspace, &frame, 0);
+        assert_eq!(resp_bytes(&result), b"val");
+
+        let get_tape = make_tape(b"*2\r\n$3\r\nGET\r\n$3\r\ngxp\r\n");
+        let get_frame = get_tape.iter().next().unwrap();
+        let get_result = cmd_get(&h.keyspace, &get_frame, 11);
+        assert_eq!(resp_bytes(&get_result), b"val");
+        assert!(h.get(&key, 11).is_some());
+    }
+
+    #[test]
+    fn getex_exat_past_returns_value_and_deletes() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"gxpast" as &[u8]);
+        h.set(key.clone(), VortexValue::from_bytes(b"old"));
+
+        let tape = make_tape(b"*4\r\n$5\r\nGETEX\r\n$6\r\ngxpast\r\n$4\r\nEXAT\r\n$1\r\n1\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_getex_with_clock(&h.keyspace, &frame, 20 * NS_PER_SEC, 20 * NS_PER_SEC);
+        assert_eq!(resp_bytes(&result), b"old");
+        assert!(h.get(&key, 20 * NS_PER_SEC).is_none());
+    }
+
+    #[test]
+    fn getex_rejects_keepttl() {
+        let h = TestHarness::new();
+        h.set(
+            VortexKey::from(b"gxk" as &[u8]),
+            VortexValue::from_bytes(b"v"),
+        );
+
+        let tape = make_tape(b"*3\r\n$5\r\nGETEX\r\n$3\r\ngxk\r\n$7\r\nKEEPTTL\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_getex(&h.keyspace, &frame, 0);
+        assert_static(&result, ERR_SYNTAX);
     }
 
     // ── APPEND ──

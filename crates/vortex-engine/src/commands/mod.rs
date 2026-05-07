@@ -5,7 +5,6 @@
 //! dynamic dispatch — the compiler inlines the entire chain.
 
 pub(crate) mod connection;
-pub(crate) mod context;
 pub(crate) mod generic;
 pub(crate) mod pattern;
 pub(crate) mod server;
@@ -252,6 +251,17 @@ impl ExecutedCommand {
     #[inline]
     pub fn aof_lsn(&self) -> Option<u64> {
         (self.aof_lsn != NO_AOF_LSN).then_some(self.aof_lsn)
+    }
+}
+
+pub(crate) trait MutationErrorExt {
+    fn into_executed(self) -> ExecutedCommand;
+}
+
+impl MutationErrorExt for crate::engine::domain::MutationError {
+    #[inline]
+    fn into_executed(self) -> ExecutedCommand {
+        ExecutedCommand::with_aof_records(CmdResult::Static(self.response), self.aof_records, None)
     }
 }
 
@@ -648,7 +658,7 @@ pub fn int_resp(n: i64) -> CmdResult {
 
 #[cfg(test)]
 pub(crate) mod test_harness {
-    use crate::commands::context::SetOptions;
+    use crate::engine::domain::SetOptions;
     use crate::keyspace::ConcurrentKeyspace;
     use vortex_common::{VortexKey, VortexValue};
 

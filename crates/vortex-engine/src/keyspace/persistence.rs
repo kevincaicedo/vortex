@@ -101,6 +101,16 @@ impl ConcurrentKeyspace {
             .get()
     }
 
+    #[inline(always)]
+    fn next_watch_visible_lsn(&self) -> u64 {
+        loop {
+            let lsn = self.next_lsn();
+            if lsn != 0 {
+                return lsn;
+            }
+        }
+    }
+
     #[inline]
     pub fn enable_aof_recording(&self) {
         if self.aof_recording_refs.fetch_add(1, Ordering::Release) == 0 {
@@ -133,18 +143,20 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
-    pub(crate) fn allocate_mutation_lsn(&self) -> (u64, Option<u64>) {
-        let lsn = self.next_lsn();
-        (lsn, self.aof_recording_enabled().then_some(lsn))
-    }
-
-    #[inline(always)]
-    pub(crate) fn allocate_mutation_lsn_with_features(
+    pub(crate) fn allocate_observed_mutation_lsn_with_features(
         &self,
         features: MutationFeatures,
-    ) -> (u64, Option<u64>) {
-        let lsn = self.next_lsn();
-        (lsn, features.aof().then_some(lsn))
+    ) -> (Option<u64>, Option<u64>) {
+        if !features.entry_lsn_observed() {
+            return (None, None);
+        }
+
+        let lsn = if features.watch() {
+            self.next_watch_visible_lsn()
+        } else {
+            self.next_lsn()
+        };
+        (Some(lsn), features.aof().then_some(lsn))
     }
 
     /// Read the current LSN value (the next LSN to be assigned).

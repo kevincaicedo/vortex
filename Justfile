@@ -73,6 +73,9 @@ profiler *ARGS:
 profiler-engine *ARGS:
     bash scripts/profiler.sh --engine-example engine_probe {{ARGS}}
 
+# Engine/server/Redis memory attribution matrix
+memory-attribution *ARGS:
+    bash scripts/memory-attribution-matrix.sh {{ARGS}}
 
 # Run the RESP parser fuzzer for 60 seconds
 fuzz duration="60":

@@ -19,7 +19,7 @@ pub(crate) type MultiReadGuards<'a> = (ShardReadGuards<'a>, ShardPlan);
 pub(crate) type MultiWriteGuards<'a> = (ShardWriteGuards<'a>, ShardPlan);
 
 pub(super) type ShardReadGuards<'a> = SmallVec<[(usize, RwLockReadGuard<'a, SwissTable>); 16]>;
-pub(super) type ShardWriteGuards<'a> = SmallVec<[(usize, ShardWriteGuard<'a>); 16]>;
+pub(crate) type ShardWriteGuards<'a> = SmallVec<[(usize, ShardWriteGuard<'a>); 16]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShardCountError {
