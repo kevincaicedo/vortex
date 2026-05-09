@@ -10,12 +10,14 @@
   ],
   "backends": [
     "redis-benchmark",
-    "memtier_benchmark"
+    "memtier_benchmark",
+    "custom-rust"
   ],
   "workloads": [
     "uniform-mixed",
     "zipfian-mixed",
-    "multi-key operations"
+    "multi-key operations",
+    "multi_key_only"
   ],
   "command_groups": [
     "strings",

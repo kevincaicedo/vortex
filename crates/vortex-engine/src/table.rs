@@ -134,6 +134,187 @@ impl LiveSlot {
     }
 }
 
+/// Result of one prehashed slot lookup.
+///
+/// The cursor owns the mutable table borrow while it is alive, so callers can
+/// observe TTL/value state and perform the matching mutation without
+/// re-looking-up the same key in the same lock scope.
+pub(crate) enum SlotCursor<'a> {
+    Live(LiveSlotCursor<'a>),
+    Expired(ExpiredSlot<'a>),
+    Vacant(VacantSlot<'a>),
+}
+
+/// Cursor for a live, non-expired slot.
+pub(crate) struct LiveSlotCursor<'a> {
+    table: &'a mut SwissTable,
+    slot: LiveSlot,
+    hash: TableHash,
+    ttl_deadline: u64,
+}
+
+/// Cursor for a slot that was live at lookup time but expired at `now_nanos`.
+pub(crate) struct ExpiredSlot<'a> {
+    table: &'a mut SwissTable,
+    slot: LiveSlot,
+    ttl_deadline: u64,
+}
+
+/// Cursor for an absent key.
+pub(crate) struct VacantSlot<'a> {
+    table: &'a mut SwissTable,
+    hash: TableHash,
+}
+
+/// Value removed from a table slot, plus the metadata observed before removal.
+#[allow(dead_code)]
+pub(crate) struct SlotRemoval {
+    value: VortexValue,
+    old_ttl: u64,
+    old_memory_bytes: usize,
+}
+
+#[allow(dead_code)]
+impl SlotRemoval {
+    #[inline]
+    pub(crate) fn into_value(self) -> VortexValue {
+        self.value
+    }
+
+    #[inline]
+    pub(crate) const fn old_ttl(&self) -> u64 {
+        self.old_ttl
+    }
+
+    #[inline]
+    pub(crate) const fn old_had_ttl(&self) -> bool {
+        self.old_ttl != 0
+    }
+
+    #[inline]
+    pub(crate) const fn old_memory_bytes(&self) -> usize {
+        self.old_memory_bytes
+    }
+}
+
+/// Metadata emitted by cursor mutations.
+#[allow(dead_code)]
+pub(crate) struct SlotMutationReport {
+    live_slot: Option<LiveSlot>,
+    previous: Option<VortexValue>,
+    old_ttl: u64,
+    new_ttl: u64,
+    old_memory_bytes: usize,
+    new_memory_bytes: usize,
+    entry_lsn_stamped: bool,
+}
+
+#[allow(dead_code)]
+impl SlotMutationReport {
+    #[inline]
+    fn inserted(
+        live_slot: LiveSlot,
+        new_ttl: u64,
+        new_memory_bytes: usize,
+        entry_lsn_stamped: bool,
+    ) -> Self {
+        Self {
+            live_slot: Some(live_slot),
+            previous: None,
+            old_ttl: 0,
+            new_ttl,
+            old_memory_bytes: 0,
+            new_memory_bytes,
+            entry_lsn_stamped,
+        }
+    }
+
+    #[inline]
+    fn replaced(
+        live_slot: LiveSlot,
+        previous: Option<VortexValue>,
+        old_ttl: u64,
+        new_ttl: u64,
+        old_memory_bytes: usize,
+        new_memory_bytes: usize,
+        entry_lsn_stamped: bool,
+    ) -> Self {
+        Self {
+            live_slot: Some(live_slot),
+            previous,
+            old_ttl,
+            new_ttl,
+            old_memory_bytes,
+            new_memory_bytes,
+            entry_lsn_stamped,
+        }
+    }
+
+    #[inline]
+    fn ttl_only(
+        live_slot: LiveSlot,
+        old_ttl: u64,
+        new_ttl: u64,
+        memory_bytes: usize,
+        entry_lsn_stamped: bool,
+    ) -> Self {
+        Self {
+            live_slot: Some(live_slot),
+            previous: None,
+            old_ttl,
+            new_ttl,
+            old_memory_bytes: memory_bytes,
+            new_memory_bytes: memory_bytes,
+            entry_lsn_stamped,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_previous(self) -> Option<VortexValue> {
+        self.previous
+    }
+
+    #[inline]
+    pub(crate) fn take_previous(&mut self) -> Option<VortexValue> {
+        self.previous.take()
+    }
+
+    #[inline]
+    pub(crate) const fn old_ttl(&self) -> u64 {
+        self.old_ttl
+    }
+
+    #[inline]
+    pub(crate) const fn new_ttl(&self) -> u64 {
+        self.new_ttl
+    }
+
+    #[inline]
+    pub(crate) const fn old_had_ttl(&self) -> bool {
+        self.old_ttl != 0
+    }
+
+    #[inline]
+    pub(crate) const fn new_has_ttl(&self) -> bool {
+        self.new_ttl != 0
+    }
+
+    #[inline]
+    pub(crate) const fn old_memory_bytes(&self) -> usize {
+        self.old_memory_bytes
+    }
+
+    #[inline]
+    pub(crate) const fn new_memory_bytes(&self) -> usize {
+        self.new_memory_bytes
+    }
+
+    #[inline]
+    pub(crate) const fn entry_lsn_stamped(&self) -> bool {
+        self.entry_lsn_stamped
+    }
+}
+
 /// Extract the 7-bit H₂ fingerprint from a 64-bit hash.
 ///
 /// Result is in `0x81..=0xFE` — never `EMPTY` (0xFF) or `DELETED` (0x80).
@@ -610,6 +791,26 @@ impl SwissTable {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline]
+    pub fn occupied_slots(&self) -> usize {
+        self.occupied
+    }
+
+    #[inline]
+    pub fn tombstone_slots(&self) -> usize {
+        self.occupied.saturating_sub(self.len)
+    }
+
+    #[inline]
+    pub fn load_factor(&self) -> f64 {
+        let total_slots = self.total_slots();
+        if total_slots == 0 {
+            0.0
+        } else {
+            self.len as f64 / total_slots as f64
+        }
     }
 
     #[inline]
@@ -1108,6 +1309,170 @@ impl MutationPolicy {
             TtlPolicy::Set(ttl_deadline) => ttl_deadline,
         }
     }
+}
+
+#[allow(dead_code)]
+impl<'a> SlotCursor<'a> {
+    #[inline]
+    pub(crate) fn old_ttl(&self) -> Option<u64> {
+        match self {
+            Self::Live(cursor) => Some(cursor.ttl_deadline()),
+            Self::Expired(cursor) => Some(cursor.ttl_deadline()),
+            Self::Vacant(_) => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+}
+
+#[allow(dead_code)]
+impl<'a> LiveSlotCursor<'a> {
+    #[inline]
+    pub(crate) const fn ttl_deadline(&self) -> u64 {
+        self.ttl_deadline
+    }
+
+    #[inline]
+    pub(crate) const fn had_ttl(&self) -> bool {
+        self.ttl_deadline != 0
+    }
+
+    #[inline]
+    pub(crate) fn value(&self) -> &VortexValue {
+        self.table.values[self.slot.get()]
+            .as_ref()
+            .expect("live slot cursor must reference a value")
+    }
+
+    #[inline]
+    pub(crate) fn cloned_value(&self) -> VortexValue {
+        self.value().clone()
+    }
+
+    #[inline]
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.table.slot_memory_usage(self.slot)
+    }
+
+    #[inline]
+    pub(crate) fn lsn_version(&self) -> u64 {
+        self.table.raw.entry(self.slot).lsn_version()
+    }
+
+    #[inline]
+    pub(crate) fn set_ttl(&mut self, deadline_nanos: u64, lsn: Option<u64>) -> SlotMutationReport {
+        let old_ttl = self.ttl_deadline;
+        let memory_bytes = self.memory_bytes();
+        let entry = self.table.raw.entry_mut(self.slot);
+        entry.set_ttl(deadline_nanos);
+        if let Some(lsn) = lsn {
+            entry.set_lsn_version(lsn);
+        }
+        self.ttl_deadline = deadline_nanos;
+        SlotMutationReport::ttl_only(
+            self.slot,
+            old_ttl,
+            deadline_nanos,
+            memory_bytes,
+            lsn.is_some(),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn clear_ttl(&mut self, lsn: Option<u64>) -> SlotMutationReport {
+        self.set_ttl(0, lsn)
+    }
+
+    #[inline]
+    pub(crate) fn replace_value(
+        self,
+        value: VortexValue,
+        policy: MutationPolicy,
+    ) -> SlotMutationReport {
+        let old_ttl = self.ttl_deadline;
+        let new_ttl = policy.ttl_for_existing(old_ttl);
+        let old_bytes = self.table.slot_memory_usage(self.slot);
+        let previous =
+            self.table
+                .replace_slot_value(self.slot, self.hash.h2(), value, new_ttl, policy.lsn);
+        let new_bytes = self.table.slot_memory_usage(self.slot);
+        self.table
+            .record_memory_delta(SwissTable::memory_delta_between(new_bytes, old_bytes));
+        SlotMutationReport::replaced(
+            self.slot,
+            previous,
+            old_ttl,
+            new_ttl,
+            old_bytes,
+            new_bytes,
+            policy.lsn.is_some(),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn remove(self) -> Option<SlotRemoval> {
+        remove_cursor_slot(self.table, self.slot, self.ttl_deadline)
+    }
+}
+
+#[allow(dead_code)]
+impl<'a> ExpiredSlot<'a> {
+    #[inline]
+    pub(crate) const fn ttl_deadline(&self) -> u64 {
+        self.ttl_deadline
+    }
+
+    #[inline]
+    pub(crate) fn remove(self) -> Option<SlotRemoval> {
+        remove_cursor_slot(self.table, self.slot, self.ttl_deadline)
+    }
+}
+
+impl<'a> VacantSlot<'a> {
+    #[inline]
+    pub(crate) fn insert(
+        self,
+        key: VortexKey,
+        value: VortexValue,
+        policy: MutationPolicy,
+    ) -> SlotMutationReport {
+        let ttl = policy.ttl_for_new();
+        self.table.ensure_capacity_for_insert();
+
+        let slot = self.table.find_insert_slot(self.hash);
+        let was_empty = self.table.raw.ctrl(slot) == CTRL_EMPTY;
+        let h2 = self.hash.h2();
+        self.table
+            .write_new_slot(slot, h2, key, value, ttl, policy.lsn);
+        self.table.finish_new_slot_insert(slot, was_empty);
+        let live_slot = self
+            .table
+            .live_slot(slot)
+            .expect("inserted slot must be live");
+        SlotMutationReport::inserted(
+            live_slot,
+            ttl,
+            self.table.slot_memory_usage(live_slot),
+            policy.lsn.is_some(),
+        )
+    }
+}
+
+#[inline]
+fn remove_cursor_slot(
+    table: &mut SwissTable,
+    slot: LiveSlot,
+    ttl_deadline: u64,
+) -> Option<SlotRemoval> {
+    let old_memory_bytes = table.slot_memory_usage(slot);
+    table.delete_live_slot(slot).map(|value| SlotRemoval {
+        value,
+        old_ttl: ttl_deadline,
+        old_memory_bytes,
+    })
 }
 
 pub(crate) struct BorrowedKey<'a>(pub(crate) &'a [u8]);
@@ -1711,7 +2076,73 @@ impl SwissTable {
         Some((value, ttl))
     }
 
-    /// Like `get_or_expire` but uses a pre-computed hash (for MGET batching).
+    /// Returns value, TTL, and entry LSN/version from one prehashed lookup.
+    #[inline]
+    pub(crate) fn get_value_ttl_lsn_prehashed(
+        &self,
+        key_bytes: &[u8],
+        hash: TableHash,
+    ) -> Option<(&VortexValue, u64, u64)> {
+        let slot = self.find_slot(key_bytes, hash)?;
+        let entry = self.raw.entry(slot);
+        let value = self.values[slot.get()].as_ref()?;
+        Some((value, entry.ttl_deadline(), entry.lsn_version()))
+    }
+
+    /// Returns a typed cursor for one prehashed slot lookup.
+    ///
+    /// The cursor keeps the mutable table borrow, so live-slot mutations can
+    /// reuse the observed slot instead of repeating the same key probe.
+    #[inline]
+    pub(crate) fn slot_cursor_prehashed(
+        &mut self,
+        key_bytes: &[u8],
+        hash: TableHash,
+        now_nanos: u64,
+    ) -> SlotCursor<'_> {
+        let Some(slot) = self.find_slot(key_bytes, hash) else {
+            return SlotCursor::Vacant(VacantSlot { table: self, hash });
+        };
+
+        let ttl_deadline = self.raw.entry(slot).ttl_deadline();
+        if ttl_deadline != 0 && ttl_deadline <= now_nanos {
+            return SlotCursor::Expired(ExpiredSlot {
+                table: self,
+                slot,
+                ttl_deadline,
+            });
+        }
+
+        SlotCursor::Live(LiveSlotCursor {
+            table: self,
+            slot,
+            hash,
+            ttl_deadline,
+        })
+    }
+
+    /// Stamp the slot referenced by a cursor mutation report without another
+    /// key probe.
+    #[inline]
+    pub(crate) fn stamp_report_lsn(
+        &mut self,
+        report: &mut SlotMutationReport,
+        lsn: Option<u64>,
+    ) -> bool {
+        let (Some(slot), Some(lsn)) = (report.live_slot, lsn) else {
+            return false;
+        };
+        debug_assert!(
+            self.live_slot(slot.index()).is_some(),
+            "cursor mutation report must reference a live slot"
+        );
+        self.raw.entry_mut(slot).set_lsn_version(lsn);
+        report.entry_lsn_stamped = true;
+        true
+    }
+
+    /// Like `get_or_expire` but uses a pre-computed hash.
+    #[allow(dead_code)]
     pub(crate) fn get_or_expire_prehashed(
         &mut self,
         key_bytes: &[u8],
@@ -1881,6 +2312,84 @@ mod tests {
         } else {
             (table.occupied - table.len) as f64 / table.occupied as f64
         }
+    }
+
+    #[test]
+    fn slot_cursor_replace_reports_ttl_memory_and_stamp_status() {
+        let mut table = SwissTable::new();
+        let key = VortexKey::from("cursor-live");
+        table.insert_with(key.clone(), VortexValue::from("old"), 123, Some(7));
+        let hash = table.table_hash_key_bytes(key.as_bytes());
+
+        let mut report = match table.slot_cursor_prehashed(key.as_bytes(), hash, 100) {
+            SlotCursor::Live(live) => {
+                assert_eq!(live.ttl_deadline(), 123);
+                assert_eq!(live.lsn_version(), 7);
+                live.replace_value(
+                    VortexValue::from("new-value"),
+                    MutationPolicy::preserve_ttl(None),
+                )
+            }
+            SlotCursor::Expired(_) | SlotCursor::Vacant(_) => panic!("expected live cursor"),
+        };
+
+        assert_eq!(report.old_ttl(), 123);
+        assert_eq!(report.new_ttl(), 123);
+        assert!(report.old_memory_bytes() > 0);
+        assert!(report.new_memory_bytes() >= report.old_memory_bytes());
+        assert!(!report.entry_lsn_stamped());
+        assert!(table.stamp_report_lsn(&mut report, Some(99)));
+        assert!(report.entry_lsn_stamped());
+        assert_eq!(
+            table.get_lsn_version_prehashed(key.as_bytes(), hash),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn slot_cursor_expired_remove_reports_old_ttl_and_memory() {
+        let mut table = SwissTable::new();
+        let key = VortexKey::from("cursor-expired");
+        table.insert_with(key.clone(), VortexValue::from("value"), 10, Some(1));
+        let hash = table.table_hash_key_bytes(key.as_bytes());
+
+        let removed = match table.slot_cursor_prehashed(key.as_bytes(), hash, 11) {
+            SlotCursor::Expired(expired) => expired.remove().expect("expired slot removal"),
+            SlotCursor::Live(_) | SlotCursor::Vacant(_) => panic!("expected expired cursor"),
+        };
+
+        assert_eq!(removed.old_ttl(), 10);
+        assert!(removed.old_had_ttl());
+        assert!(removed.old_memory_bytes() > 0);
+        assert!(table.get(&key).is_none());
+        assert_eq!(table.tombstone_slots(), 1);
+    }
+
+    #[test]
+    fn slot_cursor_vacant_insert_reports_new_memory() {
+        let mut table = SwissTable::new();
+        let key = VortexKey::from("cursor-vacant");
+        let hash = table.table_hash_key_bytes(key.as_bytes());
+
+        let report = match table.slot_cursor_prehashed(key.as_bytes(), hash, 0) {
+            SlotCursor::Vacant(vacant) => vacant.insert(
+                key.clone(),
+                VortexValue::from("value"),
+                MutationPolicy::set(500, Some(3)),
+            ),
+            SlotCursor::Live(_) | SlotCursor::Expired(_) => panic!("expected vacant cursor"),
+        };
+
+        assert_eq!(report.old_ttl(), 0);
+        assert_eq!(report.new_ttl(), 500);
+        assert_eq!(report.old_memory_bytes(), 0);
+        assert!(report.new_memory_bytes() > 0);
+        assert!(report.entry_lsn_stamped());
+        assert_eq!(table.get_entry_ttl(&key), Some(500));
+        assert_eq!(
+            table.get_lsn_version_prehashed(key.as_bytes(), hash),
+            Some(3)
+        );
     }
 
     #[test]

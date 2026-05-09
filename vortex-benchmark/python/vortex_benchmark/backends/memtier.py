@@ -14,6 +14,7 @@ from vortex_benchmark.backends.base import (
     DEFAULT_MEMTIER_PIPELINE,
     DEFAULT_MEMTIER_REQUESTS,
     DEFAULT_MEMTIER_THREAD_SWEEP,
+    apply_load_affinity,
     backend_settings,
     coerce_int_list,
     coerce_nonnegative_int,
@@ -244,6 +245,7 @@ def run_memtier_backend(context: BackendRunContext) -> BackendExecutionRecord:
                 command.extend(["--requests", str(requests)])
             if rate_limiting is not None:
                 command.extend(["--rate-limiting", str(rate_limiting)])
+            command = apply_load_affinity(context, command)
 
             snapshot_before = capture_service_snapshot(context.service)
             host_telemetry = None

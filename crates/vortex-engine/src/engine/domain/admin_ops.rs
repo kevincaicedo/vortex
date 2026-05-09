@@ -6,7 +6,7 @@ impl ConcurrentKeyspace {
         keys
     }
 
-    pub(crate) fn cmd_flush_all(&self) -> Option<u64> {
+    pub(crate) fn cmd_flush_all(&self) -> Option<AofLsn> {
         self.flush_all_with_lsn()
     }
 

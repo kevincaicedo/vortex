@@ -8,6 +8,7 @@ modes:
 server:
   threads: 4
   aof: true
+  aof_fsync: everysec
 
 workload:
   command: SET,INCR

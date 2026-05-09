@@ -25,6 +25,7 @@ source "${SCRIPTS_DIR}/profiler/summary.sh"
 source "${SCRIPTS_DIR}/profiler/build.sh"
 source "${SCRIPTS_DIR}/profiler/server.sh"
 source "${SCRIPTS_DIR}/profiler/cpu.sh"
+source "${SCRIPTS_DIR}/profiler/c2c.sh"
 source "${SCRIPTS_DIR}/profiler/memory.sh"
 source "${SCRIPTS_DIR}/profiler/cache.sh"
 source "${SCRIPTS_DIR}/profiler/criterion.sh"
@@ -40,8 +41,10 @@ Usage: just profiler [mode flags] [options]
 Modes (at least one required, combinable):
   --cpu              Full CPU profiling (flamegraph + perf stat + perf record)
     --scheduler        Scheduler-focused diagnostics with host context
+        --lock-offcpu      Lock wait and off-CPU diagnostics with blocking classification
   --memory           Heap allocation profiling (heaptrack / massif / Instruments)
   --cache            Cache locality analysis (cachegrind)
+    --c2c              Cache-line contention analysis (perf c2c on Linux)
     --aof-disk         AOF and disk-focused diagnostics with host context
     --network          Network-focused diagnostics with host context
   --all              Run cpu + memory + cache sequentially
@@ -95,6 +98,7 @@ Profiler tuning:
 
 Diagnostics:
   --check            Show OS, available tools, binary status
+    --dry-run          Write tool-check artifacts without starting a capture (currently for --c2c)
 
 Environment:
     .env               If present at repo root (or scripts/profiler/.env), it is loaded automatically
@@ -106,10 +110,13 @@ macOS note:
 Examples:
   just profiler --command SET,GET
     just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
+        just profiler --lock-offcpu --command SET --duration 10
   just profiler --cpu --command SET,GET --duration 20
   just profiler --flamegraph --command SET --threads 2
   just profiler --memory --command SET --duration 15
+    just profiler --c2c --dry-run --command SET,GET --duration 10
   just profiler --cache --command SET --threads 1
+    just profiler-engine --c2c --engine-example c2c_probe -- --variant unpadded --threads 4 --duration-seconds 3
   just profiler --callgrind --command SET --threads 1
   just profiler --all --command SET,GET
   just profiler --manifest scripts/profiler/manifests/cpu-set-heavy.yaml
@@ -123,13 +130,16 @@ EOF
 # ── Defaults ─────────────────────────────────────────────────────────────────
 MODE_CPU=false
 MODE_SCHEDULER=false
+MODE_LOCK_OFFCPU=false
 MODE_MEMORY=false
 MODE_CACHE=false
+MODE_C2C=false
 MODE_AOF_DISK=false
 MODE_NETWORK=false
 MODE_ALL=false
 MODE_CRITERION=false
 MODE_CHECK=false
+DRY_RUN=false
 
 # Specific tools
 TOOL_FLAMEGRAPH=false
@@ -186,13 +196,16 @@ while [[ $# -gt 0 ]]; do
         # Modes
         --cpu)          MODE_CPU=true;           shift ;;
         --scheduler)    MODE_SCHEDULER=true;     shift ;;
+        --lock-offcpu)  MODE_LOCK_OFFCPU=true;   shift ;;
         --memory)       MODE_MEMORY=true;        shift ;;
         --cache)        MODE_CACHE=true;         shift ;;
+        --c2c)          MODE_C2C=true;           shift ;;
         --aof-disk)     MODE_AOF_DISK=true;      shift ;;
         --network)      MODE_NETWORK=true;       shift ;;
         --all)          MODE_ALL=true;           shift ;;
         --criterion)    MODE_CRITERION=true;     shift ;;
         --check)        MODE_CHECK=true;         shift ;;
+        --dry-run)      DRY_RUN=true;            shift ;;
 
         # Specific tools
         --flamegraph)   TOOL_FLAMEGRAPH=true;    shift ;;
@@ -242,7 +255,7 @@ while [[ $# -gt 0 ]]; do
 
         --)
             shift
-            if profiling_target_is_engine; then
+            if [[ "$PROFILER_TARGET_KIND" == "engine" ]]; then
                 ENGINE_TARGET_ARGS=("$@")
                 break
             fi
@@ -270,6 +283,7 @@ if [[ -n "$MANIFEST" ]]; then
     [[ "$THREADS" == 4  && -n "${MANIFEST_SERVER_THREADS:-}" ]]    && THREADS="$MANIFEST_SERVER_THREADS"
     [[ -z "$MAXMEMORY" && -n "${MANIFEST_SERVER_MAXMEMORY:-}" ]]   && MAXMEMORY="$MANIFEST_SERVER_MAXMEMORY"
     [[ -z "$EVICTION"  && -n "${MANIFEST_SERVER_EVICTION:-}" ]]    && EVICTION="$MANIFEST_SERVER_EVICTION"
+    [[ -z "${VORTEX_AOF_FSYNC:-}" && -n "${MANIFEST_SERVER_AOF_FSYNC:-}" ]] && export VORTEX_AOF_FSYNC="$MANIFEST_SERVER_AOF_FSYNC"
     [[ "$FREQUENCY" == 99 && -n "${MANIFEST_PROFILER_FREQUENCY:-}" ]] && FREQUENCY="$MANIFEST_PROFILER_FREQUENCY"
     if [[ "${MANIFEST_SERVER_AOF:-}" == "true" ]]; then AOF=true; fi
 
@@ -280,8 +294,10 @@ if [[ -n "$MANIFEST" ]]; then
             case "$_m" in
                 cpu)              MODE_CPU=true ;;
                 scheduler)        MODE_SCHEDULER=true ;;
+                lock-offcpu)      MODE_LOCK_OFFCPU=true ;;
                 memory)           MODE_MEMORY=true ;;
                 cache)            MODE_CACHE=true ;;
+                c2c)              MODE_C2C=true ;;
                 aof-disk)         MODE_AOF_DISK=true ;;
                 network)          MODE_NETWORK=true ;;
                 all)              MODE_ALL=true ;;
@@ -313,7 +329,7 @@ fi
 
 # ── Default mode: if only --command is given with no mode, default to --cpu ──
 has_any_mode() {
-    $MODE_CPU || $MODE_SCHEDULER || $MODE_MEMORY || $MODE_CACHE || $MODE_AOF_DISK || $MODE_NETWORK || $MODE_CRITERION || $MODE_CHECK || \
+    $MODE_CPU || $MODE_SCHEDULER || $MODE_LOCK_OFFCPU || $MODE_MEMORY || $MODE_CACHE || $MODE_C2C || $MODE_AOF_DISK || $MODE_NETWORK || $MODE_CRITERION || $MODE_CHECK || \
     $TOOL_FLAMEGRAPH || $TOOL_PERF_STAT || $TOOL_SAMPLY || $TOOL_INSTRUMENTS || \
     $TOOL_HEAPTRACK || $TOOL_CACHEGRIND || $TOOL_CALLGRIND || $TOOL_MASSIF
 }
@@ -325,6 +341,10 @@ if ! has_any_mode; then
     else
         fatal "No mode specified. Run 'just profiler --help' for usage."
     fi
+fi
+
+if $DRY_RUN && ! $MODE_C2C && ! $MODE_CHECK; then
+    fatal "--dry-run is currently supported only with --c2c or --check"
 fi
 
 if [[ "${HOST_SAMPLER_INTERVAL_SECONDS:-1}" =~ ^1(\.0+)?$ ]] && {
@@ -374,6 +394,28 @@ engine_target_args_contain_flag() {
     return 1
 }
 
+engine_target_arg_value() {
+    local flag="$1"
+    local arg index next_index
+
+    for index in "${!ENGINE_TARGET_ARGS[@]}"; do
+        arg="${ENGINE_TARGET_ARGS[$index]}"
+        if [[ "$arg" == "${flag}="* ]]; then
+            printf '%s' "${arg#*=}"
+            return 0
+        fi
+        if [[ "$arg" == "$flag" ]]; then
+            next_index=$((index + 1))
+            if (( next_index < ${#ENGINE_TARGET_ARGS[@]} )); then
+                printf '%s' "${ENGINE_TARGET_ARGS[$next_index]}"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 materialize_engine_target_args() {
     local session_dir="$1"
     local parsed=()
@@ -405,8 +447,10 @@ resolve_requested_tools() {
 
     $MODE_CPU && tools+=("cpu-suite")
     $MODE_SCHEDULER && tools+=("scheduler-focus")
+    $MODE_LOCK_OFFCPU && tools+=("lock-offcpu-focus")
     $MODE_MEMORY && tools+=("memory-suite")
     $MODE_CACHE && tools+=("cache-suite")
+    $MODE_C2C && tools+=("c2c-focus")
     $MODE_AOF_DISK && tools+=("aof-disk-focus")
     $MODE_NETWORK && tools+=("network-focus")
     $MODE_CRITERION && tools+=("criterion")
@@ -467,6 +511,7 @@ prepare_session_contract_context() {
     local cargo_profile="$2"
     local binary_path="$3"
     local tool_name
+    local engine_duration=""
 
     SESSION_MODE="$mode"
     SESSION_CARGO_PROFILE="$cargo_profile"
@@ -476,11 +521,17 @@ prepare_session_contract_context() {
     SESSION_WORKLOAD_DESCRIPTION="$(describe_workload)"
     if profiling_target_is_engine; then
         SESSION_WORKLOAD_COMMAND="$(shell_join "${ENGINE_TARGET_ARGS[@]}")"
+        engine_duration="$(engine_target_arg_value "--duration-seconds" || true)"
+        if [[ -z "$engine_duration" ]]; then
+            engine_duration="$(engine_target_arg_value "--duration" || true)"
+        fi
+        SESSION_WORKLOAD_DURATION="$engine_duration"
+        SESSION_WORKLOAD_CLIENTS=""
     else
         SESSION_WORKLOAD_COMMAND="$COMMAND"
+        SESSION_WORKLOAD_DURATION="$DURATION"
+        SESSION_WORKLOAD_CLIENTS="$CLIENTS"
     fi
-    SESSION_WORKLOAD_DURATION="$DURATION"
-    SESSION_WORKLOAD_CLIENTS="$CLIENTS"
     if benchmark_bridge_enabled; then
         SESSION_WORKLOAD_MANIFEST_PATH="$BENCH_EFFECTIVE_MANIFEST"
         SESSION_WORKLOAD_REQUEST_PATH="$BENCH_EFFECTIVE_REQUEST_PATH"
@@ -574,9 +625,18 @@ else
     printf "  Threads:   %s\n" "$THREADS"
     printf "  Command:   %s\n" "${COMMAND:-<none — no load>}"
 fi
-printf "  Duration:  %ss\n" "$DURATION"
+if profiling_target_is_engine; then
+    banner_duration="$(engine_target_arg_value "--duration-seconds" || true)"
+    if [[ -z "$banner_duration" ]]; then
+        banner_duration="$(engine_target_arg_value "--duration" || true)"
+    fi
+    printf "  Duration:  %ss\n" "${banner_duration:-n/a}"
+else
+    printf "  Duration:  %ss\n" "$DURATION"
+fi
 printf "  Frequency: %s Hz\n" "$FREQUENCY"
 printf "  Session:   %s\n" "$SESSION_DIR"
+if $DRY_RUN; then printf "  DryRun:    enabled\n"; fi
 if [[ -n "$MANIFEST" ]]; then printf "  Manifest:  %s\n" "$MANIFEST"; fi
 if $AOF; then printf "  AOF:       enabled\n"; fi
 if [[ -n "$MAXMEMORY" ]]; then printf "  MaxMemory: %s\n" "$MAXMEMORY"; fi
@@ -644,6 +704,11 @@ if $MODE_SCHEDULER; then
     run_scheduler_focus "${COMMON_ARGS[@]}"
 fi
 
+if $MODE_LOCK_OFFCPU; then
+    record_executed_tool "lock-offcpu-focus"
+    run_lock_offcpu_focus "${COMMON_ARGS[@]}"
+fi
+
 if $MODE_MEMORY; then
     record_executed_tool "memory-suite"
     run_memory_all "${COMMON_ARGS[@]}"
@@ -652,6 +717,11 @@ fi
 if $MODE_CACHE; then
     record_executed_tool "cache-suite"
     run_cachegrind "${COMMON_ARGS[@]}"
+fi
+
+if $MODE_C2C; then
+    record_executed_tool "c2c-focus"
+    run_c2c_focus "${COMMON_ARGS[@]}"
 fi
 
 if $MODE_AOF_DISK; then

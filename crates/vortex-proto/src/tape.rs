@@ -159,20 +159,32 @@ fn parse_pipeline_entries_into(
     bytes: &[u8],
     entries: &mut Vec<TapeEntry>,
 ) -> Result<(usize, usize), ParseError> {
+    parse_pipeline_entries_into_limit(bytes, entries, usize::MAX)
+}
+
+fn parse_pipeline_entries_into_limit(
+    bytes: &[u8],
+    entries: &mut Vec<TapeEntry>,
+    max_frames: usize,
+) -> Result<(usize, usize), ParseError> {
     entries.clear();
-    if bytes.is_empty() {
+    if bytes.is_empty() || max_frames == 0 {
         return Err(ParseError::NeedMoreData);
     }
 
     let mut offset: usize = 0;
-    // Pre-size: typical SET command ≈ 37 bytes → 4 entries → ~0.11 entries/byte.
-    let target_entries = bytes.len() / 8;
+    // Pre-size without letting one large bulk string reserve entries
+    // proportional to payload bytes. Deep pipelines still grow the scratch
+    // vector as needed, but a single large SET should not allocate megabytes
+    // of tape entries before parsing its first frame.
+    let frame_hint = max_frames.min(2048).saturating_mul(8).max(64);
+    let target_entries = (bytes.len() / 8).min(frame_hint).min(16_384);
     if entries.capacity() < target_entries {
         entries.reserve(target_entries - entries.capacity());
     }
     let mut frame_count: usize = 0;
 
-    while offset < bytes.len() {
+    while offset < bytes.len() && frame_count < max_frames {
         let snap_entries = entries.len();
         let snap_offset = offset;
         match tape_parse_frame(bytes, &mut offset, entries, 0) {
@@ -276,6 +288,25 @@ impl<'a> BorrowedRespTape<'a> {
         entries: &'a mut Vec<TapeEntry>,
     ) -> Result<BorrowedRespTapeRef<'a>, ParseError> {
         let (frame_count, consumed) = parse_pipeline_entries_into(backing, entries)?;
+        Ok(BorrowedRespTapeRef {
+            entries: entries.as_slice(),
+            backing,
+            frame_count,
+            consumed,
+        })
+    }
+
+    /// Parse at most `max_frames` top-level frames into caller-owned scratch entries.
+    ///
+    /// This is used by cooperative reactor loops that need to stop parsing at
+    /// a command budget boundary without scanning the rest of a deep pipeline.
+    pub fn parse_pipeline_limited_into(
+        backing: &'a [u8],
+        entries: &'a mut Vec<TapeEntry>,
+        max_frames: usize,
+    ) -> Result<BorrowedRespTapeRef<'a>, ParseError> {
+        let (frame_count, consumed) =
+            parse_pipeline_entries_into_limit(backing, entries, max_frames)?;
         Ok(BorrowedRespTapeRef {
             entries: entries.as_slice(),
             backing,
@@ -1330,6 +1361,20 @@ mod tests {
         assert_eq!(tape.frame_count(), 10);
         assert_eq!(tape.consumed(), buf.len());
         assert_eq!(tape.entries().len(), 40);
+    }
+
+    #[test]
+    fn borrowed_pipeline_limited_stops_at_frame_budget() {
+        let mut buf = Vec::new();
+        for _ in 0..4 {
+            buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        }
+        let mut scratch = Vec::new();
+        let tape = BorrowedRespTape::parse_pipeline_limited_into(&buf, &mut scratch, 2).unwrap();
+
+        assert_eq!(tape.frame_count(), 2);
+        assert_eq!(tape.consumed(), b"*1\r\n$4\r\nPING\r\n".len() * 2);
+        assert_eq!(tape.iter().count(), 2);
     }
 
     #[test]

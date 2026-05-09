@@ -4,8 +4,9 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use vortex_persist::aof::{AofFileWriter, AofFsyncPolicy};
+use anyhow::{Context, Result, anyhow};
+use vortex_engine::keyspace::AofLsn;
+use vortex_persist::aof::{AofFileWriter, AofFsyncPolicy, AofReactorId, AofRecordBytes};
 use vortex_smoketests::context::SmokeContext;
 use vortex_smoketests::server::{SpawnOptions, spawn_vortex};
 
@@ -79,10 +80,20 @@ fn shard_aof_path(base: &Path, reactor_id: usize) -> PathBuf {
 }
 
 fn write_record(path: &Path, reactor_id: u16, lsn: u64, payload: &[u8]) -> Result<()> {
-    let mut writer = AofFileWriter::open(path, reactor_id, AofFsyncPolicy::No)
-        .with_context(|| format!("failed to open fixture {}", path.display()))?;
+    let mut writer =
+        AofFileWriter::open(path, AofReactorId::from_u16(reactor_id), AofFsyncPolicy::No)
+            .with_context(|| format!("failed to open fixture {}", path.display()))?;
     writer
-        .append_with_lsn(lsn, payload)
+        .append_with_lsn(
+            AofLsn::try_from_raw(lsn).map_err(|error| {
+                anyhow!(
+                    "fixture LSN {} exceeds representable max {}",
+                    error.attempted,
+                    error.max
+                )
+            })?,
+            AofRecordBytes::from_resp(payload),
+        )
         .with_context(|| format!("failed to append fixture record to {}", path.display()))?;
     writer
         .flush_buffer()
@@ -91,22 +102,45 @@ fn write_record(path: &Path, reactor_id: u16, lsn: u64, payload: &[u8]) -> Resul
 }
 
 fn spawn_with_aof(bind: &str, aof_path: &Path) -> Result<vortex_smoketests::server::SpawnedServer> {
+    spawn_with_aof_policy(bind, aof_path, "everysec", None)
+}
+
+fn spawn_with_aof_policy(
+    bind: &str,
+    aof_path: &Path,
+    fsync: &str,
+    max_pending_fsync_bytes: Option<u64>,
+) -> Result<vortex_smoketests::server::SpawnedServer> {
+    let mut vortex_args = vec![
+        "--threads".to_string(),
+        "2".to_string(),
+        "--aof-enabled".to_string(),
+        "--aof-fsync".to_string(),
+        fsync.to_string(),
+        "--aof-path".to_string(),
+        aof_path.display().to_string(),
+        "--max-clients".to_string(),
+        "64".to_string(),
+        "--fixed-buffers".to_string(),
+        "128".to_string(),
+    ];
+    if let Some(bytes) = max_pending_fsync_bytes {
+        vortex_args.push("--aof-max-pending-fsync-bytes".to_string());
+        vortex_args.push(bytes.to_string());
+    }
+
     spawn_vortex(&SpawnOptions {
         bind: Some(bind.to_string()),
-        vortex_args: vec![
-            "--threads".to_string(),
-            "2".to_string(),
-            "--aof-enabled".to_string(),
-            "--aof-path".to_string(),
-            aof_path.display().to_string(),
-            "--max-clients".to_string(),
-            "64".to_string(),
-            "--fixed-buffers".to_string(),
-            "128".to_string(),
-        ],
+        vortex_args,
         ready_timeout: Duration::from_secs(5),
         ..SpawnOptions::default()
     })
+}
+
+fn info_counter(info: &str, name: &str) -> Option<u64> {
+    let prefix = format!("{name}:");
+    info.lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.parse::<u64>().ok())
 }
 
 #[test]
@@ -227,5 +261,58 @@ fn real_server_replay_rejects_mid_file_merge_corruption() -> Result<()> {
         "startup log missing corrupt file path: {log}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn real_server_aof_always_replays_smoke_workload() -> Result<()> {
+    let fixture = TestDir::new("aof-always-smoke")?;
+    let base_path = fixture.path().join("appendonly.aof");
+
+    let bind = reserve_bind_addr()?;
+    {
+        let server = spawn_with_aof_policy(&bind, &base_path, "always", None)?;
+        let mut ctx = SmokeContext::connect(server.url())?;
+
+        ctx.set("aof:smoke:string", "value-1")?;
+        let counter: i64 = ctx.exec(&["INCR", "aof:smoke:counter"])?;
+        assert_eq!(counter, 1);
+        let counter: i64 = ctx.exec(&["INCR", "aof:smoke:counter"])?;
+        assert_eq!(counter, 2);
+
+        assert_eq!(ctx.get("aof:smoke:string")?, Some("value-1".to_string()));
+        assert_eq!(ctx.get("aof:smoke:counter")?, Some("2".to_string()));
+        drop(ctx);
+        drop(server);
+    }
+
+    let restart_bind = reserve_bind_addr()?;
+    let server = spawn_with_aof_policy(&restart_bind, &base_path, "always", None)?;
+    let mut ctx = SmokeContext::connect(server.url())?;
+    assert_eq!(ctx.get("aof:smoke:string")?, Some("value-1".to_string()));
+    assert_eq!(ctx.get("aof:smoke:counter")?, Some("2".to_string()));
+
+    drop(server);
+    Ok(())
+}
+
+#[test]
+fn real_server_aof_everysec_backpressure_smoke_reports_telemetry() -> Result<()> {
+    let fixture = TestDir::new("aof-everysec-backpressure")?;
+    let base_path = fixture.path().join("appendonly.aof");
+    let bind = reserve_bind_addr()?;
+    let server = spawn_with_aof_policy(&bind, &base_path, "everysec", Some(1))?;
+    let mut ctx = SmokeContext::connect(server.url())?;
+
+    ctx.set("aof:pressure", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")?;
+    let info: String = ctx.exec(&["INFO"])?;
+    let events = info_counter(&info, "reactor_aof_backpressure_events")
+        .context("INFO persistence missing reactor_aof_backpressure_events")?;
+    assert!(
+        events > 0,
+        "expected AOF backpressure telemetry after low pending-byte limit; INFO: {info}"
+    );
+
+    drop(server);
     Ok(())
 }

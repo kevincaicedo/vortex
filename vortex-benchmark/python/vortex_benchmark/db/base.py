@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -97,6 +99,37 @@ def best_effort_command_output(
     return output.splitlines()[0]
 
 
+def _taskset_command(cpu_list: object, command: list[str]) -> list[str]:
+    if not cpu_list:
+        return command
+    require_command("taskset")
+    return ["taskset", "-c", str(cpu_list), *command]
+
+
+def ensure_native_port_available(host: str, port: int) -> None:
+    """Fail setup before SO_REUSEPORT can hide an existing listener."""
+
+    probe_host = host
+    if host in {"", "0.0.0.0"}:
+        probe_host = "127.0.0.1"
+    elif host == "::":
+        probe_host = "::1"
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        result = probe.connect_ex((probe_host, port))
+    if result == 0:
+        raise SetupError(
+            f"native benchmark port {host}:{port} is already in use; "
+            "stop the existing listener or choose a different port_base"
+        )
+    if result not in {errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH}:
+        raise SetupError(
+            f"native benchmark port {host}:{port} could not be checked "
+            f"(connect_ex={result}); choose a different port_base"
+        )
+
+
 def parse_size_literal_to_bytes(value: str, *, label: str) -> int:
     match = SIZE_LITERAL_RE.fullmatch(value)
     if not match:
@@ -160,6 +193,7 @@ class StartRequest:
     runtime_dir: Path
     log_path: Path
     build_vortex: bool
+    resource_config: dict[str, object] = field(default_factory=dict)
     runtime_config: dict[str, object] = field(default_factory=dict)
 
 
@@ -234,12 +268,15 @@ def _start_native_service(adapter: DatabaseAdapter, request: StartRequest) -> Se
     resolved_request.runtime_dir.mkdir(parents=True, exist_ok=True)
     adapter.validate_runtime_config(resolved_request)
     adapter.prepare_native(resolved_request)
+    ensure_native_port_available(resolved_request.host, resolved_request.port)
     launch = adapter.build_native_launch(resolved_request)
-    append_log_header(request.log_path, f"launching native service: {format_command(launch.command)}")
+    service_cpus = (request.resource_config or {}).get("service_cpus")
+    launch_command = _taskset_command(service_cpus, launch.command)
+    append_log_header(request.log_path, f"launching native service: {format_command(launch_command)}")
 
     with request.log_path.open("a", encoding="utf-8") as handle:
         process = subprocess.Popen(
-            launch.command,
+            launch_command,
             cwd=launch.cwd,
             stdout=handle,
             stderr=subprocess.STDOUT,
@@ -257,6 +294,10 @@ def _start_native_service(adapter: DatabaseAdapter, request: StartRequest) -> Se
         raise SetupError(
             f"{adapter.name} did not become ready on {request.host}:{request.port}; inspect {request.log_path}"
         ) from error
+    if process.poll() is not None:
+        raise SetupError(
+            f"{adapter.name} exited during startup on {request.host}:{request.port}; inspect {request.log_path}"
+        )
 
     now = utc_now()
     return ServiceState(
@@ -275,11 +316,13 @@ def _start_native_service(adapter: DatabaseAdapter, request: StartRequest) -> Se
             "cpus": request.cpus,
             "memory": request.memory,
             "threads": adapter.resolve_threads(resolved_request),
+            "service_cpus": service_cpus,
+            "load_cpus": (request.resource_config or {}).get("load_cpus"),
         },
         runtime_config=dict(resolved_request.runtime_config),
         metadata={
             **launch.metadata,
-            "command": format_command(launch.command),
+            "command": format_command(launch_command),
             "version": adapter.native_version(resolved_request),
         },
     )
@@ -335,6 +378,8 @@ def _start_container_service(adapter: DatabaseAdapter, request: StartRequest) ->
             "cpus": request.cpus,
             "memory": request.memory,
             "threads": adapter.resolve_threads(resolved_request),
+            "service_cpus": (request.resource_config or {}).get("service_cpus"),
+            "load_cpus": (request.resource_config or {}).get("load_cpus"),
         },
         runtime_config=dict(resolved_request.runtime_config),
         metadata={

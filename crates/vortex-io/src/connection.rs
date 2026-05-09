@@ -1,34 +1,18 @@
-use slab::Slab;
-
 // ---------------------------------------------------------------------------
-// Connection state machine
+// Connection slot state machine
 // ---------------------------------------------------------------------------
 
-/// Connection lifecycle states.
-///
-/// Transitions: `New → Active`, `New → Closing`, `Active → Closing`.
+/// Connection slot lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ConnectionState {
-    /// Just accepted, awaiting first successful read.
-    New = 0,
-    /// Normal connected state — actively reading/writing.
-    Active = 1,
-    /// Teardown in progress, awaiting close CQE.
-    Closing = 2,
-}
-
-impl ConnectionState {
-    /// Decode from a raw `u8`.
-    #[inline]
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::New),
-            1 => Some(Self::Active),
-            2 => Some(Self::Closing),
-            _ => None,
-        }
-    }
+    /// The slot is available for reuse.
+    Vacant,
+    /// The slot owns a live connection.
+    Active,
+    /// The slot owns resources waiting for terminal backend completions.
+    Closing,
+    /// The slot resources have been proven terminal and moved out for cleanup.
+    Drained,
 }
 
 /// Error returned when an invalid state transition is attempted.
@@ -40,7 +24,7 @@ pub struct InvalidTransition {
 
 impl std::fmt::Display for InvalidTransition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid transition: {:?} → {:?}", self.from, self.to)
+        write!(f, "invalid transition: {:?} -> {:?}", self.from, self.to)
     }
 }
 
@@ -50,17 +34,16 @@ impl std::fmt::Display for InvalidTransition {
 
 /// Per-connection metadata packed into a single 64-byte cache line.
 ///
-/// Field layout is `#[repr(C)]` to guarantee the documented offsets.
-/// All pointers are replaced by indices into reactor-owned arrays so that
-/// the struct contains no pointers and is trivially `Copy`.
+/// Field layout is `#[repr(C)]` to guarantee the documented offsets. Lifecycle
+/// state lives in [`ConnSlot`], so this struct contains only resources and
+/// scheduler metadata valid for an active or closing connection.
 ///
 /// ```text
 /// Offset  Size  Field
-/// ──────  ────  ────────────────
+/// ------  ----  ----------------
 ///  0      4     fd
-///  4      1     state
-///  5      1     flags
-///  6      2     reserved
+///  4      1     flags
+///  5      3     _reserved
 ///  8      4     read_buf_offset
 /// 12      4     read_buf_len
 /// 16      4     write_buf_offset
@@ -70,17 +53,17 @@ impl std::fmt::Display for InvalidTransition {
 /// 32      4     addr_v4
 /// 36      2     addr_port
 /// 38      26    _pad
-/// ──────  ────
+/// ------  ----
 ///  0      64    TOTAL
 /// ```
+#[derive(Debug)]
 #[repr(C, align(64))]
 pub struct ConnectionMeta {
-    /// OS file descriptor (`-1` when uninitialised).
+    /// OS file descriptor owned by the connection slot.
     pub fd: i32,
-    /// Encoded [`ConnectionState`] (`u8`).
-    state: u8,
     /// Bitflags (see [`ConnectionFlags`]).
     pub flags: u8,
+    _reserved: [u8; 3],
     /// Index into the reactor's read-buffer array.
     pub read_buf_offset: u32,
     /// Bytes currently in the read buffer.
@@ -111,14 +94,13 @@ const _: () = assert!(
 pub const TIMER_SLOT_NONE: u32 = u32::MAX;
 
 impl ConnectionMeta {
-    /// Creates a fresh connection with the given file descriptor and buffer
-    /// index (typically equal to the slab token).
+    /// Creates a fresh connection metadata block.
     #[inline]
     pub fn new(fd: i32, buf_index: u32) -> Self {
         Self {
             fd,
-            state: ConnectionState::New as u8,
             flags: 0,
+            _reserved: [0; 3],
             read_buf_offset: buf_index,
             read_buf_len: 0,
             write_buf_offset: buf_index,
@@ -130,41 +112,120 @@ impl ConnectionMeta {
             _pad: [0; 26],
         }
     }
+}
 
-    /// Returns the current [`ConnectionState`].
+/// Live connection resources.
+pub struct ActiveConn {
+    meta: ConnectionMeta,
+}
+
+impl ActiveConn {
+    /// Wraps metadata for an active connection slot.
     #[inline]
-    pub fn state(&self) -> ConnectionState {
-        // SAFETY: we only ever write valid discriminants.
-        ConnectionState::from_u8(self.state).unwrap_or(ConnectionState::Closing)
+    pub fn new(meta: ConnectionMeta) -> Self {
+        Self { meta }
     }
 
-    /// Attempt a state transition.
-    ///
-    /// Valid transitions: `New → Active`, `New → Closing`, `Active → Closing`.
-    /// In debug builds, invalid transitions panic. In release builds they
-    /// return an error.
     #[inline]
-    pub fn transition(&mut self, to: ConnectionState) -> Result<(), InvalidTransition> {
-        let from = self.state();
-        let valid = matches!(
-            (from, to),
-            (ConnectionState::New, ConnectionState::Active)
-                | (ConnectionState::New, ConnectionState::Closing)
-                | (ConnectionState::Active, ConnectionState::Closing)
-        );
-        debug_assert!(valid, "invalid state transition: {from:?} → {to:?}");
-        if valid {
-            self.state = to as u8;
-            Ok(())
-        } else {
-            Err(InvalidTransition { from, to })
+    fn into_closing(self) -> ClosingConn {
+        ClosingConn {
+            meta: self.meta,
+            close_submitted: false,
         }
     }
 
-    /// Returns `true` when the connection is in the [`Closing`] state.
     #[inline]
-    pub fn is_closing(&self) -> bool {
-        self.state == ConnectionState::Closing as u8
+    fn into_meta(self) -> ConnectionMeta {
+        self.meta
+    }
+}
+
+/// Closing connection resources that remain live until terminal proof.
+pub struct ClosingConn {
+    meta: ConnectionMeta,
+    close_submitted: bool,
+}
+
+impl ClosingConn {
+    /// Marks that the backend owns close completion for this fd.
+    #[inline]
+    pub fn mark_close_submitted(&mut self) {
+        self.close_submitted = true;
+    }
+
+    #[inline]
+    fn drain(self) -> DrainedConn {
+        DrainedConn {
+            meta: self.meta,
+            close_submitted: self.close_submitted,
+        }
+    }
+
+    #[inline]
+    fn into_meta(self) -> ConnectionMeta {
+        self.meta
+    }
+}
+
+/// Resources moved out of a closing slot after terminal proof.
+pub struct DrainedConn {
+    meta: ConnectionMeta,
+    close_submitted: bool,
+}
+
+impl DrainedConn {
+    /// Returns `true` when the reactor still needs to close the fd directly.
+    #[inline]
+    pub fn needs_direct_close(&self) -> bool {
+        !self.close_submitted
+    }
+
+    /// Returns metadata for final reactor cleanup.
+    #[inline]
+    pub fn into_meta(self) -> ConnectionMeta {
+        self.meta
+    }
+}
+
+/// Typed connection slot.
+pub enum ConnSlot {
+    /// The slot is available for reuse.
+    Vacant,
+    /// The slot owns active connection resources.
+    Active(ActiveConn),
+    /// The slot owns terminal-unknown resources during close.
+    Closing(ClosingConn),
+    /// The slot has been drained and is awaiting cleanup.
+    Drained(DrainedConn),
+}
+
+impl ConnSlot {
+    #[inline]
+    fn state(&self) -> ConnectionState {
+        match self {
+            Self::Vacant => ConnectionState::Vacant,
+            Self::Active(_) => ConnectionState::Active,
+            Self::Closing(_) => ConnectionState::Closing,
+            Self::Drained(_) => ConnectionState::Drained,
+        }
+    }
+
+    #[inline]
+    fn meta(&self) -> Option<&ConnectionMeta> {
+        match self {
+            Self::Active(conn) => Some(&conn.meta),
+            Self::Closing(conn) => Some(&conn.meta),
+            Self::Vacant | Self::Drained(_) => None,
+        }
+    }
+
+    #[inline]
+    fn meta_mut(&mut self) -> Option<&mut ConnectionMeta> {
+        match self {
+            Self::Active(conn) => Some(&mut conn.meta),
+            Self::Closing(conn) => Some(&mut conn.meta),
+            Self::Vacant | Self::Drained(_) => None,
+        }
     }
 }
 
@@ -185,68 +246,164 @@ impl ConnectionFlags {
 // Connection slab
 // ---------------------------------------------------------------------------
 
-/// Slab-allocated connection pool.
-///
-/// Dense array with O(1) insert/remove. Pre-allocates to `max_connections`
-/// to avoid runtime reallocation.
+/// Slot-indexed connection pool with explicit lifecycle states.
 pub struct ConnectionSlab {
-    inner: Slab<ConnectionMeta>,
+    slots: Vec<ConnSlot>,
+    free: Vec<usize>,
+    len: usize,
 }
 
 impl ConnectionSlab {
     /// Creates a new connection slab with pre-allocated capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            inner: Slab::with_capacity(cap),
+            slots: Vec::with_capacity(cap),
+            free: Vec::new(),
+            len: 0,
         }
     }
 
-    /// Inserts connection metadata and returns its slab token.
+    /// Inserts an active connection and returns its slot token.
     pub fn insert(&mut self, meta: ConnectionMeta) -> usize {
-        self.inner.insert(meta)
+        let slot = ConnSlot::Active(ActiveConn::new(meta));
+        self.len += 1;
+        if let Some(token) = self.free.pop() {
+            debug_assert!(matches!(self.slots.get(token), Some(ConnSlot::Vacant)));
+            self.slots[token] = slot;
+            token
+        } else {
+            self.slots.push(slot);
+            self.slots.len() - 1
+        }
     }
 
-    /// Removes a connection by slab token.
+    /// Removes a connection by slot token.
     pub fn remove(&mut self, token: usize) -> ConnectionMeta {
-        self.inner.remove(token)
+        match self.take_slot(token) {
+            ConnSlot::Active(conn) => conn.into_meta(),
+            ConnSlot::Closing(conn) => conn.into_meta(),
+            ConnSlot::Drained(conn) => conn.into_meta(),
+            ConnSlot::Vacant => panic!("attempted to remove vacant connection slot"),
+        }
     }
 
-    /// Gets a shared reference to a connection by slab token.
+    /// Moves an active slot into closing state.
+    pub fn transition_to_closing(&mut self, token: usize) -> Result<(), InvalidTransition> {
+        let Some(slot) = self.slots.get_mut(token) else {
+            return Err(InvalidTransition {
+                from: ConnectionState::Vacant,
+                to: ConnectionState::Closing,
+            });
+        };
+        match slot.state() {
+            ConnectionState::Active => {
+                let previous = std::mem::replace(slot, ConnSlot::Vacant);
+                let ConnSlot::Active(active) = previous else {
+                    unreachable!("state checked above");
+                };
+                *slot = ConnSlot::Closing(active.into_closing());
+                Ok(())
+            }
+            ConnectionState::Closing => Ok(()),
+            from => Err(InvalidTransition {
+                from,
+                to: ConnectionState::Closing,
+            }),
+        }
+    }
+
+    /// Marks that the backend accepted the close operation for this slot.
+    pub fn mark_close_submitted(&mut self, token: usize) {
+        if let Some(ConnSlot::Closing(conn)) = self.slots.get_mut(token) {
+            conn.mark_close_submitted();
+        }
+    }
+
+    /// Moves a closing slot into a drained resource bundle and frees the slot.
+    pub fn drain_closing(&mut self, token: usize) -> Option<DrainedConn> {
+        let slot = self.slots.get_mut(token)?;
+        if !matches!(slot, ConnSlot::Closing(_)) {
+            return None;
+        }
+
+        let previous = std::mem::replace(slot, ConnSlot::Vacant);
+        let ConnSlot::Closing(closing) = previous else {
+            unreachable!("state checked above");
+        };
+        *slot = ConnSlot::Drained(closing.drain());
+        let drained = std::mem::replace(slot, ConnSlot::Vacant);
+        let ConnSlot::Drained(drained) = drained else {
+            unreachable!("drained state installed above");
+        };
+        self.len -= 1;
+        self.free.push(token);
+        Some(drained)
+    }
+
+    /// Gets a shared reference to connection metadata.
     pub fn get(&self, token: usize) -> Option<&ConnectionMeta> {
-        self.inner.get(token)
+        self.slots.get(token).and_then(ConnSlot::meta)
     }
 
-    /// Gets a mutable reference to a connection by slab token.
+    /// Gets a mutable reference to connection metadata.
     pub fn get_mut(&mut self, token: usize) -> Option<&mut ConnectionMeta> {
-        self.inner.get_mut(token)
+        self.slots.get_mut(token).and_then(ConnSlot::meta_mut)
     }
 
-    /// Returns the number of active connections.
+    /// Returns `true` when the slot is closing.
+    pub fn is_closing(&self, token: usize) -> bool {
+        matches!(self.slots.get(token), Some(ConnSlot::Closing(_)))
+    }
+
+    /// Returns the lifecycle state for a slot token.
+    pub fn state(&self, token: usize) -> ConnectionState {
+        self.slots
+            .get(token)
+            .map_or(ConnectionState::Vacant, ConnSlot::state)
+    }
+
+    /// Returns the number of active or closing connections.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.len
     }
 
     /// Returns `true` if no connections are tracked.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len == 0
     }
 
     /// Returns an iterator over `(token, &ConnectionMeta)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (usize, &ConnectionMeta)> + '_ {
-        self.inner.iter()
-    }
-
-    /// Returns an iterator over all connection IDs (slab tokens).
-    pub fn ids(&self) -> impl Iterator<Item = usize> + '_ {
-        self.inner.iter().map(|(id, _)| id)
-    }
-
-    /// Count connections in the given state.
-    pub fn count_by_state(&self, state: ConnectionState) -> usize {
-        self.inner
+        self.slots
             .iter()
-            .filter(|(_, m)| m.state() == state)
+            .enumerate()
+            .filter_map(|(id, slot)| slot.meta().map(|meta| (id, meta)))
+    }
+
+    /// Returns an iterator over all active or closing connection IDs.
+    pub fn ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.iter().map(|(id, _)| id)
+    }
+
+    /// Count slots in the given state.
+    pub fn count_by_state(&self, state: ConnectionState) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.state() == state)
             .count()
+    }
+
+    fn take_slot(&mut self, token: usize) -> ConnSlot {
+        let slot = self
+            .slots
+            .get_mut(token)
+            .expect("connection slot token out of range");
+        let previous = std::mem::replace(slot, ConnSlot::Vacant);
+        if !matches!(previous, ConnSlot::Vacant) {
+            self.len -= 1;
+            self.free.push(token);
+        }
+        previous
     }
 }
 
@@ -257,8 +414,6 @@ impl ConnectionSlab {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── 1.2.8  Connection state machine tests ───────────────────────
 
     #[test]
     fn meta_size_is_64_bytes() {
@@ -271,55 +426,45 @@ mod tests {
     }
 
     #[test]
-    fn transition_new_to_active() {
-        let mut m = ConnectionMeta::new(-1, 0);
-        assert_eq!(m.state(), ConnectionState::New);
-        m.transition(ConnectionState::Active).unwrap();
-        assert_eq!(m.state(), ConnectionState::Active);
-    }
+    fn slab_insert_starts_active() {
+        let mut slab = ConnectionSlab::with_capacity(16);
+        let token = slab.insert(ConnectionMeta::new(42, 0));
 
-    #[test]
-    fn transition_new_to_closing() {
-        let mut m = ConnectionMeta::new(-1, 0);
-        m.transition(ConnectionState::Closing).unwrap();
-        assert_eq!(m.state(), ConnectionState::Closing);
+        assert_eq!(slab.state(token), ConnectionState::Active);
+        assert_eq!(slab.get(token).unwrap().fd, 42);
     }
 
     #[test]
     fn transition_active_to_closing() {
-        let mut m = ConnectionMeta::new(-1, 0);
-        m.transition(ConnectionState::Active).unwrap();
-        m.transition(ConnectionState::Closing).unwrap();
-        assert_eq!(m.state(), ConnectionState::Closing);
+        let mut slab = ConnectionSlab::with_capacity(16);
+        let token = slab.insert(ConnectionMeta::new(42, 0));
+
+        slab.transition_to_closing(token).unwrap();
+
+        assert_eq!(slab.state(token), ConnectionState::Closing);
+        assert!(slab.is_closing(token));
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "invalid state transition")]
-    fn transition_active_to_new_panics() {
-        let mut m = ConnectionMeta::new(-1, 0);
-        m.transition(ConnectionState::Active).unwrap();
-        let _ = m.transition(ConnectionState::New);
+    fn transition_closing_to_closing_is_idempotent() {
+        let mut slab = ConnectionSlab::with_capacity(16);
+        let token = slab.insert(ConnectionMeta::new(42, 0));
+
+        slab.transition_to_closing(token).unwrap();
+        slab.transition_to_closing(token).unwrap();
+
+        assert_eq!(slab.state(token), ConnectionState::Closing);
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "invalid state transition")]
-    fn transition_closing_to_active_panics() {
-        let mut m = ConnectionMeta::new(-1, 0);
-        m.transition(ConnectionState::Closing).unwrap();
-        let _ = m.transition(ConnectionState::Active);
-    }
+    fn transition_vacant_to_closing_is_rejected() {
+        let mut slab = ConnectionSlab::with_capacity(16);
 
-    #[test]
-    fn is_closing_flag() {
-        let mut m = ConnectionMeta::new(5, 0);
-        assert!(!m.is_closing());
-        m.transition(ConnectionState::Closing).unwrap();
-        assert!(m.is_closing());
-    }
+        let error = slab.transition_to_closing(3).unwrap_err();
 
-    // ── Slab tests ──────────────────────────────────────────────────
+        assert_eq!(error.from, ConnectionState::Vacant);
+        assert_eq!(error.to, ConnectionState::Closing);
+    }
 
     #[test]
     fn slab_insert_remove() {
@@ -329,10 +474,30 @@ mod tests {
 
         let conn = slab.get(token).unwrap();
         assert_eq!(conn.fd, 42);
-        assert_eq!(conn.state(), ConnectionState::New);
+        assert_eq!(slab.state(token), ConnectionState::Active);
 
         slab.remove(token);
         assert!(slab.is_empty());
+        assert_eq!(slab.state(token), ConnectionState::Vacant);
+    }
+
+    #[test]
+    fn drain_closing_moves_to_vacant_and_reuses_slot() {
+        let mut slab = ConnectionSlab::with_capacity(16);
+        let token = slab.insert(ConnectionMeta::new(42, 0));
+        slab.transition_to_closing(token).unwrap();
+        slab.mark_close_submitted(token);
+
+        let drained = slab.drain_closing(token).unwrap();
+
+        assert!(!drained.needs_direct_close());
+        assert_eq!(drained.into_meta().fd, 42);
+        assert!(slab.is_empty());
+        assert_eq!(slab.state(token), ConnectionState::Vacant);
+
+        let reused = slab.insert(ConnectionMeta::new(43, 1));
+        assert_eq!(reused, token);
+        assert_eq!(slab.get(reused).unwrap().fd, 43);
     }
 
     #[test]
@@ -340,13 +505,11 @@ mod tests {
         let mut slab = ConnectionSlab::with_capacity(16);
         let t1 = slab.insert(ConnectionMeta::new(1, 0));
         let _t2 = slab.insert(ConnectionMeta::new(2, 1));
-        slab.get_mut(t1)
-            .unwrap()
-            .transition(ConnectionState::Active)
-            .unwrap();
+        slab.transition_to_closing(t1).unwrap();
 
         assert_eq!(slab.count_by_state(ConnectionState::Active), 1);
-        assert_eq!(slab.count_by_state(ConnectionState::New), 1);
+        assert_eq!(slab.count_by_state(ConnectionState::Closing), 1);
+        assert_eq!(slab.count_by_state(ConnectionState::Vacant), 0);
         assert_eq!(slab.iter().count(), 2);
     }
 }

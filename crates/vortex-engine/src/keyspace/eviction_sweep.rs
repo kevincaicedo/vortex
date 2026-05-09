@@ -1,16 +1,17 @@
 use smallvec::SmallVec;
 use vortex_common::VortexKey;
 
+use crate::effects::{AofRecord, AofRecords};
 use crate::eviction::{
     EVICTION_MAX_SHARDS_PER_ADMISSION, EVICTION_SWEEP_WINDOW, EvictionPolicy, next_random_u64,
 };
 use crate::table::{SwissTable, TableHash};
 
-use super::{ConcurrentKeyspace, ExpiryTransition, MutationFeatures};
+use super::{AofLsn, ConcurrentKeyspace, ExpiryTransition, MutationFeatures};
 
 #[derive(Debug)]
 pub(crate) struct EvictedKey {
-    pub(crate) lsn: u64,
+    pub(crate) lsn: AofLsn,
     pub(crate) key: VortexKey,
 }
 
@@ -22,6 +23,15 @@ pub(crate) struct EvictionScanReport {
     pub(super) slots_sampled: usize,
     pub(super) bytes_freed: usize,
     pub(super) oom_after_scan: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct EvictionMaintenanceSlice {
+    pub aof_records: AofRecords,
+    pub shards_scanned: usize,
+    pub slots_sampled: usize,
+    pub bytes_freed: usize,
+    pub oom_after_scan: bool,
 }
 
 #[derive(Debug, Default)]
@@ -334,6 +344,86 @@ impl SweepPolicy for VolatileTtlPolicy {
 }
 
 impl ConcurrentKeyspace {
+    #[inline]
+    pub fn eviction_pressure_active(&self) -> bool {
+        let snapshot = self.eviction_config();
+        snapshot.max_memory != 0
+            && !snapshot.policy.is_noeviction()
+            && self.committed_memory_pressure() > snapshot.max_memory
+    }
+
+    pub fn run_eviction_maintenance_on_shard(
+        &self,
+        preferred_shard: usize,
+        now_nanos: u64,
+    ) -> EvictionMaintenanceSlice {
+        let snapshot = self.eviction_config();
+        if snapshot.max_memory == 0 || snapshot.policy.is_noeviction() {
+            return EvictionMaintenanceSlice::default();
+        }
+
+        let pressure = self.committed_memory_pressure();
+        if pressure <= snapshot.max_memory {
+            return EvictionMaintenanceSlice::default();
+        }
+
+        let shard_count = self.shards.len();
+        if shard_count == 0 {
+            return EvictionMaintenanceSlice::default();
+        }
+
+        let shard_idx = preferred_shard & (shard_count - 1);
+        if snapshot.policy.is_volatile_only() && !self.shard_has_expiring_keys(shard_idx) {
+            return EvictionMaintenanceSlice {
+                oom_after_scan: self.committed_memory_pressure() > snapshot.max_memory,
+                ..EvictionMaintenanceSlice::default()
+            };
+        }
+
+        let mut report = EvictionScanReport {
+            shards_scanned: 1,
+            ..EvictionScanReport::default()
+        };
+        let target_used = snapshot.max_memory.saturating_sub(
+            self.memory_reserved
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        let bytes_needed = pressure.saturating_sub(target_used);
+        let scan_start = if self.runtime_profile_timers_enabled() {
+            Some(vortex_common::Timestamp::now().as_nanos())
+        } else {
+            None
+        };
+        let mut evicted = Vec::new();
+        report.bytes_freed = self.evict_from_shard(
+            shard_idx,
+            snapshot.policy,
+            bytes_needed,
+            now_nanos,
+            &mut report,
+            &mut evicted,
+        );
+        report.oom_after_scan = self.committed_memory_pressure() > snapshot.max_memory;
+        let scan_nanos = scan_start
+            .map(|start| {
+                vortex_common::Timestamp::now()
+                    .as_nanos()
+                    .saturating_sub(start)
+                    .max(1)
+            })
+            .unwrap_or(0);
+        self.eviction_metrics
+            .record_with_duration(report, scan_nanos);
+
+        EvictionMaintenanceSlice {
+            aof_records: evicted_keys_to_aof_records(evicted),
+            shards_scanned: report.shards_scanned,
+            slots_sampled: report.slots_sampled,
+            bytes_freed: report.bytes_freed,
+            oom_after_scan: report.oom_after_scan,
+        }
+    }
+
     pub(super) fn evict_until_target(
         &self,
         preferred_shard: usize,
@@ -403,6 +493,9 @@ impl ConcurrentKeyspace {
         report: &mut EvictionScanReport,
         evicted: &mut Vec<EvictedKey>,
     ) -> usize {
+        #[cfg(feature = "lock-profile")]
+        let _lock_profile =
+            self.enter_lock_profile_scope(crate::keyspace::LockProfileClass::Eviction);
         let mut guard = self.write_shard_by_index(shard_idx);
         let total_slots = guard.total_slots();
         if total_slots == 0 {
@@ -540,7 +633,7 @@ impl ConcurrentKeyspace {
             return EvictionDeletion::default();
         };
         let key = (record_aof || track_watch).then(|| key.clone());
-        let aof_lsn = record_aof.then(|| self.next_lsn());
+        let aof_lsn = record_aof.then(|| AofLsn::from_allocated_lsn(self.next_lsn()));
 
         let _ = table.delete_slot(slot);
         let mut effects = EvictionEffects::default();
@@ -560,4 +653,19 @@ impl ConcurrentKeyspace {
             effects,
         }
     }
+}
+
+fn evicted_keys_to_aof_records(evicted: Vec<EvictedKey>) -> AofRecords {
+    if evicted.is_empty() {
+        return None;
+    }
+
+    let mut records = Vec::with_capacity(evicted.len());
+    for evicted in evicted {
+        records.push(AofRecord {
+            lsn: evicted.lsn,
+            key: evicted.key,
+        });
+    }
+    Some(records.into_boxed_slice())
 }

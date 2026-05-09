@@ -16,17 +16,18 @@ use vortex_common::{VortexKey, VortexValue};
 
 use crate::EvictionConfig;
 use crate::SwissTable;
+use crate::effects::{AofRecord, AofRecords, MutationErrorKind};
 use crate::entry::Entry;
 use crate::keyspace::{
-    ConcurrentKeyspace, EvictedKey, EvictedKeys, EvictionAdmissionError, ExpiryTransition,
-    MemoryReservation, PositiveDelta, ProjectedDelta, ShardPlan, ShardWriteGuard, ShardWriteGuards,
+    AofLsn, ConcurrentKeyspace, EvictedKey, EvictedKeys, EvictionAdmissionError, ExpiryTransition,
+    MemoryReservation, PositiveDelta, PrehashedKeyPlan, PrehashedShardPlan, ProjectedDelta,
+    ShardPlan, ShardWriteGuard, ShardWriteGuards,
 };
-use crate::table::{BorrowedKey, MutationPolicy, RawValueBytes, TableHash};
+use crate::table::{
+    BorrowedKey, MutationPolicy, RawValueBytes, SlotCursor, SlotMutationReport, TableHash,
+};
 
 use crate::commands::pattern::glob_match;
-use crate::commands::{
-    AofRecord, AofRecords, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_OVERFLOW, ERR_WRONG_TYPE,
-};
 
 mod admin_ops;
 mod key_ops;

@@ -10,6 +10,8 @@
 use vortex_common::VortexKey;
 use vortex_proto::{FrameRef, RespFrame};
 
+#[cfg(test)]
+use super::ERR_NO_SUCH_KEY;
 use super::{
     CmdResult, CommandArgs, ExecutedCommand, MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE,
     RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos,
@@ -21,8 +23,6 @@ use crate::engine::domain::{ExpireOptions, MutationOutcome, TtlState};
 
 // ── Error constants ─────────────────────────────────────────────────
 
-#[cfg(test)]
-static ERR_NO_SUCH_KEY: &[u8] = b"-ERR no such key\r\n";
 static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
 
 // ── DEL / UNLINK / EXISTS ───────────────────────────────────────────
@@ -53,14 +53,18 @@ pub fn cmd_del(
         }
         return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
     }
-    let Some(args) = CommandArgs::collect(frame) else {
+    let Some(mut children) = frame.children() else {
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
-    let mut keys = Vec::with_capacity(argc - 1);
-    for kb in args.iter_from(1) {
-        keys.push(key_from_bytes(kb));
+    let _ = children.next();
+    let mut keys: smallvec::SmallVec<[&[u8]; 16]> = smallvec::SmallVec::with_capacity(argc - 1);
+    for child in children {
+        let Some(kb) = child.as_bytes() else {
+            return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+        };
+        keys.push(kb);
     }
-    let outcome = keyspace.delete_keys(&keys, now_nanos);
+    let outcome = keyspace.delete_key_bytes_batch(&keys, now_nanos);
     ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn)
 }
 
@@ -94,19 +98,22 @@ pub fn cmd_exists(
     // Single-key fast path: skip CommandArgs::collect.
     if argc == 2 {
         if let Some(kb) = arg_bytes(frame, 1) {
-            let key = key_from_bytes(kb);
-            return int_resp(keyspace.count_existing(std::slice::from_ref(&key), now_nanos));
+            return int_resp(keyspace.count_existing_key_bytes(&[kb], now_nanos));
         }
         return CmdResult::Static(RESP_ZERO);
     }
-    let Some(args) = CommandArgs::collect(frame) else {
+    let Some(mut children) = frame.children() else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
-    let mut keys = Vec::with_capacity(argc - 1);
-    for kb in args.iter_from(1) {
-        keys.push(key_from_bytes(kb));
+    let _ = children.next();
+    let mut keys: smallvec::SmallVec<[&[u8]; 16]> = smallvec::SmallVec::with_capacity(argc - 1);
+    for child in children {
+        let Some(kb) = child.as_bytes() else {
+            return CmdResult::Static(ERR_WRONG_ARGS);
+        };
+        keys.push(kb);
     }
-    int_resp(keyspace.count_existing(&keys, now_nanos))
+    int_resp(keyspace.count_existing_key_bytes(&keys, now_nanos))
 }
 
 // ── EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT / PERSIST ───────────────
@@ -813,6 +820,17 @@ mod tests {
     }
 
     #[test]
+    fn del_duplicate_key_counts_removed_key_once() {
+        let h = new_harness();
+        h.set(VortexKey::from("dup"), VortexValue::from("1"));
+
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"dup", b"dup"], NOW);
+
+        assert_integer(r, 1);
+        assert!(!h.exists(&VortexKey::from("dup"), NOW));
+    }
+
+    #[test]
     fn del_nonexistent() {
         let h = new_harness();
         let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"x"], NOW);
@@ -835,6 +853,21 @@ mod tests {
         h.set(VortexKey::from("k"), VortexValue::from("v"));
         // EXISTS k k (same key twice) — Redis counts each occurrence.
         let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"k", b"k"], NOW);
+        assert_integer(r, 2);
+    }
+
+    #[test]
+    fn touch_duplicate_key_matches_exists_counting() {
+        let h = new_harness();
+        h.set(VortexKey::from("k"), VortexValue::from("v"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_touch,
+            &[b"TOUCH", b"k", b"k", b"missing"],
+            NOW,
+        );
+
         assert_integer(r, 2);
     }
 
@@ -1281,6 +1314,22 @@ mod tests {
             NOW,
         );
         assert_static(r, RESP_ONE);
+    }
+
+    #[test]
+    fn copy_same_source_and_destination_with_replace_is_stable() {
+        let h = new_harness();
+        h.set(VortexKey::from("same"), VortexValue::from("value"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"same", b"same", b"REPLACE"],
+            NOW,
+        );
+
+        assert_static(r, RESP_ONE);
+        assert!(h.exists(&VortexKey::from("same"), NOW));
     }
 
     #[test]

@@ -24,6 +24,8 @@ fn excludes_expired_keys(ctx: &mut SmokeContext) -> Result<()> {
     assert_eq!(applied, 1);
 
     thread::sleep(Duration::from_millis(150));
+    let expired: Option<String> = ctx.exec(&["GET", "expired"])?;
+    assert_eq!(expired, None);
     assert_eq!(ctx.dbsize()?, 1);
     Ok(())
 }
@@ -50,7 +52,7 @@ pub fn spec() -> CommandSpec {
         ))
         .case(CaseDef::new(
             "excludes expired keys",
-            "DBSIZE should count only live keys, not expired-yet-unread ones.",
+            "DBSIZE should count only live keys after expiry has been observed.",
             excludes_expired_keys,
         ))
 }

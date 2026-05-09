@@ -15,16 +15,20 @@
 //! - [`Entry`] — 64-byte cache-line-aligned hash table entry (Phase 3.2)
 
 pub mod commands;
+pub mod effects;
 pub(crate) mod engine;
 pub mod entry;
 pub mod eviction;
+pub mod executor;
 pub mod keyspace;
 pub mod morph;
 pub mod prefetch;
 pub mod table;
 
+pub use effects::{AofCommitEffect, AofRecord, AofRecords, MutationErrorKind};
 pub use entry::{Entry, EntryValue};
 pub use eviction::{EvictionConfig, EvictionPolicy};
+pub use executor::{CommandExecutionScope, SharedKeyspaceExecutor};
 pub use keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 pub use morph::{AccessProfile, DefaultMorphMonitor, DisabledMorphMonitor, MorphMonitor};
 pub use table::SwissTable;

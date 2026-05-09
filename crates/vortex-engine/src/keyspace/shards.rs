@@ -1,10 +1,12 @@
 use crossbeam_utils::CachePadded;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::RwLock;
 use smallvec::SmallVec;
 
-use crate::table::SwissTable;
+use crate::table::{SwissTable, TableHash};
 
-use super::{ConcurrentKeyspace, MAX_SHARD_COUNT, MIN_SHARD_COUNT, ShardWriteGuard};
+use super::{
+    ConcurrentKeyspace, MAX_SHARD_COUNT, MIN_SHARD_COUNT, ShardReadGuard, ShardWriteGuard,
+};
 
 /// A single shard: a `SwissTable` behind a `RwLock`, padded to a full
 /// 128-byte boundary so that adjacent shard locks never share a cache line.
@@ -18,7 +20,7 @@ pub(crate) type MultiReadGuards<'a> = (ShardReadGuards<'a>, ShardPlan);
 /// `(guards_with_shard_id, shard_plan)`
 pub(crate) type MultiWriteGuards<'a> = (ShardWriteGuards<'a>, ShardPlan);
 
-pub(super) type ShardReadGuards<'a> = SmallVec<[(usize, RwLockReadGuard<'a, SwissTable>); 16]>;
+pub(super) type ShardReadGuards<'a> = SmallVec<[(usize, ShardReadGuard<'a>); 16]>;
 pub(crate) type ShardWriteGuards<'a> = SmallVec<[(usize, ShardWriteGuard<'a>); 16]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,20 +127,27 @@ pub(crate) struct ShardPlan {
 impl ShardPlan {
     pub(super) fn new(keyspace: &ConcurrentKeyspace, keys: &[&[u8]]) -> Self {
         let mut per_key_shards = SmallVec::with_capacity(keys.len());
-        for &key in keys {
-            per_key_shards.push(keyspace.shard_id(key));
+        let mut shard_order: SmallVec<[(ShardId, usize); 16]> = SmallVec::with_capacity(keys.len());
+        for (key_index, &key) in keys.iter().enumerate() {
+            let shard = keyspace.shard_id(key);
+            per_key_shards.push(shard);
+            shard_order.push((shard, key_index));
         }
 
-        let mut sorted_shards = per_key_shards.clone();
-        sorted_shards.sort_unstable();
-        sorted_shards.dedup();
-
+        shard_order.sort_unstable_by_key(|&(shard, key_index)| (shard, key_index));
+        let mut sorted_shards = SmallVec::new();
         let mut per_key_guard_indices = SmallVec::with_capacity(per_key_shards.len());
-        for shard in &per_key_shards {
-            let guard_index = sorted_shards
-                .binary_search(shard)
-                .expect("planned shard must be present in sorted shard set");
-            per_key_guard_indices.push(GuardIndex::new(guard_index));
+        per_key_guard_indices.resize(per_key_shards.len(), GuardIndex::new(0));
+
+        let mut current_shard = None;
+        let mut current_guard = GuardIndex::new(0);
+        for (shard, key_index) in shard_order {
+            if current_shard != Some(shard) {
+                current_shard = Some(shard);
+                current_guard = GuardIndex::new(sorted_shards.len());
+                sorted_shards.push(shard);
+            }
+            per_key_guard_indices[key_index] = current_guard;
         }
 
         Self {
@@ -153,6 +162,7 @@ impl ShardPlan {
         &self.sorted_shards
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn shard_for_key(&self, key_index: usize) -> ShardId {
         self.per_key_shards[key_index]
@@ -161,5 +171,99 @@ impl ShardPlan {
     #[inline]
     pub(crate) fn guard_index_for_key(&self, key_index: usize) -> GuardIndex {
         self.per_key_guard_indices[key_index]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrehashedKeyPlan<'a> {
+    key_index: usize,
+    key_bytes: &'a [u8],
+    shard_id: ShardId,
+    table_hash: TableHash,
+    guard_index: GuardIndex,
+}
+
+impl<'a> PrehashedKeyPlan<'a> {
+    #[inline]
+    pub(crate) const fn key_index(self) -> usize {
+        self.key_index
+    }
+
+    #[inline]
+    pub(crate) const fn key_bytes(self) -> &'a [u8] {
+        self.key_bytes
+    }
+
+    #[inline]
+    pub(crate) const fn shard_index(self) -> usize {
+        self.shard_id.get()
+    }
+
+    #[inline]
+    pub(crate) const fn table_hash(self) -> TableHash {
+        self.table_hash
+    }
+
+    #[inline]
+    pub(crate) const fn guard_index(self) -> GuardIndex {
+        self.guard_index
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrehashedShardPlan<'a> {
+    sorted_shards: SmallVec<[ShardId; 16]>,
+    entries: SmallVec<[PrehashedKeyPlan<'a>; 16]>,
+}
+
+impl<'a> PrehashedShardPlan<'a> {
+    pub(super) fn new<I>(keyspace: &ConcurrentKeyspace, keys: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, &'a [u8])>,
+    {
+        let mut entries: SmallVec<[PrehashedKeyPlan<'a>; 16]> = SmallVec::new();
+        for (key_index, key_bytes) in keys {
+            entries.push(PrehashedKeyPlan {
+                key_index,
+                key_bytes,
+                shard_id: keyspace.shard_id(key_bytes),
+                table_hash: keyspace.table_hash_key(key_bytes),
+                guard_index: GuardIndex::new(0),
+            });
+        }
+
+        entries.sort_unstable_by_key(|entry| (entry.shard_id, entry.key_index));
+
+        let mut sorted_shards = SmallVec::new();
+        let mut current_shard = None;
+        let mut current_guard = GuardIndex::new(0);
+        for entry in &mut entries {
+            if current_shard != Some(entry.shard_id) {
+                current_shard = Some(entry.shard_id);
+                current_guard = GuardIndex::new(sorted_shards.len());
+                sorted_shards.push(entry.shard_id);
+            }
+            entry.guard_index = current_guard;
+        }
+
+        Self {
+            sorted_shards,
+            entries,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sorted_shards(&self) -> &[ShardId] {
+        &self.sorted_shards
+    }
+
+    #[inline]
+    pub(crate) fn entries(&self) -> &[PrehashedKeyPlan<'a>] {
+        &self.entries
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 }

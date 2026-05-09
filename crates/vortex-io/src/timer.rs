@@ -98,6 +98,9 @@ pub struct TimerWheel {
     free_head: u32,
     /// Current tick (seconds since reactor start).
     current_tick: u32,
+    /// True while the current level-0 slot is being drained across bounded
+    /// maintenance slices.
+    draining_current_tick: bool,
     /// Number of active (non-cancelled, non-free) entries.
     pending: u32,
 }
@@ -128,6 +131,7 @@ impl TimerWheel {
             entries,
             free_head: if capacity > 0 { 0 } else { TIMER_NIL },
             current_tick: 0,
+            draining_current_tick: false,
             pending: 0,
         }
     }
@@ -200,24 +204,44 @@ impl TimerWheel {
     /// for checking `last_active` and deciding whether to close or
     /// reschedule each connection.
     pub fn tick(&mut self, expired: &mut Vec<ExpiredTimer>) {
+        while self.tick_limited(expired, usize::MAX) {}
+    }
+
+    /// Advance or continue draining one tick with a bounded entry budget.
+    ///
+    /// Returns `true` when the current tick still has entries to drain. The
+    /// caller can resume later without moving to the next tick.
+    pub fn tick_limited(&mut self, expired: &mut Vec<ExpiredTimer>, limit: usize) -> bool {
+        if limit == 0 {
+            return self.draining_current_tick;
+        }
+
         // Cascade from higher levels into level 0 BEFORE processing the
         // current level-0 slot.
-        if self.current_tick > 0 && self.current_tick & L0_MASK == 0 {
-            self.cascade_l1_to_l0();
+        if !self.draining_current_tick {
+            if self.current_tick > 0 && self.current_tick & L0_MASK == 0 {
+                self.cascade_l1_to_l0();
 
-            if self.current_tick & ((1u32 << L2_SHIFT) - 1) == 0 {
-                self.cascade_l2_to_l1();
+                if self.current_tick & ((1u32 << L2_SHIFT) - 1) == 0 {
+                    self.cascade_l2_to_l1();
+                }
             }
+            self.draining_current_tick = true;
         }
 
         // Drain the current level-0 slot.
         let slot = (self.current_tick & L0_MASK) as usize;
-        let mut idx = self.level0[slot];
-        self.level0[slot] = TIMER_NIL;
+        let mut remaining = limit;
 
-        while idx != TIMER_NIL {
+        while remaining != 0 {
+            let idx = self.level0[slot];
+            if idx == TIMER_NIL {
+                break;
+            }
             let entry = self.entries[idx as usize];
             let next_idx = entry.next;
+            self.level0[slot] = next_idx;
+            remaining -= 1;
 
             if entry.is_active() {
                 expired.push(ExpiredTimer {
@@ -229,10 +253,15 @@ impl TimerWheel {
 
             // Return node to the free list.
             self.free_entry(idx);
-            idx = next_idx;
         }
 
+        if self.level0[slot] != TIMER_NIL {
+            return true;
+        }
+
+        self.draining_current_tick = false;
         self.current_tick = self.current_tick.wrapping_add(1);
+        false
     }
 
     // -- Cascade helpers ----------------------------------------------------

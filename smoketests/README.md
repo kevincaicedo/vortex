@@ -48,6 +48,14 @@ Run only selected commands:
 just smoke --command GET,SET,MGET
 ```
 
+Run the real-server AOF smoke gate:
+
+```bash
+just smoke-aof
+```
+
+This covers startup replay fixtures, an `appendfsync always` restart workload, and an `everysec` low pending-byte backpressure telemetry proof. It is a correctness smoke gate, not a latency benchmark.
+
 Run an entire group:
 
 ```bash

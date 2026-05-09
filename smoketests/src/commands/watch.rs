@@ -3,18 +3,6 @@ use anyhow::Result;
 use crate::context::SmokeContext;
 use crate::spec::{CaseDef, CommandGroup, CommandSpec, SupportLevel};
 
-fn assert_redis_error_contains(err: &redis::RedisError, needle: &str) {
-    let found = err.code().is_some_and(|code| code.contains(needle))
-        || err.detail().is_some_and(|detail| detail.contains(needle))
-        || err.to_string().contains(needle);
-    assert!(
-        found,
-        "redis error `{err}` did not contain `{needle}`; code={:?}, detail={:?}",
-        err.code(),
-        err.detail()
-    );
-}
-
 fn watch_aborts_on_conflict(ctx: &mut SmokeContext) -> Result<()> {
     ctx.set("watched:key", "v1")?;
     ctx.assert_ok(&["WATCH", "watched:key"])?;
@@ -152,14 +140,14 @@ fn watch_rejects_wrong_arity(ctx: &mut SmokeContext) -> Result<()> {
     Ok(())
 }
 
-fn watch_inside_multi_aborts_exec(ctx: &mut SmokeContext) -> Result<()> {
+fn watch_inside_multi_error_keeps_empty_transaction_clean(ctx: &mut SmokeContext) -> Result<()> {
     ctx.assert_ok(&["MULTI"])?;
 
     let err = ctx.exec_error(&["WATCH", "watch:inside"])?;
     assert!(err.to_string().contains("WATCH inside MULTI"));
 
-    let err = ctx.exec_error(&["EXEC"])?;
-    assert_redis_error_contains(&err, "EXECABORT");
+    let replies: Vec<redis::Value> = ctx.exec(&["EXEC"])?;
+    assert!(replies.is_empty(), "empty transaction returned {replies:?}");
     Ok(())
 }
 
@@ -177,7 +165,7 @@ pub fn spec() -> CommandSpec {
             "TTL-only PEXPIRE mutation abort",
             "TTL-only PERSIST mutation abort",
             "Wrong arity",
-            "WATCH inside MULTI dirties transaction",
+            "WATCH inside MULTI errors without dirtying the empty transaction",
         ])
         .case(CaseDef::new(
             "watch aborts on conflict",
@@ -225,8 +213,8 @@ pub fn spec() -> CommandSpec {
             watch_rejects_wrong_arity,
         ))
         .case(CaseDef::new(
-            "watch inside multi aborts exec",
-            "WATCH inside MULTI should error and dirty the transaction.",
-            watch_inside_multi_aborts_exec,
+            "watch inside multi keeps transaction clean",
+            "WATCH inside MULTI should error immediately and leave the empty transaction clean.",
+            watch_inside_multi_error_keeps_empty_transaction_clean,
         ))
 }

@@ -12,7 +12,15 @@ from vortex_benchmark.models import EnvironmentState, split_csv_values, timestam
 from vortex_benchmark.telemetry import capture_host_metadata, capture_run_validity
 
 
-VORTEX_ONLY_RUNTIME_KEYS = {"io_backend", "ring_size", "fixed_buffers", "sqpoll_idle_ms"}
+VORTEX_ONLY_RUNTIME_KEYS = {
+    "io_backend",
+    "telemetry_mode",
+    "shard_count",
+    "ring_size",
+    "fixed_buffers",
+    "fixed_buffer_registration",
+    "sqpoll_idle_ms",
+}
 
 
 def _replicate_id(replicate_index: int) -> str:

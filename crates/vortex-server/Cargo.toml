@@ -12,6 +12,17 @@ path = "src/main.rs"
 [lints.rust]
 unsafe_code = "allow"
 
+[features]
+default = []
+lock-profile = ["vortex-engine/lock-profile", "vortex-io/lock-profile"]
+sqpoll = ["vortex-io/sqpoll"]
+profile-telemetry = [
+    "vortex-config/profile-telemetry",
+    "vortex-engine/profile-telemetry",
+    "vortex-io/profile-telemetry",
+    "vortex-persist/profile-telemetry",
+]
+
 [dependencies]
 vortex-common = { workspace = true }
 vortex-memory = { workspace = true }
@@ -26,10 +37,3 @@ ctrlc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vortex-io = { workspace = true, features = ["io-uring"] }
-
-[profile.profiling]
-inherits = "release"
-debug = true
-strip = "none"
-lto = "thin"
-split-debuginfo = "unpacked"

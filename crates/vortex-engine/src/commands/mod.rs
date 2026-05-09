@@ -21,6 +21,8 @@ use vortex_common::{
 use vortex_proto::{FrameRef, RespFrame};
 
 use crate::ConcurrentKeyspace;
+pub use crate::effects::{AofCommitEffect, AofRecord, AofRecords, MutationErrorKind};
+use crate::keyspace::AofLsn;
 
 /// Nanoseconds per second.
 pub const NS_PER_SEC: u64 = 1_000_000_000;
@@ -183,34 +185,20 @@ impl InlineResp {
 }
 
 #[derive(Debug)]
-pub struct AofRecord {
-    pub lsn: u64,
-    pub key: VortexKey,
-}
-
-pub type AofRecords = Option<Box<[AofRecord]>>;
-pub const NO_AOF_LSN: u64 = u64::MAX;
-
-#[inline]
-fn encode_aof_lsn(aof_lsn: Option<u64>) -> u64 {
-    aof_lsn.unwrap_or(NO_AOF_LSN)
-}
-
-#[derive(Debug)]
 pub struct ExecutedCommand {
     pub response: CmdResult,
     pub aof_records: AofRecords,
-    pub aof_lsn: u64,
+    pub aof_commit: Option<AofCommitEffect>,
     pub aof_payload: Option<Box<[u8]>>,
 }
 
 impl ExecutedCommand {
     #[inline]
-    pub fn with_aof_lsn(response: CmdResult, aof_lsn: Option<u64>) -> Self {
+    pub fn with_aof_lsn(response: CmdResult, aof_lsn: Option<AofLsn>) -> Self {
         Self {
             response,
             aof_records: None,
-            aof_lsn: encode_aof_lsn(aof_lsn),
+            aof_commit: aof_lsn.map(AofCommitEffect::new),
             aof_payload: None,
         }
     }
@@ -218,7 +206,7 @@ impl ExecutedCommand {
     #[inline]
     pub fn with_optional_aof_payload(
         response: CmdResult,
-        aof_lsn: Option<u64>,
+        aof_lsn: Option<AofLsn>,
         aof_payload: Option<Box<[u8]>>,
     ) -> Self {
         Self::with_optional_aof_payload_and_records(response, None, aof_lsn, aof_payload)
@@ -228,7 +216,7 @@ impl ExecutedCommand {
     pub fn with_aof_records(
         response: CmdResult,
         aof_records: AofRecords,
-        aof_lsn: Option<u64>,
+        aof_lsn: Option<AofLsn>,
     ) -> Self {
         Self::with_optional_aof_payload_and_records(response, aof_records, aof_lsn, None)
     }
@@ -237,20 +225,20 @@ impl ExecutedCommand {
     pub fn with_optional_aof_payload_and_records(
         response: CmdResult,
         aof_records: AofRecords,
-        aof_lsn: Option<u64>,
+        aof_lsn: Option<AofLsn>,
         aof_payload: Option<Box<[u8]>>,
     ) -> Self {
         Self {
             response,
             aof_records,
-            aof_lsn: encode_aof_lsn(aof_lsn),
+            aof_commit: aof_lsn.map(AofCommitEffect::new),
             aof_payload,
         }
     }
 
     #[inline]
-    pub fn aof_lsn(&self) -> Option<u64> {
-        (self.aof_lsn != NO_AOF_LSN).then_some(self.aof_lsn)
+    pub fn aof_lsn(&self) -> Option<AofLsn> {
+        self.aof_commit.map(AofCommitEffect::lsn)
     }
 }
 
@@ -261,7 +249,23 @@ pub(crate) trait MutationErrorExt {
 impl MutationErrorExt for crate::engine::domain::MutationError {
     #[inline]
     fn into_executed(self) -> ExecutedCommand {
-        ExecutedCommand::with_aof_records(CmdResult::Static(self.response), self.aof_records, None)
+        ExecutedCommand::with_aof_records(
+            CmdResult::Static(mutation_error_response(self.kind)),
+            self.aof_records,
+            None,
+        )
+    }
+}
+
+#[inline]
+pub(crate) const fn mutation_error_response(kind: MutationErrorKind) -> &'static [u8] {
+    match kind {
+        MutationErrorKind::WrongType => ERR_WRONG_TYPE,
+        MutationErrorKind::NotInteger => ERR_NOT_INTEGER,
+        MutationErrorKind::NotFloat => ERR_NOT_FLOAT,
+        MutationErrorKind::Overflow => ERR_OVERFLOW,
+        MutationErrorKind::OutOfMemory => ERR_OOM,
+        MutationErrorKind::NoSuchKey => ERR_NO_SUCH_KEY,
     }
 }
 
@@ -271,7 +275,7 @@ impl From<CmdResult> for ExecutedCommand {
         Self {
             response,
             aof_records: None,
-            aof_lsn: NO_AOF_LSN,
+            aof_commit: None,
             aof_payload: None,
         }
     }
@@ -366,6 +370,7 @@ pub static ERR_NOT_FLOAT: &[u8] = b"-ERR value is not a valid float\r\n";
 pub static ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
 pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of range\r\n";
 pub static ERR_OOM: &[u8] = b"-OOM command not allowed when used memory > 'maxmemory'.\r\n";
+pub static ERR_NO_SUCH_KEY: &[u8] = b"-ERR no such key\r\n";
 
 /// Execute a command against the shared concurrent keyspace.
 ///
@@ -709,6 +714,19 @@ pub(crate) mod test_harness {
 mod tests {
     use super::*;
 
+    fn production_region(source: &'static str) -> &'static str {
+        source.split("\n#[cfg(all(test").next().unwrap_or(source)
+    }
+
+    fn assert_forbidden_tokens_absent(name: &str, source: &str, forbidden: &[&str]) {
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "{name} must not contain `{token}` across the command/domain boundary"
+            );
+        }
+    }
+
     #[test]
     fn parse_i64_valid() {
         assert_eq!(parse_i64(b"0"), Some(0));
@@ -753,5 +771,86 @@ mod tests {
 
         let round_trip = common_deadline_nanos_to_absolute_unix_nanos(deadline, mono_now, unix_now);
         assert_eq!(round_trip, absolute);
+    }
+
+    #[test]
+    fn string_and_generic_commands_stay_parse_reply_only() {
+        let forbidden = [
+            "crate::table",
+            "crate::entry",
+            "SwissTable",
+            "EntryValue",
+            "read_shard",
+            "read_shard_by_index",
+            "try_read_shard_by_index",
+            "write_shard",
+            "write_shard_by_index",
+            "try_write_shard_by_index",
+            "multi_read",
+            "multi_write",
+            "MutationEffects",
+            "MemoryReservation",
+            "commit_effects",
+            "apply_expiry_transition",
+            "bump_watch",
+            "record_frequency",
+            "next_lsn",
+            "next_aof_lsn",
+            "set_entry_ttl",
+            "clear_entry_ttl",
+            "set_lsn_version",
+            "ensure_memory_for_snapshot",
+        ];
+
+        assert_forbidden_tokens_absent(
+            "commands/string.rs",
+            production_region(include_str!("string.rs")),
+            &forbidden,
+        );
+        assert_forbidden_tokens_absent(
+            "commands/generic.rs",
+            production_region(include_str!("generic.rs")),
+            &forbidden,
+        );
+    }
+
+    #[test]
+    fn command_hot_path_has_no_dynamic_dispatch_surface() {
+        let forbidden = ["Box<dyn", "Arc<dyn", "&dyn", "dyn Command"];
+        let files = [
+            ("commands/mod.rs", production_region(include_str!("mod.rs"))),
+            (
+                "commands/string.rs",
+                production_region(include_str!("string.rs")),
+            ),
+            (
+                "commands/generic.rs",
+                production_region(include_str!("generic.rs")),
+            ),
+            (
+                "engine/domain.rs",
+                production_region(include_str!("../engine/domain.rs")),
+            ),
+            (
+                "engine/domain/mutation.rs",
+                production_region(include_str!("../engine/domain/mutation.rs")),
+            ),
+            (
+                "engine/domain/string_ops.rs",
+                production_region(include_str!("../engine/domain/string_ops.rs")),
+            ),
+            (
+                "engine/domain/key_ops.rs",
+                production_region(include_str!("../engine/domain/key_ops.rs")),
+            ),
+            (
+                "executor.rs",
+                production_region(include_str!("../executor.rs")),
+            ),
+        ];
+
+        for (name, source) in files {
+            assert_forbidden_tokens_absent(name, source, &forbidden);
+        }
     }
 }

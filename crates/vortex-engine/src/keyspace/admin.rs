@@ -5,7 +5,7 @@ use tikv_jemalloc_sys::mallctl;
 
 use crate::table::SwissTable;
 
-use super::ConcurrentKeyspace;
+use super::{AofLsn, ConcurrentKeyspace};
 
 /// Best-effort jemalloc cache and arena purge after FLUSHDB/FLUSHALL.
 ///
@@ -129,7 +129,7 @@ impl ConcurrentKeyspace {
     /// Outstanding memory reservations are intentionally left untouched. A
     /// [`MemoryReservation`] is an owning token; only that token may release its
     /// bytes from `memory_reserved`.
-    pub(crate) fn flush_all_with_lsn(&self) -> Option<u64> {
+    pub(crate) fn flush_all_with_lsn(&self) -> Option<AofLsn> {
         let mut guards = Vec::with_capacity(self.shards.len());
         for shard in self.shards.iter() {
             guards.push(shard.write());

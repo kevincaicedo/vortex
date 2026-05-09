@@ -18,7 +18,10 @@ class DragonflyAdapter(DatabaseAdapter):
         return None
 
     def resolve_runtime_config(self, request: StartRequest) -> dict[str, object]:
+        aof_enabled = bool(request.runtime_config.get("aof_enabled", False))
         runtime_config = {
+            "aof_enabled": aof_enabled,
+            "aof_fsync": str(request.runtime_config.get("aof_fsync", "everysec")),
             "maxmemory": str(request.runtime_config.get("maxmemory", DEFAULT_DRAGONFLY_MAXMEMORY))
         }
         if request.runtime_config.get("eviction_policy") is not None:
@@ -29,8 +32,6 @@ class DragonflyAdapter(DatabaseAdapter):
         runtime = request.runtime_config
         if runtime.get("aof_enabled"):
             raise SetupError("dragonfly setup automation does not support AOF-enabled scenarios")
-        if "aof_fsync" in runtime:
-            raise SetupError("dragonfly setup automation does not support AOF fsync configuration")
         if runtime.get("eviction_policy") not in {None, "noeviction"}:
             raise SetupError(
                 "dragonfly setup automation currently only supports the default noeviction policy"

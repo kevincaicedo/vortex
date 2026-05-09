@@ -4,7 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vortex_engine::eviction::EvictionPolicy;
-use vortex_io::{AofConfig, IoBackendMode, ReactorPool, ReactorPoolConfig};
+use vortex_engine::keyspace::RuntimeTelemetryMode;
+use vortex_io::{
+    AcceptBudget, AofConfig, CommandBudget, CompletionBudget, FixedBufferRegistrationMode,
+    IoBackendMode, MaintenanceBudget, ReactorBudgets, ReactorPool, ReactorPoolConfig, TimeBudget,
+    WritevBudget,
+};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -19,6 +24,14 @@ const BANNER: &str = r"
    \ V / (_) | |  | ||  __/>  <| |_| | |_) |
     \_/ \___/|_|   \__\___/_/\_\____/|____/
 ";
+
+fn invalid_budget(name: &'static str) -> ! {
+    tracing::error!(
+        budget = name,
+        "invalid zero reactor budget after config validation"
+    );
+    std::process::exit(1);
+}
 
 fn main() {
     let config = match vortex_config::VortexConfig::load() {
@@ -35,11 +48,14 @@ fn main() {
 
     eprintln!("{BANNER}");
     tracing::info!(
-        "VortexDB v{} starting — bind={}, threads={}, io_backend={}, max_memory={}",
+        "VortexDB v{} starting — bind={}, threads={}, shard_count={}, io_backend={}, fixed_buffer_registration={}, telemetry_mode={}, max_memory={}",
         env!("CARGO_PKG_VERSION"),
         config.bind,
         config.threads,
+        config.shard_count,
         config.io_backend,
+        config.fixed_buffer_registration,
+        config.telemetry_mode,
         config.max_memory,
     );
 
@@ -64,14 +80,30 @@ fn main() {
         tracing::info!(
             path = %config.aof_path.display(),
             fsync = %config.aof_fsync,
+            max_pending_fsync_bytes = config.aof_max_pending_fsync_bytes,
             "AOF persistence enabled"
         );
         Some(AofConfig {
             path: config.aof_path.clone(),
             fsync_policy: policy,
+            max_pending_fsync_bytes: config.aof_max_pending_fsync_bytes,
         })
     } else {
         None
+    };
+
+    let budgets = ReactorBudgets {
+        completion: CompletionBudget::new(config.reactor_completion_budget)
+            .unwrap_or_else(|| invalid_budget("completion")),
+        command: CommandBudget::new(config.reactor_command_budget)
+            .unwrap_or_else(|| invalid_budget("command")),
+        accept: AcceptBudget::new(config.reactor_accept_budget)
+            .unwrap_or_else(|| invalid_budget("accept")),
+        writev: WritevBudget::new(config.reactor_writev_budget)
+            .unwrap_or_else(|| invalid_budget("writev")),
+        maintenance: MaintenanceBudget::new(config.reactor_maintenance_budget)
+            .unwrap_or_else(|| invalid_budget("maintenance")),
+        time: TimeBudget::from_micros(config.reactor_time_budget_us),
     };
 
     let pool_config = ReactorPoolConfig {
@@ -79,10 +111,32 @@ fn main() {
         threads: config.threads,
         max_connections: effective_max_clients,
         buffer_size: config.buffer_size,
+        max_request_bytes: config.max_request_bytes,
+        connection_caps: vortex_io::ConnectionMemoryCaps {
+            max_parser_accumulator_bytes: config.max_parser_accumulator_bytes,
+            max_pending_response_bytes: config.max_pending_response_bytes,
+            max_multi_queue_commands: config.max_multi_queue_commands,
+            max_multi_queue_bytes: config.max_multi_queue_bytes,
+            max_watch_registrations: config.max_watch_registrations,
+            max_writev_chunks: config.max_writev_chunks,
+        },
+        overload_policy: vortex_io::ReactorOverloadPolicy {
+            accept_throttle_connection_percent: config.reactor_overload_accept_connection_percent,
+            read_disable_pending_response_bytes: config.reactor_overload_pending_response_bytes,
+            read_disable_parser_accumulator_bytes: config.reactor_overload_parser_accumulator_bytes,
+            aof_pending_bytes: config.reactor_overload_aof_pending_bytes,
+            writev_backlog_bytes: config.reactor_overload_writev_backlog_bytes,
+            maintenance_debt: config.reactor_overload_maintenance_debt,
+        },
         buffer_count: config.fixed_buffers,
+        fixed_buffer_registration: match config.fixed_buffer_registration {
+            vortex_config::FixedBufferRegistrationKind::Auto => FixedBufferRegistrationMode::Auto,
+            vortex_config::FixedBufferRegistrationKind::On => FixedBufferRegistrationMode::On,
+            vortex_config::FixedBufferRegistrationKind::Off => FixedBufferRegistrationMode::Off,
+        },
         connection_timeout: config.connection_timeout_secs as u32,
         aof_config,
-        shard_count: vortex_engine::DEFAULT_SHARD_COUNT,
+        shard_count: config.shard_count,
         max_memory: config.max_memory as usize,
         eviction_policy: EvictionPolicy::parse_bytes(config.eviction_policy.as_bytes())
             .unwrap_or(EvictionPolicy::NoEviction),
@@ -93,6 +147,12 @@ fn main() {
         },
         ring_size: config.ring_size,
         sqpoll_idle_ms: config.sqpoll_idle_ms,
+        budgets,
+        telemetry_mode: match config.telemetry_mode {
+            vortex_config::TelemetryModeKind::Minimal => RuntimeTelemetryMode::Minimal,
+            #[cfg(feature = "profile-telemetry")]
+            vortex_config::TelemetryModeKind::Profile => RuntimeTelemetryMode::Profile,
+        },
     };
 
     let mut pool = match ReactorPool::spawn(pool_config) {
@@ -129,6 +189,14 @@ fn main() {
     // ── Wait for shutdown ──────────────────────────────────────────
     let clean = pool.wait_for_shutdown(SHUTDOWN_TIMEOUT);
     pool.join();
+
+    #[cfg(feature = "lock-profile")]
+    if let Some(path) = std::env::var_os("VORTEX_LOCK_PROFILE_JSON") {
+        let snapshot = pool.keyspace().lock_profile_snapshot();
+        if let Err(error) = std::fs::write(&path, snapshot.to_json()) {
+            tracing::warn!(?path, %error, "failed to write lock profile snapshot");
+        }
+    }
 
     // ── Persistence flush stub (1.4.5) ─────────────────────────────
     persistence_flush();

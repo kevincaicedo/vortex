@@ -43,12 +43,18 @@ fn spawn_reactor() -> (std::thread::JoinHandle<()>, u16, Arc<ShutdownCoordinator
             bind_addr: addr,
             max_connections: 64,
             buffer_size: 4096,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: Default::default(),
+            overload_policy: Default::default(),
             buffer_count: 128,
+            fixed_buffer_registration: Default::default(),
             connection_timeout: 0,
             aof_config: None,
             io_backend: IoBackendMode::Polling,
             ring_size: 4096,
             sqpoll_idle_ms: 1000,
+            budgets: Default::default(),
+            telemetry_mode: Default::default(),
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -120,6 +126,23 @@ fn set_get_roundtrip() {
     // GET missing key → nil
     let resp = cmd(&mut s, &["GET", "missing"]);
     assert_eq!(resp, "$-1\r\n");
+
+    drop(s);
+    shutdown(handle, &coordinator);
+}
+
+#[test]
+fn large_bulk_value_exceeds_io_buffer() {
+    let (handle, port, coordinator) = spawn_reactor();
+    let mut s = connect(port);
+    let value = "x".repeat(6000);
+
+    let resp = cmd(&mut s, &["SET", "large_bulk", &value]);
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = cmd(&mut s, &["GET", "large_bulk"]);
+    let expected = format!("${}\r\n{}\r\n", value.len(), value);
+    assert_eq!(resp, expected);
 
     drop(s);
     shutdown(handle, &coordinator);

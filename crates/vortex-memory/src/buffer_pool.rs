@@ -148,12 +148,24 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
+    /// Returns the page-aligned buffer size used by [`BufferPool::new`].
+    #[inline]
+    pub const fn aligned_buffer_size(buffer_size: usize) -> usize {
+        (buffer_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    }
+
+    /// Returns bytes reserved for a pool with `count` buffers.
+    #[inline]
+    pub const fn reserved_bytes_for(count: usize, buffer_size: usize) -> usize {
+        count * Self::aligned_buffer_size(buffer_size)
+    }
+
     /// Creates a new buffer pool with `count` buffers of `buffer_size` bytes each.
     ///
     /// `buffer_size` is rounded up to the nearest page boundary.
     pub fn new(count: usize, buffer_size: usize) -> Self {
         // Round up to page alignment.
-        let buffer_size = (buffer_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let buffer_size = Self::aligned_buffer_size(buffer_size);
         let total_bytes = count * buffer_size;
 
         let region = MmapRegion::new(total_bytes).expect("mmap allocation failed for buffer pool");
@@ -328,6 +340,8 @@ mod tests {
         let pool = BufferPool::new(2, 5000);
         assert_eq!(pool.buffer_size(), 8192);
         assert_eq!(pool.total_bytes(), 2 * 8192);
+        assert_eq!(BufferPool::aligned_buffer_size(5000), 8192);
+        assert_eq!(BufferPool::reserved_bytes_for(2, 5000), 2 * 8192);
     }
 
     #[test]

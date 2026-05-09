@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::Command;
@@ -9,6 +10,7 @@ use clap::{Parser, ValueEnum};
 use tikv_jemallocator::Jemalloc;
 use vortex_common::{MAX_INLINE_VALUE_LEN, VortexKey, VortexValue};
 use vortex_engine::commands::{CommandClock, NS_PER_MS, execute_command};
+use vortex_engine::keyspace::LockProfileSnapshot;
 use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_proto::RespTape;
 
@@ -28,13 +30,20 @@ enum Workload {
     SetInlineInt,
     SetInlineString,
     SetInlineStringCommand,
+    SetInlineStringWatched,
     SetInlineStringTtl,
     SetHeapString,
     GetHit,
     GetMiss,
     Mget,
     Mset,
+    Msetnx,
     Delete,
+    Append,
+    Setrange,
+    Incrbyfloat,
+    ValueMutationMixed,
+    ExpirePersist,
     TtlExpire,
     EvictionHeadroom,
     EvictionPressure,
@@ -99,6 +108,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     aof_recording: bool,
 
+    #[arg(long, default_value_t = false)]
+    lock_profile: bool,
+
     #[arg(long)]
     json: Option<PathBuf>,
 }
@@ -143,6 +155,7 @@ impl LatencyRecorder {
             p50_ns: Some(select_percentile(&sorted, 50)),
             p95_ns: Some(select_percentile(&sorted, 95)),
             p99_ns: Some(select_percentile(&sorted, 99)),
+            p999_ns: Some(select_permyriad(&sorted, 9_990)),
         }
     }
 }
@@ -153,6 +166,7 @@ struct LatencySummary {
     p50_ns: Option<u64>,
     p95_ns: Option<u64>,
     p99_ns: Option<u64>,
+    p999_ns: Option<u64>,
 }
 
 impl LatencySummary {
@@ -162,6 +176,7 @@ impl LatencySummary {
             p50_ns: None,
             p95_ns: None,
             p99_ns: None,
+            p999_ns: None,
         }
     }
 }
@@ -180,6 +195,8 @@ struct ProbeSummary {
     expiring_keys: usize,
     table_total_slots: usize,
     capacity_slack_slots: usize,
+    tombstone_slots: usize,
+    load_factor: f64,
     table_logical_bytes: usize,
     table_allocated_bytes: usize,
     bytes_per_live_key: Option<f64>,
@@ -197,6 +214,7 @@ struct ProbeSummary {
     eviction_slots_sampled: u64,
     eviction_bytes_freed: u64,
     latency: LatencySummary,
+    lock_profile: Option<LockProfileSnapshot>,
 }
 
 #[derive(Clone, Copy)]
@@ -252,13 +270,20 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
         Workload::SetInlineInt => run_set_inline_int(args),
         Workload::SetInlineString => run_set_inline_string(args),
         Workload::SetInlineStringCommand => run_set_inline_string_command(args),
+        Workload::SetInlineStringWatched => run_set_inline_string_watched(args),
         Workload::SetInlineStringTtl => run_set_inline_string_ttl(args),
         Workload::SetHeapString => run_set_heap_string(args),
         Workload::GetHit => run_get_hit(args),
         Workload::GetMiss => run_get_miss(args),
         Workload::Mget => run_mget(args),
         Workload::Mset => run_mset(args),
+        Workload::Msetnx => run_msetnx(args),
         Workload::Delete => run_delete(args),
+        Workload::Append => run_append(args),
+        Workload::Setrange => run_setrange(args),
+        Workload::Incrbyfloat => run_incrbyfloat(args),
+        Workload::ValueMutationMixed => run_value_mutation_mixed(args),
+        Workload::ExpirePersist => run_expire_persist(args),
         Workload::TtlExpire => run_ttl_expire(args),
         Workload::EvictionHeadroom => run_eviction_headroom(args),
         Workload::EvictionPressure => run_eviction_pressure(args),
@@ -268,7 +293,7 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
 fn run_set_inline_int(args: &Args) -> Result<ProbeSummary, String> {
     let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let op_started = Instant::now();
@@ -295,7 +320,7 @@ fn run_set_inline_string(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
     let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let op_started = Instant::now();
@@ -322,7 +347,7 @@ fn run_set_inline_string_command(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
     let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let key = make_key(index);
@@ -344,12 +369,44 @@ fn run_set_inline_string_command(args: &Args) -> Result<ProbeSummary, String> {
     ))
 }
 
+fn run_set_inline_string_watched(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let keyspace = new_keyspace(args, args.keys);
+    prefill_inline_strings(&keyspace, args.keys, value_size);
+    let watched = (0..args.keys)
+        .map(|index| keyspace.watch_key(VortexKey::from(make_key(index))))
+        .collect::<Vec<_>>();
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+
+    for index in 0..args.keys {
+        let key = make_key(index);
+        let value = make_value_bytes(index.wrapping_add(args.keys), value_size);
+        let parts = [b"SET".as_slice(), key.as_slice(), value.as_slice()];
+        let op_started = Instant::now();
+        execute_parts(&keyspace, b"SET", &parts, 0u64.into())?;
+        latency.record(index as u64, op_started);
+    }
+
+    let summary = finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        args.keys as u64,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    );
+    keyspace.unwatch_keys(watched);
+    Ok(summary)
+}
+
 fn run_set_inline_string_ttl(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
     let keyspace = new_keyspace(args, args.keys);
     let ttl_text = args.ttl_ms.to_string();
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let key = make_key(index);
@@ -381,7 +438,7 @@ fn run_set_heap_string(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.max(MAX_INLINE_VALUE_LEN + 1);
     let keyspace = new_keyspace(args, args.keys);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let op_started = Instant::now();
@@ -410,7 +467,7 @@ fn run_get_hit(args: &Args) -> Result<ProbeSummary, String> {
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
     let mut operations = 0u64;
 
     match args.duration {
@@ -462,7 +519,7 @@ fn run_get_miss(args: &Args) -> Result<ProbeSummary, String> {
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
     let mut operations = 0u64;
 
     match args.duration {
@@ -515,7 +572,7 @@ fn run_mget(args: &Args) -> Result<ProbeSummary, String> {
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
     let mut operations = 0u64;
 
     match args.duration {
@@ -558,7 +615,7 @@ fn run_mset(args: &Args) -> Result<ProbeSummary, String> {
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
     let mut operations = 0u64;
 
     match args.duration {
@@ -594,27 +651,355 @@ fn run_mset(args: &Args) -> Result<ProbeSummary, String> {
     ))
 }
 
-fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
+fn run_msetnx(args: &Args) -> Result<ProbeSummary, String> {
+    let width = args.multi_key_width.min(args.keys).max(1);
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
-    prefill_inline_strings(&keyspace, args.keys, value_size);
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2));
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
 
-    for index in 0..args.keys {
-        let key = make_key(index);
-        let parts = [b"DEL".as_slice(), key.as_slice()];
-        let op_started = Instant::now();
-        execute_parts(&keyspace, b"DEL", &parts, 0u64.into())?;
-        latency.record(index as u64, op_started);
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut batch = 0usize;
+            while started.elapsed() < deadline {
+                let op_started = Instant::now();
+                execute_msetnx_batch(&keyspace, width, batch, args.keys, value_size)?;
+                latency.record(operations, op_started);
+                operations += 1;
+                batch += 1;
+            }
+        }
+        None => {
+            for batch in (0..args.keys).step_by(width) {
+                let op_started = Instant::now();
+                execute_msetnx_batch(&keyspace, width, batch / width, args.keys, value_size)?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
     }
 
     Ok(finalize_summary(
         args,
         &keyspace,
         "command-path",
-        args.keys as u64,
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let width = args.multi_key_width.min(args.keys).max(1);
+    let keyspace = new_keyspace(args, args.keys);
+    prefill_inline_strings(&keyspace, args.keys, value_size);
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let batch_count = args.keys.div_ceil(width);
+    let mut operations = 0u64;
+
+    for batch in 0..batch_count {
+        if let Some(seconds) = args.duration {
+            if started.elapsed() >= Duration::from_secs(seconds) {
+                break;
+            }
+        }
+        let op_started = Instant::now();
+        execute_delete_batch(&keyspace, width, batch, args.keys)?;
+        latency.record(operations, op_started);
+        operations += 1;
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_append(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let keyspace = new_keyspace(args, args.keys);
+    prefill_inline_strings(&keyspace, args.keys, value_size);
+    let append = make_value_bytes(0, value_size.clamp(1, 8));
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let key = make_key(index % args.keys);
+                let parts = [b"APPEND".as_slice(), key.as_slice(), append.as_slice()];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"APPEND", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..args.keys {
+                let key = make_key(index);
+                let parts = [b"APPEND".as_slice(), key.as_slice(), append.as_slice()];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"APPEND", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_setrange(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let keyspace = new_keyspace(args, args.keys);
+    prefill_inline_strings(&keyspace, args.keys, value_size);
+    let offset = value_size.saturating_sub(1).min(value_size / 2);
+    let offset_text = offset.to_string();
+    let replacement = make_value_bytes(1, value_size.clamp(1, 8));
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let key = make_key(index % args.keys);
+                let parts = [
+                    b"SETRANGE".as_slice(),
+                    key.as_slice(),
+                    offset_text.as_bytes(),
+                    replacement.as_slice(),
+                ];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"SETRANGE", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..args.keys {
+                let key = make_key(index);
+                let parts = [
+                    b"SETRANGE".as_slice(),
+                    key.as_slice(),
+                    offset_text.as_bytes(),
+                    replacement.as_slice(),
+                ];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"SETRANGE", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_incrbyfloat(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = b"1.25".len();
+    let keyspace = new_keyspace(args, args.keys);
+    prefill_float_strings(&keyspace, args.keys);
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let key = make_key(index % args.keys);
+                let parts = [b"INCRBYFLOAT".as_slice(), key.as_slice(), b"0.5".as_slice()];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"INCRBYFLOAT", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..args.keys {
+                let key = make_key(index);
+                let parts = [b"INCRBYFLOAT".as_slice(), key.as_slice(), b"0.5".as_slice()];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"INCRBYFLOAT", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_value_mutation_mixed(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let partition_keys = (args.keys / 3).max(1);
+    let keyspace = new_keyspace(args, partition_keys * 3);
+    prefill_named_strings(&keyspace, b"a", partition_keys, value_size);
+    prefill_named_strings(&keyspace, b"r", partition_keys, value_size);
+    prefill_named_float_strings(&keyspace, b"f", partition_keys);
+
+    let append = make_value_bytes(0, value_size.clamp(1, 4));
+    let offset = value_size.saturating_sub(1).min(value_size / 2);
+    let offset_text = offset.to_string();
+    let replacement = make_value_bytes(1, value_size.clamp(1, 4));
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    let execute_one = |operation_index: usize| -> Result<(), String> {
+        let key_index = (operation_index / 3) % partition_keys;
+        match operation_index % 3 {
+            0 => {
+                let key = make_named_key(b"a", key_index);
+                let parts = [b"APPEND".as_slice(), key.as_slice(), append.as_slice()];
+                execute_parts(&keyspace, b"APPEND", &parts, 0u64.into())
+            }
+            1 => {
+                let key = make_named_key(b"r", key_index);
+                let parts = [
+                    b"SETRANGE".as_slice(),
+                    key.as_slice(),
+                    offset_text.as_bytes(),
+                    replacement.as_slice(),
+                ];
+                execute_parts(&keyspace, b"SETRANGE", &parts, 0u64.into())
+            }
+            _ => {
+                let key = make_named_key(b"f", key_index);
+                let parts = [b"INCRBYFLOAT".as_slice(), key.as_slice(), b"0.5".as_slice()];
+                execute_parts(&keyspace, b"INCRBYFLOAT", &parts, 0u64.into())
+            }
+        }
+    };
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let op_started = Instant::now();
+                execute_one(index)?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..(partition_keys * 3) {
+                let op_started = Instant::now();
+                execute_one(index)?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_expire_persist(args: &Args) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
+    let keyspace = new_keyspace(args, args.keys);
+    prefill_inline_strings(&keyspace, args.keys, value_size);
+    let ttl_text = args.ttl_ms.to_string();
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let key = make_key(index % args.keys);
+                let op_started = Instant::now();
+                let expire = [b"PEXPIRE".as_slice(), key.as_slice(), ttl_text.as_bytes()];
+                execute_parts(&keyspace, b"PEXPIRE", &expire, 0u64.into())?;
+                let persist = [b"PERSIST".as_slice(), key.as_slice()];
+                execute_parts(&keyspace, b"PERSIST", &persist, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..args.keys {
+                let key = make_key(index);
+                let op_started = Instant::now();
+                let expire = [b"PEXPIRE".as_slice(), key.as_slice(), ttl_text.as_bytes()];
+                execute_parts(&keyspace, b"PEXPIRE", &expire, 0u64.into())?;
+                let persist = [b"PERSIST".as_slice(), key.as_slice()];
+                execute_parts(&keyspace, b"PERSIST", &persist, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
         started.elapsed(),
         latency.summarize(),
         value_size,
@@ -636,7 +1021,7 @@ fn run_ttl_expire(args: &Args) -> Result<ProbeSummary, String> {
 
     let expiry_now = args.ttl_ms.saturating_mul(NS_PER_MS).saturating_add(1);
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
     let mut operations = 0u64;
     let mut start_slot = 0usize;
 
@@ -680,7 +1065,7 @@ fn run_eviction_headroom(args: &Args) -> Result<ProbeSummary, String> {
     );
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let key = make_new_key(index);
@@ -710,7 +1095,7 @@ fn run_eviction_pressure(args: &Args) -> Result<ProbeSummary, String> {
     preheat_eviction_candidates(&keyspace, args.keys)?;
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
-    let started = Instant::now();
+    let started = begin_measurement(args, &keyspace);
 
     for index in 0..args.keys {
         let key = make_pressure_key(index);
@@ -737,7 +1122,17 @@ fn new_keyspace(args: &Args, capacity: usize) -> ConcurrentKeyspace {
     if args.aof_recording {
         keyspace.enable_aof_recording();
     }
+    if args.lock_profile || std::env::var_os("VORTEX_LOCK_PROFILE").is_some() {
+        keyspace.set_lock_profile_enabled(true);
+    }
     keyspace
+}
+
+fn begin_measurement(args: &Args, keyspace: &ConcurrentKeyspace) -> Instant {
+    if args.lock_profile || std::env::var_os("VORTEX_LOCK_PROFILE").is_some() {
+        keyspace.reset_lock_profile();
+    }
+    Instant::now()
 }
 
 fn benchmark_insert(keyspace: &ConcurrentKeyspace, key: VortexKey, value: VortexValue) {
@@ -754,6 +1149,41 @@ fn prefill_inline_strings(keyspace: &ConcurrentKeyspace, keys: usize, value_size
             keyspace,
             VortexKey::from(make_key(index)),
             VortexValue::from_bytes(make_value_bytes(index, value_size).as_slice()),
+        );
+    }
+}
+
+fn prefill_float_strings(keyspace: &ConcurrentKeyspace, keys: usize) {
+    for index in 0..keys {
+        benchmark_insert(
+            keyspace,
+            VortexKey::from(make_key(index)),
+            VortexValue::from_bytes(make_float_value(index).as_slice()),
+        );
+    }
+}
+
+fn prefill_named_strings(
+    keyspace: &ConcurrentKeyspace,
+    prefix: &[u8],
+    keys: usize,
+    value_size: usize,
+) {
+    for index in 0..keys {
+        benchmark_insert(
+            keyspace,
+            VortexKey::from(make_named_key(prefix, index)),
+            VortexValue::from_bytes(make_value_bytes(index, value_size).as_slice()),
+        );
+    }
+}
+
+fn prefill_named_float_strings(keyspace: &ConcurrentKeyspace, prefix: &[u8], keys: usize) {
+    for index in 0..keys {
+        benchmark_insert(
+            keyspace,
+            VortexKey::from(make_named_key(prefix, index)),
+            VortexValue::from_bytes(make_float_value(index).as_slice()),
         );
     }
 }
@@ -823,6 +1253,45 @@ fn execute_mset_batch(
     execute_parts(keyspace, b"MSET", refs.as_slice(), 0u64.into())
 }
 
+fn execute_msetnx_batch(
+    keyspace: &ConcurrentKeyspace,
+    width: usize,
+    batch_index: usize,
+    key_count: usize,
+    value_size: usize,
+) -> Result<(), String> {
+    let mut parts = Vec::with_capacity((width * 2) + 1);
+    parts.push(b"MSETNX".to_vec());
+
+    let start = (batch_index * width) % key_count;
+    for offset in 0..width {
+        let key_index = (start + offset) % key_count;
+        parts.push(make_new_key(key_index + batch_index.saturating_mul(width)));
+        parts.push(make_value_bytes(key_index, value_size));
+    }
+
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    execute_parts(keyspace, b"MSETNX", refs.as_slice(), 0u64.into())
+}
+
+fn execute_delete_batch(
+    keyspace: &ConcurrentKeyspace,
+    width: usize,
+    batch_index: usize,
+    key_count: usize,
+) -> Result<(), String> {
+    let mut parts = Vec::with_capacity(width + 1);
+    parts.push(b"DEL".to_vec());
+
+    let start = (batch_index * width) % key_count;
+    for offset in 0..width {
+        parts.push(make_key((start + offset) % key_count));
+    }
+
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    execute_parts(keyspace, b"DEL", refs.as_slice(), 0u64.into())
+}
+
 fn preheat_eviction_candidates(
     keyspace: &ConcurrentKeyspace,
     key_count: usize,
@@ -844,26 +1313,7 @@ fn finalize_summary(
     latency: LatencySummary,
     value_size_bytes: usize,
 ) -> ProbeSummary {
-    let table_logical_bytes = keyspace.memory_used();
-    let (table_total_slots, table_allocated_bytes) = keyspace
-        .scan_all_shards(|_, table| (table.total_slots(), table.allocated_bytes()))
-        .into_iter()
-        .fold(
-            (0usize, 0usize),
-            |(slots_sum, bytes_sum), (slots, bytes)| {
-                (
-                    slots_sum.saturating_add(slots),
-                    bytes_sum.saturating_add(bytes),
-                )
-            },
-        );
-    let live_keys = keyspace.dbsize();
-    let capacity_slack_slots = table_total_slots.saturating_sub(live_keys);
-    let bytes_per_live_key = if live_keys == 0 {
-        None
-    } else {
-        Some(table_allocated_bytes as f64 / live_keys as f64)
-    };
+    let engine = keyspace.engine_memory_attribution();
     let allocator = read_allocator_stats();
     let runtime = keyspace.runtime_metrics();
     let eviction = keyspace.eviction_metrics();
@@ -883,13 +1333,15 @@ fn finalize_summary(
         value_size_bytes,
         shards: args.shards,
         aof_recording: args.aof_recording,
-        live_keys,
+        live_keys: engine.live_keys,
         expiring_keys: keyspace.approx_expiring_keys(),
-        table_total_slots,
-        capacity_slack_slots,
-        table_logical_bytes,
-        table_allocated_bytes,
-        bytes_per_live_key,
+        table_total_slots: engine.table_total_slots,
+        capacity_slack_slots: engine.capacity_slack_slots,
+        tombstone_slots: engine.tombstone_slots,
+        load_factor: engine.load_factor,
+        table_logical_bytes: engine.logical_dataset_bytes,
+        table_allocated_bytes: engine.table_allocated_bytes,
+        bytes_per_live_key: engine.bytes_per_live_key,
         process_rss_bytes: current_process_rss_bytes(),
         allocator_allocated_bytes: allocator.allocated,
         allocator_active_bytes: allocator.active,
@@ -904,6 +1356,8 @@ fn finalize_summary(
         eviction_slots_sampled: eviction.slots_sampled,
         eviction_bytes_freed: eviction.bytes_freed,
         latency,
+        lock_profile: (args.lock_profile || std::env::var_os("VORTEX_LOCK_PROFILE").is_some())
+            .then(|| keyspace.lock_profile_snapshot()),
     }
 }
 
@@ -990,12 +1444,26 @@ fn select_percentile(sorted: &[u64], percentile: usize) -> u64 {
     sorted[index]
 }
 
+fn select_permyriad(sorted: &[u64], permyriad: usize) -> u64 {
+    let last_index = sorted.len().saturating_sub(1);
+    let index = ((last_index * permyriad) / 10_000).min(last_index);
+    sorted[index]
+}
+
 fn estimate_insert_bytes(value_size: usize) -> usize {
     64 + 32 + 24 + value_size
 }
 
 fn make_key(index: usize) -> Vec<u8> {
     format!("k:{index:016x}").into_bytes()
+}
+
+fn make_named_key(prefix: &[u8], index: usize) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 1 + 16);
+    key.extend_from_slice(prefix);
+    key.push(b':');
+    write!(&mut key, "{index:016x}").expect("writing to Vec should not fail");
+    key
 }
 
 fn make_missing_key(index: usize) -> Vec<u8> {
@@ -1018,6 +1486,10 @@ fn make_value_bytes(index: usize, size: usize) -> Vec<u8> {
         value.resize(size, b'x');
     }
     value
+}
+
+fn make_float_value(index: usize) -> Vec<u8> {
+    format!("{}.25", index % 1000).into_bytes()
 }
 
 fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
@@ -1058,6 +1530,8 @@ impl ProbeSummary {
             self.capacity_slack_slots,
             true,
         );
+        write_json_usize_field(&mut json, "tombstone_slots", self.tombstone_slots, true);
+        write_json_f64_field(&mut json, "load_factor", self.load_factor, true);
         write_json_usize_field(
             &mut json,
             "table_logical_bytes",
@@ -1158,8 +1632,27 @@ impl ProbeSummary {
         );
         write_json_option_u64_field(&mut json, "p50", self.latency.p50_ns, true);
         write_json_option_u64_field(&mut json, "p95", self.latency.p95_ns, true);
-        write_json_option_u64_field(&mut json, "p99", self.latency.p99_ns, false);
-        let _ = writeln!(&mut json, "  }}");
+        write_json_option_u64_field(&mut json, "p99", self.latency.p99_ns, true);
+        write_json_option_u64_field(&mut json, "p999", self.latency.p999_ns, false);
+        let _ = writeln!(
+            &mut json,
+            "  }}{}",
+            if self.lock_profile.is_some() { "," } else { "" }
+        );
+        if let Some(snapshot) = &self.lock_profile {
+            let profile_json = snapshot.to_json();
+            let mut lines = profile_json.lines();
+            if lines.next().is_some() {
+                let _ = writeln!(&mut json, "  \"lock_profile\": {{");
+                for line in lines {
+                    if line == "}" {
+                        break;
+                    }
+                    let _ = writeln!(&mut json, "  {line}");
+                }
+                let _ = writeln!(&mut json, "  }}");
+            }
+        }
         let _ = writeln!(&mut json, "}}");
         json
     }
@@ -1170,13 +1663,20 @@ fn workload_name(workload: Workload) -> &'static str {
         Workload::SetInlineInt => "set-inline-int",
         Workload::SetInlineString => "set-inline-string",
         Workload::SetInlineStringCommand => "set-inline-string-command",
+        Workload::SetInlineStringWatched => "set-inline-string-watched",
         Workload::SetInlineStringTtl => "set-inline-string-ttl",
         Workload::SetHeapString => "set-heap-string",
         Workload::GetHit => "get-hit",
         Workload::GetMiss => "get-miss",
         Workload::Mget => "mget",
         Workload::Mset => "mset",
+        Workload::Msetnx => "msetnx",
         Workload::Delete => "delete",
+        Workload::Append => "append",
+        Workload::Setrange => "setrange",
+        Workload::Incrbyfloat => "incrbyfloat",
+        Workload::ValueMutationMixed => "value-mutation-mixed",
+        Workload::ExpirePersist => "expire-persist",
         Workload::TtlExpire => "ttl-expire",
         Workload::EvictionHeadroom => "eviction-headroom",
         Workload::EvictionPressure => "eviction-pressure",

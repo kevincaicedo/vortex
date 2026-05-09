@@ -33,8 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use vortex_common::{VortexKey, VortexValue};
+use vortex_common::{Timestamp, VortexKey, VortexValue};
 
+use crate::effects::MutationErrorKind;
 use crate::eviction::{
     EvictionConfig, EvictionConfigState, EvictionPolicy, FrequencySketch, next_random_u64,
     should_sample_lfu_read,
@@ -46,25 +47,41 @@ mod eviction_sweep;
 mod expiry;
 mod features;
 mod gate;
+#[cfg(feature = "lock-profile")]
+mod lock_profile;
 mod memory;
 mod metrics;
 mod persistence;
 mod shards;
 mod watch;
 
+pub use eviction_sweep::EvictionMaintenanceSlice;
 pub(super) use eviction_sweep::EvictionScanReport;
 pub(crate) use eviction_sweep::{EvictedKey, EvictedKeys};
 pub(crate) use expiry::ExpiryTransition;
 pub(crate) use features::MutationFeatures;
 use gate::TransactionGate;
-pub use gate::{CommandGateGuard, TransactionGateGuard};
+pub use gate::{CommandGateGuard, TransactionGateGuard, TransactionGatePlan};
+#[cfg(feature = "lock-profile")]
+pub use lock_profile::{
+    BUCKET_LABELS as LOCK_PROFILE_BUCKET_LABELS, LockProfileClass, LockProfileClassSnapshot,
+    LockProfileSnapshot, LockProfileStatSnapshot,
+};
+#[cfg(feature = "lock-profile")]
+use lock_profile::{LockProfileHold, LockProfileKind, LockProfileScope, LockProfileState};
+use memory::ServerMemoryAttribution;
+pub use memory::{EngineMemoryAttributionSnapshot, ServerMemoryAttributionSnapshot};
 pub(crate) use memory::{EvictionAdmissionError, MemoryReservation, PositiveDelta, ProjectedDelta};
 use metrics::{EvictionMetrics, RuntimeMetrics};
-pub use metrics::{EvictionMetricsSnapshot, RuntimeMetricsSnapshot};
+pub use metrics::{
+    EvictionMetricsSnapshot, RuntimeAofTelemetry, RuntimeBackendMode, RuntimeBackendSnapshot,
+    RuntimeLocalFlushMetrics, RuntimeMetricsSnapshot, RuntimeOverloadTelemetry,
+    RuntimeTelemetryMode,
+};
 pub use persistence::{AofLsn, EntryLsn, Lsn, LsnOverflow, LsnRestoreError, ReplayModeGuard};
 use shards::{MultiReadGuards, MultiWriteGuards, Shard, ShardId, ShardReadGuards};
+pub(crate) use shards::{PrehashedKeyPlan, PrehashedShardPlan, ShardPlan, ShardWriteGuards};
 pub use shards::{ShardCount, ShardCountError};
-pub(crate) use shards::{ShardPlan, ShardWriteGuards};
 pub use watch::WatchRegistration;
 use watch::{AbsentWatchShard, make_absent_watch_shards};
 
@@ -86,12 +103,37 @@ const AHASH_SEED_1: u64 = 0x6c62_272e_07bb_0142;
 const AHASH_SEED_2: u64 = 0x8fbc_2d2b_9e3a_6ee8;
 const AHASH_SEED_3: u64 = 0xcf41_41b0_ed82_a837;
 const ABSENT_WATCH_SHARD_COUNT: usize = 256;
-const TRANSACTION_GATE_COUNTERS: usize = 128;
+#[cfg(feature = "lock-profile")]
+pub struct ShardReadGuard<'a> {
+    guard: RwLockReadGuard<'a, SwissTable>,
+    profile: Option<LockProfileHold<'a>>,
+}
+
+#[cfg(not(feature = "lock-profile"))]
+pub type ShardReadGuard<'a> = RwLockReadGuard<'a, SwissTable>;
+
+#[cfg(feature = "lock-profile")]
+impl Deref for ShardReadGuard<'_> {
+    type Target = SwissTable;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+#[cfg(feature = "lock-profile")]
+impl Drop for ShardReadGuard<'_> {
+    fn drop(&mut self) {
+        self.profile.take();
+    }
+}
 
 pub(crate) struct ShardWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, SwissTable>,
     global_memory_used: &'a AtomicUsize,
     strict_memory_accounting: &'a AtomicBool,
+    #[cfg(feature = "lock-profile")]
+    profile: Option<LockProfileHold<'a>>,
 }
 
 impl Deref for ShardWriteGuard<'_> {
@@ -114,6 +156,10 @@ impl Drop for ShardWriteGuard<'_> {
             self.global_memory_used,
             self.strict_memory_accounting.load(Ordering::Relaxed),
         );
+        #[cfg(feature = "lock-profile")]
+        {
+            self.profile.take();
+        }
     }
 }
 
@@ -196,6 +242,8 @@ pub struct ConcurrentKeyspace {
     eviction_metrics: EvictionMetrics,
     /// Always-on low-overhead counters exported through INFO runtime.
     runtime_metrics: RuntimeMetrics,
+    /// Server/IO memory attribution published by the reactor pool.
+    server_memory_attribution: ServerMemoryAttribution,
     /// Cold WATCH registry used only for keys that were absent at WATCH time.
     /// Present-key validation reads entry-resident LSNs directly.
     absent_watch_shards: Box<[AbsentWatchShard]>,
@@ -208,9 +256,14 @@ pub struct ConcurrentKeyspace {
     watch_active: AtomicUsize,
     /// Global invalidation epoch for full-keyspace writes such as FLUSHALL.
     watch_epoch: AtomicU64,
-    /// Cross-reactor transaction gate. Normal commands enter as readers;
-    /// EXEC enters exclusively and waits for pre-existing commands to drain.
-    transaction_gate: CachePadded<TransactionGate>,
+    /// Per-shard transaction visibility gates. Normal commands enter the
+    /// gates for touched shards as readers; EXEC enters the same sorted shard
+    /// set exclusively between WATCH validation and queued mutation execution.
+    transaction_gates: Box<[CachePadded<TransactionGate>]>,
+    /// Profiling-only shard-lock wait/hold telemetry. Not compiled into the
+    /// default or release build.
+    #[cfg(feature = "lock-profile")]
+    lock_profile: LockProfileState,
 }
 
 impl std::fmt::Debug for ConcurrentKeyspace {
@@ -268,6 +321,9 @@ impl ConcurrentKeyspace {
         let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
+        let transaction_gates: Vec<CachePadded<TransactionGate>> = (0..num_shards)
+            .map(|_| CachePadded::new(TransactionGate::default()))
+            .collect();
         let absent_watch_shards = make_absent_watch_shards();
 
         Self {
@@ -289,11 +345,14 @@ impl ConcurrentKeyspace {
             frequency_sketch: FrequencySketch::new(),
             eviction_metrics: EvictionMetrics::default(),
             runtime_metrics: RuntimeMetrics::new(runtime_slots),
+            server_memory_attribution: ServerMemoryAttribution::default(),
             absent_watch_shards,
             absent_watch_active: AtomicUsize::new(0),
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
-            transaction_gate: CachePadded::new(TransactionGate::default()),
+            transaction_gates: transaction_gates.into_boxed_slice(),
+            #[cfg(feature = "lock-profile")]
+            lock_profile: LockProfileState::default(),
         }
     }
 
@@ -323,6 +382,9 @@ impl ConcurrentKeyspace {
         let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
+        let transaction_gates: Vec<CachePadded<TransactionGate>> = (0..num_shards)
+            .map(|_| CachePadded::new(TransactionGate::default()))
+            .collect();
         let absent_watch_shards = make_absent_watch_shards();
 
         Self {
@@ -344,11 +406,14 @@ impl ConcurrentKeyspace {
             frequency_sketch: FrequencySketch::new(),
             eviction_metrics: EvictionMetrics::default(),
             runtime_metrics: RuntimeMetrics::new(1),
+            server_memory_attribution: ServerMemoryAttribution::default(),
             absent_watch_shards,
             absent_watch_active: AtomicUsize::new(0),
             watch_active: AtomicUsize::new(0),
             watch_epoch: AtomicU64::new(0),
-            transaction_gate: CachePadded::new(TransactionGate::default()),
+            transaction_gates: transaction_gates.into_boxed_slice(),
+            #[cfg(feature = "lock-profile")]
+            lock_profile: LockProfileState::default(),
         }
     }
 
@@ -521,7 +586,10 @@ impl ConcurrentKeyspace {
             // Release reservation before returning error.
             self.memory_reserved
                 .fetch_sub(additional_bytes, Ordering::Release);
-            return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
+            return Err(EvictionAdmissionError::new(
+                MutationErrorKind::OutOfMemory,
+                None,
+            ));
         }
 
         let mut report = EvictionScanReport::default();
@@ -530,7 +598,10 @@ impl ConcurrentKeyspace {
                 .fetch_sub(additional_bytes, Ordering::Release);
             report.oom_after_scan = true;
             self.eviction_metrics.record(report);
-            return Err(EvictionAdmissionError::new(crate::commands::ERR_OOM, None));
+            return Err(EvictionAdmissionError::new(
+                MutationErrorKind::OutOfMemory,
+                None,
+            ));
         }
 
         let mut evicted = Vec::new();
@@ -538,6 +609,11 @@ impl ConcurrentKeyspace {
         let target_used = snapshot
             .max_memory
             .saturating_sub(self.memory_reserved.load(Ordering::Acquire));
+        let eviction_scan_start = if self.runtime_profile_timers_enabled() {
+            Some(Timestamp::now().as_nanos())
+        } else {
+            None
+        };
         report.bytes_freed = self.evict_until_target(
             preferred_shard,
             target_used,
@@ -546,10 +622,14 @@ impl ConcurrentKeyspace {
             &mut report,
             &mut evicted,
         );
+        let eviction_scan_nanos = eviction_scan_start
+            .map(|start| Timestamp::now().as_nanos().saturating_sub(start).max(1))
+            .unwrap_or(0);
 
         // Step 4: Re-check after eviction.
         report.oom_after_scan = self.committed_memory_pressure() > snapshot.max_memory;
-        self.eviction_metrics.record(report);
+        self.eviction_metrics
+            .record_with_duration(report, eviction_scan_nanos);
 
         if !report.oom_after_scan {
             Ok((
@@ -561,7 +641,7 @@ impl ConcurrentKeyspace {
             self.memory_reserved
                 .fetch_sub(additional_bytes, Ordering::Release);
             Err(EvictionAdmissionError::new(
-                crate::commands::ERR_OOM,
+                MutationErrorKind::OutOfMemory,
                 evicted_keys_to_box(evicted),
             ))
         }
@@ -578,6 +658,36 @@ impl ConcurrentKeyspace {
             .saturating_add(self.memory_reserved.load(Ordering::Acquire))
     }
 
+    #[cfg(not(feature = "lock-profile"))]
+    #[inline(always)]
+    fn tracked_read_guard<'a>(
+        &'a self,
+        guard: RwLockReadGuard<'a, SwissTable>,
+    ) -> ShardReadGuard<'a> {
+        guard
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline(always)]
+    fn tracked_read_guard<'a>(
+        &'a self,
+        guard: RwLockReadGuard<'a, SwissTable>,
+        started_at: Option<std::time::Instant>,
+        class: LockProfileClass,
+        guard_count: usize,
+    ) -> ShardReadGuard<'a> {
+        ShardReadGuard {
+            guard,
+            profile: self.lock_profile.finish_acquisition(
+                started_at,
+                class,
+                LockProfileKind::Read,
+                guard_count,
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "lock-profile"))]
     #[inline(always)]
     fn tracked_write_guard<'a>(
         &'a self,
@@ -588,6 +698,74 @@ impl ConcurrentKeyspace {
             global_memory_used: &self.global_memory_used,
             strict_memory_accounting: &self.strict_memory_accounting,
         }
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline(always)]
+    fn tracked_write_guard<'a>(
+        &'a self,
+        guard: RwLockWriteGuard<'a, SwissTable>,
+        started_at: Option<std::time::Instant>,
+        class: LockProfileClass,
+        guard_count: usize,
+    ) -> ShardWriteGuard<'a> {
+        ShardWriteGuard {
+            guard,
+            global_memory_used: &self.global_memory_used,
+            strict_memory_accounting: &self.strict_memory_accounting,
+            profile: self.lock_profile.finish_acquisition(
+                started_at,
+                class,
+                LockProfileKind::Write,
+                guard_count,
+            ),
+        }
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline(always)]
+    fn lock_profile_started(&self) -> Option<std::time::Instant> {
+        self.lock_profile.acquisition_started()
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline]
+    pub fn set_lock_profile_enabled(&self, enabled: bool) {
+        self.lock_profile.set_enabled(enabled);
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline]
+    pub fn lock_profile_snapshot(&self) -> LockProfileSnapshot {
+        self.lock_profile.snapshot()
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline]
+    pub fn reset_lock_profile(&self) {
+        self.lock_profile.reset();
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline]
+    pub fn enter_lock_profile_scope(&self, class: LockProfileClass) -> LockProfileScope {
+        if self.lock_profile.enabled() {
+            LockProfileScope::enter(class)
+        } else {
+            LockProfileScope::disabled()
+        }
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline]
+    pub(crate) fn record_lock_profile_retry(&self, class: LockProfileClass) {
+        self.lock_profile.record_retry(class);
+    }
+
+    #[cfg(feature = "lock-profile")]
+    #[inline]
+    pub(crate) fn record_lock_profile_revalidation_failure(&self, class: LockProfileClass) {
+        self.lock_profile.record_revalidation_failure(class);
     }
 
     fn publish_all_memory_drift(&self) {
@@ -662,11 +840,21 @@ impl ConcurrentKeyspace {
     ///
     /// Use for read-only operations: GET, EXISTS, TTL, PTTL, TYPE, STRLEN.
     #[inline(always)]
-    pub fn read_shard(&self, key: &[u8]) -> RwLockReadGuard<'_, SwissTable> {
+    pub fn read_shard(&self, key: &[u8]) -> ShardReadGuard<'_> {
         let idx = self.shard_index(key);
+        #[cfg(feature = "lock-profile")]
+        let started_at = self.lock_profile_started();
         // SAFETY: idx is always < shards.len() because mask = num_shards - 1
         // and num_shards is a power of 2. Bounds check is provably unnecessary.
-        unsafe { self.shards.get_unchecked(idx) }.read()
+        let guard = unsafe { self.shards.get_unchecked(idx) }.read();
+        #[cfg(feature = "lock-profile")]
+        {
+            self.tracked_read_guard(guard, started_at, LockProfileClass::SingleKey, 1)
+        }
+        #[cfg(not(feature = "lock-profile"))]
+        {
+            self.tracked_read_guard(guard)
+        }
     }
 
     /// Acquire a read lock on a specific shard by index.
@@ -675,7 +863,7 @@ impl ConcurrentKeyspace {
     ///
     /// Panics if `idx >= self.num_shards()`.
     #[inline(always)]
-    pub fn read_shard_by_index(&self, idx: usize) -> RwLockReadGuard<'_, SwissTable> {
+    pub fn read_shard_by_index(&self, idx: usize) -> ShardReadGuard<'_> {
         self.try_read_shard_by_index(idx)
             .expect("shard index out of bounds")
     }
@@ -694,9 +882,21 @@ impl ConcurrentKeyspace {
     /// Acquire a read lock on a specific shard by index, returning `None`
     /// when `idx` is out of range.
     #[inline(always)]
-    pub fn try_read_shard_by_index(&self, idx: usize) -> Option<RwLockReadGuard<'_, SwissTable>> {
+    pub fn try_read_shard_by_index(&self, idx: usize) -> Option<ShardReadGuard<'_>> {
         let shard = ShardId::try_new(idx, self.shard_count())?;
-        self.shards.get(shard.get()).map(|shard| shard.read())
+        let shard_idx = shard.get();
+        let shard = self.shards.get(shard_idx)?;
+        #[cfg(feature = "lock-profile")]
+        let started_at = self.lock_profile_started();
+        let guard = shard.read();
+        #[cfg(feature = "lock-profile")]
+        {
+            Some(self.tracked_read_guard(guard, started_at, LockProfileClass::SingleKey, 1))
+        }
+        #[cfg(not(feature = "lock-profile"))]
+        {
+            Some(self.tracked_read_guard(guard))
+        }
     }
 
     /// Acquire a write lock on a specific shard by index, returning `None`
@@ -704,9 +904,18 @@ impl ConcurrentKeyspace {
     #[inline(always)]
     pub(crate) fn try_write_shard_by_index(&self, idx: usize) -> Option<ShardWriteGuard<'_>> {
         let shard_id = ShardId::try_new(idx, self.shard_count())?;
-        self.shards
-            .get(shard_id.get())
-            .map(|shard| self.tracked_write_guard(shard.write()))
+        let shard = self.shards.get(shard_id.get())?;
+        #[cfg(feature = "lock-profile")]
+        let started_at = self.lock_profile_started();
+        let guard = shard.write();
+        #[cfg(feature = "lock-profile")]
+        {
+            Some(self.tracked_write_guard(guard, started_at, LockProfileClass::SingleKey, 1))
+        }
+        #[cfg(not(feature = "lock-profile"))]
+        {
+            Some(self.tracked_write_guard(guard))
+        }
     }
 
     // ─── Closure-based single-key access ────────────────────────────
@@ -756,17 +965,80 @@ impl ConcurrentKeyspace {
         let plan = ShardPlan::new(self, keys);
 
         // Acquire read locks in ascending shard order — deadlock-free.
+        #[cfg(feature = "lock-profile")]
+        let guard_count = plan.sorted_shards().len();
         let guards: ShardReadGuards<'_> = plan
             .sorted_shards()
             .iter()
             .map(|shard| {
                 let idx = shard.get();
+                #[cfg(feature = "lock-profile")]
+                let started_at = self.lock_profile_started();
                 // SAFETY: idx < shards.len() by construction (mask guarantees).
-                (idx, unsafe { self.shards.get_unchecked(idx) }.read())
+                let guard = unsafe { self.shards.get_unchecked(idx) }.read();
+                #[cfg(feature = "lock-profile")]
+                {
+                    (
+                        idx,
+                        self.tracked_read_guard(
+                            guard,
+                            started_at,
+                            LockProfileClass::MultiKey,
+                            guard_count,
+                        ),
+                    )
+                }
+                #[cfg(not(feature = "lock-profile"))]
+                {
+                    (idx, self.tracked_read_guard(guard))
+                }
             })
             .collect();
 
         (guards, plan)
+    }
+
+    #[inline]
+    pub(crate) fn prehashed_plan<'a, I>(&self, keys: I) -> PrehashedShardPlan<'a>
+    where
+        I: IntoIterator<Item = (usize, &'a [u8])>,
+    {
+        PrehashedShardPlan::new(self, keys)
+    }
+
+    #[inline]
+    pub(crate) fn multi_read_prehashed<'a, 'k>(
+        &'a self,
+        plan: &PrehashedShardPlan<'k>,
+    ) -> ShardReadGuards<'a> {
+        #[cfg(feature = "lock-profile")]
+        let guard_count = plan.sorted_shards().len();
+        plan.sorted_shards()
+            .iter()
+            .map(|shard| {
+                let idx = shard.get();
+                #[cfg(feature = "lock-profile")]
+                let started_at = self.lock_profile_started();
+                // SAFETY: idx < shards.len() by construction (mask guarantees).
+                let guard = unsafe { self.shards.get_unchecked(idx) }.read();
+                #[cfg(feature = "lock-profile")]
+                {
+                    (
+                        idx,
+                        self.tracked_read_guard(
+                            guard,
+                            started_at,
+                            LockProfileClass::MultiKey,
+                            guard_count,
+                        ),
+                    )
+                }
+                #[cfg(not(feature = "lock-profile"))]
+                {
+                    (idx, self.tracked_read_guard(guard))
+                }
+            })
+            .collect()
     }
 
     /// Acquire write locks on all shards touched by `keys`, in ascending order.
@@ -778,20 +1050,72 @@ impl ConcurrentKeyspace {
         let plan = ShardPlan::new(self, keys);
 
         // Acquire write locks in ascending shard order — deadlock-free.
+        #[cfg(feature = "lock-profile")]
+        let guard_count = plan.sorted_shards().len();
         let guards: ShardWriteGuards<'_> = plan
             .sorted_shards()
             .iter()
             .map(|shard| {
                 let idx = shard.get();
+                #[cfg(feature = "lock-profile")]
+                let started_at = self.lock_profile_started();
                 // SAFETY: idx < shards.len() by construction (mask guarantees).
-                (
-                    idx,
-                    self.tracked_write_guard(unsafe { self.shards.get_unchecked(idx) }.write()),
-                )
+                let guard = unsafe { self.shards.get_unchecked(idx) }.write();
+                #[cfg(feature = "lock-profile")]
+                {
+                    (
+                        idx,
+                        self.tracked_write_guard(
+                            guard,
+                            started_at,
+                            LockProfileClass::MultiKey,
+                            guard_count,
+                        ),
+                    )
+                }
+                #[cfg(not(feature = "lock-profile"))]
+                {
+                    (idx, self.tracked_write_guard(guard))
+                }
             })
             .collect();
 
         (guards, plan)
+    }
+
+    #[inline]
+    pub(crate) fn multi_write_prehashed<'a, 'k>(
+        &'a self,
+        plan: &PrehashedShardPlan<'k>,
+    ) -> ShardWriteGuards<'a> {
+        #[cfg(feature = "lock-profile")]
+        let guard_count = plan.sorted_shards().len();
+        plan.sorted_shards()
+            .iter()
+            .map(|shard| {
+                let idx = shard.get();
+                #[cfg(feature = "lock-profile")]
+                let started_at = self.lock_profile_started();
+                // SAFETY: idx < shards.len() by construction (mask guarantees).
+                let guard = unsafe { self.shards.get_unchecked(idx) }.write();
+                #[cfg(feature = "lock-profile")]
+                {
+                    (
+                        idx,
+                        self.tracked_write_guard(
+                            guard,
+                            started_at,
+                            LockProfileClass::MultiKey,
+                            guard_count,
+                        ),
+                    )
+                }
+                #[cfg(not(feature = "lock-profile"))]
+                {
+                    (idx, self.tracked_write_guard(guard))
+                }
+            })
+            .collect()
     }
 
     // ─── Scan operations ────────────────────────────────────────────
@@ -860,9 +1184,19 @@ impl ConcurrentKeyspace {
     #[inline(always)]
     fn write_shard(&self, key: &[u8]) -> ShardWriteGuard<'_> {
         let idx = self.shard_index(key);
+        #[cfg(feature = "lock-profile")]
+        let started_at = self.lock_profile_started();
         // SAFETY: idx is always < shards.len() because mask = num_shards - 1
         // and num_shards is a power of 2.
-        self.tracked_write_guard(unsafe { self.shards.get_unchecked(idx) }.write())
+        let guard = unsafe { self.shards.get_unchecked(idx) }.write();
+        #[cfg(feature = "lock-profile")]
+        {
+            self.tracked_write_guard(guard, started_at, LockProfileClass::SingleKey, 1)
+        }
+        #[cfg(not(feature = "lock-profile"))]
+        {
+            self.tracked_write_guard(guard)
+        }
     }
 
     /// Execute a raw table mutation on the shard containing `key`.
@@ -916,6 +1250,53 @@ mod tests {
         }
 
         panic!("failed to find keys for requested shards");
+    }
+
+    #[test]
+    fn shard_transaction_gate_blocks_only_touched_shards() {
+        let keyspace = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+        let keys = keys_for_shards(&keyspace, &[0, 1]);
+        let first = keys[0].clone();
+        let second = keys[1].clone();
+
+        let transaction_guard = keyspace.enter_transaction_gate_for_keys(&[first.as_slice()]);
+
+        let blocked_keyspace = Arc::clone(&keyspace);
+        let blocked_key = first.clone();
+        let (blocked_started_tx, blocked_started_rx) = mpsc::channel();
+        let (blocked_entered_tx, blocked_entered_rx) = mpsc::channel();
+        let blocked = thread::spawn(move || {
+            blocked_started_tx.send(()).unwrap();
+            let _guard = blocked_keyspace.enter_command_gate_for_keys(&[blocked_key.as_slice()], 0);
+            blocked_entered_tx.send(()).unwrap();
+        });
+
+        blocked_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked worker started");
+        assert!(
+            blocked_entered_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "same-shard command gate entered while transaction gate was active"
+        );
+
+        let unrelated_keyspace = Arc::clone(&keyspace);
+        let (unrelated_tx, unrelated_rx) = mpsc::channel();
+        let unrelated = thread::spawn(move || {
+            let _guard = unrelated_keyspace.enter_command_gate_for_keys(&[second.as_slice()], 0);
+            unrelated_tx.send(()).unwrap();
+        });
+        unrelated_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("different-shard command gate must not wait");
+        unrelated.join().unwrap();
+
+        drop(transaction_guard);
+        blocked_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-shard command gate entered after transaction gate drop");
+        blocked.join().unwrap();
     }
 
     fn keys_for_same_shard(keyspace: &ConcurrentKeyspace, count: usize) -> (usize, Vec<Vec<u8>>) {
@@ -1077,38 +1458,319 @@ mod tests {
     }
 
     #[test]
+    fn memory_attribution_reports_table_and_server_buckets() {
+        let ks = ConcurrentKeyspace::with_capacity(TEST_SHARDS, 128);
+        let key_a = VortexKey::from_bytes(b"mem:a");
+        let key_b = VortexKey::from_bytes(b"mem:b");
+
+        ks.write(b"mem:a", |table| {
+            table.insert(key_a.clone(), VortexValue::from_bytes(b"one"))
+        });
+        ks.write(b"mem:b", |table| {
+            table.insert(key_b.clone(), VortexValue::from_bytes(b"two"))
+        });
+        ks.write(b"mem:b", |table| table.remove(&key_b));
+
+        let engine = ks.engine_memory_attribution();
+        assert_eq!(engine.live_keys, 1);
+        assert_eq!(engine.shard_count, TEST_SHARDS);
+        assert!(engine.logical_dataset_bytes > 0);
+        assert!(engine.table_allocated_bytes > 0);
+        assert!(engine.table_total_slots >= engine.live_keys);
+        assert!(engine.capacity_slack_slots <= engine.table_total_slots);
+        assert!(engine.tombstone_slots <= engine.table_total_slots);
+        assert!(engine.load_factor > 0.0);
+        assert!(engine.bytes_per_live_key.is_some());
+
+        let server = ServerMemoryAttributionSnapshot {
+            io_fixed_buffer_reserved_bytes: 8 * 4096,
+            io_fixed_buffer_committed_bytes: 8 * 4096,
+            io_fixed_buffer_active_bytes: 4096,
+            per_connection_state_bytes: 2048,
+            connection_capacity: 32,
+            fixed_buffer_count: 8,
+            fixed_buffer_size: 4096,
+        };
+        ks.set_server_memory_attribution(server);
+        assert_eq!(ks.server_memory_attribution(), server);
+    }
+
+    #[test]
     fn runtime_metrics_snapshot_aggregates_reactor_counters() {
         let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 4);
 
         ks.record_reactor_loop_iteration(0);
         ks.record_reactor_loop_iteration(1);
         ks.record_reactor_accept_eagain_rearm(1);
+        ks.record_reactor_accept_drain(1, 3);
         ks.record_reactor_submit_sq_full_retry(2);
         ks.record_reactor_submit_failure(3);
+        ks.record_reactor_completion_budget_exhaustion(0);
+        ks.record_reactor_command_budget_exhaustion(1);
+        ks.record_reactor_accept_budget_exhaustion(1);
+        ks.record_reactor_writev_budget_exhaustion(2);
+        ks.record_reactor_maintenance_budget_exhaustion(3);
+        ks.record_reactor_yielded_connection(1);
+        ks.record_reactor_parser_resume(2);
         ks.record_reactor_completion_batch(0, 4);
         ks.record_reactor_completion_batch(1, 2);
+        ks.record_reactor_completion_nanos(1, 50);
         ks.record_reactor_command_batch(0, 3);
         ks.record_reactor_command_batch(1, 1);
+        ks.record_reactor_writev_chunk(0, 5);
+        ks.record_reactor_queued_response_bytes(0, 128);
+        ks.record_reactor_close_drain_nanos(0, 75);
         ks.record_reactor_active_expiry(2, 12, 5);
+        ks.record_reactor_active_expiry_nanos(2, 80);
+        ks.record_reactor_aof_append_nanos(2, 90);
+        ks.record_reactor_aof_fsync_nanos(2, 100);
+        ks.publish_reactor_aof_telemetry(
+            2,
+            RuntimeAofTelemetry {
+                pending_bytes: 4096,
+                pending_writes: 17,
+                fsync_requested: 3,
+                fsync_completed: 2,
+                fsync_failed: 1,
+                fsync_worker_saturation: 4,
+                backpressure_events: 5,
+                backpressure_nanos_total: 600,
+                backpressure_nanos_max: 300,
+                last_appended_lsn: 44,
+                last_durable_lsn: 40,
+                fsync_latency_nanos_total: 700,
+                fsync_latency_nanos_max: 500,
+                fsync_latency_buckets: [1, 2, 3, 4, 5, 6, 7, 8],
+            },
+        );
+        ks.record_reactor_maintenance_nanos(2, 180);
+        ks.record_reactor_metrics_flush_nanos(2, 7);
+        ks.publish_runtime_backend(RuntimeBackendSnapshot {
+            requested: RuntimeBackendMode::Auto,
+            effective: RuntimeBackendMode::Polling,
+            fixed_buffers_capable: false,
+            fixed_buffers_registered: false,
+            cancel_support: true,
+            nonblocking_drain: true,
+            requested_ring_size: 4096,
+            ..Default::default()
+        });
+        ks.record_reactor_backend_submit_syscall(0);
+        ks.record_reactor_backend_submit_syscall(3);
+        ks.record_reactor_backend_queue_status(0, 3, 4096, 2, 8192, 0);
+        ks.record_reactor_backend_queue_status(1, 5, 4096, 4, 8192, 2);
 
         let snapshot = ks.runtime_metrics();
 
+        assert_eq!(snapshot.telemetry_mode, RuntimeTelemetryMode::Minimal);
+        assert!(!snapshot.profile_timers_available);
+        assert!(snapshot.local_flush_metrics_available);
         assert_eq!(snapshot.reactor_slots, 4);
+        assert_eq!(snapshot.backend.requested, RuntimeBackendMode::Auto);
+        assert_eq!(snapshot.backend.effective, RuntimeBackendMode::Polling);
+        assert!(snapshot.backend.cancel_support);
+        assert_eq!(snapshot.backend.requested_ring_size, 4096);
+        assert_eq!(snapshot.backend_submit_syscalls, 2);
+        assert_eq!(snapshot.backend_sq_occupancy_max, 5);
+        assert_eq!(snapshot.backend_sq_capacity, 4096);
+        assert_eq!(snapshot.backend_cq_occupancy_max, 4);
+        assert_eq!(snapshot.backend_cq_capacity, 8192);
+        assert_eq!(snapshot.backend_cq_overflows, 2);
+        assert_eq!(snapshot.backend_completions_per_submit_syscall_x1000, 3_000);
         assert_eq!(snapshot.loop_iterations, 2);
         assert_eq!(snapshot.accept_eagain_rearms, 1);
+        assert_eq!(snapshot.accept_drain_runs, 1);
+        assert_eq!(snapshot.accept_drain_accepted, 3);
+        assert_eq!(snapshot.accept_drain_accepted_max, 3);
         assert_eq!(snapshot.submit_sq_full_retries, 1);
         assert_eq!(snapshot.submit_failures, 1);
+        assert_eq!(snapshot.completion_budget_exhaustions, 1);
+        assert_eq!(snapshot.command_budget_exhaustions, 1);
+        assert_eq!(snapshot.accept_budget_exhaustions, 1);
+        assert_eq!(snapshot.writev_budget_exhaustions, 1);
+        assert_eq!(snapshot.maintenance_budget_exhaustions, 1);
+        assert_eq!(snapshot.yielded_connections, 1);
+        assert_eq!(snapshot.parser_resumes, 1);
         assert_eq!(snapshot.completion_batch_count, 2);
         assert_eq!(snapshot.completion_batch_total, 6);
         assert_eq!(snapshot.completion_batch_max, 4);
         assert!((snapshot.completion_batch_avg - 3.0).abs() < f64::EPSILON);
+        #[cfg(feature = "profile-telemetry")]
+        {
+            assert_eq!(snapshot.completion_nanos_total, 50);
+            assert_eq!(snapshot.completion_nanos_max, 50);
+        }
+        #[cfg(not(feature = "profile-telemetry"))]
+        {
+            assert_eq!(snapshot.completion_nanos_total, 0);
+            assert_eq!(snapshot.completion_nanos_max, 0);
+        }
         assert_eq!(snapshot.command_batch_count, 2);
         assert_eq!(snapshot.command_batch_total, 4);
         assert_eq!(snapshot.command_batch_max, 3);
         assert!((snapshot.command_batch_avg - 2.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.writev_chunks, 1);
+        assert_eq!(snapshot.writev_iovecs_total, 5);
+        assert_eq!(snapshot.writev_iovecs_max, 5);
+        assert_eq!(snapshot.queued_response_bytes_total, 128);
+        assert_eq!(snapshot.queued_response_bytes_max, 128);
+        #[cfg(feature = "profile-telemetry")]
+        {
+            assert_eq!(snapshot.close_drain_nanos_total, 75);
+            assert_eq!(snapshot.close_drain_nanos_max, 75);
+        }
+        #[cfg(not(feature = "profile-telemetry"))]
+        {
+            assert_eq!(snapshot.close_drain_nanos_total, 0);
+            assert_eq!(snapshot.close_drain_nanos_max, 0);
+        }
         assert_eq!(snapshot.active_expiry_runs, 1);
         assert_eq!(snapshot.active_expiry_sampled, 12);
         assert_eq!(snapshot.active_expiry_expired, 5);
+        #[cfg(feature = "profile-telemetry")]
+        {
+            assert_eq!(snapshot.active_expiry_nanos_total, 80);
+            assert_eq!(snapshot.active_expiry_nanos_max, 80);
+            assert_eq!(snapshot.aof_append_nanos_total, 90);
+            assert_eq!(snapshot.aof_append_nanos_max, 90);
+            assert_eq!(snapshot.aof_fsync_nanos_total, 100);
+            assert_eq!(snapshot.aof_fsync_nanos_max, 100);
+        }
+        #[cfg(not(feature = "profile-telemetry"))]
+        {
+            assert_eq!(snapshot.active_expiry_nanos_total, 0);
+            assert_eq!(snapshot.active_expiry_nanos_max, 0);
+            assert_eq!(snapshot.aof_append_nanos_total, 0);
+            assert_eq!(snapshot.aof_append_nanos_max, 0);
+            assert_eq!(snapshot.aof_fsync_nanos_total, 0);
+            assert_eq!(snapshot.aof_fsync_nanos_max, 0);
+        }
+        assert_eq!(snapshot.aof_pending_bytes, 4096);
+        assert_eq!(snapshot.aof_pending_bytes_max, 4096);
+        assert_eq!(snapshot.aof_pending_writes, 17);
+        assert_eq!(snapshot.aof_pending_writes_max, 17);
+        assert_eq!(snapshot.aof_fsync_requested, 3);
+        assert_eq!(snapshot.aof_fsync_completed, 2);
+        assert_eq!(snapshot.aof_fsync_failed, 1);
+        assert_eq!(snapshot.aof_fsync_worker_saturation, 4);
+        assert_eq!(snapshot.aof_backpressure_events, 5);
+        assert_eq!(snapshot.aof_last_appended_lsn, 44);
+        assert_eq!(snapshot.aof_last_durable_lsn, 40);
+        assert_eq!(snapshot.aof_durable_lsn_lag, 4);
+        #[cfg(feature = "profile-telemetry")]
+        {
+            assert_eq!(snapshot.aof_backpressure_nanos_total, 600);
+            assert_eq!(snapshot.aof_backpressure_nanos_max, 300);
+            assert_eq!(snapshot.aof_fsync_latency_nanos_total, 700);
+            assert_eq!(snapshot.aof_fsync_latency_nanos_max, 500);
+            assert_eq!(snapshot.aof_fsync_latency_buckets, [1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(snapshot.maintenance_nanos_total, 180);
+            assert_eq!(snapshot.maintenance_nanos_max, 180);
+            assert_eq!(snapshot.metrics_flush_nanos_total, 7);
+            assert_eq!(snapshot.metrics_flush_nanos_max, 7);
+        }
+        #[cfg(not(feature = "profile-telemetry"))]
+        {
+            assert_eq!(snapshot.aof_backpressure_nanos_total, 0);
+            assert_eq!(snapshot.aof_backpressure_nanos_max, 0);
+            assert_eq!(snapshot.aof_fsync_latency_nanos_total, 0);
+            assert_eq!(snapshot.aof_fsync_latency_nanos_max, 0);
+            assert_eq!(snapshot.aof_fsync_latency_buckets, [0; 8]);
+            assert_eq!(snapshot.maintenance_nanos_total, 0);
+            assert_eq!(snapshot.maintenance_nanos_max, 0);
+            assert_eq!(snapshot.metrics_flush_nanos_total, 0);
+            assert_eq!(snapshot.metrics_flush_nanos_max, 0);
+        }
+    }
+
+    #[test]
+    fn runtime_metrics_flush_local_batches_once() {
+        let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 2);
+
+        ks.flush_reactor_local_metrics(
+            1,
+            RuntimeLocalFlushMetrics {
+                loop_iterations: 4,
+                accept_drain_runs: 2,
+                accept_drain_accepted: 5,
+                accept_drain_accepted_max: 3,
+                completion_batch_count: 2,
+                completion_batch_total: 9,
+                completion_batch_max: 7,
+                command_batch_count: 1,
+                command_batch_total: 8,
+                command_batch_max: 8,
+                writev_chunks: 3,
+                writev_iovecs_total: 11,
+                writev_iovecs_max: 6,
+                queued_response_bytes_total: 1024,
+                queued_response_bytes_max: 512,
+            },
+        );
+
+        let snapshot = ks.runtime_metrics();
+        assert_eq!(snapshot.loop_iterations, 4);
+        assert_eq!(snapshot.accept_drain_runs, 2);
+        assert_eq!(snapshot.accept_drain_accepted, 5);
+        assert_eq!(snapshot.accept_drain_accepted_max, 3);
+        assert_eq!(snapshot.completion_batch_count, 2);
+        assert_eq!(snapshot.completion_batch_total, 9);
+        assert_eq!(snapshot.completion_batch_max, 7);
+        assert_eq!(snapshot.command_batch_count, 1);
+        assert_eq!(snapshot.command_batch_total, 8);
+        assert_eq!(snapshot.command_batch_max, 8);
+        assert_eq!(snapshot.writev_chunks, 3);
+        assert_eq!(snapshot.writev_iovecs_total, 11);
+        assert_eq!(snapshot.writev_iovecs_max, 6);
+        assert_eq!(snapshot.queued_response_bytes_total, 1024);
+        assert_eq!(snapshot.queued_response_bytes_max, 512);
+    }
+
+    #[cfg(feature = "profile-telemetry")]
+    #[test]
+    fn runtime_telemetry_mode_controls_profile_availability() {
+        let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 1);
+        assert!(!ks.runtime_profile_timers_enabled());
+        assert_eq!(
+            ks.runtime_metrics().telemetry_mode,
+            RuntimeTelemetryMode::Minimal
+        );
+
+        ks.set_runtime_telemetry_mode(RuntimeTelemetryMode::Profile);
+
+        let snapshot = ks.runtime_metrics();
+        assert_eq!(snapshot.telemetry_mode, RuntimeTelemetryMode::Profile);
+        assert!(snapshot.profile_timers_available);
+        assert!(ks.runtime_profile_timers_enabled());
+    }
+
+    #[test]
+    fn runtime_backend_contract_marks_mixed_plans() {
+        let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 2);
+
+        ks.publish_runtime_backend(RuntimeBackendSnapshot {
+            requested: RuntimeBackendMode::Auto,
+            effective: RuntimeBackendMode::Polling,
+            cancel_support: true,
+            nonblocking_drain: true,
+            ..Default::default()
+        });
+        ks.publish_runtime_backend(RuntimeBackendSnapshot {
+            requested: RuntimeBackendMode::Auto,
+            effective: RuntimeBackendMode::IoUring,
+            fixed_buffers_capable: true,
+            close_opcode: true,
+            cancel_support: true,
+            nonblocking_drain: true,
+            requested_ring_size: 4096,
+            effective_ring_size: 4096,
+            ..Default::default()
+        });
+
+        let snapshot = ks.runtime_metrics();
+
+        assert!(snapshot.backend.mixed);
+        assert_eq!(snapshot.backend.effective, RuntimeBackendMode::Mixed);
     }
 
     /// Verify that concurrent max updates never lose the largest value.
@@ -1239,7 +1901,7 @@ mod tests {
 
         let flush_lsn = ks.flush_all_with_lsn();
 
-        assert_eq!(flush_lsn, Some(lsn_before_flush));
+        assert_eq!(flush_lsn.map(AofLsn::get), Some(lsn_before_flush));
         assert_eq!(ks.current_lsn(), lsn_before_flush + 1);
         assert_eq!(ks.dbsize(), 0);
         assert!(
@@ -1320,7 +1982,7 @@ mod tests {
             .expect("writer worker should not panic");
 
         assert!(
-            flush_lsn < writer_lsn,
+            flush_lsn.get() < writer_lsn,
             "post-FLUSH writer LSN must be greater than FLUSH LSN"
         );
     }
@@ -2063,7 +2725,7 @@ mod tests {
         ks.configure_eviction(ks.memory_used(), EvictionPolicy::VolatileLru);
 
         let error = ks.ensure_memory_for(0, 1, 0).unwrap_err();
-        assert_eq!(error.response, crate::commands::ERR_OOM);
+        assert_eq!(error.kind, MutationErrorKind::OutOfMemory);
 
         let metrics = ks.eviction_metrics();
         assert_eq!(metrics.admissions, 1);
@@ -2116,7 +2778,7 @@ mod tests {
             let evicted = evicted.expect("AOF-enabled eviction should return records");
             assert_eq!(evicted.len(), 1, "policy {policy:?}");
             assert_eq!(evicted[0].key, key, "policy {policy:?}");
-            assert_eq!(evicted[0].lsn, 0, "policy {policy:?}");
+            assert_eq!(evicted[0].lsn.get(), 0, "policy {policy:?}");
             assert_eq!(ks.current_lsn(), 1, "policy {policy:?}");
             assert_eq!(ks.dbsize(), 0, "policy {policy:?}");
             assert_eq!(ks.approx_expiring_keys(), 0, "policy {policy:?}");
@@ -2201,7 +2863,7 @@ mod tests {
 
         let additional_bytes = ks.max_memory() + 1;
         let error = ks.ensure_memory_for(0, additional_bytes, 0).unwrap_err();
-        assert_eq!(error.response, crate::commands::ERR_OOM);
+        assert_eq!(error.kind, MutationErrorKind::OutOfMemory);
 
         let metrics = ks.eviction_metrics();
         assert_eq!(metrics.admissions, 1);

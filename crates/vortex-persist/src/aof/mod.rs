@@ -14,7 +14,12 @@
 //!   thread. No locks, no SPSC channel, no extra thread. The 64 KB userspace
 //!   buffer absorbs write bursts; fsync is periodic or explicit.
 //! - **Three fsync modes:** `always` (durability per command), `everysec`
-//!   (default, <3% overhead), `no` (OS-managed).
+//!   (default), `no` (OS-managed).
+//!   `always` releases responses after file flush plus `sync_data()`.
+//!   `everysec` and `no` release after userspace append; they can lose
+//!   acknowledged writes on process or OS crash according to their configured
+//!   loss window. `everysec` uses a bounded async worker backlog and applies
+//!   reactor backpressure before unsynced bytes can grow without limit.
 //! - **Global LSN ordering:** each mutation is assigned a monotonic LSN from
 //!   `ConcurrentKeyspace::next_lsn()` (inside the shard write-lock critical
 //!   section). The LSN prefixes every record, enabling deterministic K-Way
@@ -46,12 +51,28 @@
 //! on replay. Truncated trailing records (from crash mid-write) are detected
 //! by the parser returning `NeedMoreData` and safely discarded.
 
+pub mod contract;
+pub mod error;
+#[cfg(any(test, feature = "test-faults"))]
+pub mod fault;
 pub mod format;
 pub mod reader;
 pub mod rewrite;
 pub mod writer;
 
-pub use format::{AOF_HEADER_SIZE, AOF_MAGIC, AofFsyncPolicy, AofHeader};
-pub use reader::{AofReader, ReplayStats};
-pub use rewrite::AofRewriter;
-pub use writer::AofFileWriter;
+pub use contract::{AofAppendOutcome, AofCommitPoint, AofDurabilityRequirement, AofPolicyContract};
+pub use error::{AofError, AofErrorKind, aof_error_kind};
+#[cfg(any(test, feature = "test-faults"))]
+pub use fault::{AofFaultPlan, AofFaultPoint, FaultingWrite};
+pub use format::{
+    AOF_HEADER_SIZE, AOF_MAGIC, AOF_TRANSACTION_BATCH_COMMAND, AofFsyncPolicy, AofHeader,
+    AofReactorId, AofReactorIdError, AofWriterMode,
+};
+pub use reader::{AofReader, AofReplayConfig, ReplayStats};
+#[cfg(any(test, feature = "test-faults"))]
+pub use rewrite::AofRewriteFaultPoint;
+pub use rewrite::{AofManifest, AofManifestState, AofRewriteOutcome, AofRewriter};
+pub use writer::{
+    AOF_FSYNC_LATENCY_BUCKETS, AofFileWriter, AofMaintenanceOutcome, AofRecordBytes,
+    AofTelemetrySnapshot,
+};

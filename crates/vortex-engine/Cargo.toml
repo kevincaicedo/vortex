@@ -9,7 +9,9 @@ autoexamples = false
 [features]
 default = ["simd"]
 simd = []
-profiling-tools = ["dep:clap", "dep:tikv-jemallocator"]
+lock-profile = []
+profile-telemetry = []
+profiling-tools = ["dep:clap", "dep:tikv-jemallocator", "lock-profile", "profile-telemetry"]
 
 [lints.rust]
 unsafe_code = "allow"
@@ -48,4 +50,24 @@ harness = false
 [[example]]
 name = "engine_probe"
 path = "examples/engine_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "c2c_probe"
+path = "examples/c2c_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "lock_offcpu_probe"
+path = "examples/lock_offcpu_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "allocation_probe"
+path = "examples/allocation_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "atomic_contention_probe"
+path = "examples/atomic_contention_probe.rs"
 required-features = ["profiling-tools"]

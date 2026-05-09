@@ -30,6 +30,7 @@ Configuration is loaded from multiple sources with the following precedence (hig
 | Option | CLI | Env Var | Default | Description |
 |--------|-----|---------|---------|-------------|
 | Threads | `--threads` | `VORTEX_THREADS` | `0` | Number of reactor threads. `0` auto-detects from CPU count — one reactor per core. Each reactor owns an independent shard, I/O backend, and connection pool. |
+| Shard count | `--shard-count` | `VORTEX_SHARD_COUNT` | `4096` | Number of engine keyspace shards. Must be a power of two in `64..=131072`. Benchmark matrix sweeps use this to test lock contention and memory overhead tradeoffs. |
 
 ---
 
@@ -39,9 +40,9 @@ Configuration is loaded from multiple sources with the following precedence (hig
 |--------|-----|---------|---------|-------------|
 | I/O backend | `--io-backend` | `VORTEX_IO_BACKEND` | `auto` | I/O multiplexing backend. Values: `auto`, `uring`, `polling`. |
 | Ring size | `--ring-size` | `VORTEX_RING_SIZE` | `4096` | io_uring submission queue size. Must be a power of two. Larger values allow more inflight I/O operations. Only applies to `uring` backend. |
-| Fixed buffers | `--fixed-buffers` | `VORTEX_FIXED_BUFFERS` | `20000` | Number of fixed I/O buffers pre-registered with io_uring for zero-copy I/O. Must be at least `max_clients * 2` because each live connection uses one read buffer and one write buffer. |
+| Fixed buffers | `--fixed-buffers` | `VORTEX_FIXED_BUFFERS` | `1024` | Number of fixed I/O buffers pre-registered with io_uring for zero-copy I/O. Each live connection leases one read buffer; the runtime active-client budget is capped by this pool. |
 | Buffer size | `--buffer-size` | `VORTEX_BUFFER_SIZE` | `16384` | Size of each I/O buffer in bytes. Minimum: `4096`. Larger buffers reduce syscalls for big values but increase memory usage. |
-| SQPOLL idle | `--sqpoll-idle-ms` | `VORTEX_SQPOLL_IDLE_MS` | `1000` | io_uring SQPOLL kernel thread idle timeout in milliseconds. The kernel thread polls SQEs without syscalls; it sleeps after this idle period. |
+| SQPOLL idle | `--sqpoll-idle-ms` | `VORTEX_SQPOLL_IDLE_MS` | `0` | io_uring SQPOLL kernel thread idle timeout in milliseconds. `0` disables SQPOLL. The kernel thread polls SQEs without syscalls; it sleeps after this idle period. |
 
 ### I/O Backend Values
 
@@ -153,13 +154,14 @@ connection_timeout_secs = 300
 
 # Threading
 threads = 0  # auto-detect
+shard_count = 4096
 
 # I/O
 io_backend = "auto"
 ring_size = 4096
 fixed_buffers = 2048
 buffer_size = 16384
-sqpoll_idle_ms = 1000
+sqpoll_idle_ms = 0
 
 # Memory
 max_memory = 0  # unlimited
@@ -196,3 +198,4 @@ The server validates configuration at startup and exits with an error for invali
 | `aof_fsync` must be `always`, `everysec`, or `no` | `invalid aof_fsync value 'X'` |
 | `eviction_policy` must be a recognized policy | `invalid eviction_policy 'X'` |
 | `threads` resolves to > 0 after auto-detection | `threads must be > 0` |
+| `shard_count` must be a power of two in `64..=131072` | `shard_count must be a power of two in 64..=131072, got N` |

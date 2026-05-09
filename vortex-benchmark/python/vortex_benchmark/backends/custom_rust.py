@@ -11,6 +11,7 @@ from vortex_benchmark.backends.base import (
     DEFAULT_CUSTOM_THREAD_SWEEP,
     DEFAULT_CUSTOM_VALUE_SIZE,
     DEFAULT_CUSTOM_WARMUP_OPS,
+    apply_load_affinity,
     coerce_int_list,
     coerce_positive_int,
     get_setting,
@@ -133,6 +134,9 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
                 "--workload",
                 workload,
             ]
+            if duration_seconds is not None:
+                command.extend(["--duration-ms", str(duration_seconds * 1000)])
+            command = apply_load_affinity(context, command)
 
             snapshot_before = capture_service_snapshot(context.service)
             host_telemetry = None
@@ -191,7 +195,7 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
     notes: list[str] = []
     if duration_seconds is not None:
         notes.append(
-            "custom-rust currently uses ops-per-thread execution; the requested duration was recorded for context but not enforced in Phase 4"
+            "custom-rust enforces requested duration for pressure workloads; standard workloads still use ops-per-thread execution"
         )
 
     completed_at = utc_now()

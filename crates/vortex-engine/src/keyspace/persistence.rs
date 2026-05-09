@@ -51,6 +51,15 @@ impl AofLsn {
     pub fn try_from_raw(lsn: u64) -> Result<Self, LsnOverflow> {
         EntryLsn::try_from_raw(lsn).map(|entry_lsn| Self(entry_lsn.get()))
     }
+
+    #[inline]
+    pub(crate) fn from_allocated_lsn(lsn: u64) -> Self {
+        Self(
+            EntryLsn::try_from_raw(lsn)
+                .expect("global LSN exceeds AOF replay storage range")
+                .get(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,15 +147,16 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
-    pub(crate) fn next_aof_lsn(&self) -> Option<u64> {
-        self.aof_recording_enabled().then(|| self.next_lsn())
+    pub(crate) fn next_aof_lsn(&self) -> Option<AofLsn> {
+        self.aof_recording_enabled()
+            .then(|| AofLsn::from_allocated_lsn(self.next_lsn()))
     }
 
     #[inline(always)]
     pub(crate) fn allocate_observed_mutation_lsn_with_features(
         &self,
         features: MutationFeatures,
-    ) -> (Option<u64>, Option<u64>) {
+    ) -> (Option<u64>, Option<AofLsn>) {
         if !features.entry_lsn_observed() {
             return (None, None);
         }
@@ -156,7 +166,10 @@ impl ConcurrentKeyspace {
         } else {
             self.next_lsn()
         };
-        (Some(lsn), features.aof().then_some(lsn))
+        (
+            Some(lsn),
+            features.aof().then(|| AofLsn::from_allocated_lsn(lsn)),
+        )
     }
 
     /// Read the current LSN value (the next LSN to be assigned).

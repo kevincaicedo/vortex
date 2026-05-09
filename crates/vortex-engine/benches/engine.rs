@@ -369,6 +369,42 @@ fn bench_cmd_append_inline(c: &mut Criterion) {
     });
 }
 
+fn bench_cmd_setrange_inline(c: &mut Criterion) {
+    let cmd = make_resp(&[b"SETRANGE", b"mykey", b"2", b"abc"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_setrange_inline", |b| {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        let key = VortexKey::from(b"mykey" as &[u8]);
+        insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"hello"));
+
+        b.iter(|| {
+            insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"hello"));
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"SETRANGE", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
+fn bench_cmd_incrbyfloat_inline(c: &mut Criterion) {
+    let cmd = make_resp(&[b"INCRBYFLOAT", b"mykey", b"0.5"]);
+    let tape = RespTape::parse_pipeline(&cmd).unwrap();
+
+    c.bench_function("cmd_incrbyfloat_inline", |b| {
+        let keyspace = ConcurrentKeyspace::new(BENCH_CONCURRENT_SHARDS);
+        let key = VortexKey::from(b"mykey" as &[u8]);
+        insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"1.25"));
+
+        b.iter(|| {
+            insert_keyspace_value(&keyspace, key.clone(), VortexValue::from_bytes(b"1.25"));
+            let frame = tape.iter().next().unwrap();
+            let r = execute_command(black_box(&keyspace), b"INCRBYFLOAT", &frame, 0);
+            black_box(r);
+        });
+    });
+}
+
 fn bench_cmd_dbsize_10k(c: &mut Criterion) {
     let keyspace = prefill_keyspace(10_000);
     let cmd = make_resp(&[b"DBSIZE"]);
@@ -516,6 +552,109 @@ fn bench_cmd_exists_small_batches(c: &mut Criterion) {
                 let r = execute_command(black_box(&keyspace), b"EXISTS", &frame, 0);
                 black_box(r);
             });
+        });
+    }
+}
+
+fn bench_eng_alpha_009_multikey_widths(c: &mut Criterion) {
+    for width in [1usize, 16, 256, 4096] {
+        let key_count = width.max(4096);
+
+        let mget_keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, key_count);
+        let mut mget_parts: Vec<Vec<u8>> = vec![b"MGET".to_vec()];
+        for i in 0..width {
+            let key = format!("key:{i:08}").into_bytes();
+            insert_keyspace_value(
+                &mget_keyspace,
+                VortexKey::from(key.as_slice()),
+                VortexValue::Integer(i as i64),
+            );
+            mget_parts.push(key);
+        }
+        let refs: Vec<&[u8]> = mget_parts.iter().map(Vec::as_slice).collect();
+        let cmd = make_resp(&refs);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        c.bench_function(&format!("eng_alpha_009_cmd_mget_{width}"), |b| {
+            b.iter(|| {
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mget_keyspace), b"MGET", &frame, 0);
+                black_box(r);
+            });
+        });
+
+        let mset_keyspace = ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, key_count);
+        let mut write_parts: Vec<Vec<u8>> = vec![b"MSET".to_vec()];
+        for i in 0..width {
+            let key = format!("key:{i:08}").into_bytes();
+            insert_keyspace_value(
+                &mset_keyspace,
+                VortexKey::from(key.as_slice()),
+                VortexValue::from_bytes(b"old"),
+            );
+            write_parts.push(key);
+            write_parts.push(format!("val:{i:08}").into_bytes());
+        }
+        let refs: Vec<&[u8]> = write_parts.iter().map(Vec::as_slice).collect();
+        let cmd = make_resp(&refs);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        c.bench_function(&format!("eng_alpha_009_cmd_mset_{width}"), |b| {
+            b.iter(|| {
+                let frame = tape.iter().next().unwrap();
+                let r = execute_command(black_box(&mset_keyspace), b"MSET", &frame, 0);
+                black_box(r);
+            });
+        });
+
+        let mut msetnx_parts = Vec::with_capacity((width * 2) + 1);
+        msetnx_parts.push(b"MSETNX".to_vec());
+        for i in 0..width {
+            msetnx_parts.push(format!("nx:{i:08}").into_bytes());
+            msetnx_parts.push(format!("val:{i:08}").into_bytes());
+        }
+        let refs: Vec<&[u8]> = msetnx_parts.iter().map(Vec::as_slice).collect();
+        let cmd = make_resp(&refs);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        c.bench_function(&format!("eng_alpha_009_cmd_msetnx_{width}"), |b| {
+            b.iter_batched_ref(
+                || ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, key_count),
+                |keyspace| {
+                    let frame = tape.iter().next().unwrap();
+                    let r = execute_command(black_box(&*keyspace), b"MSETNX", &frame, 0);
+                    black_box(r);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        let delete_keys: Vec<Vec<u8>> = (0..width)
+            .map(|i| format!("del:{i:08}").into_bytes())
+            .collect();
+        let mut del_parts = vec![b"DEL".to_vec()];
+        del_parts.extend(delete_keys.iter().cloned());
+        let refs: Vec<&[u8]> = del_parts.iter().map(Vec::as_slice).collect();
+        let cmd = make_resp(&refs);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        c.bench_function(&format!("eng_alpha_009_cmd_del_{width}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let keyspace =
+                        ConcurrentKeyspace::with_capacity(BENCH_CONCURRENT_SHARDS, key_count);
+                    for key in &delete_keys {
+                        insert_keyspace_value(
+                            &keyspace,
+                            VortexKey::from(key.as_slice()),
+                            VortexValue::Integer(0),
+                        );
+                    }
+                    keyspace
+                },
+                |keyspace| {
+                    let frame = tape.iter().next().unwrap();
+                    let r = execute_command(black_box(&*keyspace), b"DEL", &frame, 0);
+                    black_box(r);
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
 }
@@ -1472,11 +1611,14 @@ criterion_group!(
     bench_cmd_mset_100,
     bench_cmd_mset_duplicate_100_noeviction,
     bench_cmd_append_inline,
+    bench_cmd_setrange_inline,
+    bench_cmd_incrbyfloat_inline,
     bench_cmd_dbsize_10k,
     bench_cmd_del_inline,
     bench_cmd_exists,
     bench_cmd_del_small_batches,
     bench_cmd_exists_small_batches,
+    bench_eng_alpha_009_multikey_widths,
     bench_cmd_expire,
     bench_cmd_ttl,
     bench_active_expiry_empty_shard,

@@ -10,6 +10,8 @@ default = ["polling-fallback"]
 io-uring = ["dep:io-uring"]
 sqpoll = ["io-uring"]
 polling-fallback = []
+lock-profile = ["vortex-engine/lock-profile"]
+profile-telemetry = ["vortex-engine/profile-telemetry", "vortex-persist/profile-telemetry"]
 
 [dependencies]
 vortex-common = { workspace = true }
@@ -22,6 +24,7 @@ bytes = { workspace = true }
 polling = { workspace = true }
 socket2 = { workspace = true }
 slab = { workspace = true }
+smallvec = { workspace = true }
 core_affinity = { workspace = true }
 crossbeam-utils = { workspace = true }
 libc = { workspace = true }

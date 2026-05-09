@@ -15,6 +15,12 @@ from vortex_benchmark.reporting import (
     render_report_charts,
 )
 from vortex_benchmark.reporting.collector import resolve_summary_paths
+from vortex_benchmark.reporting.interpretation import (
+    annotate_interpretation_rows,
+    build_alpha_gate_summary,
+    build_interpretation_rows,
+    build_workload_contract_rows,
+)
 
 
 def _resolve_output_root(summary_paths: list[Path], results_dir: str | None, output_dir: str | None) -> str | None:
@@ -200,9 +206,38 @@ def execute_report(args) -> Path:
     payload = build_report_payload(summary_paths, title=getattr(args, "title", None))
     db_names = [d.get("database", "unknown") for d in payload.get("databases", [])]
     payload["analysis"] = build_analysis(payload.get("rows", []), db_names)
+    annotate_interpretation_rows(
+        payload.get("rows", []),
+        payload.get("validity") or {},
+        payload.get("host_metadata") or {},
+        payload["analysis"].get("comparison_validity") or [],
+    )
+    aggregated_rows = payload["analysis"].get("aggregated_rows") or payload.get("rows", [])
+    annotate_interpretation_rows(
+        aggregated_rows,
+        payload.get("validity") or {},
+        payload.get("host_metadata") or {},
+        payload["analysis"].get("comparison_validity") or [],
+    )
+    payload["analysis"]["alpha_gate_summary"] = build_alpha_gate_summary(
+        aggregated_rows,
+        payload.get("validity") or {},
+    )
+    payload["analysis"]["interpretation_rows"] = build_interpretation_rows(
+        aggregated_rows
+    )
+    payload["analysis"]["workload_contract_rows"] = build_workload_contract_rows(
+        aggregated_rows
+    )
+    diagnostics = payload.setdefault("diagnostics", {})
+    diagnostics["alpha_gate_summary"] = payload["analysis"]["alpha_gate_summary"]
+    diagnostics["interpretation_rows"] = payload["analysis"]["interpretation_rows"]
+    diagnostics["workload_contract_rows"] = payload["analysis"][
+        "workload_contract_rows"
+    ]
     benchmark = payload.get("benchmark") or {}
     benchmark["analysis"] = payload["analysis"]
-    benchmark["rows"] = payload["analysis"].get("aggregated_rows") or payload.get("rows", [])
+    benchmark["rows"] = aggregated_rows
     payload["benchmark"] = benchmark
     stamp = timestamp_slug()
     stem = f"{stamp}_report"

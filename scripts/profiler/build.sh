@@ -25,8 +25,8 @@ build_profiling_binary() {
     fi
 
     PROFILING_CARGO_PROFILE="profiling"
-    info "Building vortex-server (--profile profiling)..."
-    if ! (cd "$REPO_ROOT" && cargo build --profile profiling --bin vortex-server 2>&1); then
+    info "Building vortex-server (--profile profiling --features profile-telemetry)..."
+    if ! (cd "$REPO_ROOT" && cargo build --profile profiling --features profile-telemetry --bin vortex-server 2>&1); then
         fatal "Build failed. Fix compilation errors and retry."
     fi
     ensure_macos_debuggable_binary "$PROFILING_BINARY"

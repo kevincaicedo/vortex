@@ -1,0 +1,32 @@
+schema_version: 1
+name: wave3-eviction-pressure-native
+description: "Native Wave 3 eviction-pressure row: one writer exceeding maxmemory plus 100 latency-sensitive pipeline-1 GET clients with p99.9-capable custom-rust reporting."
+databases:
+  - vortex
+  - redis
+backends:
+  - custom-rust
+workloads:
+  - pressure-eviction_pressure
+repeat: 3
+duration: 10s
+environment:
+  mode: native
+  port_base: 18979
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  maxmemory: 128mb
+  eviction_policy: allkeys-lru
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 100
+    keyspace_size: 5000
+    ops_per_thread: 1000
+    warmup_ops: 50
+    value_size: 64

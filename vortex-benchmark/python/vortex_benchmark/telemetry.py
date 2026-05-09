@@ -121,6 +121,10 @@ def _detect_cpu_governor() -> Optional[str]:
     return _read_text(Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"))
 
 
+def _detect_cpu_scaling_driver() -> Optional[str]:
+    return _read_text(Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver"))
+
+
 def _detect_energy_performance_preference() -> Optional[str]:
     return _read_text(
         Path("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
@@ -161,6 +165,40 @@ def _detect_power_profile() -> dict[str, Any]:
     }
 
 
+def _normalize_power_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("_", "-")
+    return text or None
+
+
+def _infer_effective_cpu_power_mode(
+    *,
+    governor: Optional[str],
+    scaling_driver: Optional[str],
+    energy_preference: Optional[str],
+    power_profile: Optional[str],
+) -> Optional[str]:
+    gov = _normalize_power_value(governor)
+    driver = _normalize_power_value(scaling_driver)
+    epp = _normalize_power_value(energy_preference)
+    profile = _normalize_power_value(power_profile)
+
+    if profile == "performance" or epp == "performance" or gov == "performance":
+        return "performance"
+    if profile in {"power-saver", "power-save"}:
+        return "power-saver"
+    if profile == "balanced":
+        return "balanced"
+    if epp in {"balance-performance", "balanced-performance"}:
+        return "balanced-performance"
+    if epp in {"balance-power", "balanced-power", "power"}:
+        return "power-saver"
+    if gov == "powersave":
+        return "intel-pstate-powersave" if driver == "intel-pstate" else "powersave"
+    return gov or profile or epp
+
+
 def _detect_git_revision(repo_root: Optional[Path]) -> dict[str, Any]:
     if repo_root is None:
         return {"revision": None, "dirty": None}
@@ -174,6 +212,8 @@ def _detect_git_revision(repo_root: Optional[Path]) -> dict[str, Any]:
 def _service_validity_record(service: ServiceState) -> dict[str, Any]:
     runtime = dict(service.runtime_config or {})
     metadata = dict(service.metadata or {})
+    io_backend_requested = runtime.get("io_backend")
+    io_backend_effective = _infer_vortex_effective_backend(service, io_backend_requested)
     return {
         "database": service.database,
         "mode": service.mode,
@@ -181,16 +221,49 @@ def _service_validity_record(service: ServiceState) -> dict[str, Any]:
         "pid": service.pid,
         "container_id": service.container_id,
         "threads": (service.resource_config or {}).get("threads"),
+        "service_cpus": (service.resource_config or {}).get("service_cpus"),
+        "load_cpus": (service.resource_config or {}).get("load_cpus"),
         "bind": metadata.get("bind"),
         "binary": metadata.get("binary"),
         "version": metadata.get("version"),
         "command": metadata.get("command"),
         "io_backend": runtime.get("io_backend"),
+        "io_backend_requested": io_backend_requested,
+        "io_backend_effective": io_backend_effective,
+        "telemetry_mode": runtime.get("telemetry_mode"),
         "ring_size": runtime.get("ring_size"),
         "fixed_buffers": runtime.get("fixed_buffers"),
+        "fixed_buffer_registration": runtime.get("fixed_buffer_registration"),
         "sqpoll_idle_ms": runtime.get("sqpoll_idle_ms"),
         "shard_count": runtime.get("shard_count") or metadata.get("shard_count"),
     }
+
+
+def _infer_vortex_effective_backend(
+    service: ServiceState, requested: Any
+) -> Optional[str]:
+    if service.database != "vortex":
+        return None
+
+    requested_text = str(requested or "auto")
+    command = str((service.metadata or {}).get("command") or "")
+    log_text = _read_text(Path(service.log_path)) or ""
+
+    if requested_text in {"polling", "uring"}:
+        return requested_text
+    if "backend_effective=\"polling\"" in log_text or "backend_effective=polling" in log_text:
+        return "polling"
+    if "backend_effective=\"io_uring\"" in log_text or "backend_effective=io_uring" in log_text:
+        return "io_uring"
+    if "--io-backend polling" in command or "io_backend=polling" in log_text:
+        return "polling"
+    if "--io-backend uring" in command or "io_backend=uring" in log_text:
+        return "uring"
+    if "falling back to polling" in log_text:
+        return "polling"
+    if "io_backend=auto" in log_text and "reactor pool started" in log_text:
+        return "uring"
+    return "unknown"
 
 
 def capture_run_validity(
@@ -202,6 +275,10 @@ def capture_run_validity(
     aggregates_multiple_replicates: bool = False,
 ) -> dict[str, Any]:
     power = _detect_power_profile()
+    cpu_governor = _detect_cpu_governor()
+    cpu_scaling_driver = _detect_cpu_scaling_driver()
+    energy_preference = _detect_energy_performance_preference()
+    power_profile = power.get("profile")
     perf_event_paranoid = _detect_perf_event_paranoid()
     return {
         "captured_at": utc_now(),
@@ -209,9 +286,16 @@ def capture_run_validity(
         "requested_repeat_count": requested_repeat_count,
         "aggregates_multiple_replicates": aggregates_multiple_replicates,
         "host": {
-            "cpu_governor": _detect_cpu_governor(),
-            "energy_performance_preference": _detect_energy_performance_preference(),
-            "power_profile": power.get("profile"),
+            "cpu_governor": cpu_governor,
+            "cpu_scaling_driver": cpu_scaling_driver,
+            "energy_performance_preference": energy_preference,
+            "power_profile": power_profile,
+            "effective_cpu_power_mode": _infer_effective_cpu_power_mode(
+                governor=cpu_governor,
+                scaling_driver=cpu_scaling_driver,
+                energy_preference=energy_preference,
+                power_profile=power_profile,
+            ),
             "thermal_degraded": power.get("degraded"),
             "thermal_source": power.get("source"),
             "perf_event_paranoid": perf_event_paranoid,
@@ -937,6 +1021,8 @@ class HostTelemetryCollector:
                     collected.append(float(value))
             return collected
 
+        invalid_delta_fields: list[str] = []
+
         def delta(key: str) -> Optional[float]:
             first = next(
                 (sample.get(key) for sample in self._samples if sample.get(key) is not None),
@@ -946,9 +1032,7 @@ class HostTelemetryCollector:
                 (sample.get(key) for sample in reversed(self._samples) if sample.get(key) is not None),
                 None,
             )
-            if first is None or last is None:
-                return None
-            return float(last) - float(first)
+            return _snapshot_delta(key, first, last, invalid_delta_fields)
 
         def avg(key: str) -> Optional[float]:
             series = values(key)
@@ -967,6 +1051,15 @@ class HostTelemetryCollector:
             if not series:
                 return None
             return min(series)
+
+        runtime_summary: dict[str, Any] = {
+            "runtime_reactor_slots": peak("runtime_reactor_slots")
+        }
+        for field in _RUNTIME_DELTA_FIELDS:
+            runtime_summary[f"{field}_delta"] = delta(field)
+            runtime_summary[f"{field}_peak"] = peak(field)
+        for field in _RUNTIME_FLOAT_FIELDS:
+            runtime_summary[f"{field}_peak"] = peak(field)
 
         return {
             "supported": True,
@@ -1027,25 +1120,8 @@ class HostTelemetryCollector:
             "disk_write_bytes_delta": delta("disk_write_bytes"),
             "disk_io_time_delta_ms": delta("disk_io_time_ms"),
             "disk_io_in_progress_peak": peak("disk_io_in_progress"),
-            "runtime_reactor_slots": peak("runtime_reactor_slots"),
-            "reactor_loop_iterations_delta": delta("reactor_loop_iterations"),
-            "reactor_accept_eagain_rearms_delta": delta("reactor_accept_eagain_rearms"),
-            "reactor_completion_batches_delta": delta("reactor_completion_batches"),
-            "reactor_completion_batch_total_delta": delta("reactor_completion_batch_total"),
-            "reactor_completion_batch_max_peak": peak("reactor_completion_batch_max"),
-            "reactor_completion_batch_avg_peak": peak("reactor_completion_batch_avg"),
-            "reactor_command_batches_delta": delta("reactor_command_batches"),
-            "reactor_command_batch_total_delta": delta("reactor_command_batch_total"),
-            "reactor_command_batch_max_peak": peak("reactor_command_batch_max"),
-            "reactor_command_batch_avg_peak": peak("reactor_command_batch_avg"),
-            "reactor_active_expiry_runs_delta": delta("reactor_active_expiry_runs"),
-            "reactor_active_expiry_sampled_delta": delta("reactor_active_expiry_sampled"),
-            "reactor_active_expiry_expired_delta": delta("reactor_active_expiry_expired"),
-            "eviction_admissions_delta": delta("eviction_admissions"),
-            "eviction_shards_scanned_delta": delta("eviction_shards_scanned"),
-            "eviction_slots_sampled_delta": delta("eviction_slots_sampled"),
-            "eviction_bytes_freed_delta": delta("eviction_bytes_freed"),
-            "eviction_oom_after_scan_delta": delta("eviction_oom_after_scan"),
+            "invalid_delta_fields": sorted(set(invalid_delta_fields)),
+            **runtime_summary,
         }
 
 
@@ -1092,30 +1168,284 @@ def _parse_info_response(payload: str) -> dict[str, str]:
     return info
 
 
+_RUNTIME_INT_FIELDS = [
+    "runtime_profile_timers_available",
+    "runtime_local_flush_metrics_available",
+    "backend_plan_mixed",
+    "backend_fixed_buffers_capable",
+    "backend_fixed_buffers_registered",
+    "backend_sqpoll",
+    "backend_multishot_accept",
+    "backend_accept4",
+    "backend_close_opcode",
+    "backend_cancel_support",
+    "backend_nonblocking_drain",
+    "backend_requested_ring_size",
+    "backend_effective_ring_size",
+    "backend_submit_syscalls",
+    "backend_sq_occupancy_max",
+    "backend_sq_capacity",
+    "backend_cq_occupancy_max",
+    "backend_cq_capacity",
+    "backend_cq_overflows",
+    "backend_completions_per_submit_syscall_x1000",
+    "backend_sq_pressure_events",
+    "backend_cq_pressure_events",
+    "runtime_reactor_slots",
+    "reactor_loop_iterations",
+    "reactor_accept_eagain_rearms",
+    "reactor_accept_drain_runs",
+    "reactor_accept_drain_accepted",
+    "reactor_accept_drain_accepted_max",
+    "reactor_submit_sq_full_retries",
+    "reactor_submit_failures",
+    "reactor_completion_budget_exhaustions",
+    "reactor_command_budget_exhaustions",
+    "reactor_accept_budget_exhaustions",
+    "reactor_writev_budget_exhaustions",
+    "reactor_maintenance_budget_exhaustions",
+    "reactor_yielded_connections",
+    "reactor_parser_resumes",
+    "reactor_completion_batches",
+    "reactor_completion_batch_total",
+    "reactor_completion_batch_max",
+    "reactor_completion_nanos_total",
+    "reactor_completion_nanos_max",
+    "reactor_command_batches",
+    "reactor_command_batch_total",
+    "reactor_command_batch_max",
+    "reactor_writev_chunks",
+    "reactor_writev_iovecs_total",
+    "reactor_writev_iovecs_max",
+    "reactor_queued_response_bytes_total",
+    "reactor_queued_response_bytes_max",
+    "reactor_client_retained_bytes",
+    "reactor_client_retained_bytes_max",
+    "reactor_client_retained_bytes_peak",
+    "reactor_request_cap_exceeded",
+    "reactor_response_cap_exceeded",
+    "reactor_multi_queue_command_cap_exceeded",
+    "reactor_multi_queue_bytes_cap_exceeded",
+    "reactor_watch_cap_exceeded",
+    "reactor_writev_chunk_cap_exceeded",
+    "reactor_overload_accept_throttled",
+    "reactor_overload_accept_resumed",
+    "reactor_overload_read_disabled",
+    "reactor_overload_read_resumed",
+    "reactor_overload_command_deferred",
+    "reactor_overload_command_resumed",
+    "reactor_overload_connections_dropped",
+    "reactor_overload_pending_response_bytes",
+    "reactor_overload_pending_response_bytes_peak",
+    "reactor_overload_parser_accumulator_bytes",
+    "reactor_overload_parser_accumulator_bytes_peak",
+    "reactor_overload_writev_backlog_bytes",
+    "reactor_overload_writev_backlog_bytes_peak",
+    "reactor_overload_aof_pending_bytes",
+    "reactor_overload_aof_pending_bytes_peak",
+    "reactor_overload_maintenance_debt",
+    "reactor_overload_maintenance_debt_peak",
+    "reactor_overload_read_disabled_connections",
+    "reactor_overload_read_disabled_connections_peak",
+    "reactor_overload_deferred_commands",
+    "reactor_overload_deferred_commands_peak",
+    "reactor_close_drain_nanos_total",
+    "reactor_close_drain_nanos_max",
+    "reactor_active_expiry_runs",
+    "reactor_active_expiry_sampled",
+    "reactor_active_expiry_expired",
+    "reactor_active_expiry_nanos_total",
+    "reactor_active_expiry_nanos_max",
+    "reactor_aof_append_nanos_total",
+    "reactor_aof_append_nanos_max",
+    "reactor_aof_fsync_nanos_total",
+    "reactor_aof_fsync_nanos_max",
+    "reactor_aof_pending_bytes",
+    "reactor_aof_pending_bytes_max",
+    "reactor_aof_pending_writes",
+    "reactor_aof_pending_writes_max",
+    "reactor_aof_fsync_requested",
+    "reactor_aof_fsync_completed",
+    "reactor_aof_fsync_failed",
+    "reactor_aof_fsync_worker_saturation",
+    "reactor_aof_backpressure_events",
+    "reactor_aof_backpressure_nanos_total",
+    "reactor_aof_backpressure_nanos_max",
+    "reactor_aof_last_appended_lsn",
+    "reactor_aof_last_durable_lsn",
+    "reactor_aof_durable_lsn_lag",
+    "reactor_aof_fsync_latency_nanos_total",
+    "reactor_aof_fsync_latency_nanos_max",
+    "reactor_aof_fsync_latency_le_100us",
+    "reactor_aof_fsync_latency_le_500us",
+    "reactor_aof_fsync_latency_le_1ms",
+    "reactor_aof_fsync_latency_le_5ms",
+    "reactor_aof_fsync_latency_le_10ms",
+    "reactor_aof_fsync_latency_le_50ms",
+    "reactor_aof_fsync_latency_le_100ms",
+    "reactor_aof_fsync_latency_gt_100ms",
+    "reactor_maintenance_nanos_total",
+    "reactor_maintenance_nanos_max",
+    "reactor_metrics_flush_nanos_total",
+    "reactor_metrics_flush_nanos_max",
+    "eviction_admissions",
+    "eviction_shards_scanned",
+    "eviction_slots_sampled",
+    "eviction_bytes_freed",
+    "eviction_oom_after_scan",
+    "eviction_nanos_total",
+    "eviction_nanos_max",
+]
+
+_RUNTIME_FLOAT_FIELDS = [
+    "reactor_completion_batch_avg",
+    "reactor_command_batch_avg",
+]
+
+_RUNTIME_STRING_FIELDS = [
+    "runtime_telemetry_mode",
+    "backend_requested",
+    "backend_effective",
+]
+
+_RUNTIME_DELTA_FIELDS = [
+    field
+    for field in _RUNTIME_INT_FIELDS
+    if field
+    not in {
+        "runtime_reactor_slots",
+        "runtime_profile_timers_available",
+        "runtime_local_flush_metrics_available",
+    }
+]
+
+_MONOTONIC_DELTA_FIELDS = {
+    "keyspace_hits",
+    "keyspace_misses",
+    "evicted_keys",
+    "expired_keys",
+    "total_commands_processed",
+    "backend_submit_syscalls",
+    "backend_cq_overflows",
+    "backend_sq_pressure_events",
+    "backend_cq_pressure_events",
+    "reactor_loop_iterations",
+    "reactor_accept_eagain_rearms",
+    "reactor_accept_drain_runs",
+    "reactor_accept_drain_accepted",
+    "reactor_submit_sq_full_retries",
+    "reactor_submit_failures",
+    "reactor_completion_budget_exhaustions",
+    "reactor_command_budget_exhaustions",
+    "reactor_accept_budget_exhaustions",
+    "reactor_writev_budget_exhaustions",
+    "reactor_maintenance_budget_exhaustions",
+    "reactor_yielded_connections",
+    "reactor_parser_resumes",
+    "reactor_completion_batches",
+    "reactor_completion_batch_total",
+    "reactor_completion_nanos_total",
+    "reactor_command_batches",
+    "reactor_command_batch_total",
+    "reactor_writev_chunks",
+    "reactor_writev_iovecs_total",
+    "reactor_queued_response_bytes_total",
+    "reactor_request_cap_exceeded",
+    "reactor_response_cap_exceeded",
+    "reactor_multi_queue_command_cap_exceeded",
+    "reactor_multi_queue_bytes_cap_exceeded",
+    "reactor_watch_cap_exceeded",
+    "reactor_writev_chunk_cap_exceeded",
+    "reactor_overload_accept_throttled",
+    "reactor_overload_accept_resumed",
+    "reactor_overload_read_disabled",
+    "reactor_overload_read_resumed",
+    "reactor_overload_command_deferred",
+    "reactor_overload_command_resumed",
+    "reactor_overload_connections_dropped",
+    "reactor_close_drain_nanos_total",
+    "reactor_active_expiry_runs",
+    "reactor_active_expiry_sampled",
+    "reactor_active_expiry_expired",
+    "reactor_active_expiry_nanos_total",
+    "reactor_aof_append_nanos_total",
+    "reactor_aof_fsync_nanos_total",
+    "reactor_aof_fsync_requested",
+    "reactor_aof_fsync_completed",
+    "reactor_aof_fsync_failed",
+    "reactor_aof_fsync_worker_saturation",
+    "reactor_aof_backpressure_events",
+    "reactor_aof_backpressure_nanos_total",
+    "reactor_aof_fsync_latency_nanos_total",
+    "reactor_maintenance_nanos_total",
+    "reactor_metrics_flush_nanos_total",
+    "eviction_admissions",
+    "eviction_shards_scanned",
+    "eviction_slots_sampled",
+    "eviction_bytes_freed",
+    "eviction_oom_after_scan",
+    "eviction_nanos_total",
+    "vmstat_page_faults",
+    "vmstat_major_page_faults",
+    "vmstat_page_scan_kswapd",
+    "vmstat_page_scan_direct",
+    "vmstat_page_steal_kswapd",
+    "vmstat_page_steal_direct",
+    "vmstat_swap_in",
+    "vmstat_swap_out",
+    "vmstat_allocstall",
+    "vmstat_page_reclaim",
+    "process_minor_faults",
+    "process_major_faults",
+    "process_read_bytes",
+    "process_write_bytes",
+    "process_cancelled_write_bytes",
+    "process_syscr",
+    "process_syscw",
+    "process_voluntary_ctx_switches",
+    "process_nonvoluntary_ctx_switches",
+    "network_total_rx_bytes",
+    "network_total_tx_bytes",
+    "network_total_rx_errors",
+    "network_total_tx_errors",
+    "network_loopback_rx_bytes",
+    "network_loopback_tx_bytes",
+    "tcp_retrans_segs",
+    "tcp_listen_overflows",
+    "tcp_listen_drops",
+    "tcp_syn_retrans",
+    "disk_read_bytes",
+    "disk_write_bytes",
+    "disk_io_time_ms",
+}
+
+
+def _snapshot_delta(
+    key: str,
+    first: Any,
+    last: Any,
+    invalid_fields: list[str],
+) -> Optional[float]:
+    before = _parse_float(first)
+    after = _parse_float(last)
+    if before is None or after is None:
+        return None
+    value = after - before
+    if key in _MONOTONIC_DELTA_FIELDS and value < 0:
+        invalid_fields.append(key)
+        return None
+    return value
+
+
 def _capture_runtime_snapshot(service: ServiceState) -> dict[str, Any]:
     raw_info = _redis_cli(service, ["INFO", "runtime"])
     info = _parse_info_response(raw_info or "")
-    return {
-        "runtime_reactor_slots": _parse_int(info.get("runtime_reactor_slots")),
-        "reactor_loop_iterations": _parse_int(info.get("reactor_loop_iterations")),
-        "reactor_accept_eagain_rearms": _parse_int(info.get("reactor_accept_eagain_rearms")),
-        "reactor_completion_batches": _parse_int(info.get("reactor_completion_batches")),
-        "reactor_completion_batch_total": _parse_int(info.get("reactor_completion_batch_total")),
-        "reactor_completion_batch_max": _parse_int(info.get("reactor_completion_batch_max")),
-        "reactor_completion_batch_avg": _parse_float(info.get("reactor_completion_batch_avg")),
-        "reactor_command_batches": _parse_int(info.get("reactor_command_batches")),
-        "reactor_command_batch_total": _parse_int(info.get("reactor_command_batch_total")),
-        "reactor_command_batch_max": _parse_int(info.get("reactor_command_batch_max")),
-        "reactor_command_batch_avg": _parse_float(info.get("reactor_command_batch_avg")),
-        "reactor_active_expiry_runs": _parse_int(info.get("reactor_active_expiry_runs")),
-        "reactor_active_expiry_sampled": _parse_int(info.get("reactor_active_expiry_sampled")),
-        "reactor_active_expiry_expired": _parse_int(info.get("reactor_active_expiry_expired")),
-        "eviction_admissions": _parse_int(info.get("eviction_admissions")),
-        "eviction_shards_scanned": _parse_int(info.get("eviction_shards_scanned")),
-        "eviction_slots_sampled": _parse_int(info.get("eviction_slots_sampled")),
-        "eviction_bytes_freed": _parse_int(info.get("eviction_bytes_freed")),
-        "eviction_oom_after_scan": _parse_int(info.get("eviction_oom_after_scan")),
-    }
+    snapshot = {field: _parse_int(info.get(field)) for field in _RUNTIME_INT_FIELDS}
+    snapshot.update(
+        {field: _parse_float(info.get(field)) for field in _RUNTIME_FLOAT_FIELDS}
+    )
+    snapshot.update({field: info.get(field) for field in _RUNTIME_STRING_FIELDS})
+    return snapshot
 
 
 def _runtime_snapshot_available(snapshot: dict[str, Any]) -> bool:
@@ -1194,11 +1524,59 @@ def capture_service_snapshot(service: ServiceState) -> dict[str, Any]:
         "used_memory_overhead_bytes": _parse_int(info.get("used_memory_overhead")),
         "used_memory_startup_bytes": _parse_int(info.get("used_memory_startup")),
         "used_memory_scripts_bytes": _parse_int(info.get("used_memory_scripts")),
+        "memory_attribution_engine_scope": info.get("memory_attribution_engine_scope"),
+        "memory_attribution_full_server_scope": info.get(
+            "memory_attribution_full_server_scope"
+        ),
+        "engine_live_keys": _parse_int(info.get("engine_live_keys")),
+        "engine_logical_dataset_bytes": _parse_int(
+            info.get("engine_logical_dataset_bytes")
+        ),
+        "engine_table_allocated_bytes": _parse_int(
+            info.get("engine_table_allocated_bytes")
+        ),
+        "engine_table_total_slots": _parse_int(info.get("engine_table_total_slots")),
+        "engine_capacity_slack_slots": _parse_int(
+            info.get("engine_capacity_slack_slots")
+        ),
+        "engine_tombstone_slots": _parse_int(info.get("engine_tombstone_slots")),
+        "engine_load_factor": _parse_float(info.get("engine_load_factor")),
+        "engine_bytes_per_live_key": _parse_float(
+            info.get("engine_bytes_per_live_key")
+        ),
+        "engine_shard_count": _parse_int(info.get("engine_shard_count")),
+        "io_fixed_buffer_reserved_bytes": _parse_int(
+            info.get("io_fixed_buffer_reserved_bytes")
+        ),
+        "io_fixed_buffer_committed_bytes": _parse_int(
+            info.get("io_fixed_buffer_committed_bytes")
+        ),
+        "io_fixed_buffer_active_bytes": _parse_int(
+            info.get("io_fixed_buffer_active_bytes")
+        ),
+        "io_fixed_buffer_count": _parse_int(info.get("io_fixed_buffer_count")),
+        "io_fixed_buffer_size": _parse_int(info.get("io_fixed_buffer_size")),
+        "per_connection_state_bytes": _parse_int(
+            info.get("per_connection_state_bytes")
+        ),
+        "client_retained_bytes": _parse_int(info.get("client_retained_bytes")),
+        "client_retained_bytes_max": _parse_int(
+            info.get("client_retained_bytes_max")
+        ),
+        "client_retained_bytes_peak": _parse_int(
+            info.get("client_retained_bytes_peak")
+        ),
+        "connection_capacity": _parse_int(info.get("connection_capacity")),
+        "full_server_process_rss_bytes": _parse_int(
+            info.get("full_server_process_rss_bytes")
+        ),
         "used_memory_vm_eval_bytes": _parse_int(info.get("used_memory_vm_eval")),
         "used_memory_vm_functions_bytes": _parse_int(info.get("used_memory_vm_functions")),
         "allocator_allocated_bytes": _parse_int(info.get("allocator_allocated")),
         "allocator_active_bytes": _parse_int(info.get("allocator_active")),
         "allocator_resident_bytes": _parse_int(info.get("allocator_resident")),
+        "allocator_mapped_bytes": _parse_int(info.get("allocator_mapped")),
+        "allocator_retained_bytes": _parse_int(info.get("allocator_retained")),
         "allocator_frag_ratio": _parse_float(info.get("allocator_frag_ratio")),
         "allocator_frag_bytes": _parse_int(info.get("allocator_frag_bytes")),
         "allocator_rss_ratio": _parse_float(info.get("allocator_rss_ratio")),
@@ -1255,9 +1633,31 @@ def diff_service_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dic
         "used_memory_peak_bytes",
         "used_memory_dataset_bytes",
         "used_memory_overhead_bytes",
+        "engine_live_keys",
+        "engine_logical_dataset_bytes",
+        "engine_table_allocated_bytes",
+        "engine_table_total_slots",
+        "engine_capacity_slack_slots",
+        "engine_tombstone_slots",
+        "engine_load_factor",
+        "engine_bytes_per_live_key",
+        "engine_shard_count",
+        "io_fixed_buffer_reserved_bytes",
+        "io_fixed_buffer_committed_bytes",
+        "io_fixed_buffer_active_bytes",
+        "io_fixed_buffer_count",
+        "io_fixed_buffer_size",
+        "per_connection_state_bytes",
+        "client_retained_bytes",
+        "client_retained_bytes_max",
+        "client_retained_bytes_peak",
+        "connection_capacity",
+        "full_server_process_rss_bytes",
         "allocator_allocated_bytes",
         "allocator_active_bytes",
         "allocator_resident_bytes",
+        "allocator_mapped_bytes",
+        "allocator_retained_bytes",
         "allocator_frag_bytes",
         "allocator_rss_bytes",
         "mem_fragmentation_bytes",
@@ -1277,31 +1677,23 @@ def diff_service_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dic
         "latency_aof_fsync_max_ms",
         "latency_aof_pending_fsync_latest_ms",
         "latency_aof_pending_fsync_max_ms",
-        "reactor_loop_iterations",
-        "reactor_accept_eagain_rearms",
-        "reactor_completion_batches",
-        "reactor_completion_batch_total",
-        "reactor_command_batches",
-        "reactor_command_batch_total",
-        "reactor_active_expiry_runs",
-        "reactor_active_expiry_sampled",
-        "reactor_active_expiry_expired",
-        "eviction_admissions",
-        "eviction_shards_scanned",
-        "eviction_slots_sampled",
-        "eviction_bytes_freed",
-        "eviction_oom_after_scan",
+        *_RUNTIME_DELTA_FIELDS,
     ]
     delta: dict[str, Any] = {}
+    invalid_delta_fields: list[str] = []
     for field in delta_fields:
-        before_value = _parse_float(before.get(field))
-        after_value = _parse_float(after.get(field))
         key = f"{field}_delta"
-        if before_value is None or after_value is None:
+        value = _snapshot_delta(
+            field,
+            before.get(field),
+            after.get(field),
+            invalid_delta_fields,
+        )
+        if value is None:
             delta[key] = None
             continue
-        value = after_value - before_value
         delta[key] = int(value) if value.is_integer() else value
+    delta["invalid_delta_fields"] = sorted(set(invalid_delta_fields))
 
     hits = _parse_float(delta.get("keyspace_hits_delta")) or 0.0
     misses = _parse_float(delta.get("keyspace_misses_delta")) or 0.0

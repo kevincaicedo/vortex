@@ -201,6 +201,9 @@ fn write_info_memory(buf: &mut Vec<u8>, keyspace: &ConcurrentKeyspace) {
     let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
     let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0);
     let dataset_bytes = keyspace.memory_used();
+    let engine = keyspace.engine_memory_attribution();
+    let server = keyspace.server_memory_attribution();
+    let runtime = keyspace.runtime_metrics();
 
     // Read process RSS from /proc/self/statm
     let rss_bytes = read_proc_rss_bytes();
@@ -242,6 +245,74 @@ fn write_info_memory(buf: &mut Vec<u8>, keyspace: &ConcurrentKeyspace) {
 
     buf.extend_from_slice(b"used_memory_startup:0\r\n");
     buf.extend_from_slice(b"used_memory_scripts:0\r\n");
+
+    buf.extend_from_slice(b"memory_attribution_engine_scope:engine_only\r\n");
+    buf.extend_from_slice(b"memory_attribution_full_server_scope:process_rss_plus_io\r\n");
+
+    write_info_usize(buf, b"engine_live_keys:", engine.live_keys);
+    write_info_usize(
+        buf,
+        b"engine_logical_dataset_bytes:",
+        engine.logical_dataset_bytes,
+    );
+    write_info_usize(
+        buf,
+        b"engine_table_allocated_bytes:",
+        engine.table_allocated_bytes,
+    );
+    write_info_usize(buf, b"engine_table_total_slots:", engine.table_total_slots);
+    write_info_usize(
+        buf,
+        b"engine_capacity_slack_slots:",
+        engine.capacity_slack_slots,
+    );
+    write_info_usize(buf, b"engine_tombstone_slots:", engine.tombstone_slots);
+    write_info_float(buf, b"engine_load_factor:", engine.load_factor);
+    write_info_float(
+        buf,
+        b"engine_bytes_per_live_key:",
+        engine.bytes_per_live_key.unwrap_or(0.0),
+    );
+    write_info_usize(buf, b"engine_shard_count:", engine.shard_count);
+    write_info_usize(
+        buf,
+        b"io_fixed_buffer_reserved_bytes:",
+        server.io_fixed_buffer_reserved_bytes,
+    );
+    write_info_usize(
+        buf,
+        b"io_fixed_buffer_committed_bytes:",
+        server.io_fixed_buffer_committed_bytes,
+    );
+    write_info_usize(
+        buf,
+        b"io_fixed_buffer_active_bytes:",
+        server.io_fixed_buffer_active_bytes,
+    );
+    write_info_usize(buf, b"io_fixed_buffer_count:", server.fixed_buffer_count);
+    write_info_usize(buf, b"io_fixed_buffer_size:", server.fixed_buffer_size);
+    write_info_usize(
+        buf,
+        b"per_connection_state_bytes:",
+        server.per_connection_state_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"client_retained_bytes:",
+        runtime.client_retained_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"client_retained_bytes_max:",
+        runtime.client_retained_bytes_max,
+    );
+    write_info_u64(
+        buf,
+        b"client_retained_bytes_peak:",
+        runtime.client_retained_bytes_peak,
+    );
+    write_info_usize(buf, b"connection_capacity:", server.connection_capacity);
+    write_info_usize(buf, b"full_server_process_rss_bytes:", rss_bytes);
 
     // Allocator stats — consumed by benchmark telemetry
     buf.extend_from_slice(b"allocator_allocated:");
@@ -319,8 +390,12 @@ fn read_proc_rss_bytes() -> usize {
             let parts: Vec<&str> = statm.split_whitespace().collect();
             if parts.len() >= 2 {
                 if let Ok(rss_pages) = parts[1].parse::<usize>() {
-                    return rss_pages;
-                    // * vortex_memory::page_size();
+                    // SAFETY: sysconf reads the process page-size setting and
+                    // does not mutate Rust memory.
+                    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                    if page_size > 0 {
+                        return rss_pages.saturating_mul(page_size as usize);
+                    }
                 }
             }
         }
@@ -382,8 +457,132 @@ fn write_human_size(buf: &mut Vec<u8>, bytes: usize) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+fn write_info_u64(buf: &mut Vec<u8>, name: &[u8], value: u64) {
+    buf.extend_from_slice(name);
+    let mut tmp = itoa::Buffer::new();
+    buf.extend_from_slice(tmp.format(value).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
+fn write_info_usize(buf: &mut Vec<u8>, name: &[u8], value: usize) {
+    write_info_u64(buf, name, value as u64);
+}
+
+fn write_info_float(buf: &mut Vec<u8>, name: &[u8], value: f64) {
+    buf.extend_from_slice(name);
+    write_float(buf, value);
+    buf.extend_from_slice(b"\r\n");
+}
+
+fn write_info_str(buf: &mut Vec<u8>, name: &[u8], value: &str) {
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(value.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
+fn write_info_bool(buf: &mut Vec<u8>, name: &[u8], value: bool) {
+    write_info_u64(buf, name, u64::from(value));
+}
+
 fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"# Runtime\r\n");
+    write_info_str(
+        buf,
+        b"runtime_telemetry_mode:",
+        runtime.telemetry_mode.as_str(),
+    );
+    write_info_bool(
+        buf,
+        b"runtime_profile_timers_available:",
+        runtime.profile_timers_available,
+    );
+    write_info_bool(
+        buf,
+        b"runtime_local_flush_metrics_available:",
+        runtime.local_flush_metrics_available,
+    );
+    write_info_str(
+        buf,
+        b"backend_requested:",
+        runtime.backend.requested.as_str(),
+    );
+    write_info_str(
+        buf,
+        b"backend_effective:",
+        runtime.backend.effective.as_str(),
+    );
+    write_info_bool(buf, b"backend_plan_mixed:", runtime.backend.mixed);
+    write_info_bool(
+        buf,
+        b"backend_fixed_buffers_capable:",
+        runtime.backend.fixed_buffers_capable,
+    );
+    write_info_bool(
+        buf,
+        b"backend_fixed_buffers_registered:",
+        runtime.backend.fixed_buffers_registered,
+    );
+    write_info_bool(buf, b"backend_sqpoll:", runtime.backend.sqpoll);
+    write_info_bool(
+        buf,
+        b"backend_multishot_accept:",
+        runtime.backend.multishot_accept,
+    );
+    write_info_bool(buf, b"backend_accept4:", runtime.backend.accept4);
+    write_info_bool(buf, b"backend_close_opcode:", runtime.backend.close_opcode);
+    write_info_bool(
+        buf,
+        b"backend_cancel_support:",
+        runtime.backend.cancel_support,
+    );
+    write_info_bool(
+        buf,
+        b"backend_nonblocking_drain:",
+        runtime.backend.nonblocking_drain,
+    );
+    write_info_u64(
+        buf,
+        b"backend_requested_ring_size:",
+        runtime.backend.requested_ring_size,
+    );
+    write_info_u64(
+        buf,
+        b"backend_effective_ring_size:",
+        runtime.backend.effective_ring_size,
+    );
+    write_info_u64(
+        buf,
+        b"backend_submit_syscalls:",
+        runtime.backend_submit_syscalls,
+    );
+    write_info_u64(
+        buf,
+        b"backend_sq_occupancy_max:",
+        runtime.backend_sq_occupancy_max,
+    );
+    write_info_u64(buf, b"backend_sq_capacity:", runtime.backend_sq_capacity);
+    write_info_u64(
+        buf,
+        b"backend_cq_occupancy_max:",
+        runtime.backend_cq_occupancy_max,
+    );
+    write_info_u64(buf, b"backend_cq_capacity:", runtime.backend_cq_capacity);
+    write_info_u64(buf, b"backend_cq_overflows:", runtime.backend_cq_overflows);
+    write_info_u64(
+        buf,
+        b"backend_completions_per_submit_syscall_x1000:",
+        runtime.backend_completions_per_submit_syscall_x1000,
+    );
+    write_info_u64(
+        buf,
+        b"backend_sq_pressure_events:",
+        runtime.submit_sq_full_retries,
+    );
+    write_info_u64(
+        buf,
+        b"backend_cq_pressure_events:",
+        runtime.completion_budget_exhaustions,
+    );
     buf.extend_from_slice(b"runtime_reactor_slots:");
     itoa_append(buf, runtime.reactor_slots as i64);
     buf.extend_from_slice(b"\r\n");
@@ -393,12 +592,58 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"reactor_accept_eagain_rearms:");
     itoa_append(buf, runtime.accept_eagain_rearms as i64);
     buf.extend_from_slice(b"\r\n");
+    write_info_u64(
+        buf,
+        b"reactor_accept_drain_runs:",
+        runtime.accept_drain_runs,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_accept_drain_accepted:",
+        runtime.accept_drain_accepted,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_accept_drain_accepted_max:",
+        runtime.accept_drain_accepted_max,
+    );
     buf.extend_from_slice(b"reactor_submit_sq_full_retries:");
     itoa_append(buf, runtime.submit_sq_full_retries as i64);
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(b"reactor_submit_failures:");
     itoa_append(buf, runtime.submit_failures as i64);
     buf.extend_from_slice(b"\r\n");
+    write_info_u64(
+        buf,
+        b"reactor_completion_budget_exhaustions:",
+        runtime.completion_budget_exhaustions,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_command_budget_exhaustions:",
+        runtime.command_budget_exhaustions,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_accept_budget_exhaustions:",
+        runtime.accept_budget_exhaustions,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_writev_budget_exhaustions:",
+        runtime.writev_budget_exhaustions,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_maintenance_budget_exhaustions:",
+        runtime.maintenance_budget_exhaustions,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_yielded_connections:",
+        runtime.yielded_connections,
+    );
+    write_info_u64(buf, b"reactor_parser_resumes:", runtime.parser_resumes);
     buf.extend_from_slice(b"reactor_completion_batches:");
     itoa_append(buf, runtime.completion_batch_count as i64);
     buf.extend_from_slice(b"\r\n");
@@ -411,6 +656,16 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"reactor_completion_batch_avg:");
     write_float(buf, runtime.completion_batch_avg);
     buf.extend_from_slice(b"\r\n");
+    write_info_u64(
+        buf,
+        b"reactor_completion_nanos_total:",
+        runtime.completion_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_completion_nanos_max:",
+        runtime.completion_nanos_max,
+    );
     buf.extend_from_slice(b"reactor_command_batches:");
     itoa_append(buf, runtime.command_batch_count as i64);
     buf.extend_from_slice(b"\r\n");
@@ -423,6 +678,187 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"reactor_command_batch_avg:");
     write_float(buf, runtime.command_batch_avg);
     buf.extend_from_slice(b"\r\n");
+    write_info_u64(buf, b"reactor_writev_chunks:", runtime.writev_chunks);
+    write_info_u64(
+        buf,
+        b"reactor_writev_iovecs_total:",
+        runtime.writev_iovecs_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_writev_iovecs_max:",
+        runtime.writev_iovecs_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_queued_response_bytes_total:",
+        runtime.queued_response_bytes_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_queued_response_bytes_max:",
+        runtime.queued_response_bytes_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_client_retained_bytes:",
+        runtime.client_retained_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_client_retained_bytes_max:",
+        runtime.client_retained_bytes_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_client_retained_bytes_peak:",
+        runtime.client_retained_bytes_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_request_cap_exceeded:",
+        runtime.request_cap_exceeded,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_response_cap_exceeded:",
+        runtime.response_cap_exceeded,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_multi_queue_command_cap_exceeded:",
+        runtime.multi_queue_command_cap_exceeded,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_multi_queue_bytes_cap_exceeded:",
+        runtime.multi_queue_bytes_cap_exceeded,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_watch_cap_exceeded:",
+        runtime.watch_cap_exceeded,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_writev_chunk_cap_exceeded:",
+        runtime.writev_chunk_cap_exceeded,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_accept_throttled:",
+        runtime.overload_accept_throttled,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_accept_resumed:",
+        runtime.overload_accept_resumed,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_read_disabled:",
+        runtime.overload_read_disabled,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_read_resumed:",
+        runtime.overload_read_resumed,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_command_deferred:",
+        runtime.overload_command_deferred,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_command_resumed:",
+        runtime.overload_command_resumed,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_connections_dropped:",
+        runtime.overload_connections_dropped,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_pending_response_bytes:",
+        runtime.overload_pending_response_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_pending_response_bytes_peak:",
+        runtime.overload_pending_response_bytes_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_parser_accumulator_bytes:",
+        runtime.overload_parser_accumulator_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_parser_accumulator_bytes_peak:",
+        runtime.overload_parser_accumulator_bytes_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_writev_backlog_bytes:",
+        runtime.overload_writev_backlog_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_writev_backlog_bytes_peak:",
+        runtime.overload_writev_backlog_bytes_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_aof_pending_bytes:",
+        runtime.overload_aof_pending_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_aof_pending_bytes_peak:",
+        runtime.overload_aof_pending_bytes_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_maintenance_debt:",
+        runtime.overload_maintenance_debt,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_maintenance_debt_peak:",
+        runtime.overload_maintenance_debt_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_read_disabled_connections:",
+        runtime.overload_read_disabled_connections,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_read_disabled_connections_peak:",
+        runtime.overload_read_disabled_connections_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_deferred_commands:",
+        runtime.overload_deferred_commands,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_overload_deferred_commands_peak:",
+        runtime.overload_deferred_commands_peak,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_close_drain_nanos_total:",
+        runtime.close_drain_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_close_drain_nanos_max:",
+        runtime.close_drain_nanos_max,
+    );
     buf.extend_from_slice(b"reactor_active_expiry_runs:");
     itoa_append(buf, runtime.active_expiry_runs as i64);
     buf.extend_from_slice(b"\r\n");
@@ -432,6 +868,172 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"reactor_active_expiry_expired:");
     itoa_append(buf, runtime.active_expiry_expired as i64);
     buf.extend_from_slice(b"\r\n");
+    write_info_u64(
+        buf,
+        b"reactor_active_expiry_nanos_total:",
+        runtime.active_expiry_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_active_expiry_nanos_max:",
+        runtime.active_expiry_nanos_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_append_nanos_total:",
+        runtime.aof_append_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_append_nanos_max:",
+        runtime.aof_append_nanos_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_nanos_total:",
+        runtime.aof_fsync_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_nanos_max:",
+        runtime.aof_fsync_nanos_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_pending_bytes:",
+        runtime.aof_pending_bytes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_pending_bytes_max:",
+        runtime.aof_pending_bytes_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_pending_writes:",
+        runtime.aof_pending_writes,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_pending_writes_max:",
+        runtime.aof_pending_writes_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_requested:",
+        runtime.aof_fsync_requested,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_completed:",
+        runtime.aof_fsync_completed,
+    );
+    write_info_u64(buf, b"reactor_aof_fsync_failed:", runtime.aof_fsync_failed);
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_worker_saturation:",
+        runtime.aof_fsync_worker_saturation,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_backpressure_events:",
+        runtime.aof_backpressure_events,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_backpressure_nanos_total:",
+        runtime.aof_backpressure_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_backpressure_nanos_max:",
+        runtime.aof_backpressure_nanos_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_last_appended_lsn:",
+        runtime.aof_last_appended_lsn,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_last_durable_lsn:",
+        runtime.aof_last_durable_lsn,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_durable_lsn_lag:",
+        runtime.aof_durable_lsn_lag,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_nanos_total:",
+        runtime.aof_fsync_latency_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_nanos_max:",
+        runtime.aof_fsync_latency_nanos_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_100us:",
+        runtime.aof_fsync_latency_buckets[0],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_500us:",
+        runtime.aof_fsync_latency_buckets[1],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_1ms:",
+        runtime.aof_fsync_latency_buckets[2],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_5ms:",
+        runtime.aof_fsync_latency_buckets[3],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_10ms:",
+        runtime.aof_fsync_latency_buckets[4],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_50ms:",
+        runtime.aof_fsync_latency_buckets[5],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_le_100ms:",
+        runtime.aof_fsync_latency_buckets[6],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_aof_fsync_latency_gt_100ms:",
+        runtime.aof_fsync_latency_buckets[7],
+    );
+    write_info_u64(
+        buf,
+        b"reactor_maintenance_nanos_total:",
+        runtime.maintenance_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_maintenance_nanos_max:",
+        runtime.maintenance_nanos_max,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_metrics_flush_nanos_total:",
+        runtime.metrics_flush_nanos_total,
+    );
+    write_info_u64(
+        buf,
+        b"reactor_metrics_flush_nanos_max:",
+        runtime.metrics_flush_nanos_max,
+    );
     buf.extend_from_slice(b"eviction_admissions:");
     itoa_append(buf, runtime.eviction_admissions as i64);
     buf.extend_from_slice(b"\r\n");
@@ -446,7 +1048,10 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(b"eviction_oom_after_scan:");
     itoa_append(buf, runtime.eviction_oom_after_scan as i64);
-    buf.extend_from_slice(b"\r\n\r\n");
+    buf.extend_from_slice(b"\r\n");
+    write_info_u64(buf, b"eviction_nanos_total:", runtime.eviction_nanos_total);
+    write_info_u64(buf, b"eviction_nanos_max:", runtime.eviction_nanos_max);
+    buf.extend_from_slice(b"\r\n");
 }
 
 fn write_info_keyspace(buf: &mut Vec<u8>, keys: usize, expires: usize) {
@@ -809,11 +1414,89 @@ mod tests {
         let h = TestHarness::new();
         let r = exec(&h, &[b"INFO", b"runtime"]);
         assert_bulk_contains(&r, b"# Runtime");
+        assert_bulk_contains(&r, b"runtime_telemetry_mode:minimal");
+        assert_bulk_contains(&r, b"runtime_profile_timers_available:0");
+        assert_bulk_contains(&r, b"runtime_local_flush_metrics_available:1");
+        assert_bulk_contains(&r, b"backend_requested:");
+        assert_bulk_contains(&r, b"backend_effective:");
+        assert_bulk_contains(&r, b"backend_fixed_buffers_registered:");
+        assert_bulk_contains(&r, b"backend_sqpoll:");
+        assert_bulk_contains(&r, b"backend_multishot_accept:");
+        assert_bulk_contains(&r, b"backend_accept4:");
+        assert_bulk_contains(&r, b"backend_close_opcode:");
+        assert_bulk_contains(&r, b"backend_cancel_support:");
+        assert_bulk_contains(&r, b"backend_requested_ring_size:");
+        assert_bulk_contains(&r, b"backend_effective_ring_size:");
+        assert_bulk_contains(&r, b"backend_submit_syscalls:");
+        assert_bulk_contains(&r, b"backend_sq_occupancy_max:");
+        assert_bulk_contains(&r, b"backend_sq_capacity:");
+        assert_bulk_contains(&r, b"backend_cq_occupancy_max:");
+        assert_bulk_contains(&r, b"backend_cq_capacity:");
+        assert_bulk_contains(&r, b"backend_cq_overflows:");
+        assert_bulk_contains(&r, b"backend_completions_per_submit_syscall_x1000:");
+        assert_bulk_contains(&r, b"backend_sq_pressure_events:");
+        assert_bulk_contains(&r, b"backend_cq_pressure_events:");
         assert_bulk_contains(&r, b"reactor_loop_iterations:");
         assert_bulk_contains(&r, b"reactor_submit_sq_full_retries:");
         assert_bulk_contains(&r, b"reactor_submit_failures:");
+        assert_bulk_contains(&r, b"reactor_completion_budget_exhaustions:");
+        assert_bulk_contains(&r, b"reactor_command_budget_exhaustions:");
+        assert_bulk_contains(&r, b"reactor_accept_budget_exhaustions:");
+        assert_bulk_contains(&r, b"reactor_writev_budget_exhaustions:");
+        assert_bulk_contains(&r, b"reactor_maintenance_budget_exhaustions:");
+        assert_bulk_contains(&r, b"reactor_parser_resumes:");
         assert_bulk_contains(&r, b"reactor_completion_batch_avg:");
+        assert_bulk_contains(&r, b"reactor_writev_chunks:");
+        assert_bulk_contains(&r, b"reactor_queued_response_bytes_max:");
+        assert_bulk_contains(&r, b"reactor_client_retained_bytes:");
+        assert_bulk_contains(&r, b"reactor_response_cap_exceeded:");
+        assert_bulk_contains(&r, b"reactor_multi_queue_bytes_cap_exceeded:");
+        assert_bulk_contains(&r, b"reactor_watch_cap_exceeded:");
+        assert_bulk_contains(&r, b"reactor_overload_accept_throttled:");
+        assert_bulk_contains(&r, b"reactor_overload_read_disabled:");
+        assert_bulk_contains(&r, b"reactor_overload_command_deferred:");
+        assert_bulk_contains(&r, b"reactor_overload_pending_response_bytes_peak:");
+        assert_bulk_contains(&r, b"reactor_overload_maintenance_debt_peak:");
+        assert_bulk_contains(&r, b"reactor_close_drain_nanos_max:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_nanos_total:");
+        assert_bulk_contains(&r, b"reactor_aof_pending_bytes:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_requested:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_completed:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_failed:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_worker_saturation:");
+        assert_bulk_contains(&r, b"reactor_aof_last_appended_lsn:");
+        assert_bulk_contains(&r, b"reactor_aof_last_durable_lsn:");
+        assert_bulk_contains(&r, b"reactor_aof_durable_lsn_lag:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_latency_le_1ms:");
+        assert_bulk_contains(&r, b"reactor_aof_fsync_latency_gt_100ms:");
+        assert_bulk_contains(&r, b"reactor_metrics_flush_nanos_total:");
         assert_bulk_contains(&r, b"eviction_shards_scanned:");
+        assert_bulk_contains(&r, b"eviction_nanos_total:");
+    }
+
+    #[test]
+    fn info_memory_section_contains_attribution_fields() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"INFO", b"memory"]);
+        assert_bulk_contains(&r, b"# Memory");
+        assert_bulk_contains(&r, b"memory_attribution_engine_scope:engine_only");
+        assert_bulk_contains(
+            &r,
+            b"memory_attribution_full_server_scope:process_rss_plus_io",
+        );
+        assert_bulk_contains(&r, b"engine_logical_dataset_bytes:");
+        assert_bulk_contains(&r, b"engine_table_allocated_bytes:");
+        assert_bulk_contains(&r, b"engine_table_total_slots:");
+        assert_bulk_contains(&r, b"engine_capacity_slack_slots:");
+        assert_bulk_contains(&r, b"engine_tombstone_slots:");
+        assert_bulk_contains(&r, b"engine_load_factor:");
+        assert_bulk_contains(&r, b"engine_bytes_per_live_key:");
+        assert_bulk_contains(&r, b"io_fixed_buffer_reserved_bytes:");
+        assert_bulk_contains(&r, b"io_fixed_buffer_committed_bytes:");
+        assert_bulk_contains(&r, b"per_connection_state_bytes:");
+        assert_bulk_contains(&r, b"client_retained_bytes:");
+        assert_bulk_contains(&r, b"client_retained_bytes_peak:");
+        assert_bulk_contains(&r, b"full_server_process_rss_bytes:");
     }
 
     #[test]

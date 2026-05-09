@@ -28,6 +28,11 @@ impl ExpiryTransition {
     }
 
     #[inline]
+    pub(crate) const fn is_noop(self) -> bool {
+        self.had_ttl == self.has_ttl_after
+    }
+
+    #[inline]
     const fn before_after(self) -> (bool, bool) {
         (self.had_ttl, self.has_ttl_after)
     }
@@ -105,6 +110,9 @@ impl ConcurrentKeyspace {
         if !self.shard_has_expiring_keys(shard_idx) {
             return (0, 0);
         }
+        #[cfg(feature = "lock-profile")]
+        let _lock_profile =
+            self.enter_lock_profile_scope(crate::keyspace::LockProfileClass::ExpiryCleanup);
         let mut guard = self.write_shard_by_index(shard_idx);
         let total_slots = guard.total_slots();
         if total_slots == 0 {

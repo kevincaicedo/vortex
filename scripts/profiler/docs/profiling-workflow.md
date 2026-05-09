@@ -20,6 +20,9 @@ just profiler --cpu --command SET,GET --duration 20
 # Scheduler-focused diagnostics driven by a benchmark manifest
 just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml --duration 5
 
+# Lock wait and off-CPU diagnostics
+just profiler --lock-offcpu --command SET --duration 10
+
 # Memory heap tracking
 just profiler --memory --command SET --duration 15
 
@@ -28,6 +31,9 @@ just profiler --cache --command SET --threads 1
 
 # AOF and disk diagnostics
 just profiler --aof-disk --command SET,INCR --duration 20
+
+# Explicit AOF always off-CPU validation
+VORTEX_AOF_FSYNC=always just profiler --lock-offcpu --aof --command SET --duration 10
 
 # Network-focused diagnostics
 just profiler --network --command SET,GET,INCR --duration 20
@@ -75,7 +81,7 @@ rustflags = [
 | Question | Linux Primary | macOS Primary | Cross-Platform |
 |----------|---------------|---------------|----------------|
 | CPU hotspot triage | `cargo flamegraph`, `perf` | `samply`, Instruments Time Profiler | `cargo flamegraph` |
-| Hardware counters (IPC, cache, branches) | `perf stat -d` | Instruments System Trace | — |
+| Hardware counters, top-down, and locality (IPC, cache, branches, TLB) | dual-pass `perf stat` PMU report | Instruments System Trace | — |
 | Interactive flamegraph + source view | `samply`, `cargo flamegraph` | `samply` | `samply` |
 | Instruction-level deep dive | Callgrind | — | — |
 | Cache locality analysis | Cachegrind | — | — |
@@ -90,6 +96,7 @@ rustflags = [
 |------|-----------|-------------|
 | `--cpu` | flamegraph + perf stat + perf record (Linux) or samply + instruments CPU suite [Time Profiler, System Trace] (macOS) | Full CPU analysis |
 | `--scheduler` | perf stat (Linux) or Instruments/System Trace fallback (macOS) + host sampler pack | Run queue, context-switch, and scheduling pressure triage |
+| `--lock-offcpu` | perf stat + host sampler pack + runqlat/biolatency + offcputime/offwaketime or perf sched + futex/sync tracing (Linux) or Instruments/Samply fallback with a platform note (macOS) | Lock wait, runnable delay, off-CPU blocking, and fsync stall triage |
 | `--memory` | heaptrack or massif (Linux) or heaptrack or instruments Memory suite [Allocations, Leaks] (macOS) | Heap allocation tracking |
 | `--cache` | cachegrind | Cache locality L1/L2/LL miss rates |
 | `--aof-disk` | perf stat (Linux) or Instruments/System Trace fallback (macOS) + host sampler pack | AOF write path and disk-pressure investigation |
@@ -101,7 +108,7 @@ rustflags = [
 | Flag | Tool | Platform |
 |------|------|----------|
 | `--flamegraph` | `cargo flamegraph` | Linux + macOS |
-| `--perf-stat` | `perf stat -d` | Linux only |
+| `--perf-stat` | dual-pass `perf stat` PMU report (`perf-stat-counters.txt` + `perf-stat.txt` + `perf-stat-report.txt`) | Linux only |
 | `--samply` | `samply record` | Linux + macOS |
 | `--instruments` | `xcrun xctrace record` | macOS only |
 | `--heaptrack` | `heaptrack` | Linux + macOS |
@@ -226,6 +233,15 @@ just profiler --scheduler --bench-request .artifacts/benchmarks/requests/<reques
 
 The profiler now uses `vortex_bench attach` under the hood, writes the attached state file into the current profiler session, and keeps the benchmark request/result artifacts under `bench/` so the profiling session and benchmark workload stay aligned.
 
+
+For Linux PMU sessions, `--perf-stat` now writes two raw counter captures plus a derived report:
+
+- `perf-stat-counters.txt`: explicit IPC, branch, cache, TLB, scheduler, and page-fault counters
+- `perf-stat.txt`: top-down and locality-oriented counter pass
+- `perf-stat-context.txt`: PMU permissions, power profile, virtualization, and optional counter probe notes
+- `perf-stat-report.txt`: derived IPC, `instructions/op`, `cycles/op`, top-down percentages, locality miss rates, and reliability warnings
+
+`summary.json` exposes the same bundle under `pmu_profiles`. Engine targets derive exact operation counts from `engine-target-summary.json`. Server sessions derive `instructions/op` and `cycles/op` from the capture window and mark the values as estimated when `redis-benchmark` runs multiple sequential command sections or outlives the requested capture duration. Optional tracepoint and uncore probes retry with `sudo perf stat` only when the profiler already has `HOST_PASSWORD`, an active sudo session, or `VORTEX_PROFILER_TRY_SUDO_PERF_STAT=force`; `perf-stat-context.txt` labels those counters as `supported-sudo`.
 ## Standard Optimization Loop
 
 Every performance-sensitive change should follow this loop:
@@ -260,7 +276,10 @@ All artifacts land in a timestamped session directory:
 │   └── backend-runs/
 ├── flamegraph.svg
 ├── perf.data
+├── perf-stat-counters.txt
 ├── perf-stat.txt
+├── perf-stat-context.txt
+├── perf-stat-report.txt
 ├── perf-report.txt
 ├── samply-profile.json
 ├── *-toc.xml
@@ -276,7 +295,7 @@ All artifacts land in a timestamped session directory:
 └── criterion/
 ```
 
-`session.json` records the session contract, `notes.md` is the engineer note template, `summary.json` is the concise machine-readable summary, and `summary-compare.json` appears when `--compare-to` is used.
+`session.json` records the session contract, `notes.md` is the engineer note template, `summary.json` is the concise machine-readable summary, and `summary-compare.json` appears when `--compare-to` is used. PMU sessions also publish `pmu_profiles` in `summary.json`, including artifact paths, previews, derived highlights, and reliability warnings.
 
 ## Runtime Counter Snapshots
 
@@ -311,6 +330,7 @@ Current limit: true always-on shard lock contention is not exported here yet. Me
 The question-first Linux modes emit extra artifacts when the corresponding BPF tools are installed:
 
 - `--scheduler` -> `bpf-runqlat.txt`
+- `--lock-offcpu` -> `bpf-runqlat.txt`, `bpf-biolatency.txt`, `bpf-offcputime.txt`, `bpf-offwaketime.txt`, `bpf-futex.txt`, `bpf-sync-syscalls.txt`, `lock-offcpu-classification.txt`
 - `--aof-disk` -> `bpf-biolatency.txt`
 - `--network` -> `bpf-tcpretrans.txt`
 
@@ -319,6 +339,11 @@ The question-first Linux modes emit extra artifacts when the corresponding BPF t
 Interpretation rules:
 
 - `bpf-runqlat.txt`: check the long-tail buckets before assuming a hotspot is purely CPU-bound
+- `bpf-offcputime.txt`: look for blocked stacks when the target is sleeping off-CPU
+- `bpf-offwaketime.txt`: use the blocked+waker stacks to separate lock contention from generic scheduler delay
+- `bpf-futex.txt`: explicit futex wait evidence for the profiled process
+- `bpf-sync-syscalls.txt`: explicit `fsync`/`fdatasync`/`sync_file_range` evidence for the profiled process
+- `lock-offcpu-classification.txt`: the profiler's label for runnable off-CPU, blocked lock/off-CPU, disk/fsync, or unknown
 - `bpf-biolatency.txt`: rising right-tail latency points to block-layer stalls rather than pure userspace cost
 - `bpf-tcpretrans.txt`: empty output is valid; it usually means no retransmits occurred in that session window
 - `diff-flamegraph.svg`: red stacks grew relative to baseline, blue stacks shrank

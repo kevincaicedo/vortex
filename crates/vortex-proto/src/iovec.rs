@@ -172,13 +172,24 @@ impl IovecWriter {
     pub fn as_raw_iovecs(&self) -> Vec<libc::iovec> {
         let count = self.segment_count();
         let mut iovs = Vec::with_capacity(count);
+        self.write_raw_iovecs(&mut iovs);
+        iovs
+    }
+
+    /// Write raw `libc::iovec` entries into an existing vector.
+    ///
+    /// This lets reactor-owned write state reuse the raw-iovec allocation
+    /// across steady-state responses instead of allocating a fresh vector for
+    /// each `writev` submission.
+    pub fn write_raw_iovecs(&self, out: &mut Vec<libc::iovec>) {
+        out.clear();
+        out.reserve(self.segment_count());
         self.for_each_resolved(|ptr, len| {
-            iovs.push(libc::iovec {
+            out.push(libc::iovec {
                 iov_base: ptr as *mut libc::c_void,
                 iov_len: len,
             });
         });
-        iovs
     }
 
     /// Reset the writer for reuse, clearing all segments and scratch data.

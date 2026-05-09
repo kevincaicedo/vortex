@@ -1,0 +1,36 @@
+schema_version: 1
+name: wave3-pressure-matrix-native
+description: "Native Wave 3 pressure matrix: one pressure client plus 100 latency-sensitive pipeline-1 GET clients with p99.9-capable custom-rust reporting."
+databases:
+  - vortex
+  - redis
+backends:
+  - custom-rust
+workloads:
+  - pressure-slow_reader
+  - pressure-deep_pipeline
+  - pressure-large_bulk
+  - pressure-ttl_expiry
+  - pressure-connection_storm
+  - pressure-close_storm
+repeat: 3
+duration: 10s
+environment:
+  mode: native
+  port_base: 18779
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 100
+    keyspace_size: 5000
+    ops_per_thread: 1000
+    warmup_ops: 50
+    value_size: 64

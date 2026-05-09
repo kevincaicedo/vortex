@@ -8,16 +8,14 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use vortex_proto::{FrameRef, RespFrame};
 
-#[cfg(test)]
-use vortex_common::VortexKey;
-use vortex_common::VortexValue;
+use vortex_common::{VortexKey, VortexValue};
 
 use super::{
     CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand,
     MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO,
     absolute_unix_nanos_to_deadline_nanos, arg_bytes, deadline_nanos_to_absolute_unix_nanos,
     encode_aof_persist, encode_aof_pexpireat, encode_aof_set, encode_aof_set_pxat, int_resp,
-    key_from_bytes, owned_value_to_resp, value_from_bytes, value_to_resp,
+    key_from_bytes, mutation_error_response, owned_value_to_resp, value_from_bytes, value_to_resp,
 };
 use crate::ConcurrentKeyspace;
 use crate::engine::domain::{GetExOption, MutationOutcome, SetOptions, SetResult, TtlState};
@@ -416,15 +414,24 @@ fn mget_value_to_frame(value: &VortexValue) -> RespFrame {
 
 /// MGET key [key ...] — Returns values of all specified keys.
 pub fn cmd_mget(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
-    let Some(args) = CommandArgs::collect(frame) else {
-        return CmdResult::Static(ERR_SYNTAX);
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return CmdResult::Static(ERR_SYNTAX),
     };
-    let argc = args.len();
     if argc < 2 {
         return CmdResult::Static(ERR_SYNTAX);
-    }
+    };
+    let Some(mut children) = frame.children() else {
+        return CmdResult::Static(ERR_SYNTAX);
+    };
+    let _ = children.next();
     let mut keys: SmallVec<[&[u8]; 16]> = SmallVec::with_capacity(argc - 1);
-    keys.extend(args.iter_from(1));
+    for child in children {
+        let Some(key_bytes) = child.as_bytes() else {
+            return CmdResult::Static(ERR_SYNTAX);
+        };
+        keys.push(key_bytes);
+    }
 
     CmdResult::Resp(RespFrame::Array(Some(keyspace.mget_values_with(
         &keys,
@@ -454,7 +461,8 @@ pub fn cmd_mset(
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     };
     let _ = children.next();
-    let mut pairs = Vec::with_capacity((argc - 1) / 2);
+    let mut pairs: SmallVec<[(VortexKey, VortexValue); 16]> =
+        SmallVec::with_capacity((argc - 1) / 2);
     while let (Some(key_arg), Some(value_arg)) = (children.next(), children.next()) {
         let Some(key_bytes) = key_arg.as_bytes() else {
             return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -498,7 +506,8 @@ pub fn cmd_msetnx(
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     };
     let _ = children.next();
-    let mut pairs = Vec::with_capacity((argc - 1) / 2);
+    let mut pairs: SmallVec<[(VortexKey, VortexValue); 16]> =
+        SmallVec::with_capacity((argc - 1) / 2);
     while let (Some(key_arg), Some(value_arg)) = (children.next(), children.next()) {
         let Some(key_bytes) = key_arg.as_bytes() else {
             return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -951,7 +960,7 @@ pub fn cmd_strlen(
     match keyspace.strlen_value(&key, now_nanos) {
         Ok(Some(length)) => int_resp(length as i64),
         Ok(None) => CmdResult::Static(RESP_ZERO),
-        Err(err) => CmdResult::Static(err),
+        Err(err) => CmdResult::Static(mutation_error_response(err)),
     }
 }
 
@@ -986,7 +995,7 @@ pub fn cmd_getrange(
         Ok(Some(bytes)) if bytes.is_empty() => CmdResult::Static(super::RESP_EMPTY_BULK),
         Ok(Some(bytes)) => CmdResult::Resp(RespFrame::bulk_string(bytes)),
         Ok(None) => CmdResult::Static(super::RESP_EMPTY_BULK),
-        Err(err) => CmdResult::Static(err),
+        Err(err) => CmdResult::Static(mutation_error_response(err)),
     }
 }
 
@@ -1811,6 +1820,32 @@ mod tests {
                 }
             }
             _ => panic!("expected Array, got something else"),
+        }
+    }
+
+    #[test]
+    fn mget_duplicate_key_returns_duplicate_values() {
+        let h = TestHarness::new();
+        h.set(
+            VortexKey::from(b"dup" as &[u8]),
+            VortexValue::from_bytes(b"7"),
+        );
+
+        let tape = make_tape(b"*3\r\n$4\r\nMGET\r\n$3\r\ndup\r\n$3\r\ndup\r\n");
+        let frame = tape.iter().next().unwrap();
+        let result = cmd_mget(&h.keyspace, &frame, 0);
+
+        match result {
+            CmdResult::Resp(RespFrame::Array(Some(frames))) => {
+                assert_eq!(frames.len(), 2);
+                for frame in frames {
+                    match frame {
+                        RespFrame::BulkString(Some(bytes)) => assert_eq!(bytes.as_ref(), b"7"),
+                        other => panic!("expected duplicate bulk value, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected array response, got {other:?}"),
         }
     }
 

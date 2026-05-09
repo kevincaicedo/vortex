@@ -8,16 +8,24 @@
 //! `Arc` handles to every reactor. AOF replay happens once at the pool level
 //! before spawning reactor threads.
 
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vortex_engine::eviction::EvictionPolicy;
-use vortex_engine::keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
+use vortex_engine::keyspace::{
+    ConcurrentKeyspace, DEFAULT_SHARD_COUNT, RuntimeTelemetryMode, ServerMemoryAttributionSnapshot,
+};
+use vortex_memory::BufferPool;
+use vortex_persist::aof::AofManifest;
 use vortex_persist::aof::reader::AofReader;
 
-use crate::reactor::{AofConfig, AofFatalState, Reactor, ReactorConfig};
+use crate::aof::{AofCoordinator, reactor_aof_replay_paths};
+use crate::reactor::{
+    AofConfig, AofRuntime, ConnectionMemoryCaps, Reactor, ReactorBudgets, ReactorConfig,
+    ReactorOverloadPolicy,
+};
 use crate::shutdown::ShutdownCoordinator;
 
 /// I/O backend selection for pool-managed reactors.
@@ -32,6 +40,23 @@ pub enum IoBackendMode {
     Polling,
 }
 
+/// Fixed-buffer registration policy for io_uring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FixedBufferRegistrationMode {
+    /// Register fixed buffers when the selected backend supports them and the
+    /// pool fits the kernel buf_index range; auto-disable only for automatic
+    /// backend selection.
+    #[default]
+    Auto,
+    /// Require fixed-buffer registration and fail startup if it is unsupported
+    /// or the configured pool cannot be represented.
+    On,
+    /// Do not register fixed buffers. The buffer pool is still used as
+    /// reactor-owned staging memory, but io_uring receives normal read/write
+    /// SQEs without buf_index references.
+    Off,
+}
+
 /// Configuration for the reactor pool.
 pub struct ReactorPoolConfig {
     /// Address to bind all reactor listeners on.
@@ -42,8 +67,16 @@ pub struct ReactorPoolConfig {
     pub max_connections: usize,
     /// Read buffer size in bytes per connection.
     pub buffer_size: usize,
+    /// Max bytes retained for one in-flight request or pipeline.
+    pub max_request_bytes: usize,
+    /// Per-connection retained-memory caps.
+    pub connection_caps: ConnectionMemoryCaps,
+    /// Reactor-local overload/admission policy.
+    pub overload_policy: ReactorOverloadPolicy,
     /// Total pre-allocated I/O buffers (distributed across reactors).
     pub buffer_count: usize,
+    /// io_uring fixed-buffer registration policy.
+    pub fixed_buffer_registration: FixedBufferRegistrationMode,
     /// Idle connection timeout in seconds (0 = disabled).
     pub connection_timeout: u32,
     /// AOF persistence configuration (None = disabled).
@@ -58,8 +91,12 @@ pub struct ReactorPoolConfig {
     pub io_backend: IoBackendMode,
     /// io_uring submission queue size.
     pub ring_size: u32,
-    /// SQPOLL idle timeout in milliseconds.
+    /// SQPOLL idle timeout in milliseconds (0 = disabled).
     pub sqpoll_idle_ms: u32,
+    /// Per-activation reactor work budgets.
+    pub budgets: ReactorBudgets,
+    /// Runtime telemetry policy for all reactors.
+    pub telemetry_mode: RuntimeTelemetryMode,
 }
 
 impl Default for ReactorPoolConfig {
@@ -69,7 +106,11 @@ impl Default for ReactorPoolConfig {
             threads: 0,
             max_connections: 10_000,
             buffer_size: 16_384,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: ConnectionMemoryCaps::default(),
+            overload_policy: ReactorOverloadPolicy::default(),
             buffer_count: 20_000,
+            fixed_buffer_registration: FixedBufferRegistrationMode::Auto,
             connection_timeout: 300,
             aof_config: None,
             shard_count: DEFAULT_SHARD_COUNT,
@@ -77,7 +118,9 @@ impl Default for ReactorPoolConfig {
             eviction_policy: EvictionPolicy::NoEviction,
             io_backend: IoBackendMode::Auto,
             ring_size: 4096,
-            sqpoll_idle_ms: 1000,
+            sqpoll_idle_ms: 0,
+            budgets: ReactorBudgets::default(),
+            telemetry_mode: RuntimeTelemetryMode::Minimal,
         }
     }
 }
@@ -90,6 +133,27 @@ struct ReactorHandle {
     core_id: Option<core_affinity::CoreId>,
 }
 
+#[derive(Default)]
+struct StartupGate {
+    released: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl StartupGate {
+    fn wait(&self) {
+        let mut released = self.released.lock().expect("startup gate poisoned");
+        while !*released {
+            released = self.ready.wait(released).expect("startup gate poisoned");
+        }
+    }
+
+    fn release(&self) {
+        let mut released = self.released.lock().expect("startup gate poisoned");
+        *released = true;
+        self.ready.notify_all();
+    }
+}
+
 /// Pool of reactor threads — one per CPU core.
 ///
 /// All reactors share a single [`ConcurrentKeyspace`] via `Arc`. The pool
@@ -97,6 +161,9 @@ struct ReactorHandle {
 pub struct ReactorPool {
     handles: Vec<ReactorHandle>,
     coordinator: Arc<ShutdownCoordinator>,
+    /// Pool-owned AOF mode coordinator.
+    #[allow(dead_code)]
+    aof_coordinator: Arc<AofCoordinator>,
     /// Shared keyspace across all reactors.
     keyspace: Arc<ConcurrentKeyspace>,
 }
@@ -175,13 +242,39 @@ impl ReactorPool {
         }
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
-        let aof_fatal_state = Arc::new(AofFatalState::default());
+        let aof_coordinator = Arc::new(AofCoordinator::new(num_reactors));
+        let startup_aof_epoch = if config.aof_config.is_some() {
+            Some(aof_coordinator.begin_startup_enable()?)
+        } else {
+            None
+        };
 
         // ── Create shared ConcurrentKeyspace ────────────────────────
         let keyspace = Arc::new(ConcurrentKeyspace::new_with_runtime_slots(
             config.shard_count,
             num_reactors,
         ));
+        keyspace.set_runtime_telemetry_mode(config.telemetry_mode);
+        #[cfg(feature = "lock-profile")]
+        if std::env::var_os("VORTEX_LOCK_PROFILE").is_some() {
+            keyspace.set_lock_profile_enabled(true);
+            tracing::warn!(
+                "profiling-only shard lock wait/hold telemetry enabled; do not use for release benchmark claims"
+            );
+        }
+        let fixed_buffer_reserved_bytes =
+            BufferPool::reserved_bytes_for(config.buffer_count, config.buffer_size);
+        keyspace.set_server_memory_attribution(ServerMemoryAttributionSnapshot {
+            io_fixed_buffer_reserved_bytes: fixed_buffer_reserved_bytes,
+            // BufferPool faults one byte per page during creation, so the pool
+            // reports committed bytes equal to reserved bytes for current builds.
+            io_fixed_buffer_committed_bytes: fixed_buffer_reserved_bytes,
+            io_fixed_buffer_active_bytes: 0,
+            per_connection_state_bytes: Reactor::per_connection_state_bytes(config.max_connections),
+            connection_capacity: config.max_connections,
+            fixed_buffer_count: config.buffer_count,
+            fixed_buffer_size: BufferPool::aligned_buffer_size(config.buffer_size),
+        });
         tracing::info!(
             shard_count = config.shard_count,
             max_memory = config.max_memory,
@@ -194,47 +287,50 @@ impl ReactorPool {
         // merge (ordered by global LSN) into the shared keyspace ONCE,
         // before spawning reactor threads.
         if let Some(ref aof_cfg) = config.aof_config {
-            let mut aof_paths = Vec::with_capacity(num_reactors);
-            for i in 0..num_reactors {
-                let aof_path = if i == 0 {
-                    aof_cfg.path.clone()
-                } else {
-                    let stem = aof_cfg
-                        .path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    let ext = aof_cfg
-                        .path
-                        .extension()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    aof_cfg
-                        .path
-                        .with_file_name(format!("{stem}-shard{i}.{ext}"))
-                };
-                aof_paths.push(aof_path);
-            }
+            if num_reactors == 1
+                && let Some(manifest) = AofManifest::load_for_aof(&aof_cfg.path)?
+            {
+                tracing::info!(
+                    manifest = %manifest.path().display(),
+                    state = ?manifest.state(),
+                    "starting manifest AOF replay into shared keyspace..."
+                );
+                let stats = AofReader::replay_manifest(&manifest, &keyspace)?;
+                tracing::info!(
+                    files_merged = stats.files_merged,
+                    commands = stats.commands_replayed,
+                    bytes = stats.bytes_read,
+                    max_lsn = stats.max_lsn,
+                    duration_ms = stats.duration_ms,
+                    "manifest AOF replay complete"
+                );
+            } else {
+                let mut aof_paths = Vec::with_capacity(num_reactors);
+                for i in 0..num_reactors {
+                    aof_paths.extend(reactor_aof_replay_paths(&aof_cfg.path, i)?);
+                }
 
-            tracing::info!(
-                num_files = aof_paths.len(),
-                "starting K-Way merge AOF replay into shared keyspace..."
-            );
-            let stats = AofReader::replay_merge(&aof_paths, &keyspace)?;
-            tracing::info!(
-                files_merged = stats.files_merged,
-                commands = stats.commands_replayed,
-                bytes = stats.bytes_read,
-                max_lsn = stats.max_lsn,
-                duration_ms = stats.duration_ms,
-                "AOF K-Way merge replay complete"
-            );
+                tracing::info!(
+                    num_files = aof_paths.len(),
+                    "starting K-Way merge AOF replay into shared keyspace..."
+                );
+                let stats = AofReader::replay_merge(&aof_paths, &keyspace)?;
+                tracing::info!(
+                    files_merged = stats.files_merged,
+                    commands = stats.commands_replayed,
+                    bytes = stats.bytes_read,
+                    max_lsn = stats.max_lsn,
+                    duration_ms = stats.duration_ms,
+                    "AOF K-Way merge replay complete"
+                );
+            }
         }
 
         keyspace.configure_eviction(config.max_memory, config.eviction_policy);
 
         let mut handles = Vec::with_capacity(num_reactors);
         let (startup_tx, startup_rx) = mpsc::channel();
+        let startup_gate = Arc::new(StartupGate::default());
 
         for i in 0..num_reactors {
             let (reactor_max_connections, reactor_buffer_count) = reactor_resource_share(
@@ -246,22 +342,29 @@ impl ReactorPool {
             let core_id = core_ids.get(i).copied();
             let coord_clone = Arc::clone(&coordinator);
             let ks_clone = Arc::clone(&keyspace);
-            let aof_fatal_state_clone = Arc::clone(&aof_fatal_state);
+            let aof_coordinator_clone = Arc::clone(&aof_coordinator);
+            let gate_clone = Arc::clone(&startup_gate);
             let startup_tx = startup_tx.clone();
 
             let reactor_config = ReactorConfig {
                 bind_addr: config.bind_addr,
                 max_connections: reactor_max_connections,
                 buffer_size: config.buffer_size,
+                max_request_bytes: config.max_request_bytes,
+                connection_caps: config.connection_caps,
+                overload_policy: config.overload_policy,
                 buffer_count: reactor_buffer_count,
+                fixed_buffer_registration: config.fixed_buffer_registration,
                 connection_timeout: config.connection_timeout,
                 aof_config: config.aof_config.clone(),
                 io_backend: config.io_backend,
                 ring_size: config.ring_size,
                 sqpoll_idle_ms: config.sqpoll_idle_ms,
+                budgets: config.budgets,
+                telemetry_mode: config.telemetry_mode,
             };
 
-            let thread = std::thread::Builder::new()
+            let thread = match std::thread::Builder::new()
                 .name(format!("vortex-reactor-{i}"))
                 .spawn(move || {
                     // Pin to CPU core.
@@ -281,7 +384,7 @@ impl ReactorPool {
                         reactor_config,
                         Arc::clone(&coord_clone),
                         Arc::clone(&ks_clone),
-                        Arc::clone(&aof_fatal_state_clone),
+                        AofRuntime::new(Arc::clone(&aof_coordinator_clone), startup_aof_epoch),
                         num_reactors,
                     ) {
                         Ok(r) => r,
@@ -302,8 +405,25 @@ impl ReactorPool {
                         return;
                     }
 
+                    gate_clone.wait();
+                    if coord_clone.is_draining() {
+                        coord_clone.reactor_finished(i);
+                        return;
+                    }
+
                     reactor.run();
-                })?;
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    if let Some(epoch) = startup_aof_epoch {
+                        aof_coordinator.abort_enable(epoch);
+                    }
+                    coordinator.initiate();
+                    startup_gate.release();
+                    join_handles(&mut handles);
+                    return Err(error);
+                }
+            };
 
             handles.push(ReactorHandle {
                 thread: Some(thread),
@@ -340,7 +460,11 @@ impl ReactorPool {
         }
 
         if let Some((reactor_id, error)) = startup_failure {
+            if let Some(epoch) = startup_aof_epoch {
+                aof_coordinator.abort_enable(epoch);
+            }
             coordinator.initiate();
+            startup_gate.release();
             join_handles(&mut handles);
 
             let reactor_label = if reactor_id == usize::MAX {
@@ -357,11 +481,25 @@ impl ReactorPool {
             ));
         }
 
+        if let Some(epoch) = startup_aof_epoch {
+            if let Err(error) = aof_coordinator.commit_enable(epoch, &keyspace) {
+                coordinator.initiate();
+                startup_gate.release();
+                join_handles(&mut handles);
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("reactor pool AOF coordinator commit failed: {error}"),
+                ));
+            }
+        }
+
+        startup_gate.release();
         tracing::info!(num_reactors, "reactor pool started");
 
         Ok(Self {
             handles,
             coordinator,
+            aof_coordinator,
             keyspace,
         })
     }
@@ -459,6 +597,38 @@ mod tests {
         };
 
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("reactor pool startup failed"));
+    }
+
+    #[test]
+    fn spawn_fails_when_any_startup_aof_writer_cannot_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut missing_parent = std::env::temp_dir();
+        missing_parent.push(format!("vortex-missing-aof-parent-{}", std::process::id()));
+        let aof_path = missing_parent.join("appendonly.aof");
+
+        let error = match ReactorPool::spawn(ReactorPoolConfig {
+            bind_addr,
+            threads: 2,
+            max_connections: 2,
+            buffer_count: 2,
+            aof_config: Some(AofConfig {
+                path: aof_path,
+                fsync_policy: vortex_persist::aof::AofFsyncPolicy::No,
+                max_pending_fsync_bytes:
+                    vortex_persist::aof::writer::DEFAULT_EVERYSEC_MAX_PENDING_BYTES,
+            }),
+            io_backend: IoBackendMode::Polling,
+            ..ReactorPoolConfig::default()
+        }) {
+            Ok(_) => panic!("expected spawn to fail when AOF parent directory is missing"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("failed to open AOF file"));
         assert!(error.to_string().contains("reactor pool startup failed"));
     }
 }

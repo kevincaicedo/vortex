@@ -16,6 +16,22 @@ test *ARGS:
 smoke *ARGS:
     bash smoketests/scripts/run-local.sh {{ARGS}}
 
+# Run smoke tests against an already running Redis-compatible endpoint
+smoke-existing *ARGS:
+    bash smoketests/scripts/run-existing.sh {{ARGS}}
+
+# Run real-server AOF startup/replay/backpressure smoke tests
+smoke-aof *ARGS:
+    cargo test -p vortex-smoketests --test server_startup -- {{ARGS}}
+
+# Run the alpha correctness matrix. Use `--profile full --fail-on-skip` for release gating.
+alpha-correctness *ARGS:
+    python3 scripts/alpha_correctness_matrix.py {{ARGS}}
+
+# Generate or run the VAL-ALPHA-002 performance matrix manifests.
+alpha-performance-matrix *ARGS:
+    python3 scripts/alpha_performance_matrix.py {{ARGS}}
+
 # List smoke-test command coverage and support status
 smoke-list *ARGS:
     cargo run -p vortex-smoketests -- list {{ARGS}}

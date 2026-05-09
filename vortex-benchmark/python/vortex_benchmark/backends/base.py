@@ -77,6 +77,14 @@ def quote_command(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
+def apply_load_affinity(context: BackendRunContext, command: list[str]) -> list[str]:
+    cpu_list = (context.spec.resource_config or {}).get("load_cpus")
+    if not cpu_list or context.spec.mode != "native":
+        return command
+    ensure_command_available("taskset")
+    return ["taskset", "-c", str(cpu_list), *command]
+
+
 def ensure_command_available(name: str) -> None:
     if shutil.which(name) is None:
         raise BackendError(f"required command not found in PATH: {name}")

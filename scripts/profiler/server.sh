@@ -71,6 +71,12 @@ build_server_args() {
 
     if [[ "$aof" == "true" ]]; then
         args+=("--aof-enabled")
+        if [[ -n "${VORTEX_AOF_FSYNC:-}" ]]; then
+            args+=("--aof-fsync" "$VORTEX_AOF_FSYNC")
+        fi
+        if [[ -n "${VORTEX_AOF_MAX_PENDING_FSYNC_BYTES:-}" ]]; then
+            args+=("--aof-max-pending-fsync-bytes" "$VORTEX_AOF_MAX_PENDING_FSYNC_BYTES")
+        fi
     fi
     if [[ -n "$maxmemory" ]]; then
         args+=("--max-memory" "$maxmemory")
@@ -87,8 +93,29 @@ build_server_args() {
     if [[ -n "${FIXED_BUFFERS:-}" ]]; then
         args+=("--fixed-buffers" "$FIXED_BUFFERS")
     fi
+    if [[ -n "${MAX_REQUEST_BYTES:-}" ]]; then
+        args+=("--max-request-bytes" "$MAX_REQUEST_BYTES")
+    fi
     if [[ -n "${SQPOLL_IDLE_MS:-}" ]]; then
         args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    fi
+    if [[ -n "${REACTOR_COMPLETION_BUDGET:-}" ]]; then
+        args+=("--reactor-completion-budget" "$REACTOR_COMPLETION_BUDGET")
+    fi
+    if [[ -n "${REACTOR_COMMAND_BUDGET:-}" ]]; then
+        args+=("--reactor-command-budget" "$REACTOR_COMMAND_BUDGET")
+    fi
+    if [[ -n "${REACTOR_ACCEPT_BUDGET:-}" ]]; then
+        args+=("--reactor-accept-budget" "$REACTOR_ACCEPT_BUDGET")
+    fi
+    if [[ -n "${REACTOR_WRITEV_BUDGET:-}" ]]; then
+        args+=("--reactor-writev-budget" "$REACTOR_WRITEV_BUDGET")
+    fi
+    if [[ -n "${REACTOR_MAINTENANCE_BUDGET:-}" ]]; then
+        args+=("--reactor-maintenance-budget" "$REACTOR_MAINTENANCE_BUDGET")
+    fi
+    if [[ -n "${REACTOR_TIME_BUDGET_US:-}" ]]; then
+        args+=("--reactor-time-budget-us" "$REACTOR_TIME_BUDGET_US")
     fi
 
     printf '%s\n' "${args[@]}"
@@ -97,14 +124,24 @@ build_server_args() {
 # ── Start server in background ───────────────────────────────────────────────
 start_server() {
     local host="$1" port="$2" threads="$3" aof="$4" maxmemory="$5" eviction="$6" logfile="$7"
+    local managed_aof_path=""
 
     local args=()
     while IFS= read -r arg; do
         args+=("$arg")
     done < <(build_server_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction")
 
+    if [[ "$aof" == "true" && -z "${VORTEX_AOF_PATH:-}" ]]; then
+        managed_aof_path="${logfile%.log}.aof"
+        info "Using profiler-managed AOF path: ${managed_aof_path}"
+    fi
+
     info "Starting vortex-server: ${PROFILING_BINARY} ${args[*]}"
-    "$PROFILING_BINARY" "${args[@]}" >"$logfile" 2>&1 &
+    if [[ -n "$managed_aof_path" ]]; then
+        VORTEX_AOF_PATH="$managed_aof_path" "$PROFILING_BINARY" "${args[@]}" >"$logfile" 2>&1 &
+    else
+        "$PROFILING_BINARY" "${args[@]}" >"$logfile" 2>&1 &
+    fi
     SERVER_PID=$!
     record_session_pid "$SERVER_PID"
     info "Server started (pid ${SERVER_PID})"

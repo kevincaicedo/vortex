@@ -117,9 +117,10 @@ So the engine is not "zero allocation everywhere". It is "avoid allocation where
 `ExecutedCommand` wraps:
 
 - `response: CmdResult`
-- `aof_lsn: Option<u64>`
+- `aof_commit: Option<AofCommitEffect>`
+- optional AOF side-effect records and command payload bytes
 
-That optional LSN is the bridge from engine mutation semantics to persistence ordering. Read-only commands usually return `None`. Mutation commands may allocate an LSN and return it alongside the response.
+That optional typed commit effect is the bridge from engine mutation semantics to persistence ordering. Read-only commands usually return `None`. Mutation commands may allocate a bounded `AofLsn` and return it alongside the response without exposing a raw or sentinel `u64` across the IO boundary.
 
 ## Argument Extraction Strategy
 

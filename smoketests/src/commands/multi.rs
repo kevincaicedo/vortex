@@ -109,14 +109,14 @@ fn multi_unknown_command_aborts(ctx: &mut SmokeContext) -> Result<()> {
     Ok(())
 }
 
-fn multi_nested_marks_dirty(ctx: &mut SmokeContext) -> Result<()> {
+fn multi_nested_error_keeps_empty_transaction_clean(ctx: &mut SmokeContext) -> Result<()> {
     ctx.assert_ok(&["MULTI"])?;
 
     let err = ctx.exec_error(&["MULTI"])?;
     assert!(err.to_string().contains("MULTI calls can not be nested"));
 
-    let err = ctx.exec_error(&["EXEC"])?;
-    assert_redis_error_contains(&err, "EXECABORT");
+    let replies: Vec<redis::Value> = ctx.exec(&["EXEC"])?;
+    assert!(replies.is_empty(), "empty transaction returned {replies:?}");
     Ok(())
 }
 
@@ -144,7 +144,7 @@ pub fn spec() -> CommandSpec {
             "Wrong arity before MULTI state",
             "Queue-time error causes EXECABORT",
             "Unknown command causes EXECABORT",
-            "Nested MULTI causes EXECABORT",
+            "Nested MULTI returns an immediate error without dirtying the empty transaction",
             "Runtime errors stay in EXEC reply array",
         ])
         .case(CaseDef::new(
@@ -173,9 +173,9 @@ pub fn spec() -> CommandSpec {
             multi_unknown_command_aborts,
         ))
         .case(CaseDef::new(
-            "nested multi aborts exec",
-            "Nested MULTI should dirty the transaction and make EXEC return EXECABORT.",
-            multi_nested_marks_dirty,
+            "nested multi keeps transaction clean",
+            "Nested MULTI should error immediately and leave the empty transaction clean.",
+            multi_nested_error_keeps_empty_transaction_clean,
         ))
         .case(CaseDef::new(
             "runtime error remains in exec array",

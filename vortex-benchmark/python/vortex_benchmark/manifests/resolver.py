@@ -15,7 +15,9 @@ from vortex_benchmark.catalog import (
 )
 from vortex_benchmark.manifests.loader import (
     BenchmarkManifest,
+    SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION,
     SUPPORTED_VORTEX_IO_BACKENDS,
+    SUPPORTED_VORTEX_TELEMETRY_MODES,
     load_manifest,
 )
 from vortex_benchmark.models import (
@@ -141,6 +143,20 @@ def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(SUPPORTED_AOF_FSYNC_POLICIES)
         raise ValueError(f"aof_fsync must be one of: {supported}")
 
+    aof_max_pending_fsync_bytes = runtime_config.get("aof_max_pending_fsync_bytes")
+    if aof_max_pending_fsync_bytes is not None and (
+        not isinstance(aof_max_pending_fsync_bytes, int)
+        or aof_max_pending_fsync_bytes <= 0
+    ):
+        raise ValueError("aof_max_pending_fsync_bytes must be a positive integer when provided")
+
+    shard_count = runtime_config.get("shard_count")
+    if shard_count is not None:
+        if not isinstance(shard_count, int) or shard_count <= 0:
+            raise ValueError("shard_count must be a positive integer when provided")
+        if shard_count & (shard_count - 1) != 0:
+            raise ValueError("shard_count must be a power of two")
+
     maxmemory = runtime_config.get("maxmemory")
     if maxmemory is not None and (not isinstance(maxmemory, str) or not maxmemory.strip()):
         raise ValueError("maxmemory must be a non-empty size literal when provided")
@@ -155,6 +171,14 @@ def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(SUPPORTED_VORTEX_IO_BACKENDS)
         raise ValueError(f"io_backend must be one of: {supported}")
 
+    telemetry_mode = runtime_config.get("telemetry_mode")
+    if (
+        telemetry_mode is not None
+        and telemetry_mode not in SUPPORTED_VORTEX_TELEMETRY_MODES
+    ):
+        supported = ", ".join(SUPPORTED_VORTEX_TELEMETRY_MODES)
+        raise ValueError(f"telemetry_mode must be one of: {supported}")
+
     ring_size = runtime_config.get("ring_size")
     if ring_size is not None:
         if not isinstance(ring_size, int) or ring_size <= 0:
@@ -166,9 +190,17 @@ def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
     if fixed_buffers is not None and (not isinstance(fixed_buffers, int) or fixed_buffers <= 0):
         raise ValueError("fixed_buffers must be a positive integer when provided")
 
+    fixed_buffer_registration = runtime_config.get("fixed_buffer_registration")
+    if (
+        fixed_buffer_registration is not None
+        and fixed_buffer_registration not in SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION
+    ):
+        supported = ", ".join(SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION)
+        raise ValueError(f"fixed_buffer_registration must be one of: {supported}")
+
     sqpoll_idle_ms = runtime_config.get("sqpoll_idle_ms")
-    if sqpoll_idle_ms is not None and (not isinstance(sqpoll_idle_ms, int) or sqpoll_idle_ms <= 0):
-        raise ValueError("sqpoll_idle_ms must be a positive integer when provided")
+    if sqpoll_idle_ms is not None and (not isinstance(sqpoll_idle_ms, int) or sqpoll_idle_ms < 0):
+        raise ValueError("sqpoll_idle_ms must be a non-negative integer when provided")
 
     return runtime_config
 
@@ -235,6 +267,8 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
     memory = _coalesce_scalar(
         getattr(args, "memory", None), manifest_resource_config.get("memory"), DEFAULT_MEMORY
     )
+    service_cpus = manifest_resource_config.get("service_cpus")
+    load_cpus = manifest_resource_config.get("load_cpus")
     threads = _coalesce_scalar(
         getattr(args, "threads", None), manifest_resource_config.get("threads"), None
     )
@@ -247,6 +281,14 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
     aof_fsync = _coalesce_scalar(
         getattr(args, "aof_fsync", None), manifest_runtime_config.get("aof_fsync"), None
     )
+    aof_max_pending_fsync_bytes = _coalesce_scalar(
+        getattr(args, "aof_max_pending_fsync_bytes", None),
+        manifest_runtime_config.get("aof_max_pending_fsync_bytes"),
+        None,
+    )
+    shard_count = _coalesce_scalar(
+        getattr(args, "shard_count", None), manifest_runtime_config.get("shard_count"), None
+    )
     maxmemory = _coalesce_scalar(
         getattr(args, "maxmemory", None), manifest_runtime_config.get("maxmemory"), None
     )
@@ -258,12 +300,22 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
     io_backend = _coalesce_scalar(
         getattr(args, "io_backend", None), manifest_runtime_config.get("io_backend"), None
     )
+    telemetry_mode = _coalesce_scalar(
+        getattr(args, "telemetry_mode", None),
+        manifest_runtime_config.get("telemetry_mode"),
+        None,
+    )
     ring_size = _coalesce_scalar(
         getattr(args, "ring_size", None), manifest_runtime_config.get("ring_size"), None
     )
     fixed_buffers = _coalesce_scalar(
         getattr(args, "fixed_buffers", None),
         manifest_runtime_config.get("fixed_buffers"),
+        None,
+    )
+    fixed_buffer_registration = _coalesce_scalar(
+        getattr(args, "fixed_buffer_registration", None),
+        manifest_runtime_config.get("fixed_buffer_registration"),
         None,
     )
     sqpoll_idle_ms = _coalesce_scalar(
@@ -295,6 +347,8 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
         "cpus": cpus,
         "memory": memory,
         "threads": threads,
+        "service_cpus": service_cpus,
+        "load_cpus": load_cpus,
     }
     runtime_config = _validate_runtime_config(
         {
@@ -302,11 +356,15 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
             for key, value in {
                 "aof_enabled": aof_enabled,
                 "aof_fsync": aof_fsync,
+                "aof_max_pending_fsync_bytes": aof_max_pending_fsync_bytes,
+                "shard_count": shard_count,
                 "maxmemory": maxmemory.strip() if isinstance(maxmemory, str) else maxmemory,
                 "eviction_policy": eviction_policy,
                 "io_backend": io_backend,
+                "telemetry_mode": telemetry_mode,
                 "ring_size": ring_size,
                 "fixed_buffers": fixed_buffers,
+                "fixed_buffer_registration": fixed_buffer_registration,
                 "sqpoll_idle_ms": sqpoll_idle_ms,
             }.items()
             if value is not None

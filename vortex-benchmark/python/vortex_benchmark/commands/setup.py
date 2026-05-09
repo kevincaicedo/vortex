@@ -78,6 +78,7 @@ def execute_setup(args) -> EnvironmentState:
                 runtime_dir=layout.runtime_dir / environment_id / database,
                 log_path=layout.logs_dir / f"{environment_id}-{database}.log",
                 build_vortex=spec.build_vortex,
+                resource_config=dict(spec.resource_config),
                 runtime_config=dict(spec.runtime_config),
             )
             started_services.append(start_service(adapter, request))

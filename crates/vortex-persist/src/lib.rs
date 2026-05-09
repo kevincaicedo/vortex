@@ -20,11 +20,18 @@ pub mod aof;
 use std::path::Path;
 
 use vortex_common::VortexResult;
+use vortex_engine::keyspace::AofLsn;
 
-/// AOF writer trait. Implemented in Phase 5.
+use crate::aof::{AofAppendOutcome, AofCommitPoint, AofRecordBytes};
+
+/// Typed AOF writer trait. Implemented in Phase 5.
 pub trait AofWriter {
-    /// Append a command record to the AOF file.
-    fn append(&mut self, record: &[u8]) -> VortexResult<()>;
+    /// Append a complete RESP command record with its already-assigned AOF LSN.
+    fn append_with_lsn(
+        &mut self,
+        lsn: AofLsn,
+        record: AofRecordBytes<'_>,
+    ) -> VortexResult<AofAppendOutcome>;
 
     /// Flush the AOF buffer to disk.
     fn flush(&mut self) -> VortexResult<()>;
@@ -63,9 +70,18 @@ pub trait VxfReader {
 pub struct NoopAofWriter;
 
 impl AofWriter for NoopAofWriter {
-    fn append(&mut self, _record: &[u8]) -> VortexResult<()> {
-        Ok(())
+    fn append_with_lsn(
+        &mut self,
+        lsn: AofLsn,
+        _record: AofRecordBytes<'_>,
+    ) -> VortexResult<AofAppendOutcome> {
+        Ok(AofAppendOutcome::new(
+            lsn,
+            AofCommitPoint::UserspaceAppend,
+            None,
+        ))
     }
+
     fn flush(&mut self) -> VortexResult<()> {
         Ok(())
     }

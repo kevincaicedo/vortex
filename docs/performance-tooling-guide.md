@@ -109,6 +109,8 @@ Common combinations:
 
 Key rule: when comparing databases, keep command/workload, thread count, duration, runtime policy, and environment mode identical. If you aggregate summaries that violate that rule, the report marks those scenario groups invalid instead of pretending the comparison is fair.
 
+Native runs must start on free ports. Vortex uses `SO_REUSEPORT` for per-reactor listeners, so an old Vortex process can otherwise share the same benchmark port and corrupt both traffic distribution and `INFO runtime` before/after deltas. The native harness now fails setup when the requested host/port is already bound; stop the stale listener or choose a different `port_base` instead of accepting a run with negative monotonic telemetry deltas.
+
 ## Benchmark Manifests
 
 ### Top-Level Fields
@@ -202,13 +204,13 @@ Repeat-aware reports aggregate replicate rows into medians and attach spread, mi
 
 ### Runtime Counter Artifacts
 
-Vortex now exposes a low-overhead `INFO runtime` section for always-on diagnostic counters. The implementation uses per-reactor relaxed atomics in the shared keyspace and exports them through a dedicated `INFO runtime` section instead of piggybacking on the heavier general `INFO` path.
+Vortex now exposes a low-overhead `INFO runtime` section for always-on diagnostic counters. The implementation uses per-reactor relaxed atomics in the shared keyspace and exports them through a dedicated `INFO runtime` section instead of piggybacking on the heavier general `INFO` path. The same section publishes the startup-resolved backend contract: requested/effective backend, mixed-plan flag, fixed-buffer registration, SQPOLL, multishot accept, accept4, close opcode, cancel support, effective ring size, SQ/CQ pressure counters, queue occupancy/capacity high-water marks, CQ overflow deltas, completions per submit syscall, and backend submit syscall count.
 
 These counters show up in three places:
 
 - benchmark result JSON under `observability.before`, `observability.after`, and `observability.delta`
-- flattened benchmark report rows as `reactor_*` and `eviction_*` columns
-- profiler and benchmark host telemetry summaries as `reactor_*_delta`, `*_peak`, and `eviction_*_delta`
+- flattened benchmark report rows as `backend_*`, `reactor_*`, and `eviction_*` columns
+- profiler and benchmark host telemetry summaries as `backend_*`, `reactor_*_delta`, `*_peak`, and `eviction_*_delta`
 
 Raw interval samples still live in `host/*-host-telemetry.jsonl`. That JSONL stream is where to inspect per-sample `per_cpu_max_pct`, `per_cpu_min_pct`, `tcp_*`, and `socket_*` fields instead of only their rolled-up summary values.
 
@@ -232,8 +234,11 @@ just profiler --check
 just profiler --criterion --filter cmd_get_inline
 just profiler --cpu --command SET,GET --duration 20
 just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml --duration 5
+just profiler --lock-offcpu --command SET --duration 10
 just profiler --memory --command SET --duration 15
+just profiler --c2c --dry-run --command SET,GET --duration 10
 just profiler --aof-disk --command SET,INCR --duration 20
+VORTEX_AOF_FSYNC=always just profiler --lock-offcpu --aof --command SET --duration 10
 just profiler --network --command SET,GET,INCR --duration 20
 ```
 
@@ -243,12 +248,18 @@ Use the question-first modes unless you already know the specific tool you need.
 
 - `--cpu`: full CPU hotspot analysis
 - `--scheduler`: run queue, context-switch, and scheduling pressure diagnostics
+- `--lock-offcpu`: lock wait, runnable delay, and fsync/off-CPU blocking classification
 - `--memory`: heap allocation and memory-growth investigation
 - `--cache`: locality and cache-miss inspection
+- `--c2c`: cache-line contention and false-sharing investigation on Linux with `perf c2c`
 - `--aof-disk`: AOF and disk-pressure investigation
 - `--network`: loopback, socket, and network-path investigation
 
 Tool-centric flags such as `--flamegraph`, `--perf-stat`, `--samply`, `--heaptrack`, and `--massif` still exist and are useful when the bottleneck class is already known.
+
+On Linux, `--perf-stat` now uses a dual-pass PMU capture instead of a single raw `perf stat -d` dump. Each session writes explicit base counters to `perf-stat-counters.txt`, top-down and locality counters to `perf-stat.txt`, environment notes to `perf-stat-context.txt`, and a derived `perf-stat-report.txt` that summarizes IPC, `instructions/op`, `cycles/op`, branch/cache/TLB miss rates, top-down percentages, memory-bandwidth counters when attach mode can emit them, and reliability warnings for multiplexing, permissions, virtualization, thermal state, and noisy-neighbor pressure. The same data is exposed under `pmu_profiles` in `summary.json`. Optional tracepoint and uncore probes retry with `sudo perf stat` only when the profiler already has `HOST_PASSWORD`, an active sudo session, or `VORTEX_PROFILER_TRY_SUDO_PERF_STAT=force`; `perf-stat-context.txt` labels those counters as `supported-sudo`.
+
+Operation-normalized server metrics are exact only when the load source has an exact completed-operation count for the capture window. For the built-in `redis-benchmark` path, the report marks `instructions/op` and `cycles/op` as estimated when the selected command set runs in multiple sequential sections or when the load driver outlives the requested capture duration.
 
 ### Profiler With Benchmark Workloads
 
@@ -267,17 +278,41 @@ This uses `vortex_bench attach` and writes benchmark-side artifacts under the pr
 The question-first profiler modes now carry their matching Linux BPF escalation artifacts:
 
 - `just profiler --scheduler ...` writes `bpf-runqlat.txt` when `runqlat` is available
+- `just profiler --lock-offcpu ...` writes `bpf-runqlat.txt`, `bpf-biolatency.txt`, `bpf-offcputime.txt`, `bpf-offwaketime.txt`, `bpf-futex.txt`, `bpf-sync-syscalls.txt`, and `lock-offcpu-classification.txt` when the corresponding tools are available
 - `just profiler --aof-disk ...` writes `bpf-biolatency.txt` when `biolatency` is available
 - `just profiler --network ...` writes `bpf-tcpretrans.txt` when `tcpretrans` is available
+
+`just profiler --c2c ...` is the cache-line contention escalation path. Use it only when the active hypothesis is false sharing, HITM traffic, or cache-line bouncing. Each session writes:
+
+- `perf-c2c.data`
+- `perf-c2c-stats.txt`
+- `perf-c2c-report.txt`
+- `perf-c2c-double-cl.txt`
+- `perf-buildids.txt`
+- `c2c-tool-check.txt`
+- `c2c-context.txt`
+- `c2c-symbolization.txt`
+- optional `layout-correlation/*.txt` `pahole` dumps when `pahole` is installed
+
+Use `just profiler --c2c --dry-run ...` when you need a tool-and-permission check without starting a capture.
 
 `--compare-to` now also attempts to write `diff-flamegraph.svg` when both sessions contain `perf.data` and either Brendan Gregg's FlameGraph scripts or `inferno` are installed.
 
 Interpretation rules:
 
 - `bpf-runqlat.txt`: scheduler delay histogram; look for a fat right tail before blaming CPU hotspots alone
+- `bpf-offcputime.txt`: blocked-stack summary; use this to see where the target is sleeping off-CPU
+- `bpf-offwaketime.txt`: blocked plus waker stack summary; use this when lock wait needs a waker-side explanation
+- `bpf-futex.txt`: futex wait counts for the profiled process; this is the strongest explicit lock-wait signal in the Linux path
+- `bpf-sync-syscalls.txt`: filtered `fsync`/`fdatasync`/`sync_file_range` counts for the profiled process; use this to confirm disk/fsync classification instead of inferring it from block activity alone
+- `lock-offcpu-classification.txt`: mode-level label for runnable off-CPU, blocked lock/off-CPU, disk/fsync, or unknown based on the captured evidence
 - `bpf-biolatency.txt`: block-device latency histogram; this is the first place to check when AOF durability work stretches p99
 - `bpf-tcpretrans.txt`: retransmit events during the session; zero output is valid and usually means the run saw no retransmits
 - `diff-flamegraph.svg`: red stacks grew versus baseline, blue stacks shrank versus baseline
+- `perf-c2c-stats.txt`: first pass for local HITM, remote HITM, and peer-store totals
+- `perf-c2c-report.txt`: correlate the hottest load/store addresses and symbols back to concrete structs before changing padding
+- `perf-c2c-double-cl.txt`: use this when adjacent cacheline false sharing is plausible
+- `layout-correlation/*.txt`: treat `pahole` output as evidence for or against a suspected field mapping, not as proof by itself
 
 ### Profiler Manifests
 
@@ -304,6 +339,10 @@ Every profiler session writes:
 - optional `summary-compare.json`
 - `host/` telemetry artifacts
 - optional `bench/` benchmark bridge artifacts
+
+For `--c2c`, the session note must explicitly state the false-sharing hypothesis, the strongest HITM rows, the suspected struct fields, and whether a padding or layout change is justified.
+
+For `--lock-offcpu`, the session note must state the blocking hypothesis, the strongest runnable-delay, off-CPU, futex, and sync artifacts, and the final classification: on-CPU, runnable off-CPU, blocked lock/off-CPU, disk/fsync, network, allocator, or unknown.
 
 `notes.md` is the human interpretation template. Fill it in immediately after the session while context is still fresh.
 

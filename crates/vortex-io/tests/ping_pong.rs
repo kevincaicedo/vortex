@@ -27,12 +27,18 @@ fn ping_pong_resp() {
             bind_addr: addr,
             max_connections: 64,
             buffer_size: 4096,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: Default::default(),
+            overload_policy: Default::default(),
             buffer_count: 128,
+            fixed_buffer_registration: Default::default(),
             connection_timeout: 0,
             aof_config: None,
             io_backend: IoBackendMode::Polling,
             ring_size: 4096,
             sqpoll_idle_ms: 1000,
+            budgets: Default::default(),
+            telemetry_mode: Default::default(),
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -82,12 +88,18 @@ fn ping_pong_inline() {
             bind_addr: addr,
             max_connections: 64,
             buffer_size: 4096,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: Default::default(),
+            overload_policy: Default::default(),
             buffer_count: 128,
+            fixed_buffer_registration: Default::default(),
             connection_timeout: 0,
             aof_config: None,
             io_backend: IoBackendMode::Polling,
             ring_size: 4096,
             sqpoll_idle_ms: 1000,
+            budgets: Default::default(),
+            telemetry_mode: Default::default(),
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -125,12 +137,18 @@ fn unknown_command_returns_error() {
             bind_addr: addr,
             max_connections: 64,
             buffer_size: 4096,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: Default::default(),
+            overload_policy: Default::default(),
             buffer_count: 128,
+            fixed_buffer_registration: Default::default(),
             connection_timeout: 0,
             aof_config: None,
             io_backend: IoBackendMode::Polling,
             ring_size: 4096,
             sqpoll_idle_ms: 1000,
+            budgets: Default::default(),
+            telemetry_mode: Default::default(),
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

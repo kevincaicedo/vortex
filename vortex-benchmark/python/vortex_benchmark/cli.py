@@ -22,6 +22,8 @@ from vortex_benchmark.models import (
 )
 
 SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
+SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION = ("auto", "on", "off")
+SUPPORTED_VORTEX_TELEMETRY_MODES = ("minimal", "profile")
 SUPPORTED_EVIDENCE_TIERS = ("exploratory", "engineering", "citation-grade")
 
 
@@ -64,6 +66,11 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         type=int,
         help="Override the service thread count used for Vortex, Redis, Dragonfly, or Valkey setup.",
     )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        help="Vortex engine shard count for setup scenarios. Must be a power of two.",
+    )
     aof_group = parser.add_mutually_exclusive_group()
     aof_group.add_argument(
         "--aof-enabled",
@@ -83,6 +90,11 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         help="AOF fsync policy for supported databases. Choices: always, everysec, no.",
     )
     parser.add_argument(
+        "--aof-max-pending-fsync-bytes",
+        type=int,
+        help="Vortex everysec AOF pending-byte limit before backpressure.",
+    )
+    parser.add_argument(
         "--maxmemory",
         help="Database maxmemory setting for setup scenarios, for example 4mb, 2g, or 1073741824.",
     )
@@ -97,6 +109,11 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         help="Vortex I/O backend override for setup scenarios. Choices: auto, uring, polling.",
     )
     parser.add_argument(
+        "--telemetry-mode",
+        choices=SUPPORTED_VORTEX_TELEMETRY_MODES,
+        help="Vortex telemetry mode. minimal uses target/release; profile requires native target/profiling with profile-telemetry.",
+    )
+    parser.add_argument(
         "--ring-size",
         type=int,
         help="Vortex io_uring submission queue size override for setup scenarios.",
@@ -105,6 +122,11 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         "--fixed-buffers",
         type=int,
         help="Vortex fixed I/O buffer count override for setup scenarios.",
+    )
+    parser.add_argument(
+        "--fixed-buffer-registration",
+        choices=SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION,
+        help="Vortex io_uring fixed-buffer registration policy. Choices: auto, on, off.",
     )
     parser.add_argument(
         "--sqpoll-idle-ms",

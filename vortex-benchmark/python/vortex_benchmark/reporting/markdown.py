@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 def _fmt_float(value: Any, digits: int = 3) -> str:
@@ -47,6 +47,12 @@ def _fmt_bytes(value: Any) -> str:
     return f"{size:.2f} {units[index]}"
 
 
+def _fmt_nanos_ms(value: Any, digits: int = 3) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value) / 1_000_000.0:.{digits}f}"
+
+
 def _relative(markdown_path: Path, asset_path: Path) -> str:
     return asset_path.relative_to(markdown_path.parent).as_posix()
 
@@ -83,6 +89,8 @@ def render_markdown_report(
     _section_validity_warnings(lines, host, validity)
     _section_database_targets(lines, databases)
     _section_workloads(lines, workloads)
+    _section_alpha_interpretation(lines, analysis, diagnostics)
+    _section_workload_contract_matrix(lines, analysis, diagnostics)
     _section_cross_db_comparison(lines, analysis, databases)
     _section_workload_rankings(lines, analysis, databases)
     _section_database_scorecard(lines, analysis)
@@ -98,6 +106,7 @@ def render_markdown_report(
     timeseries_summaries = diagnostics.get("timeseries_summaries") or []
     _section_host_telemetry_timeseries(lines, timeseries_summaries)
     _section_detailed_results(lines, rows)
+    _section_reactor_fairness(lines, rows)
     _section_key_insights(lines, analysis)
     _section_visualizations(lines, markdown_path, chart_paths)
     _section_artifacts(lines, report_payload)
@@ -162,10 +171,14 @@ def _section_environment(
         f"| Aggregates multiple replicates | {validity.get('report_aggregates_multiple_replicates', 'n/a')} |"
     )
     lines.append(f"| CPU governor | {host_validity.get('cpu_governor') or 'n/a'} |")
+    lines.append(f"| CPU scaling driver | {host_validity.get('cpu_scaling_driver') or 'n/a'} |")
     lines.append(
         f"| Energy preference | {host_validity.get('energy_performance_preference') or 'n/a'} |"
     )
     lines.append(f"| Power profile | {host_validity.get('power_profile') or 'n/a'} |")
+    lines.append(
+        f"| Effective CPU power mode | {host_validity.get('effective_cpu_power_mode') or 'n/a'} |"
+    )
     lines.append(f"| Thermal degraded | {host_validity.get('thermal_degraded')!s} |")
     lines.append(
         f"| perf_event_paranoid | {host_validity.get('perf_event_paranoid') or 'n/a'} |"
@@ -191,10 +204,16 @@ def _section_validity_warnings(
             "Results may understate peak performance."
         )
     governor = host_validity.get("cpu_governor")
-    if governor and governor not in {"performance", None}:
+    effective_power = host_validity.get("effective_cpu_power_mode")
+    if effective_power and effective_power != "performance":
         warnings.append(
-            f"⚠️ **CPU governor is '{governor}'** — Frequency scaling may "
+            f"⚠️ **Effective CPU power mode is '{effective_power}'** — Frequency scaling may "
             f"add variance. Set to 'performance' for citation-grade runs."
+        )
+    elif governor == "powersave" and effective_power == "performance":
+        warnings.append(
+            "ℹ️ **Raw CPU governor is 'powersave' but effective mode is 'performance'** — "
+            "intel_pstate can report this when EPP or powerprofilesctl is set to performance."
         )
     if host_validity.get("pmu_available") is False:
         warnings.append(
@@ -230,11 +249,11 @@ def _section_database_targets(
     lines.append("")
     lines.append(
         "| Database | Mode | Version | Bind "
-        "| AOF | Fsync | Maxmemory | Eviction |"
+        "| IO Requested | IO Effective | AOF | Fsync | AOF Pending Limit | Maxmemory | Eviction |"
     )
     lines.append(
         "|----------|------|---------|------"
-        "|-----|-------|-----------|----------|"
+        "|--------------|--------------|-----|-------|-------------------|-----------|----------|"
     )
     for db in databases:
         rt = db.get("runtime_config") or {}
@@ -243,13 +262,18 @@ def _section_database_targets(
             f"| {db.get('mode') or 'n/a'} "
             f"| {db.get('version') or 'n/a'} "
             f"| {db.get('bind') or 'n/a'} "
+            f"| {db.get('io_backend_requested') or rt.get('io_backend') or 'n/a'} "
+            f"| {db.get('io_backend_effective') or 'n/a'} "
             f"| {rt.get('aof_enabled', 'n/a')} "
             f"| {rt.get('aof_fsync', 'n/a')} "
+            f"| {rt.get('aof_max_pending_fsync_bytes', 'n/a')} "
             f"| {rt.get('maxmemory', 'n/a')} "
             f"| {rt.get('eviction_policy', 'n/a')} |"
         )
     if not databases:
-        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |")
+        lines.append(
+            "| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
+        )
     lines.append("")
 
 
@@ -278,6 +302,139 @@ def _section_workloads(
         )
     if not workloads:
         lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a |")
+    lines.append("")
+
+
+def _md_cell(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    text = str(value).replace("\n", " ")
+    return text.replace("|", "\\|")
+
+
+def _section_alpha_interpretation(
+    lines: list[str],
+    analysis: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> None:
+    gate_summary = (
+        analysis.get("alpha_gate_summary")
+        or diagnostics.get("alpha_gate_summary")
+        or {}
+    )
+    interpretation_rows = (
+        analysis.get("interpretation_rows")
+        or diagnostics.get("interpretation_rows")
+        or []
+    )
+    if not gate_summary and not interpretation_rows:
+        return
+
+    lines.append("## Alpha Gates And Interpretation")
+    lines.append("")
+    target_summary = gate_summary.get("target_summary")
+    if target_summary:
+        lines.append(f"- **Target summary:** {_md_cell(target_summary)}")
+        lines.append("")
+
+    gate_rows = gate_summary.get("gates") or []
+    if gate_rows:
+        lines.append("| Gate | Decision | Target | Reason |")
+        lines.append("|------|----------|--------|--------|")
+        for row in gate_rows:
+            lines.append(
+                f"| {_md_cell(row.get('gate'))} "
+                f"| {_md_cell(row.get('decision'))} "
+                f"| {_md_cell(row.get('target'))} "
+                f"| {_md_cell(row.get('reason'))} |"
+            )
+        lines.append("")
+
+    if interpretation_rows:
+        lines.append("### Row Claim Boundaries")
+        lines.append("")
+        lines.append(
+            "| Database | Backend | Series | Service T | Load T | Evidence | Client | Limiting Resource | Latency Gate | Redis Gate | Memory Gate | Reason |"
+        )
+        lines.append(
+            "|----------|---------|--------|----------:|-------:|----------|--------|-------------------|--------------|------------|-------------|--------|"
+        )
+        for row in interpretation_rows:
+            ratio = row.get("throughput_vs_redis_ratio")
+            redis_gate = _md_cell(row.get("redis_comparison_gate"))
+            if ratio is not None:
+                redis_gate = f"{redis_gate} ({float(ratio):.2f}x)"
+            lines.append(
+                f"| {_md_cell(row.get('database'))} "
+                f"| {_md_cell(row.get('backend'))} "
+                f"| {_md_cell(row.get('series_label'))} "
+                f"| {_md_cell(row.get('service_threads'))} "
+                f"| {_md_cell(row.get('thread_count'))} "
+                f"| {_md_cell(row.get('evidence_tier'))} "
+                f"| {_md_cell(row.get('client_saturation'))} "
+                f"| {_md_cell(row.get('limiting_resource_hypothesis'))} "
+                f"| {_md_cell(row.get('alpha_latency_gate'))} "
+                f"| {redis_gate} "
+                f"| {_md_cell(row.get('alpha_memory_gate'))} "
+                f"| {_md_cell(row.get('reason'))} |"
+            )
+        lines.append("")
+
+
+def _section_workload_contract_matrix(
+    lines: list[str],
+    analysis: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> None:
+    contract_rows = (
+        analysis.get("workload_contract_rows")
+        or diagnostics.get("workload_contract_rows")
+        or []
+    )
+    if not contract_rows:
+        return
+
+    lines.append("### Workload Contract Matrix")
+    lines.append("")
+    lines.append(
+        "| Database | Backend | Series | Svc T | Load T | Client CPU | CPU Mode | Affinity | Kernel | Backend Mode | Flags | Value | Keys | Pipeline | AOF | Eviction | Maxmemory | Shards | Fixed Buffers | Repeats |"
+    )
+    lines.append(
+        "|----------|---------|--------|------:|-------:|-----------:|----------|----------|--------|--------------|-------|------:|-----:|---------:|-----|----------|-----------|-------:|--------------|--------:|"
+    )
+    for row in contract_rows:
+        fixed_buffers = "n/a"
+        if row.get("fixed_buffer_count") is not None or row.get("fixed_buffer_size") is not None:
+            fixed_buffers = (
+                f"{_md_cell(row.get('fixed_buffer_count'))}"
+                f"x{_md_cell(row.get('fixed_buffer_size'))}"
+            )
+        cpu_mode = (
+            f"{_md_cell(row.get('cpu_governor'))}/"
+            f"{_md_cell(row.get('effective_cpu_power_mode'))}"
+        )
+        lines.append(
+            f"| {_md_cell(row.get('database'))} "
+            f"| {_md_cell(row.get('backend'))} "
+            f"| {_md_cell(row.get('series_label'))} "
+            f"| {_md_cell(row.get('service_threads'))} "
+            f"| {_md_cell(row.get('load_threads'))} "
+            f"| {_fmt_float(row.get('client_cpu'), 1)} "
+            f"| {cpu_mode} "
+            f"| {_md_cell(row.get('affinity_status'))} "
+            f"| {_md_cell(row.get('kernel'))} "
+            f"| {_md_cell(row.get('backend_effective_mode'))} "
+            f"| {_md_cell(row.get('feature_flags'))} "
+            f"| {_md_cell(row.get('value_size'))} "
+            f"| {_md_cell(row.get('key_count'))} "
+            f"| {_md_cell(row.get('pipeline'))} "
+            f"| {_md_cell(row.get('aof'))} "
+            f"| {_md_cell(row.get('eviction'))} "
+            f"| {_md_cell(row.get('maxmemory'))} "
+            f"| {_md_cell(row.get('shard_count'))} "
+            f"| {fixed_buffers} "
+            f"| {_md_cell(row.get('repeat_count'))} |"
+        )
     lines.append("")
 
 
@@ -762,6 +919,7 @@ def _section_performance_analysis(
                             f"svc_threads={signature.get('configured_service_threads')}",
                             f"aof={signature.get('configured_aof_enabled')}",
                             f"fsync={signature.get('configured_aof_fsync')}",
+                            f"aof_pending_limit={signature.get('configured_aof_max_pending_fsync_bytes')}",
                             f"maxmemory={signature.get('configured_maxmemory')}",
                             f"eviction={signature.get('configured_eviction_policy')}",
                             f"mode={signature.get('database_mode')}",
@@ -953,6 +1111,148 @@ def _fmt_rate(value: Optional[float]) -> str:
     return f"{value:.0f}"
 
 
+def _section_reactor_fairness(
+    lines: list[str],
+    rows: list[dict[str, Any]],
+) -> None:
+    telemetry_rows = [
+        row
+        for row in rows
+        if any(
+            row.get(key) is not None
+            for key in (
+                "reactor_completion_budget_exhaustions_delta",
+                "backend_submit_syscalls_delta",
+                "runtime_backend_effective_after",
+                "reactor_command_budget_exhaustions_delta",
+                "reactor_parser_resumes_delta",
+                "backend_sq_occupancy_max_after",
+                "backend_cq_occupancy_max_after",
+                "backend_cq_overflows_delta",
+                "reactor_writev_chunks_delta",
+                "reactor_close_drain_nanos_max_after",
+                "reactor_maintenance_nanos_max_after",
+                "reactor_aof_fsync_nanos_max_after",
+                "eviction_nanos_max_after",
+            )
+        )
+    ]
+    if not telemetry_rows:
+        return
+
+    lines.append("### Reactor Fairness And Backend Telemetry")
+    lines.append("")
+    lines.append(
+        "| Database | Backend | IO | Telemetry | Profile Timers | Series | Threads | Fixed Reg | SQPOLL | Multishot | Accept4 "
+        "| CloseOp | Cancel | Ring | SQ Occ Max | CQ Occ Max | CQ Overflows | CQ Cap | CQE/Submit x1000 | Submit Calls | SQ Pressure | CQ Pressure | CQE Max "
+        "| SQ Retries | Submit Failures | Completion Budget | Command Budget | Accept Budget | Writev Budget | Maint Budget | Yields | Parser Resumes | Writev Chunks "
+        "| Queued Bytes Max | Client Retained Max | Request Cap | Response Cap | Tx Cmd Cap | Tx Byte Cap | Watch Cap | Writev Cap "
+        "| Accept Throttle | Read Disable | Cmd Defer | Drop | Resp Pressure | AOF Pressure | Maint Debt "
+        "| Accept Drain | Accept Max | Close ms Max | Maintenance ms Max "
+        "| AOF Append ms Max | AOF Fsync ms Max | AOF Pending | AOF LSN Lag | AOF Fsync Req "
+        "| AOF Fsync Done | AOF Fsync Fail | AOF Backpressure | Expiry ms Max | Eviction ms Max | Metrics Flush ms Max |"
+    )
+    lines.append(
+        "|----------|---------|----|-----------|---------------:|--------|--------:|----------:|-------:|----------:|--------:"
+        "|--------:|-------:|-----:|-----------:|-----------:|-------------:|-------:|-----------------:|-------------:|------------:|------------:|--------:"
+        "|-----------:|----------------:|------------------:|---------------:|--------------:|-------------:|------------:|-------:|---------------:|--------------:"
+        "|-----------------:|--------------------:|------------:|-------------:|-----------:|------------:|----------:|----------:"
+        "|----------------:|-------------:|----------:|-----:|--------------:|-------------:|-----------:"
+        "|-------------:|-----------:|-------------:|-------------------:"
+        "|------------------:|-----------------:|------------:|------------:|---------------:|----------------:"
+        "|---------------:|-----------------:|--------------:|----------------:|---------------------:|"
+    )
+    for row in telemetry_rows:
+        effective_io = row.get("runtime_backend_effective_after") or row.get("io_backend_effective")
+        lines.append(
+            f"| {row.get('database') or 'n/a'} "
+            f"| {row.get('backend') or 'n/a'} "
+            f"| {_md_cell(effective_io)} "
+            f"| {_md_cell(row.get('runtime_telemetry_mode_after') or row.get('configured_telemetry_mode'))} "
+            f"| {_md_cell(row.get('runtime_profile_timers_available_after'))} "
+            f"| {row.get('series_label') or 'n/a'} "
+            f"| {row.get('thread_count') or 'n/a'} "
+            f"| {_md_cell(row.get('backend_fixed_buffers_registered_after'))} "
+            f"| {_md_cell(row.get('backend_sqpoll_after'))} "
+            f"| {_md_cell(row.get('backend_multishot_accept_after'))} "
+            f"| {_md_cell(row.get('backend_accept4_after'))} "
+            f"| {_md_cell(row.get('backend_close_opcode_after'))} "
+            f"| {_md_cell(row.get('backend_cancel_support_after'))} "
+            f"| {_md_cell(row.get('backend_effective_ring_size_after'))} "
+            f"| {_fmt_float(row.get('backend_sq_occupancy_max_after'), 0)} "
+            f"| {_fmt_float(row.get('backend_cq_occupancy_max_after'), 0)} "
+            f"| {_fmt_float(row.get('backend_cq_overflows_delta'), 0)} "
+            f"| {_fmt_float(row.get('backend_cq_capacity_after'), 0)} "
+            f"| {_fmt_float(row.get('backend_completions_per_submit_syscall_x1000_after'), 0)} "
+            f"| {_fmt_float(row.get('backend_submit_syscalls_delta'), 0)} "
+            f"| {_fmt_float(row.get('backend_sq_pressure_events_delta'), 0)} "
+            f"| {_fmt_float(row.get('backend_cq_pressure_events_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_completion_batch_max_after'), 0)} "
+            f"| {_fmt_float(row.get('reactor_submit_sq_full_retries_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_submit_failures_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_completion_budget_exhaustions_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_command_budget_exhaustions_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_accept_budget_exhaustions_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_writev_budget_exhaustions_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_maintenance_budget_exhaustions_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_yielded_connections_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_parser_resumes_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_writev_chunks_delta'), 0)} "
+            f"| {_fmt_bytes(row.get('reactor_queued_response_bytes_max_after'))} "
+            f"| {_fmt_bytes(row.get('reactor_client_retained_bytes_max_after'))} "
+            f"| {_fmt_float(row.get('reactor_request_cap_exceeded_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_response_cap_exceeded_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_multi_queue_command_cap_exceeded_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_multi_queue_bytes_cap_exceeded_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_watch_cap_exceeded_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_writev_chunk_cap_exceeded_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_overload_accept_throttled_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_overload_read_disabled_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_overload_command_deferred_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_overload_connections_dropped_delta'), 0)} "
+            f"| {_fmt_bytes(row.get('reactor_overload_pending_response_bytes_peak_after'))} "
+            f"| {_fmt_bytes(row.get('reactor_overload_aof_pending_bytes_peak_after'))} "
+            f"| {_fmt_float(row.get('reactor_overload_maintenance_debt_peak_after'), 0)} "
+            f"| {_fmt_float(row.get('reactor_accept_drain_accepted_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_accept_drain_accepted_max_after'), 0)} "
+            f"| {_fmt_nanos_ms(row.get('reactor_close_drain_nanos_max_after'))} "
+            f"| {_fmt_nanos_ms(row.get('reactor_maintenance_nanos_max_after'))} "
+            f"| {_fmt_nanos_ms(row.get('reactor_aof_append_nanos_max_after'))} "
+            f"| {_fmt_nanos_ms(row.get('reactor_aof_fsync_nanos_max_after'))} "
+            f"| {_fmt_bytes(row.get('reactor_aof_pending_bytes_after'))} "
+            f"| {_fmt_float(row.get('reactor_aof_durable_lsn_lag_after'), 0)} "
+            f"| {_fmt_float(row.get('reactor_aof_fsync_requested_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_aof_fsync_completed_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_aof_fsync_failed_delta'), 0)} "
+            f"| {_fmt_float(row.get('reactor_aof_backpressure_events_delta'), 0)} "
+            f"| {_fmt_nanos_ms(row.get('reactor_active_expiry_nanos_max_after'))} "
+            f"| {_fmt_nanos_ms(row.get('eviction_nanos_max_after'))} "
+            f"| {_fmt_nanos_ms(row.get('reactor_metrics_flush_nanos_max_after'))} |"
+        )
+    invalid_rows = [
+        row
+        for row in telemetry_rows
+        if row.get("service_invalid_delta_fields") or row.get("host_invalid_delta_fields")
+    ]
+    if invalid_rows:
+        lines.append("")
+        lines.append("Telemetry validity notes:")
+        for row in invalid_rows:
+            service_fields = row.get("service_invalid_delta_fields") or []
+            host_fields = row.get("host_invalid_delta_fields") or []
+            notes = []
+            if service_fields:
+                notes.append(f"service={', '.join(service_fields[:12])}")
+            if host_fields:
+                notes.append(f"host={', '.join(host_fields[:12])}")
+            lines.append(
+                f"- {row.get('database') or 'n/a'} / {row.get('backend') or 'n/a'} / "
+                f"{row.get('series_label') or 'n/a'} / t{row.get('thread_count') or 'n/a'} "
+                f"had invalid monotonic delta fields: {'; '.join(notes)}."
+            )
+    lines.append("")
+
+
 # ---------------------------------------------------------------------------
 # Detailed Results
 # ---------------------------------------------------------------------------
@@ -1068,6 +1368,24 @@ def _section_diagnostics(
             f"| Max allocator resident after | {_fmt_bytes(diagnostic_summary.get('max_allocator_resident_after_bytes'))} |"
         )
         lines.append(
+            f"| Max engine bytes/live-key | {_fmt_float(diagnostic_summary.get('max_engine_bytes_per_live_key'), 2)} |"
+        )
+        lines.append(
+            f"| Max full-server RSS/Redis ratio | {_fmt_float(diagnostic_summary.get('max_full_server_rss_vs_redis_ratio'), 2)} |"
+        )
+        lines.append(
+            "| Engine memory claim decisions | "
+            f"Allowed {diagnostic_summary.get('engine_memory_claims_allowed') or 0}, "
+            f"Narrowed {diagnostic_summary.get('engine_memory_claims_narrowed') or 0}, "
+            f"Rejected {diagnostic_summary.get('engine_memory_claims_rejected') or 0} |"
+        )
+        lines.append(
+            "| Full-server RSS claim decisions | "
+            f"Allowed {diagnostic_summary.get('full_server_rss_claims_allowed') or 0}, "
+            f"Narrowed {diagnostic_summary.get('full_server_rss_claims_narrowed') or 0}, "
+            f"Rejected {diagnostic_summary.get('full_server_rss_claims_rejected') or 0} |"
+        )
+        lines.append(
             f"| Max dirty memory peak | {_fmt_bytes(diagnostic_summary.get('max_system_mem_dirty_peak_bytes'))} |"
         )
         lines.append(
@@ -1085,10 +1403,10 @@ def _section_diagnostics(
         lines.append("### Memory And Reclaim")
         lines.append("")
         lines.append(
-            "| Database | Backend | Series | Threads | RSS Peak | Dataset After | Allocator Resident After | Frag Ratio | Dirty Peak | Writeback Peak | Direct Scan | Allocstall |"
+            "| Database | Backend | Series | Threads | Engine B/key | Engine Claim | RSS/Redis | RSS Claim | Table Alloc | Slots | Slack | Tombstones | Load | IO Reserved | IO Committed | Conn State | RSS Peak | Dataset After | Allocator Resident After | Frag Ratio | Dirty Peak | Writeback Peak | Direct Scan | Allocstall |"
         )
         lines.append(
-            "|----------|---------|--------|--------:|---------:|--------------:|------------------------:|-----------:|-----------:|---------------:|------------:|-----------:|"
+            "|----------|---------|--------|--------:|-------------:|--------------|----------:|-----------|------------:|------:|------:|-----------:|-----:|------------:|-------------:|-----------:|---------:|--------------:|------------------------:|-----------:|-----------:|---------------:|------------:|-----------:|"
         )
         for row in memory_rows:
             lines.append(
@@ -1096,6 +1414,18 @@ def _section_diagnostics(
                 f"| {row.get('backend') or 'n/a'} "
                 f"| {row.get('series_label') or 'n/a'} "
                 f"| {row.get('thread_count') or 'n/a'} "
+                f"| {_fmt_float(row.get('engine_bytes_per_live_key_after'), 2)} "
+                f"| {row.get('engine_memory_claim_decision') or 'n/a'} "
+                f"| {_fmt_float(row.get('full_server_rss_vs_redis_ratio'), 2)} "
+                f"| {row.get('full_server_rss_claim_decision') or 'n/a'} "
+                f"| {_fmt_bytes(row.get('engine_table_allocated_after_bytes'))} "
+                f"| {_fmt_float(row.get('engine_table_total_slots_after'), 0)} "
+                f"| {_fmt_float(row.get('engine_capacity_slack_slots_after'), 0)} "
+                f"| {_fmt_float(row.get('engine_tombstone_slots_after'), 0)} "
+                f"| {_fmt_float(row.get('engine_load_factor_after'), 2)} "
+                f"| {_fmt_bytes(row.get('io_fixed_buffer_reserved_after_bytes'))} "
+                f"| {_fmt_bytes(row.get('io_fixed_buffer_committed_after_bytes'))} "
+                f"| {_fmt_bytes(row.get('per_connection_state_after_bytes'))} "
                 f"| {_fmt_bytes(row.get('process_rss_peak_bytes'))} "
                 f"| {_fmt_bytes(row.get('used_memory_dataset_after_bytes'))} "
                 f"| {_fmt_bytes(row.get('allocator_resident_after_bytes'))} "
@@ -1160,10 +1490,10 @@ def _section_diagnostics(
     lines.append("")
     if eviction_rows:
         lines.append(
-            "| Database | Backend | Series | Threads | Evicted Keys | Throughput ops/s |"
+            "| Database | Backend | Series | Threads | Evicted Keys | Admissions | Bytes Freed | OOM After Scan | Throughput ops/s |"
         )
         lines.append(
-            "|----------|---------|--------|---------|-------------:|-------------------:|"
+            "|----------|---------|--------|---------|-------------:|-----------:|------------:|---------------:|-------------------:|"
         )
         for row in eviction_rows:
             lines.append(
@@ -1172,6 +1502,9 @@ def _section_diagnostics(
                 f"| {row.get('series_label') or 'n/a'} "
                 f"| {row.get('thread_count') or 'n/a'} "
                 f"| {_fmt_float(row.get('evicted_keys_delta'), 0)} "
+                f"| {_fmt_float(row.get('eviction_admissions_delta'), 0)} "
+                f"| {_fmt_bytes(row.get('eviction_bytes_freed_delta'))} "
+                f"| {_fmt_float(row.get('eviction_oom_after_scan_delta'), 0)} "
                 f"| {_fmt_ops(row.get('throughput_ops_sec'))} |"
             )
     else:
@@ -1259,9 +1592,41 @@ def _section_visualizations(
 # ---------------------------------------------------------------------------
 
 
-def _section_artifacts(
-    lines: list[str], payload: dict[str, Any]
+def _append_artifact_path_samples(
+    lines: list[str],
+    label: str,
+    paths: list[str],
+    *,
+    limit: int = 5,
 ) -> None:
+    if not paths:
+        return
+
+    lines.append(f"- {label}:")
+    for path in paths[:limit]:
+        lines.append(f"  - {path}")
+    remaining = len(paths) - limit
+    if remaining > 0:
+        lines.append(f"  - ... {remaining} more in the report JSON rows")
+
+
+def _unique_row_paths(rows: list[dict[str, Any]], *keys: str) -> list[str]:
+    seen: set[str] = set()
+    paths: list[str] = []
+    for row in rows:
+        for key in keys:
+            value = row.get(key)
+            if not value:
+                continue
+            path = Path(str(value)).as_posix()
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _section_artifacts(lines: list[str], payload: dict[str, Any]) -> None:
     lines.append("---")
     lines.append("")
     lines.append("## Artifact Index")
@@ -1295,3 +1660,38 @@ def _section_artifacts(
             f"- History Index: "
             f"{Path(artifacts.get('index', '')).as_posix()}"
         )
+    rows = payload.get("rows") or []
+    _append_artifact_path_samples(
+        lines,
+        "Source summaries",
+        _unique_row_paths(rows, "source_summary"),
+    )
+    _append_artifact_path_samples(
+        lines,
+        "Raw command results",
+        _unique_row_paths(
+            rows,
+            "backend_json_path",
+            "backend_csv_path",
+            "backend_stdout_path",
+            "backend_stderr_path",
+        ),
+    )
+    _append_artifact_path_samples(
+        lines,
+        "Host and memory telemetry summaries",
+        _unique_row_paths(rows, "host_telemetry_summary_path"),
+    )
+    _append_artifact_path_samples(
+        lines,
+        "Profiler artifacts",
+        _unique_row_paths(
+            rows,
+            "flamegraph_path",
+            "perf_stat_path",
+            "perf_report_path",
+            "profile_session_path",
+            "memory_profile_path",
+            "heaptrack_path",
+        ),
+    )

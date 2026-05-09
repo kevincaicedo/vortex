@@ -23,14 +23,9 @@ impl ConcurrentKeyspace {
                 drop(guard);
                 let key = VortexKey::from_bytes(key_bytes);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                let had_ttl = matches!(wguard.get_entry_ttl(&key), Some(ttl) if ttl != 0);
-                if remove_if_expired(&mut wguard, &key, now_nanos) {
-                    self.commit_effects(
-                        MutationEffects::none()
-                            .with_ttl(shard_index, ExpiryTransition::remove(had_ttl))
-                            .with_watch_key(&key),
-                    );
-                }
+                let effects = self.cleanup_expired_key(shard_index, &mut wguard, &key, now_nanos);
+                drop(wguard);
+                self.publish_optional_deferred_effects(effects);
                 encode(None)
             }
             None => encode(None),
@@ -50,7 +45,9 @@ impl ConcurrentKeyspace {
                 // Expired — drop read lock, escalate to write lock, double-check.
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
+                let effects = self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
+                drop(wguard);
+                self.publish_optional_deferred_effects(effects);
                 None
             }
             None => None,
@@ -71,40 +68,59 @@ impl ConcurrentKeyspace {
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
         let mut guard = self.write_shard_by_index(shard_index);
-        let Some((value, ttl_deadline)) = guard.get_with_ttl(key) else {
-            return MutationOutcome::new(None, None);
-        };
-        let had_ttl = ttl_deadline != 0;
-        if had_ttl && ttl_deadline <= now_nanos {
-            let removed = remove_if_expired(&mut guard, key, now_nanos);
-            debug_assert!(removed, "expired GETEX key must be removable");
-            self.commit_effects(
-                MutationEffects::none()
-                    .with_ttl(shard_index, ExpiryTransition::ttl_removed())
-                    .with_watch_key(key),
-            );
-            return MutationOutcome::new(None, None);
+        let (value, changed, transition, mut mutation_report) =
+            match guard.slot_cursor_prehashed(key_bytes, table_hash, now_nanos) {
+                SlotCursor::Vacant(_) => return MutationOutcome::new(None, None),
+                SlotCursor::Expired(expired) => {
+                    let removed = expired.remove();
+                    debug_assert!(removed.is_some(), "expired GETEX key must be removable");
+                    let effects = MutationEffects::none()
+                        .with_ttl(
+                            shard_index,
+                            removed
+                                .as_ref()
+                                .map_or(ExpiryTransition::default(), |removed| {
+                                    ExpiryTransition::remove(removed.old_had_ttl())
+                                }),
+                        )
+                        .with_watch_key(key)
+                        .defer();
+                    drop(guard);
+                    self.publish_deferred_effects(effects);
+                    return MutationOutcome::new(None, None);
+                }
+                SlotCursor::Live(mut live) => {
+                    let value = live.cloned_value();
+                    match option {
+                        GetExOption::None => unreachable!("GETEX none exits through get_value"),
+                        GetExOption::ExpireAt(deadline) if deadline <= now_nanos => {
+                            let removed = live.remove();
+                            let transition = removed
+                                .as_ref()
+                                .map_or(ExpiryTransition::default(), |removed| {
+                                    ExpiryTransition::remove(removed.old_had_ttl())
+                                });
+                            (value, removed.is_some(), transition, None)
+                        }
+                        GetExOption::ExpireAt(deadline) => {
+                            let report = live.set_ttl(deadline, None);
+                            let transition =
+                                ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl());
+                            (value, true, transition, Some(report))
+                        }
+                        GetExOption::Persist => {
+                            let report = live.clear_ttl(None);
+                            let changed = report.old_had_ttl();
+                            let transition =
+                                ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl());
+                            (value, changed, transition, Some(report))
+                        }
+                    }
+                }
+            };
+        if !matches!(option, GetExOption::ExpireAt(deadline) if deadline <= now_nanos) {
+            self.record_access_prehashed(&guard, key_bytes, table_hash);
         }
-
-        let value = value.clone();
-        self.record_access_prehashed(&guard, key_bytes, table_hash);
-
-        let (changed, transition) = match option {
-            GetExOption::None => unreachable!("GETEX none exits through get_value"),
-            GetExOption::ExpireAt(deadline) if deadline <= now_nanos => {
-                let removed = guard.remove(key).is_some();
-                debug_assert!(removed, "live GETEX key must be removable");
-                (removed, ExpiryTransition::remove(had_ttl))
-            }
-            GetExOption::ExpireAt(deadline) => {
-                let updated = guard.set_entry_ttl(key, deadline);
-                (updated, ExpiryTransition::new(had_ttl, updated))
-            }
-            GetExOption::Persist => {
-                let updated = guard.clear_entry_ttl(key);
-                (updated, ExpiryTransition::remove(had_ttl))
-            }
-        };
 
         let aof_lsn = if changed {
             match option {
@@ -112,21 +128,24 @@ impl ConcurrentKeyspace {
                 _ => {
                     let (entry_lsn, aof_lsn) =
                         self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
-                    stamp_entry_lsn_if(&mut guard, key_bytes, table_hash, entry_lsn);
+                    if let Some(report) = mutation_report.as_mut() {
+                        let _ = guard.stamp_report_lsn(report, entry_lsn);
+                    } else {
+                        stamp_entry_lsn_if(&mut guard, key_bytes, table_hash, entry_lsn);
+                    }
                     aof_lsn
                 }
             }
         } else {
             None
         };
-        let aof_lsn = self
-            .commit_effects(
-                MutationEffects::none()
-                    .with_ttl(shard_index, transition)
-                    .with_watch_key_if(changed, key)
-                    .with_aof_lsn(aof_lsn),
-            )
-            .into_lsn();
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, transition)
+            .with_watch_key_if(changed, key)
+            .with_aof_lsn(aof_lsn)
+            .defer();
+        drop(guard);
+        let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
         MutationOutcome::new(Some(value), aof_lsn)
     }
 
@@ -169,13 +188,13 @@ impl ConcurrentKeyspace {
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features);
         let previous = guard.insert_with(key, value, ttl_deadline_nanos, entry_lsn);
-        self.commit_effects(
-            MutationEffects::none()
-                .with_ttl(shard_index, ExpiryTransition::new(had_ttl, true))
-                .with_frequency(table_hash)
-                .with_optional_watch_key(watched_key.as_ref()),
-        );
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, ExpiryTransition::new(had_ttl, true))
+            .with_frequency(table_hash)
+            .with_optional_watch_key(watched_key.as_ref())
+            .defer();
         drop(guard);
+        self.publish_deferred_effects(effects);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(previous, aof_lsn, evicted))
     }
@@ -239,9 +258,11 @@ impl ConcurrentKeyspace {
                 )
                 .had_ttl()
         };
-        self.commit_effects(
-            MutationEffects::none().with_ttl(shard_index, ExpiryTransition::remove(old_had_ttl)),
-        );
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, ExpiryTransition::remove(old_had_ttl))
+            .defer();
+        drop(guard);
+        self.publish_deferred_effects(effects);
         Ok(MutationOutcome::new((), None))
     }
 
@@ -301,8 +322,9 @@ impl ConcurrentKeyspace {
         if features.maxmemory() {
             effects = effects.with_frequency(table_hash);
         }
-        let aof_lsn = self.commit_effects(effects).into_lsn();
+        let effects = effects.defer();
         drop(guard);
+        let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
         reservation.settle();
         Ok(mutation_outcome_with_evictions((), aof_lsn, evicted))
     }
@@ -345,7 +367,7 @@ impl ConcurrentKeyspace {
             evicted,
             ..
         } = state;
-        let (result, transition) =
+        let (result, transition, mut mutation_report) =
             set_with_options_on_table(&mut guard, key.clone(), value, options, now_nanos);
         let changed = matches!(&result, SetResult::Ok | SetResult::OkGet(_));
         let table_hash = self.table_hash_key(key.as_bytes());
@@ -353,7 +375,11 @@ impl ConcurrentKeyspace {
             let key_bytes = key.as_bytes();
             let (entry_lsn, aof_lsn) =
                 self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
-            stamp_entry_lsn_if(&mut guard, key_bytes, table_hash, entry_lsn);
+            if let Some(report) = mutation_report.as_mut() {
+                let _ = guard.stamp_report_lsn(report, entry_lsn);
+            } else {
+                stamp_entry_lsn_if(&mut guard, key_bytes, table_hash, entry_lsn);
+            }
             aof_lsn
         } else {
             None
@@ -364,8 +390,9 @@ impl ConcurrentKeyspace {
         if changed {
             effects = effects.with_frequency(table_hash).with_watch_key(&key);
         }
-        let aof_lsn = self.commit_effects(effects).into_lsn();
+        let effects = effects.defer();
         drop(guard);
+        let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
         reservation.settle();
         Ok(mutation_outcome_with_evictions(result, aof_lsn, evicted))
     }
@@ -439,20 +466,27 @@ impl ConcurrentKeyspace {
         // `expired` is emitted in the same shard-group order as the read pass,
         // so we can batch lazy expiry cleanup with one write lock per shard.
         let mut expired_cursor = 0;
+        let mut cleanup_effects: SmallVec<[DeferredEffects<'_>; 8]> = SmallVec::new();
         while expired_cursor < expired.len() {
             let shard_idx = expired[expired_cursor].shard_idx;
             let mut wguard = self.write_shard_by_index(shard_idx);
             while expired_cursor < expired.len() && expired[expired_cursor].shard_idx == shard_idx {
                 let lookup = expired[expired_cursor];
-                let _ = self.cleanup_expired_prehashed(
+                if let Some(effect) = self.cleanup_expired_prehashed(
                     shard_idx,
                     &mut wguard,
                     keys[lookup.output_idx],
                     lookup.hash,
                     now_nanos,
-                );
+                ) {
+                    cleanup_effects.push(effect);
+                }
                 expired_cursor += 1;
             }
+            drop(wguard);
+        }
+        for effect in cleanup_effects {
+            self.publish_deferred_effects(effect);
         }
 
         values
@@ -464,11 +498,11 @@ impl ConcurrentKeyspace {
             .collect()
     }
 
-    pub(crate) fn mset_values(
-        &self,
-        pairs: Vec<(VortexKey, VortexValue)>,
-        now_nanos: u64,
-    ) -> MutationResult<()> {
+    pub(crate) fn mset_values<I>(&self, pairs: I, now_nanos: u64) -> MutationResult<()>
+    where
+        I: IntoIterator<Item = (VortexKey, VortexValue)>,
+    {
+        let pairs: OwnedKeyValueBatch = pairs.into_iter().collect();
         if pairs.is_empty() {
             return Ok(MutationOutcome::new((), None));
         }
@@ -493,22 +527,27 @@ impl ConcurrentKeyspace {
             ReservationState::empty(self, eviction)
         };
 
-        let (key_refs, lookups) = build_multi_write_lookups(self, &pairs);
-        let (mut guards, plan, state) = coordinator.acquire_multi_write(
-            &key_refs,
+        let plan = self.prehashed_plan(
+            pairs
+                .iter()
+                .enumerate()
+                .map(|(pair_index, (key, _))| (pair_index, key.as_bytes())),
+        );
+        let (mut guards, state) = coordinator.acquire_prehashed_multi_write(
+            &plan,
             preferred_shard,
             state,
             "mset_values",
             admission_active,
             |guards, plan| {
-                Ok(PositiveDelta::sum(lookups.iter().map(|lookup| {
-                    let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
+                Ok(PositiveDelta::sum(plan.entries().iter().map(|lookup| {
+                    let guard_pos = lookup.guard_index().get();
                     let table = &*guards[guard_pos].1;
-                    let (key, value) = &pairs[lookup.pair_index];
+                    let (key, value) = &pairs[lookup.key_index()];
                     positive_delta(table.projected_insert_delta_prehashed(
                         key,
                         value,
-                        lookup.table_hash,
+                        lookup.table_hash(),
                     ))
                 })))
             },
@@ -518,15 +557,21 @@ impl ConcurrentKeyspace {
             evicted,
             ..
         } = state;
-        drop(key_refs);
-        let mut pairs = pairs.into_iter().map(Some).collect::<Vec<_>>();
+        let lookups = planned_write_lookups(&plan);
+        let lookup_count = lookups.len();
+        drop(plan);
+        let mut pairs: SmallVec<[Option<(VortexKey, VortexValue)>; 16]> =
+            pairs.into_iter().map(Some).collect();
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features);
+        let record_frequency = publish_features.maxmemory();
+        let mut effects: SmallVec<[DeferredEffects<'static>; 16]> =
+            SmallVec::with_capacity(lookup_count);
+        let mut owned_watch_effects: SmallVec<[OwnedDeferredEffects; 16]> = SmallVec::new();
 
         for lookup in lookups {
-            let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
-            let table = &mut *guards[guard_pos].1;
+            let table = &mut *guards[lookup.guard_pos].1;
             let (key, value) = pairs[lookup.pair_index]
                 .take()
                 .expect("mset pair must be available exactly once");
@@ -539,35 +584,48 @@ impl ConcurrentKeyspace {
                     MutationPolicy::clear(entry_lsn),
                 )
                 .had_ttl();
-            self.commit_effects(
-                MutationEffects::none()
-                    .with_ttl(lookup.shard_idx, ExpiryTransition::remove(old_had_ttl))
-                    .with_frequency(lookup.table_hash)
-                    .with_optional_watch_key(watched_key.as_ref()),
-            );
+            let transition = ExpiryTransition::remove(old_had_ttl);
+            let mut effect = MutationEffects::none();
+            if !transition.is_noop() {
+                effect = effect.with_ttl(lookup.shard_idx, transition);
+            }
+            if record_frequency {
+                effect = effect.with_frequency(lookup.table_hash);
+            }
+            if watched_key.is_some() {
+                owned_watch_effects
+                    .push(OwnedDeferredEffects::from_owned_watch(effect, watched_key));
+            } else if !effect.is_empty() {
+                effects.push(effect.defer());
+            }
         }
         drop(guards);
+        for effect in effects {
+            self.publish_deferred_effects(effect);
+        }
+        for effect in owned_watch_effects {
+            self.publish_owned_deferred_effects(effect);
+        }
         reservation.settle();
         Ok(mutation_outcome_with_evictions((), aof_lsn, evicted))
     }
 
-    pub(crate) fn msetnx_values(
-        &self,
-        pairs: Vec<(VortexKey, VortexValue)>,
-        now_nanos: u64,
-    ) -> MutationResult<bool> {
-        let pairs = deduplicate_last_write_pairs(pairs);
+    pub(crate) fn msetnx_values<I>(&self, pairs: I, now_nanos: u64) -> MutationResult<bool>
+    where
+        I: IntoIterator<Item = (VortexKey, VortexValue)>,
+    {
+        let pairs = deduplicate_last_write_pairs(pairs.into_iter().collect());
         if pairs.is_empty() {
             return Ok(MutationOutcome::new(true, None));
         }
 
-        let all_absent = pairs.iter().all(|(key, _)| {
-            !matches!(
-                self.read_shard_by_index(self.shard_index(key.as_bytes()))
-                    .get_with_ttl(key),
-                Some((_, ttl)) if ttl == 0 || ttl > now_nanos
-            )
-        });
+        let plan = self.prehashed_plan(
+            pairs
+                .iter()
+                .enumerate()
+                .map(|(pair_index, (key, _))| (pair_index, key.as_bytes())),
+        );
+        let all_absent = msetnx_all_absent_read_plan(self, &plan, now_nanos);
         if !all_absent {
             return Ok(MutationOutcome::new(false, None));
         }
@@ -587,25 +645,24 @@ impl ConcurrentKeyspace {
             ReservationState::empty(self, eviction)
         };
 
-        let (key_refs, lookups) = build_multi_write_lookups(self, &pairs);
-        let (mut guards, plan, state) = coordinator.acquire_multi_write(
-            &key_refs,
+        let (mut guards, state) = coordinator.acquire_prehashed_multi_write(
+            &plan,
             preferred_shard,
             state,
             "msetnx_values",
             admission_active,
             |guards, plan| {
-                if !msetnx_all_absent_locked(self, guards, plan, &pairs, &lookups, now_nanos) {
+                if !msetnx_all_absent_for_projection(guards, plan, &pairs, now_nanos) {
                     return Ok(PositiveDelta::zero());
                 }
-                Ok(PositiveDelta::sum(lookups.iter().map(|lookup| {
-                    let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
+                Ok(PositiveDelta::sum(plan.entries().iter().map(|lookup| {
+                    let guard_pos = lookup.guard_index().get();
                     let table = &*guards[guard_pos].1;
-                    let (key, value) = &pairs[lookup.pair_index];
+                    let (key, value) = &pairs[lookup.key_index()];
                     positive_delta(table.projected_insert_delta_prehashed(
                         key,
                         value,
-                        lookup.table_hash,
+                        lookup.table_hash(),
                     ))
                 })))
             },
@@ -615,32 +672,63 @@ impl ConcurrentKeyspace {
             evicted,
             ..
         } = state;
-        if !msetnx_all_absent_locked(self, &mut guards, &plan, &pairs, &lookups, now_nanos) {
+        let mut cleanup_effects: SmallVec<[OwnedDeferredEffects; 16]> = SmallVec::new();
+        if !msetnx_cleanup_and_all_absent_locked(
+            self,
+            &mut guards,
+            &plan,
+            &pairs,
+            now_nanos,
+            &mut cleanup_effects,
+        ) {
             drop(guards);
+            for effect in cleanup_effects {
+                self.publish_owned_deferred_effects(effect);
+            }
             reservation.settle();
             return Ok(mutation_outcome_with_evictions(false, None, evicted));
         }
-        drop(key_refs);
 
-        let mut pairs = pairs.into_iter().map(Some).collect::<Vec<_>>();
+        let lookups = planned_write_lookups(&plan);
+        let lookup_count = lookups.len();
+        drop(plan);
+        let mut pairs: SmallVec<[Option<(VortexKey, VortexValue)>; 16]> =
+            pairs.into_iter().map(Some).collect();
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features);
+        let record_frequency = publish_features.maxmemory();
+        let mut effects: SmallVec<[DeferredEffects<'static>; 16]> =
+            SmallVec::with_capacity(lookup_count);
+        let mut owned_watch_effects: SmallVec<[OwnedDeferredEffects; 16]> = SmallVec::new();
         for lookup in lookups {
-            let guard_pos = plan.guard_index_for_key(lookup.pair_index).get();
-            let table = &mut *guards[guard_pos].1;
+            let table = &mut *guards[lookup.guard_pos].1;
             let (key, value) = pairs[lookup.pair_index]
                 .take()
                 .expect("msetnx pair must be available exactly once");
             let watched_key = publish_features.watch().then(|| key.clone());
             table.insert_new_prehashed(key, value, lookup.table_hash, entry_lsn);
-            self.commit_effects(
-                MutationEffects::none()
-                    .with_frequency(lookup.table_hash)
-                    .with_optional_watch_key(watched_key.as_ref()),
-            );
+            let mut effect = MutationEffects::none();
+            if record_frequency {
+                effect = effect.with_frequency(lookup.table_hash);
+            }
+            if watched_key.is_some() {
+                owned_watch_effects
+                    .push(OwnedDeferredEffects::from_owned_watch(effect, watched_key));
+            } else if !effect.is_empty() {
+                effects.push(effect.defer());
+            }
         }
         drop(guards);
+        for effect in cleanup_effects {
+            self.publish_owned_deferred_effects(effect);
+        }
+        for effect in effects {
+            self.publish_deferred_effects(effect);
+        }
+        for effect in owned_watch_effects {
+            self.publish_owned_deferred_effects(effect);
+        }
         reservation.settle();
 
         Ok(mutation_outcome_with_evictions(true, aof_lsn, evicted))
@@ -682,18 +770,138 @@ impl ConcurrentKeyspace {
                 Ok(result) => result,
                 Err(err) => return Err(MutationError::with_evictions(err, evicted)),
             };
-        self.commit_effects(
-            MutationEffects::none()
-                .with_ttl(shard_index, transition)
-                .with_frequency(table_hash)
-                .with_optional_watch_key(watched_key.as_ref()),
-        );
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, transition)
+            .with_frequency(table_hash)
+            .with_optional_watch_key(watched_key.as_ref())
+            .defer();
         drop(guard);
+        self.publish_deferred_effects(effects);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(result, aof_lsn, evicted))
     }
 
+    #[inline]
+    fn optimistic_value_mutations_enabled(&self) -> bool {
+        let features = self.mutation_features();
+        !features.maxmemory() && !self.replay_mode_active()
+    }
+
+    #[inline]
+    fn record_optimistic_value_mutation_retry(&self) {
+        #[cfg(feature = "lock-profile")]
+        self.record_lock_profile_retry(crate::keyspace::LockProfileClass::SingleKey);
+    }
+
+    fn commit_prepared_value_mutation<T>(
+        &self,
+        key: &VortexKey,
+        shard_index: usize,
+        prepared: PreparedValueMutation,
+        result: T,
+        now_nanos: u64,
+    ) -> Result<Option<MutationOutcome<T>>, MutationError> {
+        let table_hash = prepared.table_hash();
+        let key_bytes = key.as_bytes();
+        let mut guard = self.write_shard_by_index(shard_index);
+        let publish_features = self.mutation_features();
+        if publish_features.maxmemory() || self.replay_mode_active() {
+            return Ok(None);
+        }
+
+        if !prepared
+            .snapshot()
+            .revalidates(&guard, key_bytes, table_hash, now_nanos)
+        {
+            self.record_optimistic_value_mutation_retry();
+            return Ok(None);
+        }
+
+        let had_ttl = prepared.snapshot().had_live_ttl();
+        let was_missing = prepared.snapshot().is_missing();
+        let _projected_delta = prepared.projected_delta();
+        let watched_key = publish_features.watch().then(|| key.clone());
+        let (entry_lsn, aof_lsn) =
+            self.allocate_observed_mutation_lsn_with_features(publish_features);
+        let value = prepared.into_value();
+
+        if was_missing {
+            let _ = guard.mutate_prehashed(
+                BorrowedKey(key_bytes),
+                value,
+                table_hash,
+                MutationPolicy::clear(entry_lsn),
+            );
+        } else {
+            guard
+                .replace_prehashed(
+                    key_bytes,
+                    value,
+                    table_hash,
+                    MutationPolicy::preserve_ttl(entry_lsn),
+                )
+                .expect("revalidated live key must exist while swapping prepared value");
+        }
+
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, ExpiryTransition::new(had_ttl, had_ttl))
+            .with_frequency(table_hash)
+            .with_optional_watch_key(watched_key.as_ref())
+            .defer();
+        drop(guard);
+        self.publish_deferred_effects(effects);
+        Ok(Some(mutation_outcome_with_evictions(result, aof_lsn, None)))
+    }
+
     pub(crate) fn increment_by_float(
+        &self,
+        key: VortexKey,
+        increment: f64,
+        now_nanos: u64,
+    ) -> MutationResult<FloatIncrementResult> {
+        if self.optimistic_value_mutations_enabled() {
+            for _ in 0..OPTIMISTIC_VALUE_MUTATION_RETRIES {
+                let key_bytes = key.as_bytes();
+                let shard_index = self.shard_index(key_bytes);
+                let table_hash = self.table_hash_key(key_bytes);
+                let read_guard = self.read_shard_by_index(shard_index);
+                let Some(prepared) = prepare_increment_by_float(
+                    &read_guard,
+                    &key,
+                    table_hash,
+                    increment,
+                    now_nanos,
+                )?
+                else {
+                    break;
+                };
+                drop(read_guard);
+                maybe_pause_after_optimistic_prepare("increment_by_float");
+
+                let ttl_after = match prepared.mutation().snapshot().ttl_deadline() {
+                    Some(deadline) if deadline > now_nanos => TtlState::Deadline(deadline),
+                    _ => TtlState::Persistent,
+                };
+                let result = FloatIncrementResult {
+                    value: prepared.bytes(),
+                    ttl_after,
+                };
+                if let Some(outcome) = self.commit_prepared_value_mutation(
+                    &key,
+                    shard_index,
+                    prepared.into_mutation(),
+                    result,
+                    now_nanos,
+                )? {
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        self.increment_by_float_locked(key, increment, now_nanos)
+    }
+
+    fn increment_by_float_locked(
         &self,
         key: VortexKey,
         increment: f64,
@@ -747,8 +955,9 @@ impl ConcurrentKeyspace {
         if let Some(key) = watched_key.as_ref() {
             effects = effects.with_watch_key(key);
         }
-        self.commit_effects(effects);
+        let effects = effects.defer();
         drop(guard);
+        self.publish_deferred_effects(effects);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(
             FloatIncrementResult {
@@ -787,28 +996,22 @@ impl ConcurrentKeyspace {
             evicted,
             ..
         } = state;
-        let ttl_deadline = guard.get_entry_ttl(&key);
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features);
-        let length = match append_to_table(&mut guard, key, append_bytes, entry_lsn, now_nanos) {
-            Ok(length) => length,
-            Err(err) => return Err(MutationError::with_evictions(err, evicted)),
-        };
-        self.commit_effects(
-            MutationEffects::none()
-                .with_ttl(
-                    shard_index,
-                    ExpiryTransition::new(
-                        ttl_present(ttl_deadline),
-                        matches!(ttl_deadline, Some(deadline) if deadline > now_nanos),
-                    ),
-                )
-                .with_frequency(table_hash)
-                .with_optional_watch_key(watched_key.as_ref()),
-        );
+        let (length, transition) =
+            match append_to_table(&mut guard, key, append_bytes, entry_lsn, now_nanos) {
+                Ok(result) => result,
+                Err(err) => return Err(MutationError::with_evictions(err, evicted)),
+            };
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, transition)
+            .with_frequency(table_hash)
+            .with_optional_watch_key(watched_key.as_ref())
+            .defer();
         drop(guard);
+        self.publish_deferred_effects(effects);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(length, aof_lsn, evicted))
     }
@@ -817,7 +1020,7 @@ impl ConcurrentKeyspace {
         &self,
         key: &VortexKey,
         now_nanos: u64,
-    ) -> Result<Option<usize>, &'static [u8]> {
+    ) -> Result<Option<usize>, MutationErrorKind> {
         let shard_index = self.shard_index(key.as_bytes());
         let table_hash = self.table_hash_key(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
@@ -825,7 +1028,7 @@ impl ConcurrentKeyspace {
             Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
                 self.record_access_prehashed(&guard, key.as_bytes(), table_hash);
                 if !value.is_string() {
-                    Err(ERR_WRONG_TYPE)
+                    Err(MutationErrorKind::WrongType)
                 } else {
                     Ok(Some(value.strlen()))
                 }
@@ -833,7 +1036,9 @@ impl ConcurrentKeyspace {
             Some(_) => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
+                let effects = self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
+                drop(wguard);
+                self.publish_optional_deferred_effects(effects);
                 Ok(None)
             }
             None => Ok(None),
@@ -846,7 +1051,7 @@ impl ConcurrentKeyspace {
         start: i64,
         end: i64,
         now_nanos: u64,
-    ) -> Result<Option<Bytes>, &'static [u8]> {
+    ) -> Result<Option<Bytes>, MutationErrorKind> {
         let shard_index = self.shard_index(key.as_bytes());
         let table_hash = self.table_hash_key(key.as_bytes());
         let guard = self.read_shard_by_index(shard_index);
@@ -859,7 +1064,9 @@ impl ConcurrentKeyspace {
             Some(_) => {
                 drop(guard);
                 let mut wguard = self.write_shard_by_index(shard_index);
-                self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
+                let effects = self.cleanup_expired_key(shard_index, &mut wguard, key, now_nanos);
+                drop(wguard);
+                self.publish_optional_deferred_effects(effects);
                 Ok(None)
             }
             None => Ok(None),
@@ -867,6 +1074,49 @@ impl ConcurrentKeyspace {
     }
 
     pub(crate) fn setrange_value(
+        &self,
+        key: VortexKey,
+        offset: usize,
+        new_bytes: &[u8],
+        now_nanos: u64,
+    ) -> MutationResult<usize> {
+        if self.optimistic_value_mutations_enabled() {
+            for _ in 0..OPTIMISTIC_VALUE_MUTATION_RETRIES {
+                let key_bytes = key.as_bytes();
+                let shard_index = self.shard_index(key_bytes);
+                let table_hash = self.table_hash_key(key_bytes);
+                let read_guard = self.read_shard_by_index(shard_index);
+                let Some(prepared) = prepare_setrange_value(
+                    &read_guard,
+                    &key,
+                    table_hash,
+                    offset,
+                    new_bytes,
+                    now_nanos,
+                )?
+                else {
+                    break;
+                };
+                drop(read_guard);
+                maybe_pause_after_optimistic_prepare("setrange_value");
+
+                let length = prepared.length();
+                if let Some(outcome) = self.commit_prepared_value_mutation(
+                    &key,
+                    shard_index,
+                    prepared.into_mutation(),
+                    length,
+                    now_nanos,
+                )? {
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        self.setrange_value_locked(key, offset, new_bytes, now_nanos)
+    }
+
+    fn setrange_value_locked(
         &self,
         key: VortexKey,
         offset: usize,
@@ -895,25 +1145,22 @@ impl ConcurrentKeyspace {
             evicted,
             ..
         } = state;
-        let had_ttl = ttl_present(guard.get_entry_ttl(&key));
-        let ttl_probe_key = key.clone();
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features);
-        let length =
+        let (length, transition) =
             match setrange_in_table(&mut guard, key, offset, new_bytes, entry_lsn, now_nanos) {
-                Ok(length) => length,
+                Ok(result) => result,
                 Err(err) => return Err(MutationError::with_evictions(err, evicted)),
             };
-        let has_ttl_after = ttl_present(guard.get_entry_ttl(&ttl_probe_key));
-        self.commit_effects(
-            MutationEffects::none()
-                .with_ttl(shard_index, ExpiryTransition::new(had_ttl, has_ttl_after))
-                .with_frequency(table_hash)
-                .with_optional_watch_key(watched_key.as_ref()),
-        );
+        let effects = MutationEffects::none()
+            .with_ttl(shard_index, transition)
+            .with_frequency(table_hash)
+            .with_optional_watch_key(watched_key.as_ref())
+            .defer();
         drop(guard);
+        self.publish_deferred_effects(effects);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(length, aof_lsn, evicted))
     }

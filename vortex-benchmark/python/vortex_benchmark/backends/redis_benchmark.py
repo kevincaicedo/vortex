@@ -14,6 +14,7 @@ from vortex_benchmark.backends.base import (
     DEFAULT_REDIS_KEYSPACE,
     DEFAULT_REDIS_PIPELINE,
     DEFAULT_REDIS_REQUESTS,
+    apply_load_affinity,
     coerce_positive_int,
     get_setting,
     quote_command,
@@ -270,6 +271,7 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
             command.extend(["-t", item.builtin_test or item.label])
         else:
             command.extend(item.command_args)
+        command = apply_load_affinity(context, command)
 
         snapshot_before = capture_service_snapshot(context.service)
         host_telemetry = None

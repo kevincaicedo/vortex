@@ -265,6 +265,60 @@ make_session_dir() {
 create_session_notes_template() {
     local session_dir="$1"
     SESSION_NOTES_FILE="${session_dir}/notes.md"
+    if session_requested_tool "c2c-focus"; then
+        cat >"${SESSION_NOTES_FILE}" <<'EOF'
+# Profiler Session Notes
+
+## Question
+
+- State the cache-line contention, HITM, or false-sharing hypothesis and the exact workload contract.
+
+## HITM Summary
+
+- Record the strongest local HITM, remote HITM, and peer-store rows from `perf c2c report`.
+
+## Address And Layout Correlation
+
+- Note the hottest load/store addresses, suspected struct fields, and whether `pahole` or type-layout evidence confirms the mapping.
+
+## Interpretation
+
+- Explain whether the evidence supports a real cache-line contention problem or points to another limiting resource.
+
+## Layout Change Verdict
+
+- State whether a layout or padding change is justified, narrowed, or rejected.
+EOF
+        return 0
+    fi
+
+    if session_requested_tool "lock-offcpu-focus"; then
+        cat >"${SESSION_NOTES_FILE}" <<'EOF'
+# Profiler Session Notes
+
+## Question
+
+- State the p99 or p99.9 blocking hypothesis, workload contract, and whether the suspicion is runnable scheduler delay, lock wait, fsync/disk stall, or another off-CPU cause.
+
+## Evidence
+
+- Summarize the strongest run-queue, off-CPU, futex/parking, and fsync/disk artifacts from this session.
+
+## Classification
+
+- Classify the tail as one of: on-CPU, runnable off-CPU, blocked lock/off-CPU, disk/fsync, network, allocator, or unknown.
+
+## Interpretation
+
+- Explain why the classification fits the captured evidence and what the main blocker appears to be.
+
+## Missing Signals
+
+- Record any unavailable Linux-only probes, weak evidence, or follow-up captures still required.
+EOF
+        return 0
+    fi
+
     cat >"${SESSION_NOTES_FILE}" <<'EOF'
 # Profiler Session Notes
 
@@ -284,6 +338,20 @@ create_session_notes_template() {
 
 -
 EOF
+}
+
+session_requested_tool() {
+    local wanted="$1"
+    local tool_name
+
+    while IFS= read -r tool_name; do
+        [[ -z "$tool_name" ]] && continue
+        if [[ "$tool_name" == "$wanted" ]]; then
+            return 0
+        fi
+    done <<< "${SESSION_TOOLS_REQUESTED:-}"
+
+    return 1
 }
 
 write_session_contract() {

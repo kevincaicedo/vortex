@@ -12,6 +12,25 @@ _check_tool() {
     fi
 }
 
+_check_any_tool() {
+    local label="$1"
+    shift
+    local candidate=""
+
+    for candidate in "$@"; do
+        if has_cmd "$candidate"; then
+            printf "  ${C_GREEN}✓${C_RESET} %-24s %s\n" "$label" "$(command -v "$candidate")"
+            return 0
+        fi
+        if [[ -x "$candidate" ]]; then
+            printf "  ${C_GREEN}✓${C_RESET} %-24s %s\n" "$label" "$candidate"
+            return 0
+        fi
+    done
+
+    printf "  ${C_DIM}✗ %-24s not found${C_RESET}\n" "$label"
+}
+
 run_check_mode() {
     header "Vortex Profiler — Environment Check"
 
@@ -20,6 +39,11 @@ run_check_mode() {
     printf "${C_BOLD}CPU Profiling:${C_RESET}\n"
     _check_tool cargo-flamegraph
     _check_tool perf
+    if perf_supports_c2c; then
+        printf "  ${C_GREEN}✓${C_RESET} %-24s %s\n" "perf c2c" "supported by $(command -v perf)"
+    else
+        printf "  ${C_DIM}✗ %-24s unsupported by installed perf${C_RESET}\n" "perf c2c"
+    fi
     _check_tool samply
     if [[ "$OS" == "macos" ]]; then
         _check_tool xcrun "(Instruments via xcrun xctrace)"
@@ -36,10 +60,36 @@ run_check_mode() {
 
     printf "${C_BOLD}Cache / Call-Graph:${C_RESET}\n"
     _check_tool valgrind "(cachegrind, callgrind)"
+    _check_tool pahole
+    _check_tool taskset
     _check_tool cg_annotate
     _check_tool callgrind_annotate
     _check_tool kcachegrind
     echo ""
+
+    printf "${C_BOLD}Blocking / Off-CPU:${C_RESET}\n"
+    _check_any_tool runqlat runqlat runqlat-bpfcc /usr/share/bcc/tools/runqlat
+    _check_any_tool biolatency biolatency biolatency-bpfcc /usr/share/bcc/tools/biolatency
+    _check_any_tool offcputime offcputime offcputime-bpfcc /usr/share/bcc/tools/offcputime
+    _check_any_tool offwaketime offwaketime offwaketime-bpfcc /usr/share/bcc/tools/offwaketime
+    _check_tool bpftrace
+    if has_cmd perf; then
+        printf "  ${C_GREEN}✓${C_RESET} %-24s %s\n" "perf sched" "available via $(command -v perf)"
+    else
+        printf "  ${C_DIM}✗ %-24s perf not found${C_RESET}\n" "perf sched"
+    fi
+    echo ""
+
+    if [[ "$OS" == "linux" ]]; then
+        printf "${C_BOLD}Linux perf permissions:${C_RESET}\n"
+        if [[ -r /proc/sys/kernel/perf_event_paranoid ]]; then
+            printf "  %-26s %s\n" "perf_event_paranoid" "$(tr -d '\n' </proc/sys/kernel/perf_event_paranoid)"
+        fi
+        if [[ -r /proc/sys/kernel/kptr_restrict ]]; then
+            printf "  %-26s %s\n" "kptr_restrict" "$(tr -d '\n' </proc/sys/kernel/kptr_restrict)"
+        fi
+        echo ""
+    fi
 
     printf "${C_BOLD}Load Generation:${C_RESET}\n"
     _check_tool redis-benchmark

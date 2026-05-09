@@ -23,9 +23,19 @@ resource_config:
   cpus: 4
   memory: 2g
   threads: 4
+  # Pin service/load to separate physical P-cores on the local alpha host.
+  # Avoid 0-3 style masks here: on hybrid/SMT CPUs that can place four
+  # "threads" onto only two physical cores and create invalid Redis deltas.
+  service_cpus: "0,2,4,6"
+  load_cpus: "8,10,12,14"
 runtime_config:
   aof_enabled: false
   eviction_policy: noeviction
+  telemetry_mode: minimal
+  io_backend: uring
+  fixed_buffers: 1024
+  fixed_buffer_registration: auto
+  sqpoll_idle_ms: 0
 settings:
   redis-benchmark:
     requests: 30000
