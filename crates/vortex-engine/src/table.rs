@@ -1781,8 +1781,6 @@ impl SwissTable {
         K: TableMutationKey,
         V: TableMutationValue,
     {
-        self.ensure_capacity_for_insert();
-
         let h2 = hash.h2();
 
         if let Some(slot) = self.find_slot(key.as_bytes(), hash) {
@@ -1795,6 +1793,8 @@ impl SwissTable {
             self.record_memory_delta(Self::memory_delta_between(new_bytes, old_bytes));
             return UpsertOutcome::replaced(previous, old_ttl != 0);
         }
+
+        self.ensure_capacity_for_insert();
 
         let slot = self.find_insert_slot(hash);
         let was_empty = self.raw.ctrl(slot) == CTRL_EMPTY;
@@ -2014,34 +2014,6 @@ impl SwissTable {
         let new_bytes = self.slot_memory_usage(slot);
         self.record_memory_delta(Self::memory_delta_between(new_bytes, old_bytes));
         previous
-    }
-
-    /// Inserts a key known to be absent from the table and optionally records an LSN.
-    pub(crate) fn insert_new_prehashed(
-        &mut self,
-        key: VortexKey,
-        value: VortexValue,
-        hash: TableHash,
-        lsn: Option<u64>,
-    ) {
-        self.ensure_capacity_for_insert();
-
-        debug_assert_eq!(
-            self.table_hash_key_bytes(key.as_bytes()),
-            hash,
-            "insert_new_prehashed requires a hash computed for `key`"
-        );
-        debug_assert!(
-            self.find_slot(key.as_bytes(), hash).is_none(),
-            "insert_new_prehashed requires an absent key"
-        );
-
-        let h2 = hash.h2();
-        let slot = self.find_insert_slot(hash);
-        let was_empty = self.raw.ctrl(slot) == CTRL_EMPTY;
-
-        self.write_new_slot(slot, h2, key, value, 0, lsn);
-        self.finish_new_slot_insert(slot, was_empty);
     }
 
     /// Like [`remove_with_ttl`](Self::remove_with_ttl) but uses raw bytes and a
@@ -2290,6 +2262,26 @@ mod safe_slot_access_tests {
         assert!(table.slot_entry(slot).is_none());
         assert_eq!(table.slot_memory_bytes(slot), 0);
         assert_eq!(table.slot_entry_ttl(slot), 0);
+    }
+
+    #[test]
+    fn empty_and_deleted_slots_do_not_expose_entries() {
+        let mut table = SwissTable::with_capacity(128);
+
+        for slot in 0..table.total_slots() {
+            assert!(table.slot_entry(slot).is_none());
+            assert_eq!(table.slot_entry_ttl(slot), 0);
+        }
+
+        let key = VortexKey::from("live-slot-safety");
+        table.insert(key.clone(), VortexValue::Integer(1));
+        let live_slot = (0..table.total_slots())
+            .find(|&slot| table.slot_entry(slot).is_some())
+            .expect("inserted key must publish one live entry");
+
+        assert!(table.remove(&key).is_some());
+        assert!(table.slot_entry(live_slot).is_none());
+        assert_eq!(table.slot_entry_ttl(live_slot), 0);
     }
 }
 
@@ -2631,6 +2623,31 @@ mod tests {
         }
         // After resize, occupied == len (tombstones cleaned).
         assert_eq!(table.len, table.occupied);
+    }
+
+    #[test]
+    fn replacing_existing_key_at_growth_limit_does_not_resize() {
+        let mut table = SwissTable::with_capacity(16);
+        let growth_limit = table.growth_limit();
+        let mut keys = Vec::with_capacity(growth_limit);
+
+        for index in 0..growth_limit {
+            let key = VortexKey::from(format!("growth:{index:04}").as_str());
+            table.insert(key.clone(), VortexValue::Integer(index as i64));
+            keys.push(key);
+        }
+
+        assert_eq!(table.occupied_slots(), growth_limit);
+        let slots_before = table.total_slots();
+        let memory_before = table.memory_used();
+        let old = table.insert(keys[0].clone(), VortexValue::Integer(-1));
+
+        assert_eq!(old, Some(VortexValue::Integer(0)));
+        assert_eq!(table.total_slots(), slots_before);
+        assert_eq!(table.occupied_slots(), growth_limit);
+        assert_eq!(table.len(), growth_limit);
+        assert_eq!(table.memory_used(), memory_before);
+        assert_eq!(table.get(&keys[0]), Some(&VortexValue::Integer(-1)));
     }
 
     #[test]

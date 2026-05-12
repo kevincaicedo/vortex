@@ -707,7 +707,15 @@ impl ConcurrentKeyspace {
                 .take()
                 .expect("msetnx pair must be available exactly once");
             let watched_key = publish_features.watch().then(|| key.clone());
-            table.insert_new_prehashed(key, value, lookup.table_hash, entry_lsn);
+            let _report =
+                match table.slot_cursor_prehashed(key.as_bytes(), lookup.table_hash, now_nanos) {
+                    SlotCursor::Vacant(vacant) => {
+                        vacant.insert(key, value, MutationPolicy::clear(entry_lsn))
+                    }
+                    SlotCursor::Live(_) | SlotCursor::Expired(_) => {
+                        unreachable!("MSETNX key must stay absent after locked revalidation")
+                    }
+                };
             let mut effect = MutationEffects::none();
             if record_frequency {
                 effect = effect.with_frequency(lookup.table_hash);

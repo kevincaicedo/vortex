@@ -102,8 +102,22 @@ def best_effort_command_output(
 def _taskset_command(cpu_list: object, command: list[str]) -> list[str]:
     if not cpu_list:
         return command
-    require_command("taskset")
+    if shutil.which("taskset") is None:
+        return command
     return ["taskset", "-c", str(cpu_list), *command]
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        return
+    except (PermissionError, ProcessLookupError):
+        pass
+
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
 
 
 def ensure_native_port_available(host: str, port: int) -> None:
@@ -287,10 +301,7 @@ def _start_native_service(adapter: DatabaseAdapter, request: StartRequest) -> Se
     try:
         wait_until_ready(request.host, request.port)
     except TimeoutError as error:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        _terminate_process(process)
         raise SetupError(
             f"{adapter.name} did not become ready on {request.host}:{request.port}; inspect {request.log_path}"
         ) from error
@@ -416,8 +427,12 @@ def stop_service(service: ServiceState) -> ServiceState:
     elif service.process_group:
         try:
             os.killpg(service.process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        except (PermissionError, ProcessLookupError):
+            if service.pid:
+                try:
+                    os.kill(service.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
     elif service.pid:
         try:
             os.kill(service.pid, signal.SIGTERM)

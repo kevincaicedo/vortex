@@ -1,98 +1,120 @@
-# SwissTable Deep Dive
+# SwissTable And Entry Layout
 
-Inside each shard, Vortex stores keys in a custom open-addressing hash table implemented in [src/table.rs](../src/table.rs). The design borrows the core SwissTable idea: keep a compact control-byte array separate from the payload array, probe in groups of 16 slots, and use SIMD to reject most non-matches before touching the full entry.
+`SwissTable` is the per-shard storage engine in `vortex-engine`. It is an open-addressing hash table inspired by SwissTable-style designs: keep compact control bytes separate from payload storage, probe 16 slots at a time, and touch full entries only for likely matches.
 
-That last point matters because the real hot path is not "hash -> chase pointer -> compare key". The hot path is:
+This document explains the current implementation in `src/table.rs` and `src/entry.rs`.
 
-1. hash the key once with `ahash`
-2. compute a small fingerprint called `H2`
-3. scan 16 control bytes at a time using SIMD
-4. only touch full entries for the few candidate slots whose control byte matches
+## What "Swiss Table" Means
 
-The result is a table optimized around cache locality, predictable probing, and low branch pressure.
+A normal hash table often does this:
 
-## What The Table Actually Owns
+```text
+hash key -> choose bucket -> follow pointer -> compare full key
+```
 
-The most important correction to the original draft is this: the 64-byte `Entry` is not the entire data store by itself. The table is split across four cooperating regions.
+SwissTable-style probing changes the first part:
+
+```text
+hash key
+  -> split hash into H1 and H2
+  -> use H1 to choose a group of 16 slots
+  -> SIMD-compare 16 one-byte H2 fingerprints
+  -> only inspect full entries for matching control bytes
+```
+
+The control bytes are dense and cache-friendly. Most failed lookups never touch the 64-byte `Entry` or the owned key/value arrays.
+
+## Table Ownership
+
+`SwissTable` owns four kinds of state:
 
 ```mermaid
-flowchart LR
+flowchart TD
     T[SwissTable]
-    T --> R[RawTable]
-    T --> K[keys: Vec<Option<VortexKey>>]
-    T --> V[values: Vec<Option<VortexValue>>]
-    T --> M[len occupied local_memory_used local_memory_drift]
-
-    R --> C[control bytes]
-    R --> E[64-byte Entry array]
+    T --> Raw[RawTable]
+    T --> Keys["keys: Vec Option VortexKey"]
+    T --> Values["values: Vec Option VortexValue"]
+    T --> Counters["len, occupied, memory_used, memory_drift"]
+    Raw --> Ctrl["control bytes"]
+    Raw --> Entries["Entry array, 64 bytes per slot"]
 ```
 
-- `RawTable` holds the manually allocated contiguous memory block for the control-byte array and the `Entry` array.
-- `keys` is the ownership store for `VortexKey` values.
-- `values` is the ownership store for `VortexValue` values.
-- Each `Entry` stores compact metadata, inline small payloads when possible, and borrowed pointers into the owning `keys` and `values` vectors when the payload spills.
+`Entry` is slot metadata and a compact payload view. It is not the only key/value owner:
 
-This split is deliberate. It lets the probe path touch only the tiny control-byte region first, while still allowing the API to return borrowed `&VortexValue` references from stable owned storage.
+- `keys[slot]` owns the `VortexKey`.
+- `values[slot]` owns the `VortexValue`.
+- `Entry` stores inline copies for small bytes when possible and borrowed pointer metadata for heap-backed owners.
 
-## High-Level Memory Layout
+That split is why `Entry::write_borrowed` is unsafe and crate-private to the table: the table must guarantee that the owned key/value outlive the entry view and that entries are rewritten when owners move during resize.
 
-`RawTable` allocates a single contiguous block with this shape:
+## RawTable Allocation
+
+`RawTable` allocates one aligned block:
 
 ```text
-[ ctrl bytes: (num_groups + 1) * 16 ] [ pad to 64-byte alignment ] [ Entry array ]
+raw allocation
+  [ control bytes: (num_groups + 1) * 16 ]
+  [ padding up to 64-byte alignment ]
+  [ Entry array: num_groups * 16 * 64 bytes ]
 ```
 
-- `GROUP_SIZE` is always 16.
-- Each group has 16 control bytes and 16 corresponding entries.
-- The extra `+1` control group is a sentinel mirror of group 0.
-- Entries are 64-byte aligned and exactly 64 bytes wide.
+The extra control group is a sentinel mirror of group 0. It allows unaligned 16-byte SIMD loads near the logical end of the control array without reading outside the allocation.
 
-The sentinel mirror exists so a 16-byte SIMD load at the logical end of the control-byte array is still safe. When slot `0..15` changes, `RawTable::set_ctrl` also writes the mirrored byte into the extra control group.
+Current code initializes:
 
-## Probe Groups And Control Bytes
+- all control bytes to `CTRL_EMPTY`
+- every entry slot to `Entry::empty()`
+- `keys` and `values` to `vec![None; num_slots]`
 
-The table does not probe entries one-by-one first. It probes *groups*.
+This means an empty pre-sized table reserves and touches table-owned slot storage. `allocated_bytes()` reports the table-owned footprint for control bytes, entries, and key/value slot arrays. `memory_used()` reports logical live dataset usage.
 
-- 1 group = 16 slots
-- 1 group = 16 control bytes
-- 1 control group fits exactly in one SSE2 or NEON register
+## Groups And Slots
 
-Control bytes encode the slot state:
+One group has 16 slots:
 
 ```text
-EMPTY   = 0xFF   // never used
-DELETED = 0x80   // tombstone
-H2      = control-byte-safe fingerprint for occupied slots
+group 0: slots  0..15
+group 1: slots 16..31
+group 2: slots 32..47
+...
 ```
 
-Two properties matter here:
+The matching control bytes are stored contiguously:
 
-1. `EMPTY` ends a search. If a probe sequence reaches an empty slot, the key is definitely not in the table.
-2. `DELETED` does not end a search. A tombstone means "something used to be here, keep probing".
+```text
+control group 0: ctrl[0..15]
+control group 1: ctrl[16..31]
+control group 2: ctrl[32..47]
+...
+sentinel group: mirror of ctrl[0..15]
+```
 
-The table stores the same control byte twice:
+`SlotIndex` and `GroupIndex` are small newtypes used inside the table so code does not pass unchecked `usize` values through the low-level paths.
 
-- in the separate control-byte array used by `Group::match_h2`
-- in `Entry.control` so the entry remains self-describing
+## Control Bytes
 
-The probe path uses the separate control array because it is denser and much cheaper to scan than loading full 64-byte entries.
+Every slot has one control byte.
+
+```text
+0xff = CTRL_EMPTY    never used
+0x80 = CTRL_DELETED  tombstone
+other high-bit-set values = occupied H2 fingerprint
+```
+
+Rules:
+
+- `EMPTY` terminates lookup. If the probe chain reaches an empty slot, the key was never inserted along that chain.
+- `DELETED` does not terminate lookup. It means "a key used to be here, keep probing."
+- `DELETED` can be reused for insertion.
+- Occupied slots store an H2 fingerprint in both the control array and `Entry.control`.
 
 ## H1 And H2
 
-Every key is hashed with `ahash::RandomState`.
+The table hashes key bytes with `ahash::RandomState` and splits the 64-bit hash.
 
-```rust
-let hash = self.hasher.hash_one(key_bytes);
-```
+### H1
 
-That 64-bit hash is split into two logical parts:
-
-- `H1`: the starting group index
-- `H2`: the short fingerprint stored in each control byte
-
-### H1: Starting Group
-
-`H1` is simply the low bits of the hash:
+`H1` is used to pick the starting group:
 
 ```rust
 const fn h1_from_hash(hash: u64) -> usize {
@@ -100,481 +122,303 @@ const fn h1_from_hash(hash: u64) -> usize {
 }
 ```
 
-`ProbeSeq::new` masks this with `num_groups - 1`.
+The group index is:
 
-```rust
-pos = h1 & mask
+```text
+start_group = H1 & (num_groups - 1)
 ```
 
-Because the number of groups is always a power of two, that mask is a fast modulo operation.
+The `&` operation works as fast modulo because `num_groups` is always a power of two.
 
-### H2: Fingerprint Stored In Control Bytes
+### H2
 
-`H2` comes from the high bits of the hash and is encoded so it never collides with the sentinel bytes:
+`H2` is a one-byte fingerprint:
 
 ```rust
-fn h2_from_hash(hash: u64) -> u8 {
-    let raw = ((hash >> 57) as u8) | 0x81;
-    if raw == CTRL_EMPTY { 0xFE } else { raw }
+let raw = ((hash >> 57) as u8) | 0x80;
+match raw {
+    CTRL_DELETED => 0x81,
+    CTRL_EMPTY => 0xFE,
+    _ => raw,
 }
 ```
 
-Breakdown of `((hash >> 57) as u8) | 0x81`:
+Step by step:
 
-1. `hash >> 57` keeps the top 7 bits of the 64-bit hash.
-2. `as u8` moves that small value into a single byte.
-3. `| 0x81` forces the high bit on and keeps the result in the occupied-slot encoding space rather than the sentinel space.
-4. If the encoded byte still lands on `0xFF`, the code remaps it to `0xFE` so `0xFF` remains reserved for `EMPTY`.
+1. `hash >> 57` keeps the top 7 bits of the hash.
+2. `as u8` narrows those bits to one byte.
+3. `| 0x80` forces the high bit on, putting the byte in the occupied-control-byte range.
+4. `0x80` and `0xff` are remapped because they are reserved for `DELETED` and `EMPTY`.
 
-The exact goal is not "use every byte value densely". The goal is "derive a short fingerprint that is legal for occupied slots and easy to compare in bulk".
+H2 is only a prefilter. A matching H2 means "check this full key." It does not prove equality.
 
-`H2` is only a prefilter. A matching control byte does **not** prove key equality. It only means "this slot is worth checking".
+## BitMask
 
-## BitMask: Compact Match Results
-
-`Group::match_h2` returns a `BitMask(u16)`.
-
-One bit corresponds to one slot in the 16-slot group:
+`Group::match_h2` returns `BitMask(u16)`: one bit for each slot in the group.
 
 ```text
-bit 0  -> slot 0
-bit 1  -> slot 1
+bit 0  -> group-local slot 0
+bit 1  -> group-local slot 1
 ...
-bit 15 -> slot 15
+bit 15 -> group-local slot 15
 ```
 
-If bits 1, 5, and 9 are set, the mask means "candidate matches exist at group-local slots 1, 5, and 9".
-
-The helper methods are small but important:
-
-- `any_set()` answers "did anything match?"
-- `lowest()` uses `trailing_zeros()` to find the first candidate slot cheaply
-- the iterator implementation repeatedly clears the lowest set bit with `self.0 &= self.0 - 1`
-
-That last trick is a classic bit-twiddling operation:
+If the mask is:
 
 ```text
-mask         = 0010_1000
-mask - 1     = 0010_0111
-mask&(mask-1)= 0010_0000
+0000_0000_0010_1000
 ```
 
-It removes the lowest set bit without looping over all 16 positions.
+then group-local slots 3 and 5 matched.
 
-## Group: SIMD Probe Of 16 Control Bytes
-
-`Group` is the abstraction that probes one control group.
-
-### x86_64 Path
-
-On x86_64, the code uses SSE2:
-
-1. `_mm_loadu_si128` loads 16 control bytes.
-2. `_mm_set1_epi8` broadcasts the `H2` byte across all 16 lanes.
-3. `_mm_cmpeq_epi8` compares all lanes in parallel.
-4. `_mm_movemask_epi8` converts lane equality into a 16-bit bitmask.
-
-### aarch64 Path
-
-On aarch64, the code uses portable SIMD with a 16-lane `Simd<u8, 16>` and `simd_eq().to_bitmask()`.
-
-### Scalar Fallback
-
-If the `simd` feature is disabled or no supported SIMD target is active, the code falls back to a scalar loop over the 16 bytes.
-
-### `match_empty` And `match_empty_or_deleted`
-
-- `match_empty(ctrl)` finds search terminators.
-- `match_empty_or_deleted(ctrl)` finds insert candidates.
-
-Insertion cannot use an empty-only probe because tombstones are reusable. The implementation simply ORs the `EMPTY` and `DELETED` masks.
-
-## ProbeSeq: Triangular Probing
-
-The table uses triangular probing rather than linear probing.
-
-```text
-start at group g
-then probe g + 1
-then g + 1 + 2
-then g + 1 + 2 + 3
-...
-```
-
-In code:
+The iterator removes the lowest set bit with:
 
 ```rust
-self.stride += 1;
-self.pos = (self.pos + self.stride) & self.mask;
+self.0 &= self.0 - 1;
 ```
 
-Why this shape:
+Why this works:
 
-- it spreads collisions across the table better than naive linear probing
-- it keeps the operation branch-light
-- with a power-of-two group count, the sequence visits every group before repeating
+```text
+mask          0010_1000
+mask - 1      0010_0111
+mask & mask-1 0010_0000
+```
 
-For example, with 8 groups and start position 0, the probe order is:
+Subtracting one flips the lowest set bit and all lower bits. ANDing clears only that lowest set bit.
+
+## SIMD Group Matching
+
+On x86_64 with the `simd` feature:
+
+1. `_mm_loadu_si128` loads 16 control bytes.
+2. `_mm_set1_epi8` copies H2 into all 16 SIMD lanes.
+3. `_mm_cmpeq_epi8` compares all 16 lanes at once.
+4. `_mm_movemask_epi8` converts equality lanes into a 16-bit mask.
+
+On aarch64 with the `simd` feature, the code uses `Simd<u8, 16>` and `simd_eq().to_bitmask()`.
+
+Without those paths, scalar matching loops over 16 bytes. Correctness is the same; only the cost changes.
+
+## Triangular Probing
+
+The probe sequence is triangular:
+
+```text
+pos = start
+stride = 0
+
+next:
+  stride += 1
+  pos = (pos + stride) & mask
+```
+
+For 8 groups starting at 0:
 
 ```text
 0 -> 1 -> 3 -> 6 -> 2 -> 7 -> 5 -> 4
 ```
 
-That covers all 8 groups exactly once before cycling.
+This visits every group before repeating when the group count is a power of two. It spreads collisions better than simple linear probing while staying branch-light.
 
-## RawTable: Manual Allocation For The Hot Arrays
-
-`RawTable` is the low-level allocator and pointer wrapper.
-
-Responsibilities:
-
-- allocate one aligned block for control bytes plus entries
-- initialize every control byte to `CTRL_EMPTY`
-- initialize every `Entry` to `Entry::empty()`
-- expose pointer-level helpers like `ctrl_group`, `ctrl_at`, `entry`, and `entry_mut`
-- maintain the mirrored sentinel group
-- free the block in `dealloc`
-
-This layer is intentionally small. It owns raw memory and pointer arithmetic. It does **not** implement hashing policy, key comparison policy, TTL policy, or growth policy. Those live one level up in `SwissTable`.
-
-## The 64-Byte Entry
-
-Each slot has a 64-byte `Entry` defined in [src/entry.rs](../src/entry.rs).
-
-```rust
-#[repr(C, align(64))]
-pub struct Entry {
-    pub control: u8,
-    pub key_len: u8,
-    pub flags: AtomicU16,
-    pub _pad0: u32,
-    pub ttl_deadline: u64,
-    pub key_data: [u8; 23],
-    pub value_tag: u8,
-    pub value_data: [u8; 21],
-    pub _pad1: [u8; 3],
-}
-```
-
-Field-by-field meaning:
-
-- `control`: the slot fingerprint or sentinel
-- `key_len`: inline key length when the key is stored inline
-- `flags`: inline/heap markers, integer marker, TTL marker, a 4-bit Morris eviction counter, and the value-type nibble
-- `_pad0`: currently reused for `AccessProfile` without increasing entry size
-- `ttl_deadline`: absolute expiration time in nanoseconds, `0` means no TTL
-- `key_data`: inline key bytes or heap-key metadata
-- `value_tag`: inline length or special tag (`HEAP_VALUE_TAG` / `INTEGER_VALUE_TAG`)
-- `value_data`: inline bytes, integer bytes, or a pointer to the owning `VortexValue`
-
-The high-level bit layout of `flags` matters because eviction piggybacks on it:
-
-- low bits: inline / integer / TTL markers
-- bits 4-7: Morris counter used by clock-sweep second chances
-- bits 12-15: value-type nibble
-
-That reuse is deliberate. The entry stays one cache line wide, and eviction metadata never turns into a second pointer-chasing structure.
-
-### Inline Fast Path
-
-For small string workloads, the entry can carry almost everything inline:
-
-- key inline if `key.len() <= 23`
-- string value inline if `value.len() <= 21`
-- integer inline in `value_data[..8]`
-
-Example:
-
-```text
-SET my_token short_data
-```
-
-- `my_token` fits in `key_data`
-- `short_data` fits in `value_data`
-- TTL is in the same cache line
-- lookup avoids a second hop into heap-owned payload for the string bytes
-
-### Heap-Spill Encoding
-
-When the key or value is too large to fit inline, the entry switches to a borrowed-metadata form:
-
-- long keys store `ptr + len` in `key_data`
-- heap-backed values store a pointer to the owned `VortexValue` in `value_data`
-- complex container types (`List`, `Hash`, `Set`, `SortedSet`, `Stream`) always use the heap-backed path
-
-This is where the separate `keys` and `values` vectors matter. The `Entry` does not own those heap values. It borrows them. `SwissTable` owns them and rewrites the entry metadata on overwrite or resize so the borrowed pointers stay valid.
-
-## SwissTable Structure
-
-At the top level, `SwissTable` contains:
-
-- `raw: RawTable`
-- `hasher: RandomState`
-- `keys: Vec<Option<VortexKey>>`
-- `values: Vec<Option<VortexValue>>`
-- `len`: live entry count
-- `occupied`: live entries + tombstones
-- `local_memory_used`: exact local memory usage for live entries
-- `local_memory_drift`: signed delta not yet flushed to the global counter
-
-Two counters are easy to confuse:
-
-- `len` tracks only live entries
-- `occupied` tracks live entries **plus tombstones**
-
-Growth decisions use `occupied`, not `len`, because too many tombstones degrade probe quality even if many entries were deleted.
-
-## How Lookup Works
-
-`get()` is a thin wrapper around `find_slot()`.
+## Lookup
 
 ```mermaid
 flowchart TD
-    A[hash key] --> B[compute H1 and H2]
-    B --> C[load control group]
-    C --> D[SIMD compare all 16 control bytes with H2]
-    D --> E{any candidate bits set?}
-    E -- yes --> F[check full key equality for each candidate slot]
-    F --> G{key matched?}
-    G -- yes --> H[return values[slot]]
-    G -- no --> I[check EMPTY mask]
-    E -- no --> I
-    I -- empty present --> J[stop: key absent]
-    I -- no empty --> K[advance triangular probe]
-    K --> C
+    A[hash key] --> B[derive H1 and H2]
+    B --> C[start ProbeSeq at H1 masked]
+    C --> D[load 16 control bytes]
+    D --> E[SIMD compare against H2]
+    E --> F{candidate bits?}
+    F -- yes --> G[check Entry.matches_key for each candidate]
+    G --> H{key equal?}
+    H -- yes --> I[return live slot]
+    H -- no --> J{empty bit?}
+    F -- no --> J
+    J -- yes --> K[return not found]
+    J -- no --> L[advance triangular probe]
+    L --> D
 ```
 
-Detailed steps:
+`Entry.matches_key` reads inline key bytes or borrowed heap-key metadata and then compares full bytes.
 
-1. Hash the key bytes.
-2. Compute `H2` for control-byte filtering.
-3. Compute starting group from `H1`.
-4. Probe one group at a time.
-5. For each matching `H2` bit, load the full `Entry` and run `entry.matches_key(key_bytes)`.
-6. If any `EMPTY` control byte exists in the group and no candidate matched, stop immediately: the key does not exist.
-7. Otherwise advance the triangular probe sequence and repeat.
+## Insert And Tombstone Reuse
 
-The key insight is that most misses never touch most full entries. They die in the control-byte stage.
+Insertion first ensures the table is below the growth limit. The growth limit is 7/8 of slots.
 
-## How Insertion Works
+Then it probes for an insert candidate:
 
-`insert()` is a two-phase operation.
+- first `EMPTY` slot
+- or first `DELETED` tombstone slot
 
-### Phase 1: Check Whether The Key Already Exists
+If it uses an empty slot, `occupied` increases. If it uses a tombstone, `occupied` does not increase because the slot was already non-empty for probe-chain purposes. `len` increases for every new live key.
 
-Before inserting, the table probes with `find_slot()`.
+When `occupied >= capacity * 7 / 8`, resize doubles the number of groups and rehashes live entries. Tombstones disappear during resize.
 
-If the key exists:
+## Slot Cursors
 
-- calculate the old memory usage
-- preserve the old TTL for plain `insert()`
-- replace the owned key/value in `keys[slot]` and `values[slot]`
-- rewrite the 64-byte `Entry` via `write_entry`
-- update the control byte to the new `H2`
-- record the memory delta
+The table exposes crate-private cursor types for fused domain mutations:
 
-### Phase 2: Find The First Reusable Slot
+| Cursor | Meaning |
+| --- | --- |
+| `LiveSlotCursor` | Key exists and has not expired at the supplied time. |
+| `ExpiredSlot` | Key exists but its TTL has passed. |
+| `VacantSlot` | Key is absent. |
 
-If the key is absent, the table probes again with `find_insert_slot()`.
+The cursor owns the mutable table borrow. Domain code can inspect TTL/value state and mutate the observed slot without probing the same key again.
 
-That path stops at the first slot marked `EMPTY` or `DELETED`.
+This is used by SET options, GETEX, PERSIST, EXPIRE, lazy expiry, and performance-sensitive string mutations.
 
-Then it:
+## Entry Layout
 
-1. stores the owned `VortexKey` and `VortexValue`
-2. writes the compact entry metadata
-3. writes the control byte
-4. increments `len`
-5. increments `occupied` only if the slot was truly `EMPTY`
-6. records the new memory usage
-
-Reusing a tombstone increases `len` but does **not** increase `occupied`, because the slot was already counted as non-empty.
-
-## How Removal Works
-
-Removal uses `delete_slot()` after locating the slot.
-
-`delete_slot()` does three things:
-
-1. marks the entry as deleted with `entry.mark_deleted()`
-2. updates the control-byte array to `CTRL_DELETED`
-3. clears the owned key and takes the owned value out of `values[slot]`
-
-Then it:
-
-- decrements `len`
-- subtracts the slot's memory usage from `local_memory_used`
-- leaves `occupied` unchanged
-
-That last point is critical. A tombstone is still an occupied probe location, so the table cannot pretend the slot became empty.
-
-## Resize Strategy
-
-The table resizes when:
+Each table slot has exactly one 64-byte, 64-byte-aligned `Entry`.
 
 ```text
-occupied >= capacity * 7 / 8
+offset  size  field
+------  ----  -------------------
+0       1     control
+1       1     key_len
+2       1     flags
+3       1     morris_cnt
+4       4     access_profile
+8       8     ttl_deadline_nanos
+16      6     lsn_version
+22      1     value_tag
+23      1     _reserved
+24      24    key_data
+48      16    value_data
 ```
 
-That `7/8` load factor is standard SwissTable territory: aggressive enough to use memory well, conservative enough to keep probes short.
-
-Resize steps:
-
-1. double the number of groups
-2. allocate a fresh `RawTable`
-3. allocate fresh `keys` and `values` vectors
-4. walk the old table and skip `EMPTY` / `DELETED` slots
-5. rehash each live key into the new table
-6. move ownership into the new `keys` / `values` vectors
-7. rewrite each new `Entry`
-8. free the old raw allocation
-9. set `occupied = len`
-
-Rewriting the entries is necessary because some entries store borrowed pointers into the owning vectors. A resize moves ownership to new vector slots, so the metadata must be rebuilt rather than copied byte-for-byte.
-
-## Memory Accounting: `local_memory_used`, `local_memory_drift`, `flush_memory_drift`
-
-The table carries two different memory views.
-
-### `local_memory_used`
-
-This is the exact shard-local memory usage for *live* entries. The helper is:
+The static assertions in `entry.rs` enforce:
 
 ```rust
+size_of::<Entry>() == 64
+align_of::<Entry>() == 64
+```
+
+### Flags
+
+`flags` uses low bits for representation and high bits for value type:
+
+```text
+bit 0     FLAG_INLINE_KEY
+bit 1     FLAG_INLINE_VALUE
+bit 2     FLAG_INTEGER_VALUE
+bit 3     FLAG_HAS_TTL
+bits 4-7  value type nibble
+```
+
+The value type nibble identifies logical value families such as integer, string, list, hash, set, zset, and stream.
+
+### Inline And Heap Encoding
+
+Keys up to `MAX_INLINE_KEY_LEN` bytes, currently 24, can be stored inline in `key_data`. Larger keys store pointer-plus-length metadata pointing at the slot-owned `VortexKey`.
+
+String values up to `MAX_INLINE_VALUE_LEN` bytes, currently 16, can be stored inline in `value_data`. Integer values store their `i64` bytes in `value_data[..8]`. Heap-backed or complex values store a pointer to the slot-owned `VortexValue`.
+
+The entry readers are safe because raw fields are private. External safe Rust cannot forge a heap pointer and then call `read_value`.
+
+## TTL Deadline
+
+`ttl_deadline_nanos` stores the monotonic deadline. `0` means no TTL.
+
+The `FLAG_HAS_TTL` bit mirrors whether the deadline is non-zero. `Entry::is_expired(now_nanos)` checks both the flag and the deadline.
+
+TTL state is stored in the entry so lookup can decide live-versus-expired without consulting a side map.
+
+## LSN Version
+
+`lsn_version` stores six bytes, or 48 bits. The maximum storable value is:
+
+```text
+(1 << 48) - 1
+```
+
+`Entry::set_lsn_version` panics if a larger value is supplied. The keyspace wrapper types keep AOF and entry LSNs inside this bound.
+
+The entry version is used by WATCH and AOF-visible mutations. It is intentionally not updated for every featureless write because that would add a global atomic to the plain SET hot path without an observer.
+
+## Morris Count
+
+`morris_cnt` is an `AtomicU8` per entry. It is a probabilistic access counter:
+
+- it saturates at 255
+- access recording increments less often as the count rises
+- eviction can decrement it to give recently accessed keys a second chance
+
+Increment probability is controlled by a random mask:
+
+```text
+counter = 0       -> increment every sampled access
+counter = 1       -> increment when random low 1 bit is zero
+counter = 2       -> increment when random low 2 bits are zero
+...
+counter = 63      -> increment when random low 63 bits are zero
+counter >= 64     -> increment only when random is exactly all zero bits
+```
+
+This gives a compact approximation of "hotness" without an exact write-heavy counter. Exact counters can become expensive because each read would update a shared cache line. The Morris counter trades precision for much lower metadata cost.
+
+## AccessProfile
+
+`access_profile` is an `AtomicU32` storing `morph::AccessProfile`.
+
+It packs:
+
+```text
+bits 0-3    read intensity
+bits 4-7    write intensity
+bit 8       sequential hint
+bits 9-11   size class
+bits 12-15  encoding
+bits 16-25  access counter for periodic checks
+bits 26-31  reserved
+```
+
+The current engine tracks this metadata in entries. Most adaptive structure transitions are future work, but keeping the profile entry-resident avoids adding a side allocation later.
+
+## Memory Accounting
+
+`SwissTable::memory_used()` is logical live dataset memory:
+
+```text
 size_of::<Entry>() + key.memory_usage() + value.memory_usage()
 ```
 
-Each insert, overwrite, or remove updates that number immediately.
+for each live slot.
 
-### `local_memory_drift`
+`SwissTable::allocated_bytes()` is table-owned allocation:
 
-This is a signed accumulator of unflushed memory deltas.
+```text
+raw control bytes
++ raw Entry array bytes
++ keys Vec slot capacity bytes
++ values Vec slot capacity bytes
+```
 
-- insertions push it positive
-- removals push it negative
-- overwrites add the difference between new and old payload size
+These numbers answer different questions:
 
-Why keep both values:
+- `memory_used`: how much live logical data the engine thinks it stores.
+- `allocated_bytes`: how much table capacity has been reserved for slots.
 
-- `local_memory_used` stays exact for the shard
-- `local_memory_drift` batches updates to the global atomic counter so the hot path does not pay an atomic operation for every mutation
+Both are needed for fair memory work. A table can have low logical bytes and high allocated bytes when it is mostly empty, over-provisioned, or tombstone-heavy.
 
-### `flush_memory_drift`
+## Prefetch
 
-`flush_memory_drift(&AtomicUsize)` publishes buffered drift to the shared counter only when the absolute value exceeds `16 * 1024` bytes.
+`prefetch_group(hash)` and `prefetch_group_write(hash)` compute the initial group for a hash and issue CPU prefetch hints for:
 
-Behavior:
+- the control group
+- the first entry in that group
 
-- positive drift uses `fetch_add(Ordering::Relaxed)`
-- negative drift uses `fetch_update` with `saturating_sub` so the global count never underflows
-- after publishing, `local_memory_drift` resets to `0`
+Prefetch is a hint only. It cannot affect correctness and should be used only where measurement shows the extra instruction helps, such as selected batch paths.
 
-This is a classic fast-path tradeoff:
+## Important Invariants
 
-- local numbers stay exact
-- the global number is slightly delayed
-- atomic contention drops substantially on write-heavy paths
-
-## TTL And Expiry Behavior
-
-TTL is integrated directly into the entry layout and the table API.
-
-### Per-Entry TTL Storage
-
-Each entry stores `ttl_deadline: u64` in absolute nanoseconds.
-
-- `0` means no TTL
-- non-zero means expire at or after that timestamp
-
-### TTL-Specific Table Operations
-
-The table exposes a dedicated TTL API:
-
-- `insert_with_ttl`
-- `get_with_ttl`
-- `get_with_ttl_mut`
-- `get_with_ttl_prehashed`
-- `remove_with_ttl`
-- `set_entry_ttl`
-- `clear_entry_ttl`
-- `get_entry_ttl`
-
-### Lazy Expiry
-
-`get_or_expire` and `contains_key_or_expire` perform lazy expiry:
-
-1. find the slot
-2. check `entry.is_expired(now_nanos)`
-3. if expired, tombstone it in place with `delete_slot`
-4. return miss / false
-
-That keeps the common read path cheap while still cleaning up stale keys as they are touched.
-
-### Active Expiry Safety
-
-The active expiry path uses `remove_expired_by_hash(hash, deadline_nanos)`.
-
-It does **not** remove a slot solely because `H2` and the deadline match. It also verifies the full key hash before deleting the entry. That matters because `H2` is only a short fingerprint and collisions are expected.
-
-In other words:
-
-- `H2` narrows the search
-- full hash verification makes the delete correct
-
-## `ctrl_group`, `ctrl_at`, And Why They Exist
-
-The raw helper methods are worth calling out because they shape the entire design.
-
-- `ctrl_group(group_idx)` returns a pointer to the first of 16 control bytes for one probe group
-- `ctrl_at(slot)` returns the control byte for one absolute slot
-- `entry(slot)` and `entry_mut(slot)` return the `Entry` payload for one absolute slot
-
-This split lets the table do two different things efficiently:
-
-- bulk group-level filtering through `ctrl_group`
-- precise single-slot mutation through `ctrl_at` and `entry_mut`
-
-Without that separation, every probe would have to touch 64-byte entries far too early.
-
-## Prefetch Support
-
-The table also exposes:
-
-- `prefetch_group(hash)`
-- `prefetch_group_write(hash)`
-
-These compute the starting group from `H1` and prefetch:
-
-- the 16-byte control group
-- the first entry in the group
-
-This is used by some batch command paths to overlap memory latency with earlier work, although software prefetch is workload-dependent and is not universally beneficial.
-
-## Why This Design Fits Vortex
-
-This implementation is tuned for Vortex's actual workload profile:
-
-- many tiny keys
-- many tiny string or integer values
-- frequent point lookups
-- predictable shard-local access under `RwLock`
-- strict interest in memory traffic, not just algorithmic big-O
-
-The combination of group probing, 64-byte entries, inline small payloads, tombstone reuse, and batched global memory accounting is what makes the table fast in practice, not any single trick alone.
-
-## Summary
-
-The Vortex SwissTable is a hybrid of four ideas working together:
-
-1. a SIMD-scannable control-byte array for cheap candidate filtering
-2. a 64-byte entry format for cache-line-local metadata and inline payloads
-3. external ownership vectors for full `VortexKey` / `VortexValue` storage and stable borrowing
-4. shard-local memory and TTL bookkeeping integrated directly into the table API
-
-That is why the table can support fast `GET`, `SET`, TTL operations, memory accounting, and future structure-specific optimizations without turning the hot path into a pointer-heavy maze.
-
-Next documents in this series:
-
-- [01-architecture-overview.md](01-architecture-overview.md)
-- [02-concurrent-keyspace.md](02-concurrent-keyspace.md)
-- [04-command-execution.md](04-command-execution.md)
+- The number of groups is a power of two.
+- Control bytes are authoritative for slot liveness.
+- The sentinel control group mirrors group 0.
+- A `LiveSlot` must only be created from a non-empty, non-deleted control byte.
+- Entry heap pointers are valid only because the table owns the corresponding key/value slot and rewrites entries after movement.
+- Tombstones keep probe chains valid until resize.
+- Resize preserves TTL, LSN, Morris count, and access profile for live entries.
+- Table memory drift must be flushed through `ShardWriteGuard` before global accounting is trusted.

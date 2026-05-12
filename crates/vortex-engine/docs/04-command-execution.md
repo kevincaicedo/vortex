@@ -1,72 +1,56 @@
-# Command Execution Deep Dive
+# Command And Domain Execution
 
-The command layer in `vortex-engine` is intentionally simple at the top and highly specialized underneath. It does not use trait objects, dynamic registries, or per-command heap allocation to find a handler. Instead, it uses a static `match` on an already-normalized uppercase command name and then funnels the real work into keyspace helper methods.
+The command layer in `vortex-engine` is split into two parts:
 
-That gives the crate three useful properties:
+- `commands/*`: parse already-framed RESP arguments, apply Redis command syntax, shape RESP replies, and encode AOF command payloads.
+- `engine::domain/*`: perform typed operations over `ConcurrentKeyspace`, including shard locks, memory admission, TTL transitions, WATCH invalidation, LSN stamping, and table mutation.
 
-- dispatch is branchy but predictable and inlineable
-- handlers can specialize hot paths aggressively
-- locking and storage policy stay centralized in `ConcurrentKeyspace` and `SwissTable`
+This replaced the old command-context shape. Command modules should stay focused on protocol semantics. Domain modules own the data-engine mechanics.
 
-## Entry Point: `execute_command`
-
-The engine's main dispatch function is:
+## Entry Point
 
 ```rust
 pub fn execute_command(
     keyspace: &ConcurrentKeyspace,
     name: &[u8],
     frame: &FrameRef<'_>,
-    now_nanos: u64,
+    clock: impl Into<CommandClock>,
 ) -> Option<ExecutedCommand>
 ```
 
 Inputs:
 
-- `keyspace`: the shared concurrent database
-- `name`: uppercase ASCII command name
-- `frame`: zero-copy RESP view from `vortex-proto`
-- `now_nanos`: caller-supplied timestamp used for TTL logic
+| Input | Meaning |
+| --- | --- |
+| `keyspace` | Shared engine state. |
+| `name` | Uppercase ASCII command name. The caller normalizes it before entering the engine. |
+| `frame` | Zero-copy RESP frame view from `vortex-proto`. |
+| `clock` | Monotonic and Unix nanosecond clock values supplied by the reactor. |
 
 Output:
 
-- `Some(ExecutedCommand)` if the engine knows the command
-- `None` if the command is unknown to the engine dispatcher
+- `Some(ExecutedCommand)` when the engine recognizes the command.
+- `None` for unknown commands or connection-state commands that the reactor owns, such as `MULTI` and `WATCH`.
 
-The caller is expected to do command-name normalization before entering the engine. That keeps the engine focused on execution rather than command parsing policy.
+`EXEC`, `DISCARD`, and `UNWATCH` have stateless fallback handlers for Redis-compatible behavior outside active transaction state. The real in-transaction implementation lives in `vortex-io` because it is connection-scoped.
 
-## Command Module Layout
+## Command Modules
 
-The command subsystem is split by responsibility.
+| Module | Commands and role |
+| --- | --- |
+| `commands/mod.rs` | Static dispatch, response types, argument helpers, shared RESP constants, AOF payload encoders. |
+| `commands/string.rs` | `GET`, `SET`, `MGET`, `MSET`, `INCR`, `APPEND`, `GETEX`, `SETRANGE`, and related string commands. |
+| `commands/generic.rs` | `DEL`, `EXISTS`, TTL commands, `TYPE`, `RENAME`, `SCAN`, `KEYS`, `RANDOMKEY`, `TOUCH`, `COPY`. |
+| `commands/server.rs` | `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `INFO`, `COMMAND`, `TIME`. |
+| `commands/connection.rs` | Stateless connection-compatible commands such as `PING`, `ECHO`, `QUIT`, `SELECT`. |
+| `commands/transaction.rs` | Stateless transaction fallbacks and documentation for reactor-owned transaction behavior. |
+| `commands/pattern.rs` | Glob matching used by `KEYS` and `SCAN`. |
 
-- `commands/mod.rs`: static dispatch, shared result types, argument helpers
-- `commands/context.rs`: methods on `ConcurrentKeyspace` that implement common lock-and-table patterns
-- `commands/string.rs`: string commands such as `GET`, `SET`, `MGET`, `APPEND`, `INCR`
-- `commands/key.rs`: key management and TTL commands such as `DEL`, `EXPIRE`, `TTL`, `RENAME`, `SCAN`
-- `commands/server.rs`: server and connection-level commands such as `PING`, `DBSIZE`, `INFO`, `COMMAND`
-- `commands/pattern.rs`: glob matching used by `KEYS` / `SCAN`
+The dispatcher is a static `match` on command bytes. There is no handler registry, trait object, or per-command allocation for dispatch.
 
-This split keeps parsing and response shaping in the leaf handler files while keeping common locking and mutation patterns in one place.
+## Response Types
 
-## Dispatch Model
-
-The dispatcher is a compile-time `match` over byte strings.
-
-That matters because it avoids:
-
-- trait object calls
-- hash-table-based handler lookup inside the engine
-- command object allocation
-
-The handler list is explicit and readable. More importantly, it lets the compiler inline short handlers and propagate constants such as `RESP_OK` and `RESP_NIL` deep into the call graph.
-
-## Response Model: `CmdResult` And `ExecutedCommand`
-
-The command layer separates the *payload* from the *mutation metadata*.
-
-### `CmdResult`
-
-`CmdResult` has three variants:
+`CmdResult` has three tiers:
 
 ```rust
 pub enum CmdResult {
@@ -76,289 +60,292 @@ pub enum CmdResult {
 }
 ```
 
-They correspond to three cost tiers.
+| Variant | Use | Cost |
+| --- | --- | --- |
+| `Static` | Fixed replies such as `+OK`, nil, small integer constants, and common errors. | No allocation or formatting. |
+| `Inline` | Tiny dynamic bulk replies in a 32-byte stack buffer. | No heap allocation. |
+| `Resp` | Larger or structured dynamic replies. | Allocates or owns a `RespFrame`. |
 
-#### `Static(&'static [u8])`
+`ExecutedCommand` wraps `CmdResult` with:
 
-Used for precomputed wire bytes such as:
-
-- `+OK\r\n`
-- `$-1\r\n`
-- `:0\r\n`
-- common error responses
-
-This is the cheapest path: no dynamic allocation and no per-call serialization work.
-
-#### `Inline(InlineResp)`
-
-Used for tiny dynamic responses that still fit in a fixed stack buffer.
-
-Examples:
-
-- small bulk strings
-- integer replies formatted into a small inline buffer
-
-`InlineResp` stores up to 32 bytes in-place, which covers many hot-path string and integer replies.
-
-#### `Resp(RespFrame)`
-
-Used when the response is structurally dynamic or larger than the inline path is designed for.
-
-Examples:
-
-- large bulk strings
-- arrays such as `MGET` or `COMMAND`
-- `INFO` output
-
-So the engine is not "zero allocation everywhere". It is "avoid allocation where possible, allocate only where the response shape actually requires it".
-
-### `ExecutedCommand`
-
-`ExecutedCommand` wraps:
-
-- `response: CmdResult`
 - `aof_commit: Option<AofCommitEffect>`
-- optional AOF side-effect records and command payload bytes
+- `aof_records: AofRecords`
+- `aof_payload: Option<Box<[u8]>>`
 
-That optional typed commit effect is the bridge from engine mutation semantics to persistence ordering. Read-only commands usually return `None`. Mutation commands may allocate a bounded `AofLsn` and return it alongside the response without exposing a raw or sentinel `u64` across the IO boundary.
+This lets the engine return the wire response and persistence metadata together without writing files itself.
 
-## Argument Extraction Strategy
+## Argument Strategy
 
-The engine uses a layered argument strategy rather than always collecting everything first.
-
-### Fast Single-Argument Access
-
-For hot commands with a tiny fixed argument count, handlers often use:
+Handlers avoid collecting arguments when a fixed small shape is enough:
 
 - `arg_bytes(frame, index)`
 - `arg_count(frame)`
 - `arg_i64(frame, index)`
 
-That avoids building a temporary argument vector.
+For option-rich or variable-arity commands, handlers use `CommandArgs::collect(frame)`, backed by `SmallVec<[&[u8]; 8]>`.
 
-### `CommandArgs`
+The engine stores integer-looking byte strings as `VortexValue::Integer` when possible. That makes common counters allocation-free.
 
-For commands with options or variable arity, handlers use `CommandArgs::collect(frame)`.
+## Domain Modules
 
-`CommandArgs` stores arguments in `SmallVec<[&[u8]; 8]>`, which keeps small command shapes on the stack and only spills to the heap for larger argument counts.
+`engine::domain` is private to the crate. It contains inherent methods on `ConcurrentKeyspace` and helper functions. The important point is that this is still zero-cost Rust: no boxed operation objects and no dynamic dispatch are added between command parsing and table mutation.
 
-### Shared Parsing Helpers
+| Domain file | Role |
+| --- | --- |
+| `mutation.rs` | Shared mutation effects, memory reservation coordinator, TTL state, SET options, error mapping, deferred publication hooks. |
+| `string_ops.rs` | String reads, SET, MGET/MSET/MSETNX, increments, append, range operations. |
+| `string_tables.rs` | Table-local string projection, prepared value mutations, duplicate MSET handling, SET option table helpers. |
+| `key_ops.rs` | Deletes, existence checks, expiry, persist, type, rename, copy, and key movement. |
+| `scan_ops.rs` | SCAN cursor encoding, pattern/type filtering, random key lookup, KEYS collection. |
+| `admin_ops.rs` | DBSIZE, FLUSH, and INFO keyspace helpers. |
 
-`commands/mod.rs` also provides:
+## Mutation Pipeline
 
-- `parse_i64(bytes)`
-- `key_from_bytes(bytes)`
-- `value_from_bytes(bytes)`
-- `value_to_resp(&VortexValue)`
-- `owned_value_to_resp(VortexValue)`
+Most mutations follow the same shape:
 
-These helpers encode engine policy, not just syntax:
+```mermaid
+flowchart TD
+    A[Command parser] --> B[Domain operation]
+    B --> C[Compute shard and table hash]
+    C --> D[Load mutation feature bits]
+    D --> E{maxmemory active?}
+    E -- yes --> F[Project positive memory delta]
+    F --> G[Reserve memory and maybe evict]
+    E -- no --> H[Acquire shard lock]
+    G --> H
+    H --> I[Revalidate projection if needed]
+    I --> J[Mutate SwissTable]
+    J --> K[Build TTL WATCH frequency AOF effects]
+    K --> L[Drop shard guards]
+    L --> M[Publish deferred effects]
+    M --> N[Settle memory reservation]
+    N --> O[Return MutationOutcome]
+```
 
-- integer-looking byte strings are stored as `VortexValue::Integer` when possible
-- response formatting tries to stay on `Static` or `Inline` where it can
+This design keeps cold effects out of the shard critical section when correctness allows it.
 
-## The Real Work Happens In `commands/context.rs`
+## Deferred Effects
 
-The crucial architectural detail is that leaf handlers in `string.rs`, `key.rs`, and `server.rs` do not all reimplement lock orchestration themselves.
+Mutations produce `MutationEffects` while holding table locks, then publish them after dropping the locks.
 
-Instead, `commands/context.rs` adds methods directly onto `ConcurrentKeyspace`, such as:
+Effects can include:
 
-- `get_value`
-- `set_value_plain`
-- `set_value_with_options`
-- `set_value_with_ttl`
-- `mget_frames`
-- `mset_values`
-- `delete_keys`
-- `count_existing`
-- `expire_key`
-- `persist_key`
-- `ttl_state_bytes`
-- `rename_key`
+- TTL counter transition
+- WATCH invalidation
+- LFU frequency update
+- AOF commit LSN
 
-This helper layer is where command semantics meet concurrency policy.
+There are borrowed and owned forms:
 
-## GET: Read Path With Lazy Expiry
+- `DeferredEffects<'a>` borrows watched key bytes or keys that are still alive long enough.
+- `OwnedDeferredEffects` owns watched keys when a batch must drop guards and source data before publication.
 
-`GET` is a good example of the execution style.
+The `#[must_use]` marker on these types is intentional: forgetting to publish an effect can break TTL counts, WATCH correctness, or AOF ordering.
 
-High-level flow:
+## LSN Allocation In Mutations
 
-1. extract `key_bytes`
-2. compute `shard_index` and `table_hash` before locking
-3. acquire a read lock on that shard
-4. probe the table with `get_with_ttl_prehashed`
-5. if live, format the borrowed value directly into a `CmdResult`
-6. if expired, drop the read lock, take a write lock, double-check and tombstone the key, then return nil
+Domain code calls:
+
+```rust
+allocate_observed_mutation_lsn_with_features(features)
+```
+
+It returns:
+
+```text
+(entry_lsn: Option<u64>, aof_lsn: Option<AofLsn>)
+```
+
+Rules:
+
+- If neither WATCH nor AOF is active, both are `None`.
+- If WATCH is active, an entry LSN is allocated and stamped on the live entry so WATCH validation can observe it.
+- If AOF is active, an `AofLsn` is returned so the reactor can append the command in mutation order.
+- Some deletion-only operations produce AOF LSNs without an entry to stamp.
+
+Plain featureless `SET key value` therefore avoids the global LSN atomic.
+
+## GET Path
+
+`GET` uses `read_value_with` for borrowed response formatting:
 
 ```mermaid
 flowchart TD
     A[GET key] --> B[compute shard index and table hash]
-    B --> C[read lock shard]
-    C --> D[get_with_ttl_prehashed]
-    D --> E{live value?}
-    E -- yes --> F[value_to_resp from borrowed value]
-    E -- expired --> G[drop read lock]
-    G --> H[write lock shard]
-    H --> I[remove_if_expired / cleanup]
-    I --> J[return nil]
-    E -- missing --> J
+    B --> C[read shard]
+    C --> D[get value and ttl with prehashed lookup]
+    D --> E{live?}
+    E -- yes --> F[record access if eviction policy needs it]
+    F --> G[format borrowed value]
+    E -- expired --> H[drop read guard]
+    H --> I[write shard]
+    I --> J[cleanup expired key]
+    J --> K[publish TTL/WATCH effects]
+    K --> L[return nil]
+    E -- missing --> L
 ```
 
-Two things to notice:
+The common hit path does not clone the value. The command encodes the borrowed value while the read guard is held.
 
-- hashing happens before locking to shorten the critical section
-- lazy expiry uses double-checked locking so the common read path stays cheap
+## Plain SET Fast Path
 
-## SET: Fast Path And Option Path
+Plain `SET key value` has a special path:
 
-`SET` has an explicit hot-path split.
+- no option parsing
+- no TTL option state
+- no read-to-write expiry cleanup
+- prehash before lock
+- if mutation features are empty, avoid memory reservation, WATCH, and AOF work
+- for larger raw byte values, `RawValueBytes` can reuse the existing `Bytes` allocation when possible
 
-### Plain `SET key value`
+The fast path is still correct for expired keys because plain SET overwrites unconditionally and clears TTL. It only needs to publish an expiry transition if the old entry had a TTL.
 
-If the frame has exactly three elements, the handler avoids `CommandArgs::collect` and skips option parsing entirely.
+## SET With Options
 
-It calls `keyspace.set_value_plain(key, value)`.
-
-That fast path also skips extra probes that would only matter for option-rich variants. It directly overwrites the key with TTL cleared, updates the expiry count from the old TTL state, and returns `RESP_OK` plus an optional LSN.
-
-### Option-Rich `SET`
-
-If options are present, the handler parses flags such as:
+Option-rich SET parses:
 
 - `EX`, `PX`, `EXAT`, `PXAT`
 - `NX`, `XX`
 - `GET`
 - `KEEPTTL`
 
-Those are packed into `SetOptions` and passed to `set_value_with_options`, which applies Redis semantics under the correct shard lock and returns a `SetResult` describing whether the write happened and whether an old value should be returned.
+Those are packed into `SetOptions`. Domain code uses a `SlotCursor`:
 
-So the handler stays as a parser and result-shaper; the mutation policy stays in the keyspace helper layer.
+- live slot: apply NX/XX/GET/KEEPTTL semantics against the current value
+- expired slot: remove expired entry, then treat as absent
+- vacant slot: insert if the options allow it
 
-## Batch Commands: `MGET`, `MSET`, `MSETNX`
+The result is `SetResult`, which says whether SET happened and whether a previous/current value should be returned.
 
-Batch commands are where the command layer becomes most interesting.
+## Batch Read: MGET
 
-### `MGET`
+`MGET` does not loop over `GET`.
 
-`mget_frames` does not naively loop `GET` N times.
+It:
 
-Instead it:
+1. Builds one lookup record per key: output index, shard index, and table hash.
+2. Sorts lookup records by shard.
+3. Processes one shard at a time under one read lock.
+4. Prefetches table groups for the shard-local keys.
+5. Fills the output vector in original command order.
+6. Records expired hits.
+7. Performs batched lazy-expiry cleanup with one write lock per affected shard.
 
-1. builds a compact lookup record for each key: output position, shard index, table hash
-2. sorts those lookup records by shard index
-3. processes one shard at a time under one read lock
-4. prefetches the relevant groups inside that shard
-5. fills the output array in the original command order
-6. records any expired hits
-7. performs batched lazy-expiry cleanup afterward with one write lock per affected shard
+This keeps response order stable while reducing lock churn and redundant hash work.
 
-This preserves response order while minimizing lock churn.
+## Batch Write: MSET And MSETNX
 
-### `MSET`
+`MSET` uses `PrehashedShardPlan` and sorted write guards. When maxmemory admission is active, it deduplicates duplicate keys by last write before projecting memory so `MSET a small a huge` reserves for the final state, not the sum of both writes.
 
-`mset_values`:
+`MSETNX` is all-or-nothing:
 
-1. computes shard routing and table hashes for all pairs
-2. acquires write locks in sorted shard order
-3. inserts values with precomputed table hashes
-4. updates TTL counts as needed
-5. allocates one AOF LSN for the logical batch
+1. Deduplicate duplicate keys by last write.
+2. Read-plan all keys and verify no live target exists.
+3. Reserve memory for the full insert set.
+4. Revalidate absence under write locks.
+5. Insert all keys or insert none.
 
-### `MSETNX`
+Both paths allocate one logical AOF commit LSN for the batch when AOF is active.
 
-`msetnx_values` uses a two-pass algorithm:
+## Value-Dependent Mutations
 
-1. first pass checks that no target key exists after cleaning expired keys
-2. second pass inserts all pairs if and only if the first pass succeeded
+Commands such as `APPEND`, `SETRANGE`, `INCRBYFLOAT`, and `INCRBY` need to inspect the current value before deciding the new value and memory delta.
 
-That preserves all-or-nothing semantics across multiple keys.
+The locked fallback path is:
 
-## TTL Commands Are Engine Semantics, Not Post-Processing
+```text
+read current state -> project delta -> reserve -> write lock -> revalidate -> mutate
+```
 
-TTL commands in `key.rs` are thin wrappers over a keyspace TTL model.
+For selected value mutations, the engine can use an optimistic prepare/revalidate/swap path when maxmemory and replay mode are inactive:
 
-Key pieces:
+```text
+read lock
+  -> clone current value/ttl/lsn snapshot
+  -> compute new value outside write lock
+  -> write lock
+  -> revalidate value, ttl, and lsn
+  -> swap prepared value if unchanged
+  -> retry a small number of times on conflict
+```
 
-- `TtlState` distinguishes `Missing`, `Persistent`, and `Deadline(deadline)`
-- `expire_generic` implements shared logic for `EXPIRE`, `PEXPIRE`, `EXPIREAT`, and `PEXPIREAT`
-- `ttl_state_bytes` performs lazy cleanup if an expired key is discovered during a TTL check
+This is currently used for `INCRBYFLOAT` and `SETRANGE`. If revalidation fails or the optimization is disabled, the code falls back to the locked path.
 
-The important architectural point is that TTL is not handled by a separate command-only cache. It is enforced at the table and keyspace layer, then surfaced by commands.
+## TTL Commands
 
-## Key Management Commands
+TTL commands are implemented in `generic.rs` and domain `key_ops.rs`.
 
-`key.rs` contains more than simple wrappers. Several commands depend on specific engine-level mechanics.
+The domain uses:
 
-### `DEL` / `UNLINK` / `EXISTS`
+- `TtlState::Missing`
+- `TtlState::Persistent`
+- `TtlState::Deadline(deadline)`
+- `ExpireOptions` for `NX`, `XX`, `GT`, and `LT`
 
-- single-key fast paths skip `CommandArgs::collect`
-- multi-key versions group work through keyspace helpers
-- lazy expiry is honored before existence or deletion decisions are finalized
+`EXPIRE` with a deadline at or before `now_nanos` deletes the key. Future deadlines update the entry TTL and stamp an LSN if WATCH or AOF is active. `PERSIST` clears a TTL only if a live TTL existed.
 
-### `RENAME` / `RENAMENX`
+## Delete And Rename
 
-These commands must preserve value and TTL semantics. The keyspace helper layer handles both same-shard and cross-shard cases while respecting lock ordering.
+`DEL` and `UNLINK` share delete mechanics. Single-key delete uses the direct byte path. Multi-key delete uses a prehashed plan, sorted write locks, and deferred effects.
 
-### `SCAN` / `KEYS`
+`RENAME` and `RENAMENX` support same-shard and cross-shard paths:
 
-The engine implements table scanning directly over shard-local tables. `SCAN` cursors encode both shard index and slot index into one `u64`, which lets the engine resume traversal without pretending the whole database is a single contiguous array.
+- same shard: one write guard
+- cross shard: sorted multi-write guards plus helper splitting to obtain distinct mutable table references
 
-### `COPY`
+Memory admission is based on the final state: source removed, destination inserted or replaced, and TTL carried forward if it is still live.
 
-The helper layer clones the value and preserves TTL when appropriate. Replace vs non-replace behavior is decided before insertion, again under the proper lock topology.
+## SCAN, KEYS, RANDOMKEY
 
-## Server Commands And Current Limits
+`SCAN` encodes its cursor as:
 
-`server.rs` contains commands that are not just data mutations.
+```text
+upper 32 bits: shard index
+lower 32 bits: slot index
+```
 
-Implemented areas include:
+The scan path walks shard tables by slot index, filters expired entries, applies optional glob and type filters, and returns a new cursor. It is incremental and not a global snapshot.
 
-- `PING`, `ECHO`, `QUIT`
-- `DBSIZE`, `FLUSHDB`, `FLUSHALL`
-- `INFO`
-- `COMMAND`
-- `SELECT`, `TIME`
+`KEYS` scans all shards and collects matching keys. `RANDOMKEY` starts at a pseudo-random shard and pseudo-random slot, then searches for a live key.
 
-Current limitations worth documenting explicitly:
+## AOF Payloads And Side Records
 
-- `MULTI`, `EXEC`, `DISCARD`, and `WATCH` are still stub-style responses, not full transaction semantics
-- `INFO` returns engine-owned fields directly, but some process- or connection-level fields are placeholders because the reactor owns that state
-- `FLUSHDB` / `FLUSHALL` operate through the shared keyspace and are not presented as globally atomic snapshots across shards
+The command layer encodes AOF command payloads such as:
 
-These are not hidden quirks. They are current architectural boundaries.
+- `SET`
+- `SET ... PXAT`
+- `PEXPIREAT`
+- `PERSIST`
 
-## AOF LSN Flow
+The engine returns:
 
-Mutation helpers typically return `MutationOutcome<T>` internally.
+- `aof_payload`: command bytes for persistence when the reactor needs an owned canonical command
+- `aof_commit`: the mutation LSN for the command
+- `aof_records`: side records, currently used for eviction deletes
 
-That type carries:
+The engine does not decide fsync policy. It only identifies what mutation happened and in what logical order.
 
-- the semantic result of the command
-- an optional AOF LSN allocated from `ConcurrentKeyspace::next_lsn()`
+## Error Mapping
 
-Handlers then wrap that into `ExecutedCommand`.
+Domain operations return `MutationErrorKind`:
 
-This matters because persistence ordering is decided by the engine at the same time the logical mutation is decided. Higher layers do not need to reverse-engineer whether a command truly changed state.
+- `WrongType`
+- `NotInteger`
+- `NotFloat`
+- `Overflow`
+- `OutOfMemory`
+- `NoSuchKey`
 
-## Why This Command Layer Works Well With The Rest Of The Engine
+The command layer maps those to Redis-compatible RESP errors. If eviction happened before an OOM result, the error can still carry AOF side records for keys evicted during the failed admission attempt.
 
-The command subsystem is effective because it is narrow at the edges and opinionated in the middle.
+## Hot-Path Rules
 
-- the edge contract is simple: `name`, `FrameRef`, `now_nanos`, `keyspace`
-- static dispatch avoids runtime indirection
-- handlers specialize hot paths aggressively
-- `commands/context.rs` keeps concurrency policy centralized
-- `SwissTable` remains the only place that knows slot-level storage mechanics
+When changing command execution, preserve these rules:
 
-That separation is what keeps the crate maintainable even as command coverage grows.
-
-## Summary
-
-The command layer in `vortex-engine` is not just a parser-to-table shim. It is a full execution pipeline built from three pieces:
-
-1. static dispatch and response shaping in `commands/mod.rs`
-2. command-specific syntax and semantic handling in `string.rs`, `key.rs`, and `server.rs`
-3. shared lock-aware execution helpers in `commands/context.rs`
-
-Together they turn a parsed RESP frame into a correct shard-local or multi-shard operation, preserve TTL and memory-accounting invariants, and optionally attach the mutation LSN needed by persistence.
+- Parse RESP and shape replies in `commands/*`.
+- Keep lock ordering and storage mutation in domain/keyspace/table code.
+- Prehash before locking when the table hash is needed.
+- Do not publish cold effects while a shard guard is live unless correctness requires it.
+- Do not add LSN allocation to featureless writes.
+- Do not bypass memory admission for command-visible growth.
+- Do not hold shard guards across reactor yield or requeue points.

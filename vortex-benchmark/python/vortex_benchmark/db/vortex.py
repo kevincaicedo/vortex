@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +22,22 @@ from .base import (
 DEFAULT_VORTEX_MAXMEMORY = "1800mb"
 DEFAULT_AOF_MAX_PENDING_FSYNC_BYTES = 64 * 1024 * 1024
 CONTAINER_RUNTIME_DIR = "/benchmark-runtime"
+
+
+def normalize_vortex_runtime_config(
+    runtime_config: dict[str, object], *, mode: str
+) -> dict[str, object]:
+    normalized = dict(runtime_config)
+    normalized["io_backend"] = _resolve_native_io_backend(
+        normalized.get("io_backend"), mode=mode
+    )
+    return normalized
+
+
+def _resolve_native_io_backend(io_backend: object, *, mode: str) -> object:
+    if mode == "native" and io_backend == "uring" and platform.system() != "Linux":
+        return "polling"
+    return io_backend
 
 
 def _append_reactor_budget_args(command: list[str], runtime: dict[str, object]) -> None:
@@ -94,21 +111,24 @@ class VortexAdapter(DatabaseAdapter):
         )
 
     def resolve_runtime_config(self, request: StartRequest) -> dict[str, object]:
+        normalized_runtime = normalize_vortex_runtime_config(
+            request.runtime_config, mode=request.mode
+        )
         maxmemory = str(
-            request.runtime_config.get("maxmemory", DEFAULT_VORTEX_MAXMEMORY)
+            normalized_runtime.get("maxmemory", DEFAULT_VORTEX_MAXMEMORY)
         )
         resolved: dict[str, object] = {
-            "aof_enabled": bool(request.runtime_config.get("aof_enabled", False)),
-            "aof_fsync": str(request.runtime_config.get("aof_fsync", DEFAULT_AOF_FSYNC)),
+            "aof_enabled": bool(normalized_runtime.get("aof_enabled", False)),
+            "aof_fsync": str(normalized_runtime.get("aof_fsync", DEFAULT_AOF_FSYNC)),
             "aof_max_pending_fsync_bytes": int(
-                request.runtime_config.get(
+                normalized_runtime.get(
                     "aof_max_pending_fsync_bytes", DEFAULT_AOF_MAX_PENDING_FSYNC_BYTES
                 )
             ),
             "eviction_policy": str(
-                request.runtime_config.get("eviction_policy", DEFAULT_EVICTION_POLICY)
+                normalized_runtime.get("eviction_policy", DEFAULT_EVICTION_POLICY)
             ),
-            "telemetry_mode": str(request.runtime_config.get("telemetry_mode", "minimal")),
+            "telemetry_mode": str(normalized_runtime.get("telemetry_mode", "minimal")),
             "maxmemory": maxmemory,
             "maxmemory_bytes": parse_size_literal_to_bytes(
                 maxmemory, label="runtime_config.maxmemory"
@@ -135,7 +155,7 @@ class VortexAdapter(DatabaseAdapter):
             "reactor_maintenance_budget",
             "reactor_time_budget_us",
         ):
-            value = request.runtime_config.get(key)
+            value = normalized_runtime.get(key)
             if value is not None:
                 resolved[key] = value
         return resolved

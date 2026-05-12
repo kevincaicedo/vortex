@@ -71,3 +71,11 @@ required-features = ["profiling-tools"]
 name = "atomic_contention_probe"
 path = "examples/atomic_contention_probe.rs"
 required-features = ["profiling-tools"]
+
+[[example]]
+name = "table_growth_limit_probe"
+path = "examples/table_growth_limit_probe.rs"
+
+[[example]]
+name = "table_live_slot_probe"
+path = "examples/table_live_slot_probe.rs"

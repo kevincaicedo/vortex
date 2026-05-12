@@ -1,338 +1,318 @@
 # ConcurrentKeyspace Deep Dive
 
-`ConcurrentKeyspace` is the concurrency control plane of `vortex-engine`. It owns the shard array, decides how keys map to shards, acquires locks for single-key and multi-key operations, tracks global counters, and exposes maintenance operations such as scans and active expiry.
+`ConcurrentKeyspace` is the engine coordination layer. It makes thousands of independent `SwissTable` shards behave like one Redis-compatible database while keeping the normal command path local and predictable.
 
-If `SwissTable` is the per-shard storage engine, `ConcurrentKeyspace` is the system that makes many `SwissTable`s behave like one database.
+It owns:
 
-## Internal Layout
+- shard routing and lock acquisition
+- TTL counters and active-expiry entry points
+- memory accounting, maxmemory admission, and eviction
+- WATCH versions and absent-key watch tracking
+- global LSN allocation for WATCH and AOF
+- per-shard transaction visibility gates
+- runtime metrics and memory attribution
 
-At a high level the type looks like this:
+It does not parse RESP, own connection state, or write persistence files.
+
+## Shape
 
 ```mermaid
 flowchart TD
     KS[ConcurrentKeyspace]
-    KS --> S[shards: Box<[CachePadded<RwLock<SwissTable>>]>]
-    KS --> C[clock_hands: Box<[CachePadded<AtomicUsize>]>]
-    KS --> E[expiry_key_count: Box<[CachePadded<AtomicUsize>]>]
-    KS --> M[mask]
-    KS --> H[hasher]
-    KS --> TH[table_hasher]
-    KS --> GM[global_memory_used]
-    KS --> GL[global_lsn]
-    KS --> EV[eviction: EvictionConfigState]
-    KS --> FS[frequency_sketch: FrequencySketch]
+    KS --> Shards["shards: Box CachePadded RwLock SwissTable"]
+    KS --> Clock["clock_hands: per-shard eviction cursor"]
+    KS --> Expiry["expiry_key_count + expiry_key_total"]
+    KS --> Route["mask + fixed-seed shard hasher"]
+    KS --> TableHash["table_hasher shared by all shard tables"]
+    KS --> Memory["global_memory_used + memory_reserved"]
+    KS --> Features["mutation_features bits"]
+    KS --> LSN["global_lsn + aof_recording_refs"]
+    KS --> Eviction["EvictionConfigState + FrequencySketch"]
+    KS --> Watch["absent_watch_shards + watch_active + watch_epoch"]
+    KS --> Gates["transaction_gates per shard"]
+    KS --> Metrics["runtime_metrics + eviction_metrics"]
 ```
 
-These fields divide into six jobs:
-
-- data ownership: `shards`
-- eviction cursor state: `clock_hands`
-- TTL metadata: `expiry_key_count`
-- routing: `mask`, `hasher`, `table_hasher`
-- global bookkeeping: `global_memory_used`, `global_lsn`
-- runtime policy state: `eviction`
-- LFU frequency estimation: `frequency_sketch`
-
-## Shard Topology
-
-Each shard is:
+The shard array is the main state owner:
 
 ```rust
 type Shard = CachePadded<RwLock<SwissTable>>;
 ```
 
-Important invariants:
+`CachePadded` keeps adjacent shard locks from sharing cache lines. The `RwLock` is from `parking_lot`, and each shard table is independent from every other shard table.
 
-- shard count must be a power of two
-- shard count must be in `[64, 131072]`
-- default shard count is `4096`
+## Shard Count Invariants
 
-Why `CachePadded` matters:
+Shard count is represented by `ShardCount`.
 
-- adjacent locks do not share a cache line
-- one hot shard lock does not cause false sharing with its neighbor
-- lock metadata remains isolated under heavy parallel access
+The allowed range is:
 
-Why `RwLock<SwissTable>` matters:
-
-- read-heavy commands can share a shard read lock
-- write commands still serialize per shard
-- unrelated shards proceed independently
-
-The design is not lock-free. It is deliberately sharded so that the lock scope stays narrow and predictable.
-
-## Two Hashers, Two Jobs
-
-One subtle but important part of `ConcurrentKeyspace` is that it keeps **two** hashers.
-
-### `hasher`: Shard Routing Hasher
-
-`hasher` uses fixed seeds.
-
-That gives deterministic shard routing across process restarts:
-
-```rust
-pub fn shard_index(&self, key: &[u8]) -> usize {
-    (self.hasher.hash_one(key) & self.mask) as usize
-}
+```text
+MIN_SHARD_COUNT = 64
+DEFAULT_SHARD_COUNT = 4096
+MAX_SHARD_COUNT = 131072
 ```
 
-The `& self.mask` operation is valid because the shard count is a power of two. It is a fast modulo replacement on the routing hot path.
+The count must be a power of two. That rule allows shard routing to use a bitwise AND instead of division:
 
-### `table_hasher`: Per-Table Hashing Hasher
+```text
+shard_index = hash(key) & (num_shards - 1)
+```
 
-`table_hasher` is cloned into every `SwissTable` in the keyspace.
+For a power-of-two shard count, `num_shards - 1` is a mask with the low bits set. If there are 4096 shards, the mask is `0xfff`. `hash & 0xfff` keeps only the low 12 bits, which is equivalent to `hash % 4096` but cheaper.
 
-That solves a different problem: command handlers often want to compute the table hash **before** acquiring a shard lock, then pass that precomputed hash down into the table operation. Keeping one shared table-hash policy for the whole keyspace allows that optimization without exposing random per-table state to callers.
+## Two Hashers
 
-In short:
+The keyspace keeps two hashers because it has two different jobs.
 
-- `hasher` decides *which shard*
-- `table_hasher` decides *where inside that shard's SwissTable*
+| Hasher | Seeds | Used for | Why |
+| --- | --- | --- | --- |
+| `hasher` | Fixed seeds | Shard routing | Stable routing across process restarts and benchmark runs. |
+| `table_hasher` | Random per keyspace | Slot placement inside each SwissTable | Lets batch commands pre-hash before taking shard locks while keeping the table hash policy shared across shards. |
 
-## Single-Key Access Paths
+This means "which shard?" and "which control group inside the table?" are separate contracts.
 
-The keyspace exposes direct lock acquisition helpers:
+## Locking Model
 
-- `read_shard(key)`
-- `write_shard(key)`
-- `read_shard_by_index(idx)`
-- `write_shard_by_index(idx)`
+Single-key commands route to one shard and acquire one read or write lock.
 
-It also exposes closure-based helpers:
+Multi-key commands first build a shard plan:
 
-- `read(key, |table| ...)`
-- `write(key, |table| ...)`
+```mermaid
+flowchart LR
+    Keys["input keys in client order"] --> Plan[ShardPlan]
+    Plan --> PerKey["per_key_shards"]
+    Plan --> Sorted["sorted_shards deduped ascending"]
+    Plan --> Guards["per_key_guard_indices"]
+```
 
-These are useful for keeping data conversion outside the lock and limiting the critical section to the actual table operation.
+The keyspace then locks `sorted_shards` in ascending order. That deterministic order prevents deadlocks because all threads wait for shard locks in the same sequence.
 
-### Why `unsafe get_unchecked` Appears Here
+Example:
 
-The code uses `unsafe { self.shards.get_unchecked(idx) }` on hot paths.
+```text
+keys arrive in order:     k0 -> shard 25, k1 -> shard 10, k2 -> shard 25, k3 -> shard 90
+sorted unique lock order: shard 10, shard 25, shard 90
+guard mapping:            k0 -> guard 1, k1 -> guard 0, k2 -> guard 1, k3 -> guard 2
+```
 
-That is safe because:
+The engine uses two plan types:
 
-- `idx` is derived from `hash & mask`
-- `mask == num_shards - 1`
-- `num_shards` is a power of two
+- `ShardPlan`: plans from raw key byte slices.
+- `PrehashedShardPlan`: stores each key index, key bytes, shard id, table hash, and guard index. Batch paths use this to avoid repeated hashing and binary searches.
 
-So `idx < shards.len()` is guaranteed by construction.
+## Read Guards And Write Guards
 
-## `ShardWriteGuard`: Flushing Memory Drift On Drop
+Read guards are direct `RwLockReadGuard` values in normal builds.
 
-Write guards are wrapped in `ShardWriteGuard` instead of exposing `RwLockWriteGuard<SwissTable>` directly.
+Write guards are wrapped by `ShardWriteGuard`. On drop, a write guard flushes table-local memory drift to the shared memory counter:
 
-That wrapper exists for one reason:
+```text
+table mutation
+  -> SwissTable.memory_used changes exactly
+  -> SwissTable.memory_drift accumulates signed delta
+  -> ShardWriteGuard drops
+  -> flush_memory_drift_with(global_memory_used, strict_memory_accounting)
+```
 
-- when a shard write guard is dropped, it calls `SwissTable::flush_memory_drift(&global_memory_used)`
+This avoids one shared atomic update per mutation. In normal mode, drift flushes once it crosses `MEMORY_ACCOUNTING_FLUSH_THRESHOLD` or when forced. With maxmemory active, `strict_memory_accounting` forces publication on each write guard drop so admission and eviction see current pressure.
 
-This is how the keyspace converts exact per-table memory deltas into a batched approximate global memory counter without paying an atomic operation for every insert, append, increment, or delete.
+## Mutation Features
 
-So a write lock is not just a lock. It is also the publication boundary for shard-local memory accounting.
+Hot mutation code checks one feature word instead of repeatedly loading unrelated atomics.
 
-## Multi-Key Operations And Deadlock Freedom
+`MutationFeatures` currently has:
 
-Multi-key commands are where `ConcurrentKeyspace` earns its name.
+| Bit | Meaning |
+| --- | --- |
+| `MAXMEMORY` | Mutations may need memory reservation and eviction. |
+| `WATCH` | Mutations must publish WATCH invalidations and entry-visible versions. |
+| `AOF` | Mutations must allocate AOF-visible LSNs and may create AOF side records. |
 
-The core helpers are:
+The WATCH bit is derived from `watch_active`, so the write path stays cold when no client is using WATCH.
 
-- `ShardPlan::new(keyspace, keys)`
-- `multi_read(keys)`
-- `multi_write(keys)`
+## Memory Admission
 
-### `ShardPlan`
-
-For a slice of keys, the keyspace builds a `ShardPlan` with:
-
-- `per_key_shards`: one typed `ShardId` per input key
-- `sorted_shards`: deduplicated `ShardId`s in ascending lock order
-- `per_key_guard_indices`: one typed `GuardIndex` per input key
-
-This gives three views of the same operation:
-
-- input-order mapping back to each key
-- lock-order list for acquisition
-- precomputed guard positions for command code
-
-### Ordered Lock Acquisition
-
-`multi_read` and `multi_write` return `(guards, plan)` and acquire locks in strictly ascending shard order.
-
-That total ordering prevents deadlocks. No thread can hold shard 25 and then wait for shard 10 while another thread does the opposite, because both threads are forced into the same order.
+Maxmemory admission is reservation based. It prevents concurrent writers from all passing against the same stale memory value.
 
 ```mermaid
 sequenceDiagram
-    participant Cmd
+    participant Cmd as Domain mutation
     participant KS as ConcurrentKeyspace
-    participant S10 as Shard 10
-    participant S25 as Shard 25
-    participant S90 as Shard 90
+    participant Ev as Eviction
+    participant Table as SwissTable
 
-    Cmd->>KS: keys -> shards [25, 10, 90]
-    KS->>KS: sort + dedup -> [10, 25, 90]
-    KS->>S10: acquire lock
-    KS->>S25: acquire lock
-    KS->>S90: acquire lock
-    KS-->>Cmd: guards + mapping tables
+    Cmd->>Table: project positive memory delta
+    Cmd->>KS: reserve additional bytes
+    KS->>KS: memory_reserved += delta
+    KS->>KS: check global_memory_used + memory_reserved
+    alt fits
+        KS-->>Cmd: MemoryReservation
+    else over maxmemory
+        KS->>Ev: evict until target
+        Ev-->>KS: bytes freed and side effects
+        KS-->>Cmd: reservation or OOM
+    end
+    Cmd->>Table: mutate under write guard
+    Cmd->>KS: publish deferred effects
+    Cmd->>KS: reservation.settle()
 ```
 
-### Mapping Keys Back To Guards
+`MemoryReservation` is an RAII token. If an error path returns early, dropping the token releases the reservation. After a successful mutation, `settle()` releases the reserved bytes once table memory drift has been published.
 
-Once the locks are held, command code uses `plan.guard_index_for_key(key_index)` to find the guard that corresponds to each input key.
+When admission requires revalidation, `ReservationCoordinator` follows this loop:
 
-Because `ShardPlan` derives those guard positions from the same sorted shard set used for lock acquisition, callers do not repeat binary searches or carry raw shard-index tuples through mutation code.
+1. Project delta before locking or from a read guard.
+2. Reserve that projected positive delta.
+3. Acquire the write lock.
+4. Recompute the required delta against the current table state.
+5. If the reservation is too small, drop the lock, reserve the extra bytes, and retry.
+6. Mutate only after the reservation covers the actual required delta.
 
-### Transaction Locking
+That loop is why maxmemory correctness does not depend on an optimistic stale projection.
 
-`exec_transaction_locks(keys)` currently aliases `multi_write(keys)`.
+## TTL State
 
-Even reads inside a transaction take write locks. That is conservative, but it ensures the transaction sees a serializable view instead of allowing interleaving writers.
+TTL state is entry-resident. `Entry::ttl_deadline()` returns an absolute monotonic nanosecond deadline, and `0` means persistent.
 
-## Scan And Maintenance Operations
+The keyspace tracks TTL counts separately:
 
-The keyspace also owns whole-database and maintenance traversal patterns.
+- `expiry_key_count[shard]`: approximate count of TTL-bearing keys in one shard.
+- `expiry_key_total`: approximate total TTL-bearing keys.
 
-### `scan_all_shards`
+Domain mutations do not directly edit those counters. They build an `ExpiryTransition`:
 
-`scan_all_shards` acquires a read lock on each shard one at a time and applies a closure.
+```text
+had_ttl before mutation -> has_ttl after mutation
+```
 
-This is used for operations such as:
+After shard guards drop, the domain publishes the transition and the keyspace updates the counters.
 
-- `KEYS`
-- `SCAN`
-- `DBSIZE`
+### Lazy Expiry
 
-The result is best-effort, not a globally atomic snapshot. Shard 0 may be read at a different moment than shard 1.
+Reads treat expired entries as missing. Common flow:
 
-### `run_active_expiry_on_shard`
+```text
+read lock
+  -> lookup value and ttl
+  -> if ttl is live, return value
+  -> if ttl is expired:
+       drop read lock
+       take write lock
+       re-check via slot cursor
+       delete if still expired
+       publish TTL and WATCH effects
+       return missing/nil
+```
 
-This method performs one active-expiry sweep on one shard.
+This keeps the common read-hit path on a read lock and moves cleanup to a write lock only when necessary.
 
-It:
+### Active Expiry
 
-1. acquires a write lock for one shard
-2. scans up to `max_effort` slots starting from `start_slot`
-3. reads TTL deadlines directly by slot index
-4. removes expired entries via `delete_slot(slot)`
-5. updates the per-shard expiry counter
+Reactors can call `run_active_expiry_on_shard(shard, start_slot, max_effort, now_nanos)`. It:
 
-Notable property: it deletes by slot index instead of cloning the key and re-probing. That keeps expiry sweeps allocation-free and O(1) per confirmed expired slot.
+1. Skips the shard if the TTL count says no TTL-bearing keys exist.
+2. Takes one shard write lock.
+3. Scans up to `max_effort` slots from `start_slot`.
+4. Deletes expired slots by slot index.
+5. Updates TTL counters and WATCH state.
 
-### `flush_all` And `flush_all_with_lsn`
+The operation is bounded and allocation-free for ordinary slot deletion.
 
-`flush_all` replaces every shard table with a fresh empty `SwissTable`.
+## LSNs
 
-That is intentionally blunt:
+LSN means logical sequence number.
 
-- it releases stored key/value memory
-- it clears expiry counters
-- it resets approximate global memory usage
+There are three wrapper types:
 
-`flush_all_with_lsn` does the same while also returning an LSN if there were live entries to flush.
+| Type | Meaning |
+| --- | --- |
+| `Lsn` | Generic raw logical sequence number wrapper. |
+| `EntryLsn` | Entry-storable LSN. It must fit in 48 bits because `Entry` stores six bytes. |
+| `AofLsn` | AOF-visible LSN used by persistence coordination. It shares the same 48-bit bound. |
 
-One caveat is worth documenting explicitly: `flush_all` is not a globally atomic snapshot barrier across shards. It locks and resets shards sequentially.
+`global_lsn` is an `AtomicU64`. `next_lsn()` increments it with relaxed ordering. That is enough because callers allocate LSNs while holding the shard write lock that orders same-key mutations.
 
-## Counters And Metadata
+Important details:
 
-`ConcurrentKeyspace` owns several counters above the per-table level.
+- Featureless writes can skip LSN allocation.
+- WATCH-visible mutations allocate entry LSNs so present-key WATCH validation can compare versions.
+- AOF recording allocates an `AofLsn` so the reactor can append the command in engine mutation order.
+- `next_watch_visible_lsn()` skips `0`; `0` is the initial entry version and also used by absent WATCH state.
+- Replay restoration can advance `global_lsn` to `max_replayed_lsn + 1`, but only during single-threaded startup or a quiesced state.
 
-### `expiry_key_count`
+## WATCH State
 
-This is a per-shard `AtomicUsize` array counting how many keys currently carry a TTL.
+WATCH is connection-scoped, but the keyspace owns the data needed to validate watched keys.
 
-Command helpers return or build an `ExpiryTransition` whenever they change TTL state, then call `apply_expiry_transition`. The raw `(had_ttl, has_ttl)` counter update remains private to the keyspace. This lets server-style metadata operations answer questions such as "how many expiring keys exist?" without scanning the full table.
+Present-key WATCH:
 
-### `global_memory_used`
+1. `watch_key` reads the key's current entry LSN.
+2. The connection stores `WatchRegistration`.
+3. Mutations to that key stamp a new entry LSN when WATCH is active.
+4. `watched_keys_changed` compares the current entry LSN with the stored version.
 
-This is the approximate global memory counter.
+Absent-key WATCH:
 
-- it is updated from shard-local drift buffers
-- it is cheap enough for hot-path checks such as memory limits or eviction heuristics
-- it may lag slightly behind the exact value
+1. There is no entry LSN to read, so the keyspace registers the key in `absent_watch_shards`.
+2. Mutations that create or touch that key bump the absent-watch version.
+3. Validation checks that the key is still absent and that its absent-watch version did not change.
 
-For the exact value, the keyspace provides `memory_used()`, which sums `local_memory_used()` across all shards under read locks.
+Whole-keyspace mutations such as FLUSH use `watch_epoch` to invalidate all watches.
 
-So the memory API intentionally exposes both views:
+The hot path avoids absent-key locks unless `absent_watch_active != 0`.
 
-- `memory_used()` = exact but slower
-- `approx_memory_used()` = cheap but buffered
+## Transaction Gates
 
-### `global_lsn`
+`TransactionGate` is a small per-shard reader/writer gate:
 
-This is the global logical sequence number.
+```text
+normal command touching shard S -> enters gate S as reader
+EXEC touching shard S          -> enters gate S as writer
+```
 
-- `next_lsn()` allocates the next mutation sequence number
-- `current_lsn()` reads the current frontier
-- `set_lsn()` restores or initializes it during startup / replay
+The reactor owns `MULTI`, queued commands, dirty transaction state, and WATCH lists. Before `EXEC` validates WATCH and drains queued commands, it enters the transaction gates for the sorted shard set that the transaction can touch.
 
-The ordering guarantee is simple: mutations that the engine chooses to publish as distinct logical changes can carry a monotonic sequence number upward to persistence layers.
+This removes the old global transaction gate from normal commands. A normal single-key GET or SET only pays the gate for its touched shard when the reactor asks for scoped execution.
 
-### `clock_hands` And Runtime Eviction State
+## Eviction Ownership
 
-Eviction is owned here rather than in command handlers or inside individual `SwissTable`s.
+The keyspace owns eviction because eviction crosses several concerns:
 
-- `clock_hands` stores one sweep cursor per shard
-- `eviction` stores the live `maxmemory` and policy values shared by all reactors
-- `ensure_memory_for(...)` is the admission boundary used by mutating growth paths before they take the shard write lock
+- current maxmemory and policy
+- memory pressure and reservations
+- per-shard sweep cursors
+- TTL filtering for volatile policies
+- WATCH invalidation for evicted keys
+- AOF side records for evicted keys
+- runtime eviction metrics
 
-The key point is that memory enforcement is not an afterthought bolted onto `SET`. The command layer asks the keyspace how much growth it needs, and the keyspace either proves there is room or reclaims it first.
+Eviction has two entry points:
 
-### `frequency_sketch`
+- Admission-time eviction from `ensure_memory_for_snapshot`.
+- Maintenance-time eviction from `run_eviction_maintenance_on_shard`.
 
-LFU uses one shared Count-Min Sketch across the whole keyspace.
+Both call the same bounded sweep driver over `SwissTable` slots.
 
-- 4 rows × 2048 counters = 8KB total logical footprint
-- counters are updated with relaxed atomics and periodically halved in place to age old history out
-- reads and successful writes record one frequency sample for LFU policies
+## Metrics And Attribution
 
-Why keep the sketch here instead of inside each shard:
+`ConcurrentKeyspace` exposes:
 
-- it avoids per-shard hot-key skew from becoming invisible when keys move across workloads
-- it lets LFU stay a cheap shared estimate rather than a lock-coupled queue
-- it keeps policy state and policy mechanics in the same ownership layer
+- `engine_memory_attribution()`: live keys, logical dataset bytes, table allocated bytes, slots, tombstones, load factor, bytes per live key, and shard count.
+- `server_memory_attribution()`: IO-owned memory fields published by the reactor pool.
+- `runtime_metrics()`: backend, reactor, AOF, overload, expiry, eviction, and profile-gated timing fields.
+- `eviction_metrics()`: admissions, shards scanned, slots sampled, bytes freed, OOM-after-scan, and optional timing.
 
-## Read, Write, And Cleanup Patterns
+The key design is that high-frequency reactor counters use sharded slots. Profile timing fields are compiled only with `profile-telemetry`.
 
-The keyspace is also where many command semantics become concrete.
+## Things To Avoid
 
-Common patterns implemented here or in `commands/context.rs` include:
+Engine code should not:
 
-- read under a shared lock, then escalate to a write lock only if lazy-expiry cleanup is required
-- pre-hash a key before taking the lock to shorten lock hold time
-- group multi-key operations by shard so one lock can serve several keys
-- preserve TTL counts whenever a mutation changes key expiry state
-- allocate one AOF LSN for a whole logical mutation such as `MSET`
-- compute projected growth before mutation, then call `ensure_memory_for(...)` so memory checks happen before the actual write path
-- keep LFU victim selection inside the shard-local clock sweep by combining entry-local Morris counters with the global sketch estimate
-
-This helper layer is why command handlers can stay thin while the locking policy remains consistent.
-
-## Why The Keyspace Exists As A Separate Layer
-
-It would be possible to let command handlers lock shards directly and operate on raw tables. The crate deliberately does not do that.
-
-`ConcurrentKeyspace` centralizes:
-
-- shard routing
-- lock ordering
-- TTL counter maintenance
-- memory publication
-- global LSN allocation
-- runtime eviction policy state
-- LFU frequency tracking and victim selection
-
-That centralization prevents each command from re-implementing slightly different concurrency rules. The keyspace is the one place where concurrency policy is supposed to live.
-
-## Summary
-
-`ConcurrentKeyspace` is more than an array of `RwLock<SwissTable>`.
-
-It is the layer that turns many independent shard-local tables into one coherent database by combining:
-
-1. deterministic shard routing
-2. deadlock-free ordered multi-lock acquisition
-3. per-shard TTL and memory bookkeeping
-4. global mutation ordering through LSNs
-5. shard-scoped maintenance and scan operations
-
-For the next layer down, see [03-swiss-table-layout.md](03-swiss-table-layout.md). For the layer above, see [04-command-execution.md](04-command-execution.md).
+- hold shard guards across reactor yield points
+- allocate AOF files or call fsync
+- parse connection-level transaction state
+- bypass `engine::domain` for command-visible mutations
+- update TTL counters without an `ExpiryTransition`
+- stamp entry LSNs for featureless writes unless a feature consumes them
+- add shared hot atomics without benchmark and profiler evidence

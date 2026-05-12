@@ -6,6 +6,7 @@ from typing import Optional
 
 from vortex_benchmark.backends import BackendRunContext, execute_backend, resolve_backend_names
 from vortex_benchmark.backends.base import BackendExecutionRecord
+from vortex_benchmark.db.vortex import normalize_vortex_runtime_config
 from vortex_benchmark.env import build_layout, load_environment_state, probe_redis_endpoint
 from vortex_benchmark.manifests import resolve_benchmark_spec, validate_run_inputs
 from vortex_benchmark.models import EnvironmentState, split_csv_values, timestamp_slug, utc_now
@@ -86,7 +87,10 @@ def _validate_runtime_config(state: EnvironmentState, spec, selected_databases: 
     for service in state.services:
         if service.database not in selected_databases:
             continue
-        for key, expected in spec.runtime_config.items():
+        expected_runtime = dict(spec.runtime_config)
+        if service.database == "vortex":
+            expected_runtime = normalize_vortex_runtime_config(expected_runtime, mode=state.mode)
+        for key, expected in expected_runtime.items():
             if service.database != "vortex" and key in VORTEX_ONLY_RUNTIME_KEYS:
                 continue
             actual = (service.runtime_config or {}).get(key)

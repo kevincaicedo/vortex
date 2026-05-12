@@ -1,217 +1,189 @@
 # Vortex Engine Crate Overview
 
-`vortex-engine` is the in-memory execution core of VortexDB. It owns data layout, shard topology, TTL semantics, command semantics, and memory accounting. It does **not** own sockets, event loops, or RESP parsing. Those concerns live outside the crate.
+`vortex-engine` is the in-memory execution core of VortexDB. It owns Redis-compatible command semantics, the shared keyspace, shard-level hash tables, entry metadata, TTL, WATCH-visible versions, eviction policy, memory admission, and engine-owned runtime metrics.
 
-That separation is the first architectural rule to understand:
+It deliberately does not own sockets, event loops, kernel I/O, RESP parsing from byte streams, AOF file formats, or fsync policy. Those concerns live in sibling crates:
 
-- `vortex-io` owns connections, reactors, and writeback
-- `vortex-proto` owns RESP parsing, command metadata, and serialization helpers
-- `vortex-engine` owns the data engine itself
+- `vortex-io`: reactors, connections, parser scheduling, write lifetimes, transaction queues, WATCH connection state, and AOF writer coordination.
+- `vortex-proto`: RESP frame/tape parsing and frame representation.
+- `vortex-persist`: append-only file format, replay, rewrite, fsync, truncation, and crash recovery.
+- `vortex-common`: shared key/value types, timestamp helpers, encoding enums, and constants.
 
-The engine takes already-parsed commands and executes them against a shared concurrent keyspace.
+The engine receives a parsed RESP frame, an uppercase command name, and a caller-supplied clock. It returns a response plus typed mutation effects for the reactor to persist or write back.
 
-## Crate Boundary
+## Terms
 
-At the top of the crate, the public surface is intentionally small:
+This docs set uses these terms consistently:
 
-- `ConcurrentKeyspace` is the shared database
-- `SwissTable` is the per-shard storage engine
-- `Entry` is the 64-byte slot layout
-- `eviction` owns runtime maxmemory policy state and LFU frequency tracking helpers
-- `morph` and `prefetch` provide support for adaptive behavior and cache hints
+- RESP: Redis Serialization Protocol, the wire format used by Redis-compatible clients.
+- TTL: time to live. In Vortex this is stored as an absolute monotonic nanosecond deadline. `0` means no expiry.
+- LSN: logical sequence number. This is the engine mutation version used for WATCH validation and AOF ordering.
+- AOF: append-only file. The engine creates typed commit metadata, but `vortex-persist` owns the file format and durability contract.
+- shard: one independently locked partition of the keyspace.
+- SwissTable: the per-shard open-addressing hash table that probes groups of control bytes before touching full entries.
+- control byte: one byte per table slot that says empty, deleted, or occupied with a short hash fingerprint.
+- tombstone: a deleted slot marker that keeps probe chains valid until resize.
+- Morris counter: a probabilistic saturating counter used as cheap per-entry eviction metadata.
 
-From the point of view of the caller, the hot contract is effectively:
+## Public Surface
 
-```text
-uppercase command name + FrameRef + now_nanos + ConcurrentKeyspace -> CmdResult / ExecutedCommand
-```
+The crate root re-exports the public types most callers need:
 
-The engine never asks the OS for time on the hot path. The caller supplies `now_nanos`, which keeps TTL decisions consistent across one reactor iteration and avoids repeated system clock reads.
+| Type | Role |
+| --- | --- |
+| `ConcurrentKeyspace` | Shared sharded database and engine coordination layer. |
+| `SharedKeyspaceExecutor` | Concrete command executor used by reactors in the alpha shared-keyspace topology. |
+| `SwissTable` | Per-shard storage table. Public for focused tests, probes, and lower-level engine work. |
+| `Entry` | 64-byte cache-line-aligned slot metadata and compact payload view. Its raw fields are private. |
+| `EvictionConfig` / `EvictionPolicy` | Runtime maxmemory and eviction policy contract. |
+| `AofCommitEffect`, `AofRecord`, `AofRecords` | Typed persistence effects returned by mutations. |
+| `AccessProfile` and morph monitors | Entry-resident adaptive-structure metadata and future morphing policy hooks. |
 
-## Module Map
+Most production callers should enter through `SharedKeyspaceExecutor::execute_scoped` or `commands::execute_command`, not by mutating `SwissTable` directly.
+
+## Current Module Map
 
 ```mermaid
 flowchart TD
-    IO[vortex-io reactor] --> PROTO[uppercase command name + FrameRef]
-    PROTO --> CMD[commands::execute_command]
+    Reactor[vortex-io reactor] --> Executor[SharedKeyspaceExecutor]
+    Executor --> Dispatch[commands::execute_command]
 
-    subgraph ENGINE[vortex-engine]
-        CMD --> CTX[commands/context.rs]
-        CTX --> KS[ConcurrentKeyspace]
-        KS --> TABLE[SwissTable per shard]
-        TABLE --> ENTRY[Entry]
-        KS --> MORPH[morph]
-        TABLE --> PREFETCH[prefetch]
+    subgraph Engine["vortex-engine"]
+        Dispatch --> CommandModules["commands/* parse args and shape replies"]
+        CommandModules --> Domain["engine::domain::*"]
+        Domain --> Effects["effects::*"]
+        Domain --> Keyspace[ConcurrentKeyspace]
+        Keyspace --> Shards["CachePadded RwLock shards"]
+        Shards --> Table[SwissTable]
+        Table --> Entry[Entry]
+        Keyspace --> Eviction[eviction + eviction_sweep]
+        Keyspace --> Metrics[keyspace::metrics]
+        Entry --> Morph[AccessProfile]
+        Table --> Prefetch[prefetch]
     end
 
-    CMD --> OUT[CmdResult / ExecutedCommand]
-    OUT --> IO
+    Effects --> Reactor
 ```
 
 Module responsibilities:
 
-- `commands/`: static dispatch, argument decoding, result shaping, and command-specific semantics
-- `keyspace.rs`: shard topology, lock acquisition, memory counters, TTL-key counters, global LSN, and eviction control
-- `table.rs`: SIMD-probed SwissTable implementation for one shard
-- `entry.rs`: 64-byte slot format used by the table
-- `eviction.rs`: runtime eviction policy enum, config state, frequency sketch, and RNG helpers
-- `morph.rs`: access-profile packing and future adaptive structure decisions
-- `prefetch.rs`: platform-specific read/write prefetch helpers used by selected batch paths
+| Module | Responsibility |
+| --- | --- |
+| `commands/` | Static command dispatch, argument extraction, Redis-compatible option parsing, RESP reply shaping, AOF command payload encoding. |
+| `engine::domain` | Zero-cost command-domain operations over the keyspace: lock choice, mutation coordination, TTL transitions, memory admission, WATCH invalidation, eviction effects, and LSN stamping. |
+| `effects.rs` | Typed side-effect vocabulary shared with reactor/persistence coordination. |
+| `executor.rs` | Concrete executor boundary for the current shared-keyspace architecture and future executor/router experiments. |
+| `keyspace.rs` and `keyspace/*` | Sharding, sorted lock acquisition, transaction gates, WATCH state, LSN allocation, memory admission, TTL counters, eviction maintenance, runtime metrics, and memory attribution. |
+| `table.rs` | SwissTable probing, insert/update/delete, tombstone reuse, resize, prehashed batch APIs, slot cursors, and table allocation accounting. |
+| `entry.rs` | 64-byte entry layout, key/value metadata encoding, TTL deadline, 48-bit version storage, Morris count, and access profile storage. |
+| `eviction.rs` | Eviction policy enum, packed config state, LFU frequency sketch, and random sampling helpers. |
+| `morph.rs` | `AccessProfile` bit packing and morph-monitor hooks. Current code tracks metadata; most adaptive transitions are future work. |
+| `prefetch.rs` | Safe wrappers around platform prefetch hints used by selected batch paths. |
 
-## Architecture Layers
+## Layer Boundaries
 
-The crate is easiest to understand as three stacked layers.
+The current alpha boundary is:
 
-### 1. Command Layer
+```text
+vortex-io
+  owns sockets, connection state, parser scheduling, transaction queues,
+  response lifetimes, AOF writer handoff, and reactor budgets
 
-The command layer lives in `commands/`.
+vortex-engine::commands
+  owns command-name dispatch, RESP argument interpretation, Redis-compatible
+  errors, response shaping, and AOF payload encoding
 
-It is responsible for:
+vortex-engine::engine::domain
+  owns typed key/value operations, memory reservation, revalidation,
+  mutation effects, WATCH/AOF/TTL/eviction coordination, and table calls
 
-- static match-based dispatch in `commands/mod.rs`
-- lightweight argument extraction from `FrameRef`
-- Redis-compatible option parsing and semantic decisions
-- shaping responses as `Static`, `Inline`, or full `RespFrame`
-- returning an optional AOF LSN for mutation commands
+vortex-engine::keyspace
+  owns shard routing, lock ordering, transaction gates, WATCH registries,
+  LSN allocation, TTL counters, eviction state, metrics, and memory attribution
 
-This layer does not manage raw pointers or lock arrays directly. It delegates storage access to `ConcurrentKeyspace` methods implemented in `commands/context.rs`.
+vortex-engine::table
+  owns slot lookup, probing, tombstones, resize, payload owner arrays,
+  table-local memory accounting, and entry publication
 
-### 2. Concurrency Layer
+vortex-engine::entry
+  owns slot-resident metadata and compact borrowed payload representation
+```
 
-`ConcurrentKeyspace` is the ownership and coordination layer.
+The important rule is direction of knowledge: upper layers may ask lower layers to perform typed operations, but lower layers must not know RESP syntax, connection state, or kernel I/O.
 
-It is responsible for:
-
-- routing keys to shards
-- acquiring one or many shard locks in a deadlock-free order
-- tracking per-shard TTL counts
-- publishing approximate global memory usage
-- allocating global logical sequence numbers for mutations
-- exposing shard-scoped maintenance operations such as active expiry and scans
-
-This is the layer that turns Redis-style commands into safe concurrent operations.
-
-### 3. Storage Layer
-
-Each shard contains one `SwissTable`.
-
-That layer is responsible for:
-
-- hashing within the shard table
-- control-byte probing and slot lookup
-- inline vs heap-spill entry encoding
-- resize and tombstone management
-- per-table local memory accounting
-- per-entry TTL storage and lazy-expiry helpers
-
-This is the layer documented in depth in [03-swiss-table-layout.md](03-swiss-table-layout.md).
-
-## Core Request Lifecycle
-
-Most requests follow the same pipeline.
+## Request Lifecycle
 
 ```mermaid
 sequenceDiagram
-    participant Reactor
-    participant Engine as execute_command
-    participant Keyspace as ConcurrentKeyspace
+    participant IO as vortex-io reactor
+    participant Exec as SharedKeyspaceExecutor
+    participant Cmd as commands
+    participant Dom as engine::domain
+    participant KS as ConcurrentKeyspace
     participant Table as SwissTable
 
-    Reactor->>Engine: name + FrameRef + now_nanos
-    Engine->>Engine: parse args / choose fast path
-    Engine->>Keyspace: read, write, or multi-key helper
-    Keyspace->>Table: shard-local operation under lock
-    Table-->>Keyspace: value / mutation result / ttl state
-    Keyspace-->>Engine: semantic result + optional AOF LSN
-    Engine-->>Reactor: CmdResult / ExecutedCommand
+    IO->>Exec: name, FrameRef, CommandClock, scope
+    Exec->>KS: enter transaction gate if scope requires it
+    Exec->>Cmd: execute_command
+    Cmd->>Cmd: parse args and options
+    Cmd->>Dom: call typed domain operation
+    Dom->>KS: plan shard locks / reserve memory / allocate LSN when needed
+    KS->>Table: table operation under shard guard
+    Table-->>Dom: value, slot report, TTL state, memory delta
+    Dom-->>Cmd: MutationOutcome or query result
+    Cmd-->>Exec: ExecutedCommand
+    Exec-->>IO: response + AOF effects
 ```
 
-Concrete stages:
+The caller supplies `CommandClock`, currently containing monotonic and Unix nanosecond values. Monotonic time drives TTL deadlines inside the engine. Unix time is used only when a Redis command uses wall-clock options such as `EXAT`, `PXAT`, `EXPIRETIME`, `PEXPIRETIME`, or `TIME`.
 
-1. Upstream code normalizes the command name to uppercase ASCII.
-2. `execute_command` selects the handler with a static `match`.
-3. The handler uses either a fast path or `CommandArgs::collect`.
-4. The handler calls a `ConcurrentKeyspace` helper.
-5. `ConcurrentKeyspace` selects the shard or set of shards, acquires the required lock topology, and calls into one or more `SwissTable`s.
-6. The handler converts the result into a wire-oriented response type.
-7. For mutations, the engine may also return an AOF LSN so persistence layers can order writes correctly.
+## Data Ownership
 
-## Why The Shared Keyspace Matters
+The hot storage path has three nested owners:
 
-Vortex does not use a shared-nothing actor model inside the engine crate. It uses one shared keyspace split into many independently locked shards.
+```mermaid
+flowchart LR
+    KS[ConcurrentKeyspace] --> S0[Shard 0 RwLock]
+    KS --> S1[Shard 1 RwLock]
+    KS --> SN[Shard N RwLock]
+    S0 --> T0[SwissTable]
+    T0 --> R[RawTable control bytes plus Entry array]
+    T0 --> K[keys Vec Option VortexKey]
+    T0 --> V[values Vec Option VortexValue]
+    R --> E[Entry metadata and borrowed payload view]
+```
 
-That decision drives several downstream properties:
-
-- single-key commands are cheap because they touch exactly one shard lock
-- multi-key commands can still be implemented inside the engine without cross-thread RPC
-- reads on unrelated shards proceed concurrently
-- cross-shard coordination remains explicit and deterministic instead of being hidden in mailbox traffic
-
-The keyspace is therefore not just a container. It is the concurrency policy of the engine.
+`Entry` is not the only owner of key/value data. The table owns full `VortexKey` and `VortexValue` instances in parallel slot arrays. Each `Entry` stores inline small bytes when possible and borrowed pointer metadata into those slot owners when data is heap backed. The table rewrites entry metadata after insert, overwrite, and resize so those borrowed views stay valid.
 
 ## Cross-Cutting Systems
 
-Several concerns appear across multiple modules.
-
 ### TTL And Expiry
 
-- `Entry` stores the absolute TTL deadline
-- `SwissTable` exposes TTL-aware table methods
-- `ConcurrentKeyspace` tracks per-shard counts of keys with TTLs
-- command helpers implement lazy cleanup with read-to-write lock escalation when a stale key is encountered
+`Entry` stores the deadline. `SwissTable` exposes TTL-aware lookup and mutation helpers. `ConcurrentKeyspace` maintains per-shard and global counts of keys with TTLs. Domain operations publish `ExpiryTransition` effects after dropping shard guards. Reactors can run bounded active-expiry maintenance by calling `run_active_expiry_on_shard`.
 
-TTL is not a side structure bolted on later. It is integrated through the whole call chain.
+### LSN And WATCH
 
-### Memory Accounting
+The keyspace owns one global `AtomicU64` LSN counter. Mutations allocate entry-visible LSNs only when WATCH or AOF recording needs them. Featureless writes can skip the global LSN atomic. Present-key WATCH validation reads the entry LSN directly. Absent-key WATCH validation uses a cold sharded registry because there is no entry to stamp.
 
-- `SwissTable` tracks exact `local_memory_used` and buffered `local_memory_drift`
-- `ShardWriteGuard` flushes buffered drift to the global counter when the write lock is dropped
-- `ConcurrentKeyspace` exposes `memory_used()` for exact totals and `approx_memory_used()` for fast approximate totals
+### Memory Admission
 
-This gives the engine exact per-shard accounting without paying an atomic update on every mutation.
+`SwissTable` tracks exact shard-local logical dataset bytes and buffered drift. `ShardWriteGuard` flushes drift to the global approximate counter on drop. Maxmemory admission uses a reservation counter so concurrent writers cannot all pass against the same stale published memory value.
 
-### Global Mutation Ordering
+### Eviction
 
-Mutation commands can allocate a global LSN from `ConcurrentKeyspace::next_lsn()`.
+Eviction lives in the keyspace because it needs global policy, per-shard clock hands, memory pressure, TTL knowledge, WATCH invalidation, and optional AOF records. It does not maintain Redis-style linked lists. It sweeps table slots in bounded windows and uses entry-local Morris counters plus a small global LFU sketch when LFU policies are active.
 
-That LSN is used by higher layers for AOF ordering and recovery. The engine itself does not write AOF files, but it is the source of the mutation order used by persistence.
+### Runtime Metrics
 
-### Eviction And Frequency Tracking
+The engine owns low-overhead runtime counters that IO updates through the keyspace. Minimal release mode keeps health, backend, memory, AOF, overload, expiry, and eviction counters available. Profile timers stay behind the `profile-telemetry` feature and profiling builds.
 
-- `Entry.flags` stores a 4-bit Morris counter used by clock-sweep second chances without increasing the 64-byte slot size
-- `ConcurrentKeyspace` owns the runtime `maxmemory` / policy state, per-shard `clock_hands`, and the `ensure_memory_for(...)` admission boundary used by mutating growth paths
-- `eviction::FrequencySketch` provides the global LFU frequency estimate as a flat 4 × 2048 Count-Min Sketch with periodic half-decay
-- read hits and successful writes feed the LFU sketch through the same access hook that updates entry-local counters
+## Read The Docs In This Order
 
-This is where the engine's mechanical-sympathy story becomes concrete: eviction does not maintain linked lists, global LRU queues, or per-entry heap nodes. It stays on top of the existing array-backed SwissTable layout, uses one tiny global sketch, and keeps victim selection inside the shard-local sweep while the write lock is already held.
+1. [01-architecture-overview.md](01-architecture-overview.md): crate shape and module boundaries.
+2. [02-concurrent-keyspace.md](02-concurrent-keyspace.md): shards, locks, WATCH, LSN, TTL, memory, eviction, and metrics.
+3. [03-swiss-table-layout.md](03-swiss-table-layout.md): table groups, control bytes, probing, entry layout, bit operations, and memory layout.
+4. [04-command-execution.md](04-command-execution.md): command dispatch, domain mutations, deferred effects, hot paths, and batch paths.
+5. [05-integration-and-transactions.md](05-integration-and-transactions.md): reactor integration, transaction gates, WATCH/MULTI/EXEC ownership, AOF handoff, and maintenance.
+6. [metrics.md](metrics.md) and [profiling.md](profiling.md): release metrics and profile-only metrics.
 
-### Prefetch And Adaptive Hooks
-
-- `prefetch.rs` provides explicit read/write prefetch helpers for batch table operations
-- `morph.rs` stores `AccessProfile` metadata inside `Entry::_pad0` without increasing entry size
-
-These are support systems that let the engine grow into more adaptive data-structure choices without changing the core request pipeline.
-
-## What The Crate Does Not Do
-
-This is just as important as what it does do.
-
-`vortex-engine` does not:
-
-- accept TCP connections
-- parse sockets or schedule event loops
-- serialize bytes onto the wire itself
-- own AOF files or fsync policy
-- implement client state machines
-
-Those boundaries keep the engine testable and mechanically focused. Unit tests can exercise command semantics and data-structure behavior without bringing in the network stack.
-
-## Reading Order For The Docs Set
-
-The docs are intended to read from outside to inside:
-
-1. this file for the crate-level shape
-2. [02-concurrent-keyspace.md](02-concurrent-keyspace.md) for concurrency topology
-3. [03-swiss-table-layout.md](03-swiss-table-layout.md) for per-shard storage
-4. [04-command-execution.md](04-command-execution.md) for the execution pipeline
-
+For a deeper internal tutorial, see `learn/vortex-engine-design.md` at the repository root.

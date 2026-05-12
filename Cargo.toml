@@ -52,7 +52,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # ── Concurrency ──
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
-parking_lot = "0.12"
+parking_lot = { version = "0.12.5", features = ["hardware-lock-elision"] }
 
 # ── I/O ──
 polling = "3"

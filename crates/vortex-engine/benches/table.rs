@@ -204,6 +204,32 @@ fn bench_swiss_table_insert_single(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark single-key replacement into a pre-filled table with pre-generated keys.
+/// This isolates the existing-key SET path from table construction and key allocation.
+fn bench_swiss_table_replace_existing_single(c: &mut Criterion) {
+    let mut group = c.benchmark_group("swiss_table_replace_existing_single");
+    for &size in &[100, 10_000, 1_000_000] {
+        let keys: Vec<VortexKey> = (0..size)
+            .map(|i| VortexKey::from(format!("key:{i:08}").as_str()))
+            .collect();
+        let values: Vec<VortexValue> = (0..size)
+            .map(|i| VortexValue::Integer(-(i as i64) - 1))
+            .collect();
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || (prefill_table(size), keys.clone(), values.clone()),
+                |(mut table, keys, values)| {
+                    for (k, v) in keys.into_iter().zip(values) {
+                        table.insert(k, v);
+                    }
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 /// Compare with rust HashMap insert single
 fn bench_hashmap_insert_single(c: &mut Criterion) {
     use std::collections::HashMap;
@@ -962,6 +988,7 @@ criterion_group!(
     benches,
     bench_swiss_table_insert,
     bench_swiss_table_insert_single,
+    bench_swiss_table_replace_existing_single,
     bench_hashmap_insert_single,
     bench_hashmap_lookup_miss,
     bench_hashmap_lookup_hit,

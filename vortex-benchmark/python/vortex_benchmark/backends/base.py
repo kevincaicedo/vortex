@@ -81,7 +81,8 @@ def apply_load_affinity(context: BackendRunContext, command: list[str]) -> list[
     cpu_list = (context.spec.resource_config or {}).get("load_cpus")
     if not cpu_list or context.spec.mode != "native":
         return command
-    ensure_command_available("taskset")
+    if shutil.which("taskset") is None:
+        return command
     return ["taskset", "-c", str(cpu_list), *command]
 
 

@@ -2182,5 +2182,6 @@ mod tests {
             h.get(&VortexKey::from(b"a" as &[u8]), 0),
             Some(VortexValue::Integer(2))
         );
+        assert_eq!(h.keyspace.dbsize(), 1);
     }
 }
