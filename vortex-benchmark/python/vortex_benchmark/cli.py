@@ -24,6 +24,7 @@ from vortex_benchmark.models import (
 SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
 SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION = ("auto", "on", "off")
 SUPPORTED_VORTEX_TELEMETRY_MODES = ("minimal", "profile")
+SUPPORTED_VORTEX_ENGINE_TOPOLOGIES = ("shared-keyspace", "shared-nothing")
 SUPPORTED_EVIDENCE_TIERS = ("exploratory", "engineering", "citation-grade")
 
 
@@ -107,6 +108,11 @@ def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_
         "--io-backend",
         choices=SUPPORTED_VORTEX_IO_BACKENDS,
         help="Vortex I/O backend override for setup scenarios. Choices: auto, uring, polling.",
+    )
+    parser.add_argument(
+        "--engine-topology",
+        choices=SUPPORTED_VORTEX_ENGINE_TOPOLOGIES,
+        help="Vortex engine topology override. Choices: shared-keyspace, shared-nothing.",
     )
     parser.add_argument(
         "--telemetry-mode",

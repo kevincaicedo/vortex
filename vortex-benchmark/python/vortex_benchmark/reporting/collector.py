@@ -424,6 +424,106 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "runtime_local_flush_metrics_available_after": after.get(
             "runtime_local_flush_metrics_available"
         ),
+        "shared_nothing_accepted_remote_after": after.get(
+            "shared_nothing_accepted_remote"
+        ),
+        "shared_nothing_accepted_remote_delta": delta.get(
+            "shared_nothing_accepted_remote_delta"
+        ),
+        "shared_nothing_remote_backpressure_after": after.get(
+            "shared_nothing_remote_backpressure"
+        ),
+        "shared_nothing_remote_backpressure_delta": delta.get(
+            "shared_nothing_remote_backpressure_delta"
+        ),
+        "shared_nothing_reply_backpressure_after": after.get(
+            "shared_nothing_reply_backpressure"
+        ),
+        "shared_nothing_reply_backpressure_delta": delta.get(
+            "shared_nothing_reply_backpressure_delta"
+        ),
+        "shared_nothing_deferred_replies_after": after.get(
+            "shared_nothing_deferred_replies"
+        ),
+        "shared_nothing_deferred_replies_delta": delta.get(
+            "shared_nothing_deferred_replies_delta"
+        ),
+        "shared_nothing_wakeups_sent_after": after.get("shared_nothing_wakeups_sent"),
+        "shared_nothing_wakeups_sent_delta": delta.get(
+            "shared_nothing_wakeups_sent_delta"
+        ),
+        "shared_nothing_wakeup_failures_after": after.get(
+            "shared_nothing_wakeup_failures"
+        ),
+        "shared_nothing_wakeup_failures_delta": delta.get(
+            "shared_nothing_wakeup_failures_delta"
+        ),
+        "shared_nothing_aggregates_accepted_after": after.get(
+            "shared_nothing_aggregates_accepted"
+        ),
+        "shared_nothing_aggregates_accepted_delta": delta.get(
+            "shared_nothing_aggregates_accepted_delta"
+        ),
+        "shared_nothing_aggregate_width_max_after": after.get(
+            "shared_nothing_aggregate_width_max"
+        ),
+        "shared_nothing_txns_accepted_after": after.get(
+            "shared_nothing_txns_accepted"
+        ),
+        "shared_nothing_txns_accepted_delta": delta.get(
+            "shared_nothing_txns_accepted_delta"
+        ),
+        "shared_nothing_txn_prepare_messages_after": after.get(
+            "shared_nothing_txn_prepare_messages"
+        ),
+        "shared_nothing_txn_prepare_messages_delta": delta.get(
+            "shared_nothing_txn_prepare_messages_delta"
+        ),
+        "shared_nothing_txn_commit_messages_after": after.get(
+            "shared_nothing_txn_commit_messages"
+        ),
+        "shared_nothing_txn_commit_messages_delta": delta.get(
+            "shared_nothing_txn_commit_messages_delta"
+        ),
+        "shared_nothing_txn_abort_messages_after": after.get(
+            "shared_nothing_txn_abort_messages"
+        ),
+        "shared_nothing_txn_abort_messages_delta": delta.get(
+            "shared_nothing_txn_abort_messages_delta"
+        ),
+        "shared_nothing_txn_condition_aborts_after": after.get(
+            "shared_nothing_txn_condition_aborts"
+        ),
+        "shared_nothing_txn_condition_aborts_delta": delta.get(
+            "shared_nothing_txn_condition_aborts_delta"
+        ),
+        "shared_nothing_txn_conflict_aborts_after": after.get(
+            "shared_nothing_txn_conflict_aborts"
+        ),
+        "shared_nothing_txn_conflict_aborts_delta": delta.get(
+            "shared_nothing_txn_conflict_aborts_delta"
+        ),
+        "shared_nothing_prepared_key_waits_after": after.get(
+            "shared_nothing_prepared_key_waits"
+        ),
+        "shared_nothing_prepared_key_waits_delta": delta.get(
+            "shared_nothing_prepared_key_waits_delta"
+        ),
+        "shared_nothing_prepared_key_retries_after": after.get(
+            "shared_nothing_prepared_key_retries"
+        ),
+        "shared_nothing_prepared_key_retries_delta": delta.get(
+            "shared_nothing_prepared_key_retries_delta"
+        ),
+        "shared_nothing_prepared_key_wait_nanos_total_after": after.get(
+            "shared_nothing_prepared_key_wait_nanos_total"
+        ),
+        "shared_nothing_prepared_key_wait_nanos_total_delta": delta.get(
+            "shared_nothing_prepared_key_wait_nanos_total_delta"
+        ),
+        "shared_nothing_prepared_key_wait_nanos_max_after": after.get(
+            "shared_nothing_prepared_key_wait_nanos_max"
+        ),
         "service_invalid_delta_fields": delta.get("invalid_delta_fields"),
         "host_invalid_delta_fields": telemetry_summary.get("invalid_delta_fields"),
         "backend_plan_mixed_after": after.get("backend_plan_mixed"),

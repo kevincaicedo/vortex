@@ -16,6 +16,7 @@ from vortex_benchmark.catalog import (
 from vortex_benchmark.manifests.loader import (
     BenchmarkManifest,
     SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION,
+    SUPPORTED_VORTEX_ENGINE_TOPOLOGIES,
     SUPPORTED_VORTEX_IO_BACKENDS,
     SUPPORTED_VORTEX_TELEMETRY_MODES,
     load_manifest,
@@ -171,6 +172,11 @@ def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(SUPPORTED_VORTEX_IO_BACKENDS)
         raise ValueError(f"io_backend must be one of: {supported}")
 
+    engine_topology = runtime_config.get("engine_topology")
+    if engine_topology is not None and engine_topology not in SUPPORTED_VORTEX_ENGINE_TOPOLOGIES:
+        supported = ", ".join(SUPPORTED_VORTEX_ENGINE_TOPOLOGIES)
+        raise ValueError(f"engine_topology must be one of: {supported}")
+
     telemetry_mode = runtime_config.get("telemetry_mode")
     if (
         telemetry_mode is not None
@@ -300,6 +306,11 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
     io_backend = _coalesce_scalar(
         getattr(args, "io_backend", None), manifest_runtime_config.get("io_backend"), None
     )
+    engine_topology = _coalesce_scalar(
+        getattr(args, "engine_topology", None),
+        manifest_runtime_config.get("engine_topology"),
+        None,
+    )
     telemetry_mode = _coalesce_scalar(
         getattr(args, "telemetry_mode", None),
         manifest_runtime_config.get("telemetry_mode"),
@@ -361,6 +372,7 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
                 "maxmemory": maxmemory.strip() if isinstance(maxmemory, str) else maxmemory,
                 "eviction_policy": eviction_policy,
                 "io_backend": io_backend,
+                "engine_topology": engine_topology,
                 "telemetry_mode": telemetry_mode,
                 "ring_size": ring_size,
                 "fixed_buffers": fixed_buffers,

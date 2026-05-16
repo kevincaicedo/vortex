@@ -270,6 +270,16 @@ impl Reactor {
             if matches!(op, OpType::Writev) {
                 self.writev_states[conn_id].clear();
             }
+            if self.shared_nothing.is_some() {
+                if !self.publish_shared_nothing_ready(conn_id) {
+                    self.close_connection(conn_id);
+                    return;
+                }
+                if self.writev_states[conn_id].queued_len() != 0 {
+                    self.finish_command_processing(conn_id, fd, false, false);
+                    return;
+                }
+            }
             if self
                 .connections
                 .get(conn_id)

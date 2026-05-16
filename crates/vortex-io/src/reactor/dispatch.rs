@@ -1,6 +1,91 @@
 use super::*;
 
 impl Reactor {
+    pub(super) fn dispatch_shared_nothing_command(
+        &mut self,
+        conn_id: usize,
+        frame: &FrameRef<'_>,
+    ) -> SharedNothingServerDispatch {
+        let Some((upper, len)) = Self::normalized_command_name(frame) else {
+            return SharedNothingServerDispatch::Unsupported;
+        };
+        let command_name = &upper[..len];
+        let clock = CommandClock::new(self.cached_nanos, self.cached_unix_nanos);
+        let connection = if conn_id <= u32::MAX as usize {
+            vortex_engine::SharedNothingConnectionId::new(conn_id as u32)
+        } else {
+            return SharedNothingServerDispatch::Unsupported;
+        };
+        let generation = vortex_engine::SharedNothingConnectionGeneration::new(
+            self.generations.get(conn_id).copied().unwrap_or(0) as u64,
+        );
+        let admin_response = if command_name == b"INFO" {
+            Some(self.dispatch_command(conn_id, frame).0)
+        } else {
+            None
+        };
+
+        let (dispatch, local_owner) = {
+            let Some(runtime) = self.shared_nothing.as_mut() else {
+                return SharedNothingServerDispatch::Unsupported;
+            };
+            (
+                if let Some(response) = admin_response {
+                    runtime.complete_admin_response(connection, response)
+                } else {
+                    runtime.dispatch_ingress(connection, generation, command_name, frame, clock)
+                },
+                runtime.local_owner(),
+            )
+        };
+        match dispatch {
+            SharedNothingServerDispatch::Ready => {
+                if self.publish_shared_nothing_ready(conn_id) {
+                    SharedNothingServerDispatch::Ready
+                } else {
+                    SharedNothingServerDispatch::Backpressure(SharedNothingServerBackpressure {
+                        source: local_owner,
+                        destination: local_owner,
+                        lane: SharedNothingServerLane::Reply,
+                        used_slots: 0,
+                        capacity_slots: 0,
+                    })
+                }
+            }
+            SharedNothingServerDispatch::Pending
+            | SharedNothingServerDispatch::Backpressure(_)
+            | SharedNothingServerDispatch::Unsupported => dispatch,
+        }
+    }
+
+    pub(super) fn publish_shared_nothing_ready(&mut self, conn_id: usize) -> bool {
+        if self
+            .inflight_ops
+            .get(conn_id)
+            .is_some_and(|inflight| inflight.has(OpType::Write) || inflight.has(OpType::Writev))
+        {
+            return true;
+        }
+        let connection = if conn_id <= u32::MAX as usize {
+            vortex_engine::SharedNothingConnectionId::new(conn_id as u32)
+        } else {
+            return false;
+        };
+        loop {
+            let response = match self.shared_nothing.as_mut() {
+                Some(runtime) => runtime.take_publishable(connection),
+                None => return true,
+            };
+            let Some(response) = response else {
+                return true;
+            };
+            if !self.try_push_command_response(conn_id, response) {
+                self.reject_response_cap(conn_id);
+                return false;
+            }
+        }
+    }
+
     pub(super) fn execute_queued_payload(
         &mut self,
         payload: &[u8],

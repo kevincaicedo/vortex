@@ -27,12 +27,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::num::NonZeroUsize;
 use std::os::fd::{BorrowedFd, RawFd};
+use std::sync::Arc;
 
 use polling::{Event, Events, PollMode, Poller};
 
 use super::{
-    BackendDriver, Completion, CompletionToken, ConnFd, DecodedCompletionToken, IovecBatch,
-    ListenerFd, OpType, ReadLease, SubmitError, WriteLease,
+    BackendDriver, BackendWaker, Completion, CompletionToken, ConnFd, DecodedCompletionToken,
+    IovecBatch, ListenerFd, OpType, ReadLease, SubmitError, WriteLease,
 };
 
 /// Interest flag: fd is registered for read-readiness.
@@ -116,7 +117,7 @@ struct ConnOpHandles {
 
 /// Cross-platform I/O backend using the `polling` crate.
 pub struct PollingBackend {
-    poller: Poller,
+    poller: Arc<Poller>,
     events: Events,
     pending: VecDeque<PendingOp>,
     pending_accept: Option<CompletionToken>,
@@ -138,8 +139,9 @@ pub struct PollingBackend {
 impl PollingBackend {
     /// Creates a new polling backend.
     pub fn new() -> io::Result<Self> {
+        let poller = Arc::new(Poller::new()?);
         Ok(Self {
-            poller: Poller::new()?,
+            poller,
             events: Events::with_capacity(NonZeroUsize::new(READINESS_EVENT_BUDGET).unwrap()),
             pending: VecDeque::with_capacity(256),
             pending_accept: None,
@@ -155,6 +157,12 @@ impl PollingBackend {
             registered: Vec::with_capacity(64),
             registered_lookup: HashMap::with_capacity(64),
         })
+    }
+
+    /// Returns a cross-thread wake handle for this poller.
+    #[inline]
+    pub(crate) fn waker(&self) -> BackendWaker {
+        BackendWaker::Polling(Arc::clone(&self.poller))
     }
 
     #[inline]
@@ -368,6 +376,7 @@ impl PollingBackend {
                     }
                 }
                 Ok(DecodedCompletionToken::Cancel { .. })
+                | Ok(DecodedCompletionToken::Wake)
                 | Err(_)
                 | Ok(DecodedCompletionToken::Accept) => {}
             }
@@ -1029,7 +1038,9 @@ fn armed_write_token(write: &ArmedWrite) -> CompletionToken {
 fn decode_conn_token(token: CompletionToken) -> Option<(usize, OpType)> {
     match token.decode().ok()? {
         DecodedCompletionToken::Conn { id, op, .. } => Some((id, op)),
-        DecodedCompletionToken::Accept | DecodedCompletionToken::Cancel { .. } => None,
+        DecodedCompletionToken::Accept
+        | DecodedCompletionToken::Cancel { .. }
+        | DecodedCompletionToken::Wake => None,
     }
 }
 

@@ -125,12 +125,15 @@ impl Reactor {
 
     /// Submit a read SQE for the given connection using the fixed buffer pool.
     pub(super) fn submit_read_for(&mut self, conn_id: usize, fd: RawFd) {
+        if self.connections.is_closing(conn_id) {
+            return;
+        }
         if self
             .inflight_ops
             .get(conn_id)
             .is_some_and(|inflight| inflight.has(OpType::Read))
         {
-            tracing::warn!(conn_id, "read submission skipped; read already in flight");
+            tracing::debug!(conn_id, "read submission skipped; read already in flight");
             return;
         }
 
@@ -213,6 +216,13 @@ impl Reactor {
         // Cancel pending idle timer.
         self.timer_wheel.cancel(timer_slot);
         self.clear_command_accumulator(conn_id);
+        if let Some(runtime) = self.shared_nothing.as_mut()
+            && conn_id <= u32::MAX as usize
+        {
+            runtime.disconnect(vortex_engine::SharedNothingConnectionId::new(
+                conn_id as u32,
+            ));
+        }
 
         if let Err(error) = self.connections.transition_to_closing(conn_id) {
             tracing::warn!(

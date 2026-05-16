@@ -40,6 +40,7 @@ RUNTIME_CONFIG_KEYS = {
     "maxmemory",
     "eviction_policy",
     "io_backend",
+    "engine_topology",
     "telemetry_mode",
     "ring_size",
     "fixed_buffers",
@@ -57,6 +58,7 @@ SIZE_LITERAL_RE = re.compile(r"^\d+(?:[kmgt]i?b?|[kmgt]b?)?$", re.IGNORECASE)
 SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
 SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION = ("auto", "on", "off")
 SUPPORTED_VORTEX_TELEMETRY_MODES = ("minimal", "profile")
+SUPPORTED_VORTEX_ENGINE_TOPOLOGIES = ("shared-keyspace", "shared-nothing")
 
 
 @dataclass
@@ -233,6 +235,16 @@ def _validate_runtime_config(payload: dict[str, Any]) -> dict[str, Any]:
         supported = ", ".join(SUPPORTED_VORTEX_IO_BACKENDS)
         raise ValueError(f"runtime_config.io_backend must be one of: {supported}")
 
+    engine_topology = _optional_string(
+        payload.get("engine_topology"), "runtime_config.engine_topology"
+    )
+    if (
+        engine_topology is not None
+        and engine_topology not in SUPPORTED_VORTEX_ENGINE_TOPOLOGIES
+    ):
+        supported = ", ".join(SUPPORTED_VORTEX_ENGINE_TOPOLOGIES)
+        raise ValueError(f"runtime_config.engine_topology must be one of: {supported}")
+
     telemetry_mode = _optional_string(
         payload.get("telemetry_mode"), "runtime_config.telemetry_mode"
     )
@@ -302,6 +314,8 @@ def _validate_runtime_config(payload: dict[str, Any]) -> dict[str, Any]:
         normalized["eviction_policy"] = eviction_policy
     if io_backend is not None:
         normalized["io_backend"] = io_backend
+    if engine_topology is not None:
+        normalized["engine_topology"] = engine_topology
     if telemetry_mode is not None:
         normalized["telemetry_mode"] = telemetry_mode
     if ring_size is not None:

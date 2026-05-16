@@ -312,7 +312,7 @@ def _start_native_service(adapter: DatabaseAdapter, request: StartRequest) -> Se
 
     now = utc_now()
     return ServiceState(
-        database=adapter.name,
+        database=request.database,
         mode=request.mode,
         host=request.host,
         port=request.port,
@@ -375,7 +375,7 @@ def _start_container_service(adapter: DatabaseAdapter, request: StartRequest) ->
     capture_container_logs(container_id, request.log_path)
     now = utc_now()
     return ServiceState(
-        database=adapter.name,
+        database=request.database,
         mode=request.mode,
         host=request.host,
         port=request.port,

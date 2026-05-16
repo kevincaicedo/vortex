@@ -19,10 +19,52 @@ use std::io;
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::pool::IoBackendMode;
 
+/// Backend-specific cross-thread wake handle.
+#[derive(Clone)]
+pub(crate) enum BackendWaker {
+    /// Wake a `polling` backend through the poller notification fd.
+    Polling(Arc<::polling::Poller>),
+    /// Wake an io_uring backend through an eventfd read SQE.
+    #[cfg(target_os = "linux")]
+    EventFd(RawFd),
+}
+
+impl BackendWaker {
+    /// Wakes the reactor if it is currently blocked in its completion wait.
+    #[inline]
+    pub(crate) fn wake(&self) -> io::Result<()> {
+        match self {
+            Self::Polling(poller) => poller.notify(),
+            #[cfg(target_os = "linux")]
+            Self::EventFd(fd) => {
+                let value = 1u64.to_ne_bytes();
+                // SAFETY: `fd` is the eventfd owned by the live backend. The
+                // source buffer is a stack u64 valid for this syscall.
+                let rc =
+                    unsafe { libc::write(*fd, value.as_ptr().cast::<libc::c_void>(), value.len()) };
+                if rc == value.len() as isize
+                    || (rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN))
+                {
+                    Ok(())
+                } else if rc < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short eventfd wake write",
+                    ))
+                }
+            }
+        }
+    }
+}
+
 const ACCEPT_TOKEN_RAW: u64 = 0;
+const WAKE_TOKEN_RAW: u64 = 0xFF;
 const CANCEL_TOKEN_BIT: u64 = 1 << 63;
 const OP_MASK: u64 = 0xFF;
 const GENERATION_MASK: u64 = 0xFF_FFFF;
@@ -82,6 +124,13 @@ impl CompletionToken {
         self.0
     }
 
+    /// Returns the backend wake token.
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn wake() -> Self {
+        Self(WAKE_TOKEN_RAW)
+    }
+
     /// Creates a token for a connection operation.
     ///
     /// The generation is truncated to the 24 bits stored in the token layout,
@@ -120,6 +169,9 @@ impl CompletionToken {
                 Ok(Self(target.raw() | CANCEL_TOKEN_BIT))
             }
             Ok(DecodedCompletionToken::Cancel { .. }) => Err(TokenEncodeError::NestedCancel),
+            Ok(DecodedCompletionToken::Wake) => Err(TokenEncodeError::MalformedCancelTarget {
+                target: target.raw(),
+            }),
             Err(_) => Err(TokenEncodeError::MalformedCancelTarget {
                 target: target.raw(),
             }),
@@ -318,6 +370,30 @@ impl Backend {
             Self::Uring(backend) => backend.drain_cq(out),
             #[cfg(test)]
             Self::Test(backend) => backend.drain_cq(out),
+        }
+    }
+
+    /// Returns a cross-thread wake handle when the backend has one.
+    #[inline]
+    pub(crate) fn waker(&self) -> Option<BackendWaker> {
+        match self {
+            Self::Polling(backend) => Some(backend.waker()),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(backend) => Some(backend.waker()),
+            #[cfg(test)]
+            Self::Test(_) => None,
+        }
+    }
+
+    /// Rearms backend-local wake completion state after a wake CQE.
+    #[inline]
+    pub(crate) fn rearm_wakeup(&mut self) -> Result<(), SubmitError> {
+        match self {
+            Self::Polling(_) => Ok(()),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            Self::Uring(backend) => backend.rearm_wakeup(),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
         }
     }
 
@@ -754,6 +830,8 @@ pub enum DecodedCompletionToken {
         /// Connection operation kind.
         op: OpType,
     },
+    /// Backend-local wake completion used by shared-nothing message passing.
+    Wake,
 }
 
 /// Error returned when raw backend completion bits are not a valid token.
@@ -872,7 +950,9 @@ pub fn decode_token(token: CompletionToken) -> Result<DecodedCompletionToken, To
             Ok(DecodedCompletionToken::Accept | DecodedCompletionToken::Conn { .. }) => {
                 Ok(DecodedCompletionToken::Cancel { target })
             }
-            Ok(DecodedCompletionToken::Cancel { .. }) => unreachable!("cancel bit was cleared"),
+            Ok(DecodedCompletionToken::Cancel { .. } | DecodedCompletionToken::Wake) => {
+                unreachable!("cancel bit was cleared")
+            }
             Err(_) => Err(TokenDecodeError::MalformedCancelTarget {
                 token: raw,
                 target: target.raw(),
@@ -882,6 +962,9 @@ pub fn decode_token(token: CompletionToken) -> Result<DecodedCompletionToken, To
 
     if raw == ACCEPT_TOKEN_RAW {
         return Ok(DecodedCompletionToken::Accept);
+    }
+    if raw == WAKE_TOKEN_RAW {
+        return Ok(DecodedCompletionToken::Wake);
     }
 
     let op_bits = (raw & OP_MASK) as u8;
@@ -1080,6 +1163,15 @@ mod tests {
                 op: 0xFE,
             })
         );
+    }
+
+    #[test]
+    fn wake_token_decodes_distinct_from_connection_tokens() {
+        assert_eq!(
+            decode_token(CompletionToken::wake()).unwrap(),
+            DecodedCompletionToken::Wake
+        );
+        assert!(CompletionToken::cancel(CompletionToken::wake()).is_err());
     }
 
     #[test]

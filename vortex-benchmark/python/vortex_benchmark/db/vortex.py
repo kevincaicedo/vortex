@@ -22,6 +22,11 @@ from .base import (
 DEFAULT_VORTEX_MAXMEMORY = "1800mb"
 DEFAULT_AOF_MAX_PENDING_FSYNC_BYTES = 64 * 1024 * 1024
 CONTAINER_RUNTIME_DIR = "/benchmark-runtime"
+VORTEX_TOPOLOGY_DATABASE_ALIASES = {
+    "vortex-shared-keyspace": "shared-keyspace",
+    "vortex-shared-nothing": "shared-nothing",
+}
+SUPPORTED_ENGINE_TOPOLOGIES = {"shared-keyspace", "shared-nothing"}
 
 
 def normalize_vortex_runtime_config(
@@ -114,6 +119,17 @@ class VortexAdapter(DatabaseAdapter):
         normalized_runtime = normalize_vortex_runtime_config(
             request.runtime_config, mode=request.mode
         )
+        alias_topology = VORTEX_TOPOLOGY_DATABASE_ALIASES.get(request.database)
+        requested_topology = normalized_runtime.get("engine_topology")
+        if alias_topology is not None:
+            if requested_topology is not None and requested_topology != alias_topology:
+                raise SetupError(
+                    f"{request.database} requires engine_topology={alias_topology}, "
+                    f"got {requested_topology}"
+                )
+            normalized_runtime["engine_topology"] = alias_topology
+        elif requested_topology is None:
+            normalized_runtime["engine_topology"] = "shared-keyspace"
         maxmemory = str(
             normalized_runtime.get("maxmemory", DEFAULT_VORTEX_MAXMEMORY)
         )
@@ -141,6 +157,7 @@ class VortexAdapter(DatabaseAdapter):
         }
         for key in (
             "io_backend",
+            "engine_topology",
             "telemetry_mode",
             "shard_count",
             "ring_size",
@@ -170,6 +187,10 @@ class VortexAdapter(DatabaseAdapter):
             raise SetupError(f"unsupported Vortex AOF fsync policy: {runtime.get('aof_fsync')}")
         if runtime.get("io_backend") not in {None, "auto", "uring", "polling"}:
             raise SetupError(f"unsupported Vortex io backend: {runtime.get('io_backend')}")
+        if runtime.get("engine_topology") not in {None, *SUPPORTED_ENGINE_TOPOLOGIES}:
+            raise SetupError(
+                f"unsupported Vortex engine topology: {runtime.get('engine_topology')}"
+            )
         if runtime.get("fixed_buffer_registration") not in {None, "auto", "on", "off"}:
             raise SetupError(
                 "unsupported Vortex fixed-buffer registration policy: "
@@ -224,6 +245,8 @@ class VortexAdapter(DatabaseAdapter):
             command.extend(["--eviction-policy", str(runtime["eviction_policy"])])
         if runtime.get("io_backend"):
             command.extend(["--io-backend", str(runtime["io_backend"])])
+        if runtime.get("engine_topology"):
+            command.extend(["--engine-topology", str(runtime["engine_topology"])])
         if runtime.get("telemetry_mode"):
             command.extend(["--telemetry-mode", str(runtime["telemetry_mode"])])
         if runtime.get("ring_size") is not None:
@@ -281,6 +304,8 @@ class VortexAdapter(DatabaseAdapter):
             command.extend(["--eviction-policy", str(runtime["eviction_policy"])])
         if runtime.get("io_backend"):
             command.extend(["--io-backend", str(runtime["io_backend"])])
+        if runtime.get("engine_topology"):
+            command.extend(["--engine-topology", str(runtime["engine_topology"])])
         if runtime.get("telemetry_mode"):
             command.extend(["--telemetry-mode", str(runtime["telemetry_mode"])])
         if runtime.get("ring_size") is not None:
@@ -329,7 +354,7 @@ class VortexAdapter(DatabaseAdapter):
                 "--ulimit",
                 "memlock=-1",
             ],
-            container_name=f"{request.environment_id}-{self.name}",
+            container_name=f"{request.environment_id}-{request.database}",
             metadata={"bind": "0.0.0.0:6379"},
         )
 

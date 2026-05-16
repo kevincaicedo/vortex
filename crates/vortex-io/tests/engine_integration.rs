@@ -10,7 +10,10 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vortex_io::{IoBackendMode, Reactor, ReactorConfig, ShutdownCoordinator};
+use vortex_io::{
+    EngineTopologyMode, IoBackendMode, Reactor, ReactorConfig, ReactorPool, ReactorPoolConfig,
+    ShutdownCoordinator,
+};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
 fn free_port() -> u16 {
@@ -22,6 +25,16 @@ fn free_port() -> u16 {
 
 /// RESP-encode a command from parts: `resp_cmd(&["SET", "foo", "bar"])`.
 fn resp_cmd(parts: &[&str]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        buf.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        buf.extend_from_slice(part.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
+}
+
+fn resp_cmd_owned(parts: &[String]) -> Vec<u8> {
     let mut buf = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
         buf.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
@@ -104,10 +117,51 @@ fn cmd(stream: &mut TcpStream, parts: &[&str]) -> String {
     send_recv(stream, &resp_cmd(parts))
 }
 
+fn cmd_owned(stream: &mut TcpStream, parts: &[String]) -> String {
+    send_recv(stream, &resp_cmd_owned(parts))
+}
+
 /// Shutdown the reactor cleanly.
 fn shutdown(handle: std::thread::JoinHandle<()>, coordinator: &Arc<ShutdownCoordinator>) {
     coordinator.initiate();
     handle.join().expect("reactor thread join");
+}
+
+fn spawn_shared_nothing_pool() -> (ReactorPool, u16) {
+    let port = free_port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let pool = ReactorPool::spawn(ReactorPoolConfig {
+        bind_addr: addr,
+        threads: 2,
+        max_connections: 64,
+        buffer_count: 128,
+        buffer_size: 4096,
+        max_request_bytes: 64 * 1024 * 1024,
+        shard_count: 64,
+        engine_topology: EngineTopologyMode::SharedNothing,
+        io_backend: IoBackendMode::Polling,
+        connection_timeout: 0,
+        ..ReactorPoolConfig::default()
+    })
+    .expect("shared-nothing pool creation");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("shared-nothing pool did not listen on {addr}: {error}"),
+        }
+    }
+
+    (pool, port)
 }
 
 // ── SET / GET round-trip ───────────────────────────────────────────
@@ -129,6 +183,80 @@ fn set_get_roundtrip() {
 
     drop(s);
     shutdown(handle, &coordinator);
+}
+
+#[test]
+fn shared_nothing_pool_single_connection_phase1_commands() {
+    let (mut pool, port) = spawn_shared_nothing_pool();
+    let mut s = connect(port);
+
+    assert_eq!(cmd(&mut s, &["SET", "sn:key", "value"]), "+OK\r\n");
+    assert_eq!(cmd(&mut s, &["GET", "sn:key"]), "$5\r\nvalue\r\n");
+    assert_eq!(cmd(&mut s, &["EXISTS", "sn:key"]), ":1\r\n");
+    assert_eq!(cmd(&mut s, &["TYPE", "sn:key"]), "+string\r\n");
+    assert_eq!(cmd(&mut s, &["TTL", "sn:key"]), ":-1\r\n");
+    assert_eq!(cmd(&mut s, &["PTTL", "sn:key"]), ":-1\r\n");
+    assert_eq!(cmd(&mut s, &["DEL", "sn:key"]), ":1\r\n");
+    assert_eq!(cmd(&mut s, &["GET", "sn:key"]), "$-1\r\n");
+
+    pool.shutdown();
+    assert!(pool.wait_for_shutdown(Duration::from_secs(2)));
+    pool.join();
+}
+
+#[test]
+fn shared_nothing_pool_mget_and_multi_exists_widths() {
+    let (mut pool, port) = spawn_shared_nothing_pool();
+    let mut s = connect(port);
+
+    for i in 0..16 {
+        let key = format!("sn:mget:{i:03}");
+        let value = format!("v{i:03}");
+        assert_eq!(cmd(&mut s, &["SET", &key, &value]), "+OK\r\n");
+    }
+
+    let mut mget = Vec::with_capacity(17);
+    mget.push("MGET".to_string());
+    for i in 0..16 {
+        mget.push(format!("sn:mget:{i:03}"));
+    }
+    let response = cmd_owned(&mut s, &mget);
+    let mut expected = "*16\r\n".to_string();
+    for i in 0..16 {
+        expected.push_str("$4\r\n");
+        expected.push_str(&format!("v{i:03}"));
+        expected.push_str("\r\n");
+    }
+    assert_eq!(response, expected);
+
+    let mut exists = Vec::with_capacity(65);
+    exists.push("EXISTS".to_string());
+    for i in 0..64 {
+        exists.push(format!("sn:mget:{:03}", i % 16));
+    }
+    assert_eq!(cmd_owned(&mut s, &exists), ":64\r\n");
+
+    for width in [1usize, 16, 64, 256] {
+        let mut missing_mget = Vec::with_capacity(width + 1);
+        missing_mget.push("MGET".to_string());
+        for i in 0..width {
+            missing_mget.push(format!("sn:missing:{width}:{i}"));
+        }
+        let response = cmd_owned(&mut s, &missing_mget);
+        let expected = format!("*{width}\r\n{}", "$-1\r\n".repeat(width));
+        assert_eq!(response, expected);
+
+        let mut missing_exists = Vec::with_capacity(width + 1);
+        missing_exists.push("EXISTS".to_string());
+        for i in 0..width {
+            missing_exists.push(format!("sn:missing-exists:{width}:{i}"));
+        }
+        assert_eq!(cmd_owned(&mut s, &missing_exists), ":0\r\n");
+    }
+
+    pool.shutdown();
+    assert!(pool.wait_for_shutdown(Duration::from_secs(2)));
+    pool.join();
 }
 
 #[test]

@@ -120,6 +120,7 @@ impl Reactor {
             // 4. Run bounded maintenance classes. Each class owns its own
             // resume cursor and consumes at most one maintenance unit per
             // scheduler dispatch.
+            self.run_shared_nothing_scheduler();
             self.run_maintenance_scheduler();
             self.run_admission_resume_slice();
 
@@ -216,6 +217,53 @@ impl Reactor {
         self.running
     }
 
+    pub(super) fn run_shared_nothing_scheduler(&mut self) {
+        if self.shared_nothing.is_none() {
+            return;
+        }
+
+        let budget = self.config.budgets.command.get().min(256);
+        if let Some(runtime) = self.shared_nothing.as_mut() {
+            runtime.drain_owner_commands(budget);
+            runtime.drain_replies(budget);
+        }
+        self.flush_shared_nothing_replies(budget);
+    }
+
+    fn flush_shared_nothing_replies(&mut self, budget: usize) {
+        if budget == 0 {
+            return;
+        }
+        let mut connection_ids = std::mem::take(&mut self.shared_nothing_flush_ids);
+        connection_ids.clear();
+        connection_ids.extend(self.connections.ids().take(budget));
+        for conn_id in connection_ids.iter().copied() {
+            if self.connections.is_closing(conn_id) {
+                continue;
+            }
+            if self
+                .inflight_ops
+                .get(conn_id)
+                .is_some_and(|inflight| inflight.has(OpType::Write) || inflight.has(OpType::Writev))
+            {
+                continue;
+            }
+            if !self.publish_shared_nothing_ready(conn_id) {
+                self.close_connection(conn_id);
+                continue;
+            }
+            if self.writev_states[conn_id].queued_len() == 0 {
+                continue;
+            }
+            let Some(fd) = self.connections.get(conn_id).map(|conn| conn.fd) else {
+                continue;
+            };
+            self.finish_command_processing(conn_id, fd, false, false);
+        }
+        connection_ids.clear();
+        self.shared_nothing_flush_ids = connection_ids;
+    }
+
     pub(super) fn process_pending_completion_queue(&mut self, budget: &mut SliceBudget) -> bool {
         let mut saw_work = false;
         while !budget.is_empty() {
@@ -251,6 +299,17 @@ impl Reactor {
     pub(super) fn handle_completion(&mut self, cqe: &Completion) {
         match cqe.token.decode() {
             Ok(DecodedCompletionToken::Accept) => self.handle_accept(cqe),
+            Ok(DecodedCompletionToken::Wake) => {
+                if let Err(error) = self.backend.rearm_wakeup() {
+                    self.keyspace.record_reactor_submit_failure(self.id);
+                    tracing::warn!(
+                        reactor_id = self.id,
+                        error = %error,
+                        "failed to rearm backend wakeup"
+                    );
+                }
+                self.run_shared_nothing_scheduler();
+            }
             Ok(DecodedCompletionToken::Cancel { target }) => {
                 self.handle_cancel_completion(target, cqe);
             }

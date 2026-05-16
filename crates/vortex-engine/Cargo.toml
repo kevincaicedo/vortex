@@ -47,6 +47,38 @@ harness = false
 name = "table"
 harness = false
 
+[[bench]]
+name = "owner_mailbox"
+harness = false
+
+[[bench]]
+name = "owner_harness"
+harness = false
+
+[[bench]]
+name = "shared_nothing_executor"
+harness = false
+
+[[bench]]
+name = "shared_nothing_executor_cost"
+harness = false
+
+[[bench]]
+name = "shared_nothing_locality"
+harness = false
+
+[[bench]]
+name = "shared_nothing_continuation"
+harness = false
+
+[[bench]]
+name = "shared_nothing_envelope"
+harness = false
+
+[[bench]]
+name = "shared_nothing_scatter"
+harness = false
+
 [[example]]
 name = "engine_probe"
 path = "examples/engine_probe.rs"

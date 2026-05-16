@@ -33,7 +33,7 @@ pub mod shutdown;
 pub mod timer;
 
 pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
-pub use pool::{FixedBufferRegistrationMode, IoBackendMode};
+pub use pool::{EngineTopologyMode, FixedBufferRegistrationMode, IoBackendMode};
 pub use pool::{ReactorPool, ReactorPoolConfig};
 pub use reactor::{
     AcceptBudget, AofConfig, CommandBudget, CompletionBudget, ConnectionMemoryCaps,

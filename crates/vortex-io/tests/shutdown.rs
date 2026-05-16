@@ -116,6 +116,7 @@ fn graceful_shutdown_pool() {
         telemetry_mode: Default::default(),
         max_memory: 0,
         eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
+        engine_topology: Default::default(),
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

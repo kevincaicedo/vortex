@@ -2525,7 +2525,7 @@ fn completion_budget_requeues_overflow_in_reactor_order() {
             flags: 0,
         },
         Completion {
-            token: CompletionToken::from_raw(0xFF),
+            token: CompletionToken::from_raw(0xFE),
             result: 0,
             flags: 0,
         },

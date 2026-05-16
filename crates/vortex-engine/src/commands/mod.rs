@@ -8,6 +8,7 @@ pub(crate) mod connection;
 pub(crate) mod generic;
 pub(crate) mod pattern;
 pub(crate) mod server;
+pub(crate) mod shared_nothing;
 pub(crate) mod string;
 pub(crate) mod transaction;
 
@@ -810,6 +811,11 @@ mod tests {
         assert_forbidden_tokens_absent(
             "commands/generic.rs",
             production_region(include_str!("generic.rs")),
+            &forbidden,
+        );
+        assert_forbidden_tokens_absent(
+            "commands/shared_nothing.rs",
+            production_region(include_str!("shared_nothing.rs")),
             &forbidden,
         );
     }

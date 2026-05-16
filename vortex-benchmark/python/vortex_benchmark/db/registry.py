@@ -8,6 +8,8 @@ from .vortex import VortexAdapter
 
 ADAPTERS: dict[str, DatabaseAdapter] = {
     "vortex": VortexAdapter(),
+    "vortex-shared-keyspace": VortexAdapter(),
+    "vortex-shared-nothing": VortexAdapter(),
     "redis": RedisAdapter(),
     "dragonfly": DragonflyAdapter(),
     "valkey": ValkeyAdapter(),

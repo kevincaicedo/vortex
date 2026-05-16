@@ -6,9 +6,9 @@ use std::time::Duration;
 use vortex_engine::eviction::EvictionPolicy;
 use vortex_engine::keyspace::RuntimeTelemetryMode;
 use vortex_io::{
-    AcceptBudget, AofConfig, CommandBudget, CompletionBudget, FixedBufferRegistrationMode,
-    IoBackendMode, MaintenanceBudget, ReactorBudgets, ReactorPool, ReactorPoolConfig, TimeBudget,
-    WritevBudget,
+    AcceptBudget, AofConfig, CommandBudget, CompletionBudget, EngineTopologyMode,
+    FixedBufferRegistrationMode, IoBackendMode, MaintenanceBudget, ReactorBudgets, ReactorPool,
+    ReactorPoolConfig, TimeBudget, WritevBudget,
 };
 
 #[global_allocator]
@@ -48,11 +48,12 @@ fn main() {
 
     eprintln!("{BANNER}");
     tracing::info!(
-        "VortexDB v{} starting — bind={}, threads={}, shard_count={}, io_backend={}, fixed_buffer_registration={}, telemetry_mode={}, max_memory={}",
+        "VortexDB v{} starting — bind={}, threads={}, shard_count={}, engine_topology={}, io_backend={}, fixed_buffer_registration={}, telemetry_mode={}, max_memory={}",
         env!("CARGO_PKG_VERSION"),
         config.bind,
         config.threads,
         config.shard_count,
+        config.engine_topology,
         config.io_backend,
         config.fixed_buffer_registration,
         config.telemetry_mode,
@@ -140,6 +141,10 @@ fn main() {
         max_memory: config.max_memory as usize,
         eviction_policy: EvictionPolicy::parse_bytes(config.eviction_policy.as_bytes())
             .unwrap_or(EvictionPolicy::NoEviction),
+        engine_topology: match config.engine_topology {
+            vortex_config::EngineTopologyKind::SharedKeyspace => EngineTopologyMode::SharedKeyspace,
+            vortex_config::EngineTopologyKind::SharedNothing => EngineTopologyMode::SharedNothing,
+        },
         io_backend: match config.io_backend {
             vortex_config::IoBackendKind::Auto => IoBackendMode::Auto,
             vortex_config::IoBackendKind::Uring => IoBackendMode::Uring,

@@ -37,6 +37,14 @@ impl Reactor {
             c.last_active = self.now_secs;
         }
 
+        if self
+            .inflight_ops
+            .get(conn_id)
+            .is_some_and(|inflight| inflight.has(OpType::Write) || inflight.has(OpType::Writev))
+        {
+            return;
+        }
+
         // Attempt to parse and process commands from the read buffer.
         self.process_commands(conn_id, fd);
     }
@@ -219,7 +227,7 @@ impl Reactor {
             match BorrowedRespTape::parse_pipeline_limited_into(
                 &input[offset..],
                 parse_entries,
-                if self.aof_write_backpressure_active() {
+                if self.shared_nothing.is_some() || self.aof_write_backpressure_active() {
                     1
                 } else {
                     command_budget.remaining()
@@ -234,15 +242,45 @@ impl Reactor {
                             yielded = true;
                             break;
                         }
-                        batch_width += 1;
-                        let (response, should_close) = self.dispatch_command(conn_id, &frame);
-                        if should_close {
-                            close_after_write = true;
-                        }
-                        if !self.try_push_command_response(conn_id, response) {
-                            self.reject_response_cap(conn_id);
-                            close_after_write = true;
-                            break;
+                        if self.shared_nothing.is_some() {
+                            match self.dispatch_shared_nothing_command(conn_id, &frame) {
+                                SharedNothingServerDispatch::Ready
+                                | SharedNothingServerDispatch::Pending => {
+                                    batch_width += 1;
+                                }
+                                SharedNothingServerDispatch::Backpressure(backpressure) => {
+                                    tracing::debug!(
+                                        reactor_id = self.id,
+                                        source = backpressure.source.get(),
+                                        destination = backpressure.destination.get(),
+                                        lane = ?backpressure.lane,
+                                        used_slots = backpressure.used_slots,
+                                        capacity_slots = backpressure.capacity_slots,
+                                        "shared-nothing dispatch backpressure; deferring command without consuming frame"
+                                    );
+                                    self.defer_command_processing(conn_id);
+                                    yielded = true;
+                                    break;
+                                }
+                                SharedNothingServerDispatch::Unsupported => {
+                                    batch_width += 1;
+                                    self.push_static_if_response_cap_allows(
+                                        conn_id,
+                                        RESP_ERR_SHARED_NOTHING_UNSUPPORTED,
+                                    );
+                                }
+                            }
+                        } else {
+                            batch_width += 1;
+                            let (response, should_close) = self.dispatch_command(conn_id, &frame);
+                            if should_close {
+                                close_after_write = true;
+                            }
+                            if !self.try_push_command_response(conn_id, response) {
+                                self.reject_response_cap(conn_id);
+                                close_after_write = true;
+                                break;
+                            }
                         }
                     }
                     if batch_width != 0 {
@@ -296,7 +334,7 @@ impl Reactor {
         &mut self,
         conn_id: usize,
         fd: RawFd,
-        close_after_write: bool,
+        mut close_after_write: bool,
         yielded: bool,
     ) {
         if close_after_write {
@@ -310,6 +348,10 @@ impl Reactor {
             self.keyspace
                 .record_reactor_command_budget_exhaustion(self.id);
             self.keyspace.record_reactor_yielded_connection(self.id);
+        }
+
+        if self.shared_nothing.is_some() && !self.publish_shared_nothing_ready(conn_id) {
+            close_after_write = true;
         }
 
         self.writev_states[conn_id].finalize();
@@ -383,6 +425,14 @@ impl Reactor {
     /// staging only; oversized partial requests are promoted into a bounded
     /// per-connection accumulator.
     pub(super) fn process_commands(&mut self, conn_id: usize, fd: RawFd) {
+        if self
+            .inflight_ops
+            .get(conn_id)
+            .is_some_and(|inflight| inflight.has(OpType::Write) || inflight.has(OpType::Writev))
+        {
+            return;
+        }
+
         if self.has_pending_command_bytes(conn_id) {
             self.process_accumulated_commands(conn_id, fd);
             return;

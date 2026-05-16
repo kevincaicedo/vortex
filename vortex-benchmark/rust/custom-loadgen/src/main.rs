@@ -52,6 +52,8 @@ struct WorkloadSpec {
     multi_key: bool,
     transactional: bool,
     hot_key: bool,
+    read_only_multi: Option<ReadOnlyMultiKind>,
+    multi_key_width: usize,
     pressure: Option<PressureKind>,
 }
 
@@ -71,6 +73,26 @@ impl WorkloadSpec {
             multi_key,
             transactional,
             hot_key,
+            read_only_multi: None,
+            multi_key_width: 3,
+            pressure: None,
+        }
+    }
+
+    fn read_only_multi(
+        canonical_name: &'static str,
+        kind: ReadOnlyMultiKind,
+        multi_key_width: usize,
+    ) -> Self {
+        Self {
+            canonical_name,
+            read_weight: 100,
+            write_weight: 0,
+            multi_key: true,
+            transactional: false,
+            hot_key: false,
+            read_only_multi: Some(kind),
+            multi_key_width,
             pressure: None,
         }
     }
@@ -83,9 +105,17 @@ impl WorkloadSpec {
             multi_key: false,
             transactional: false,
             hot_key: false,
+            read_only_multi: None,
+            multi_key_width: 1,
             pressure: Some(pressure),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReadOnlyMultiKind {
+    Mget,
+    Exists,
 }
 
 #[derive(Clone, Copy)]
@@ -650,9 +680,12 @@ fn execute_operation(
     if spec.transactional {
         return execute_transaction(writer, reader, spec, value, num_keys, rng);
     }
+    if let Some(kind) = spec.read_only_multi {
+        return execute_read_only_multi(writer, reader, spec, kind, num_keys, rng);
+    }
     if spec.multi_key {
         if is_read(spec, rng) {
-            let keys = next_keys(spec, num_keys, rng, 3);
+            let keys = next_keys(spec, num_keys, rng, spec.multi_key_width);
             return execute_command(
                 writer,
                 reader,
@@ -664,7 +697,7 @@ fn execute_operation(
                 ],
             );
         }
-        let keys = next_keys(spec, num_keys, rng, 3);
+        let keys = next_keys(spec, num_keys, rng, spec.multi_key_width);
         return execute_command(
             writer,
             reader,
@@ -689,6 +722,24 @@ fn execute_operation(
             &["SET".to_string(), key_name(key), value.to_string()],
         )
     }
+}
+
+fn execute_read_only_multi(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    spec: WorkloadSpec,
+    kind: ReadOnlyMultiKind,
+    num_keys: u64,
+    rng: &mut StdRng,
+) -> io::Result<()> {
+    let keys = next_keys(spec, num_keys, rng, spec.multi_key_width);
+    let mut command = Vec::with_capacity(keys.len() + 1);
+    command.push(match kind {
+        ReadOnlyMultiKind::Mget => "MGET".to_string(),
+        ReadOnlyMultiKind::Exists => "EXISTS".to_string(),
+    });
+    command.extend(keys.into_iter().map(key_name));
+    execute_command(writer, reader, &command)
 }
 
 fn execute_transaction(
@@ -754,7 +805,7 @@ fn flush_and_preload(host: &str, port: u16, num_keys: u64, value_size: usize) ->
     let mut writer = TcpStream::connect((host, port))?;
     writer.set_nodelay(true)?;
     let mut reader = BufReader::new(writer.try_clone()?);
-    execute_command(&mut writer, &mut reader, &["FLUSHALL".to_string()])?;
+    execute_pressure_command(&mut writer, &mut reader, &["FLUSHALL".to_string()])?;
 
     let value = "x".repeat(value_size);
     for key_id in 1..=num_keys {
@@ -1016,6 +1067,46 @@ fn resolve_workload(name: &str) -> Result<WorkloadSpec, Box<dyn Error>> {
             WorkloadSpec::standard("multi-key operations", 50, 50, true, false, false)
         }
         "multi-key-only" => WorkloadSpec::standard("multi_key_only", 50, 50, true, false, false),
+        "mget-width-1" => WorkloadSpec::read_only_multi(
+            "mget_width_1",
+            ReadOnlyMultiKind::Mget,
+            1,
+        ),
+        "mget-width-16" => WorkloadSpec::read_only_multi(
+            "mget_width_16",
+            ReadOnlyMultiKind::Mget,
+            16,
+        ),
+        "mget-width-64" => WorkloadSpec::read_only_multi(
+            "mget_width_64",
+            ReadOnlyMultiKind::Mget,
+            64,
+        ),
+        "mget-width-256" => WorkloadSpec::read_only_multi(
+            "mget_width_256",
+            ReadOnlyMultiKind::Mget,
+            256,
+        ),
+        "exists-width-1" => WorkloadSpec::read_only_multi(
+            "exists_width_1",
+            ReadOnlyMultiKind::Exists,
+            1,
+        ),
+        "exists-width-16" => WorkloadSpec::read_only_multi(
+            "exists_width_16",
+            ReadOnlyMultiKind::Exists,
+            16,
+        ),
+        "exists-width-64" => WorkloadSpec::read_only_multi(
+            "exists_width_64",
+            ReadOnlyMultiKind::Exists,
+            64,
+        ),
+        "exists-width-256" => WorkloadSpec::read_only_multi(
+            "exists_width_256",
+            ReadOnlyMultiKind::Exists,
+            256,
+        ),
         "transaction" => WorkloadSpec::standard("transaction", 50, 50, false, true, false),
         "transaction-only" => {
             WorkloadSpec::standard("transaction_only", 50, 50, false, true, false)

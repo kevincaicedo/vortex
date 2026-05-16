@@ -205,6 +205,7 @@ impl Reactor {
         self.publish_aof_telemetry();
         self.publish_client_retained_memory();
         self.publish_overload_telemetry();
+        self.publish_shared_nothing_telemetry();
         self.keyspace
             .publish_runtime_backend(Self::runtime_backend_snapshot(
                 &self.config,
@@ -215,6 +216,36 @@ impl Reactor {
         self.keyspace
             .record_reactor_metrics_flush_nanos(self.id, elapsed);
         MaintenanceRun::ran(elapsed, false)
+    }
+
+    fn publish_shared_nothing_telemetry(&self) {
+        let Some(runtime) = self.shared_nothing.as_ref() else {
+            return;
+        };
+        let metrics = runtime.metrics();
+        self.keyspace.publish_reactor_shared_nothing_telemetry(
+            self.id,
+            RuntimeSharedNothingTelemetry {
+                accepted_remote: metrics.accepted_remote,
+                remote_backpressure: metrics.remote_backpressure,
+                reply_backpressure: metrics.reply_backpressure,
+                deferred_replies: metrics.deferred_replies,
+                wakeups_sent: metrics.wakeups_sent,
+                wakeup_failures: metrics.wakeup_failures,
+                aggregates_accepted: metrics.aggregates_accepted,
+                aggregate_width_max: metrics.aggregate_width_max,
+                txns_accepted: metrics.txns_accepted,
+                txn_prepare_messages: metrics.txn_prepare_messages,
+                txn_commit_messages: metrics.txn_commit_messages,
+                txn_abort_messages: metrics.txn_abort_messages,
+                txn_condition_aborts: metrics.txn_condition_aborts,
+                txn_conflict_aborts: metrics.txn_conflict_aborts,
+                prepared_key_waits: metrics.prepared_key_waits,
+                prepared_key_retries: metrics.prepared_key_retries,
+                prepared_key_wait_nanos_total: metrics.prepared_key_wait_nanos_total,
+                prepared_key_wait_nanos_max: metrics.prepared_key_wait_nanos_max,
+            },
+        );
     }
 
     // ── Accept handler ─────────────────────────────────────────────

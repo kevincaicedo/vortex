@@ -22,6 +22,7 @@ pub mod eviction;
 pub mod executor;
 pub mod keyspace;
 pub mod morph;
+pub mod owner;
 pub mod prefetch;
 pub mod table;
 
@@ -31,4 +32,10 @@ pub use eviction::{EvictionConfig, EvictionPolicy};
 pub use executor::{CommandExecutionScope, SharedKeyspaceExecutor};
 pub use keyspace::{ConcurrentKeyspace, DEFAULT_SHARD_COUNT};
 pub use morph::{AccessProfile, DefaultMorphMonitor, DisabledMorphMonitor, MorphMonitor};
+pub use owner::{
+    OwnedSharedNothingCommand, RemoteContinuation, SharedNothingConnectionGeneration,
+    SharedNothingConnectionId, SharedNothingConnectionToken, SharedNothingExecutionResult,
+    SharedNothingExecutor, SharedNothingOwnerDispatch, SharedNothingOwnerRuntime, TxnAction,
+    TxnFinishOutcome, TxnId, TxnIntent, TxnIntentKind, TxnPrepareOutcome,
+};
 pub use table::SwissTable;

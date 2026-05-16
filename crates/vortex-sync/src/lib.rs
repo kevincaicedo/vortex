@@ -8,8 +8,8 @@
 //!
 //! ## Key Types
 //!
-//! - [`SpscRingBuffer`] — Single-producer, single-consumer lock-free ring buffer
-//!   with `CachePadded` head/tail for false-sharing prevention.
+//! - [`spsc_channel`] — typed single-producer, single-consumer endpoints backed
+//!   by a lock-free ring buffer with `CachePadded` head/tail.
 //! - [`MpscQueue`] — Multi-producer, single-consumer lock-free queue for
 //!   work-stealing across reactors.
 //! - [`Backoff`] — Exponential backoff helper for CAS retry loops.
@@ -32,4 +32,4 @@ pub use backoff::Backoff;
 pub use counter::ShardedCounter;
 pub use mpsc::MpscQueue;
 pub use signal::ShutdownSignal;
-pub use spsc::SpscRingBuffer;
+pub use spsc::{SpscReceiver, SpscRingBuffer, SpscSender, spsc_channel};

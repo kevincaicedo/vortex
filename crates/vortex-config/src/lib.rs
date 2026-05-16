@@ -64,6 +64,28 @@ impl fmt::Display for FixedBufferRegistrationKind {
     }
 }
 
+/// Engine execution topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineTopologyKind {
+    /// Current alpha topology: every reactor executes against one shared
+    /// concurrent keyspace.
+    #[default]
+    SharedKeyspace,
+    /// Research topology: one owner partition per reactor with bounded
+    /// reactor-to-reactor message passing.
+    SharedNothing,
+}
+
+impl fmt::Display for EngineTopologyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SharedKeyspace => write!(f, "shared-keyspace"),
+            Self::SharedNothing => write!(f, "shared-nothing"),
+        }
+    }
+}
+
 /// Runtime telemetry cost policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -132,6 +154,15 @@ pub struct VortexConfig {
     /// Number of engine keyspace shards. Must be a power of two.
     #[arg(long, default_value_t = DEFAULT_SHARD_COUNT, env = "VORTEX_SHARD_COUNT")]
     pub shard_count: usize,
+
+    /// Engine topology: shared-keyspace or shared-nothing.
+    #[arg(
+        long,
+        default_value = "shared-keyspace",
+        env = "VORTEX_ENGINE_TOPOLOGY",
+        value_enum
+    )]
+    pub engine_topology: EngineTopologyKind,
 
     /// Maximum number of client connections.
     ///
@@ -404,6 +435,7 @@ impl Default for VortexConfig {
             bind: "127.0.0.1:6379".parse().expect("valid default addr"),
             threads: 0,
             shard_count: DEFAULT_SHARD_COUNT,
+            engine_topology: EngineTopologyKind::SharedKeyspace,
             max_clients: 10_000,
             max_memory: 0,
             eviction_policy: "noeviction".to_string(),
@@ -631,6 +663,9 @@ impl VortexConfig {
         if self.shard_count == sentinel.shard_count {
             self.shard_count = defaults.shard_count;
         }
+        if self.engine_topology == sentinel.engine_topology {
+            self.engine_topology = defaults.engine_topology;
+        }
         if self.max_clients == sentinel.max_clients {
             self.max_clients = defaults.max_clients;
         }
@@ -808,6 +843,7 @@ mod tests {
         let config = VortexConfig::default();
         assert_eq!(config.bind.port(), 6379);
         assert_eq!(config.shard_count, DEFAULT_SHARD_COUNT);
+        assert_eq!(config.engine_topology, EngineTopologyKind::SharedKeyspace);
         assert_eq!(config.max_clients, 10_000);
         assert_eq!(config.fixed_buffers, 1_024);
         assert_eq!(config.effective_max_clients(), 1_024);
@@ -902,6 +938,21 @@ mod tests {
         assert_eq!(config.bind.port(), 6380);
         assert_eq!(config.threads, 4);
         assert_eq!(config.shard_count, 16_384);
+        assert_eq!(config.engine_topology, EngineTopologyKind::SharedKeyspace);
+    }
+
+    #[test]
+    fn from_args_engine_topology_shared_nothing() {
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "2".to_string(),
+            "--engine-topology".to_string(),
+            "shared-nothing".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(config.engine_topology, EngineTopologyKind::SharedNothing);
     }
 
     #[test]

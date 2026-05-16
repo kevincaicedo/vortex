@@ -26,8 +26,8 @@ use vortex_engine::commands::{
 };
 use vortex_engine::keyspace::{
     AofLsn, DEFAULT_SHARD_COUNT, RuntimeAofTelemetry, RuntimeBackendMode, RuntimeBackendSnapshot,
-    RuntimeLocalFlushMetrics, RuntimeOverloadTelemetry, RuntimeTelemetryMode, TransactionGatePlan,
-    WatchRegistration,
+    RuntimeLocalFlushMetrics, RuntimeOverloadTelemetry, RuntimeSharedNothingTelemetry,
+    RuntimeTelemetryMode, TransactionGatePlan, WatchRegistration,
 };
 use vortex_engine::{
     CommandExecutionScope, ConcurrentKeyspace, EvictionPolicy, SharedKeyspaceExecutor,
@@ -55,6 +55,7 @@ mod event_loop;
 mod inflight;
 mod maintenance;
 mod read_path;
+pub(crate) mod shared_nothing;
 mod shutdown;
 mod state;
 #[cfg(test)]
@@ -78,6 +79,11 @@ use self::config::{
     make_backend, open_aof_writer, runtime_effective_backend, runtime_requested_backend,
 };
 use self::inflight::InflightSet;
+use self::shared_nothing::{
+    RESP_ERR_SHARED_NOTHING_UNSUPPORTED, SHARED_NOTHING_MAILBOX_RING_SLOTS,
+    SharedNothingServerBackpressure, SharedNothingServerDispatch, SharedNothingServerFabric,
+    SharedNothingServerLane, SharedNothingServerRuntime,
+};
 #[cfg(test)]
 use self::types::append_resp_frame;
 use self::types::{
@@ -223,6 +229,12 @@ pub struct Reactor {
     command_router: CommandRouter,
     /// Concrete command executor for the alpha shared-keyspace topology.
     command_executor: SharedKeyspaceExecutor,
+    /// Experimental shared-nothing server runtime. Present only when
+    /// `VORTEX_ENGINE_TOPOLOGY=shared-nothing`.
+    shared_nothing: Option<SharedNothingServerRuntime<SHARED_NOTHING_MAILBOX_RING_SLOTS>>,
+    /// Reusable connection-id scratch for publishing shared-nothing replies
+    /// outside read completion handling.
+    shared_nothing_flush_ids: Vec<usize>,
     /// Shared concurrent keyspace — all reactors operate on the same data.
     keyspace: Arc<ConcurrentKeyspace>,
     /// Cached monotonic timestamp (nanoseconds) for the current event-loop iteration.

@@ -6,6 +6,7 @@
 //! This module is only compiled on Linux (`#[cfg(target_os = "linux")]`).
 
 use std::io;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -13,8 +14,8 @@ use io_uring::types::{SubmitArgs, Timespec};
 use io_uring::{IoUring, opcode, types::Fd};
 
 use super::{
-    BackendDriver, BackendQueueStatus, Completion, CompletionToken, ConnFd, IovecBatch, ListenerFd,
-    ReadLease, SubmitError, WriteLease,
+    BackendDriver, BackendQueueStatus, BackendWaker, Completion, CompletionToken, ConnFd,
+    IovecBatch, ListenerFd, ReadLease, SubmitError, WriteLease,
 };
 
 /// io_uring-based I/O backend for Linux.
@@ -23,6 +24,9 @@ pub struct IoUringBackend {
     fixed_buffers_registered: AtomicBool,
     sqpoll_enabled: bool,
     last_cq_overflow: u32,
+    wakeup_fd: RawFd,
+    wakeup_word: Box<u64>,
+    wakeup_armed: bool,
 }
 
 impl IoUringBackend {
@@ -50,17 +54,71 @@ impl IoUringBackend {
         }
 
         let ring = builder.build(ring_size)?;
-        Ok(Self {
+        // SAFETY: `eventfd` returns a nonblocking, close-on-exec counter fd
+        // owned by this backend on success.
+        let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if wakeup_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut backend = Self {
             ring,
             fixed_buffers_registered: AtomicBool::new(false),
             sqpoll_enabled,
             last_cq_overflow: 0,
-        })
+            wakeup_fd,
+            wakeup_word: Box::new(0),
+            wakeup_armed: false,
+        };
+        backend.rearm_wakeup().map_err(|error| {
+            io::Error::other(format!("failed to arm io_uring wake eventfd: {error:?}"))
+        })?;
+        Ok(backend)
     }
 
     #[inline]
     pub(crate) const fn sqpoll_enabled(&self) -> bool {
         self.sqpoll_enabled
+    }
+
+    #[inline]
+    pub(crate) const fn waker(&self) -> BackendWaker {
+        BackendWaker::EventFd(self.wakeup_fd)
+    }
+
+    pub(crate) fn rearm_wakeup(&mut self) -> Result<(), SubmitError> {
+        if self.wakeup_armed {
+            return Ok(());
+        }
+        *self.wakeup_word = 0;
+        let read = opcode::Read::new(
+            Fd(self.wakeup_fd),
+            self.wakeup_word.as_mut() as *mut u64 as *mut u8,
+            std::mem::size_of::<u64>() as u32,
+        )
+        .build()
+        .user_data(CompletionToken::wake().raw());
+        // SAFETY: The SQE is valid, the eventfd remains owned by the backend,
+        // and `wakeup_word` is stable until the wake CQE is reaped.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&read)
+                .map_err(|_| SubmitError::QueueFull)?;
+        }
+        self.wakeup_armed = true;
+        Ok(())
+    }
+}
+
+impl Drop for IoUringBackend {
+    fn drop(&mut self) {
+        if self.wakeup_fd >= 0 {
+            // SAFETY: `wakeup_fd` is owned by this backend and closed once.
+            unsafe {
+                libc::close(self.wakeup_fd);
+            }
+            self.wakeup_fd = -1;
+        }
     }
 }
 
@@ -274,6 +332,9 @@ impl BackendDriver for IoUringBackend {
                 let cq = self.ring.completion();
                 let mut got_any = false;
                 for cqe in cq {
+                    if cqe.user_data() == CompletionToken::wake().raw() {
+                        self.wakeup_armed = false;
+                    }
                     out.push(Completion {
                         token: CompletionToken::from_raw(cqe.user_data()),
                         result: cqe.result(),
@@ -310,6 +371,9 @@ impl BackendDriver for IoUringBackend {
 
         let cq = self.ring.completion();
         for cqe in cq {
+            if cqe.user_data() == CompletionToken::wake().raw() {
+                self.wakeup_armed = false;
+            }
             out.push(Completion {
                 token: CompletionToken::from_raw(cqe.user_data()),
                 result: cqe.result(),
@@ -327,6 +391,9 @@ impl BackendDriver for IoUringBackend {
         // has already placed in the completion ring.
         let cq = self.ring.completion();
         for cqe in cq {
+            if cqe.user_data() == CompletionToken::wake().raw() {
+                self.wakeup_armed = false;
+            }
             out.push(Completion {
                 token: CompletionToken::from_raw(cqe.user_data()),
                 result: cqe.result(),

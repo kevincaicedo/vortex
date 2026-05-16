@@ -193,6 +193,28 @@ pub struct RuntimeOverloadTelemetry {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeSharedNothingTelemetry {
+    pub accepted_remote: u64,
+    pub remote_backpressure: u64,
+    pub reply_backpressure: u64,
+    pub deferred_replies: u64,
+    pub wakeups_sent: u64,
+    pub wakeup_failures: u64,
+    pub aggregates_accepted: u64,
+    pub aggregate_width_max: u64,
+    pub txns_accepted: u64,
+    pub txn_prepare_messages: u64,
+    pub txn_commit_messages: u64,
+    pub txn_abort_messages: u64,
+    pub txn_condition_aborts: u64,
+    pub txn_conflict_aborts: u64,
+    pub prepared_key_waits: u64,
+    pub prepared_key_retries: u64,
+    pub prepared_key_wait_nanos_total: u64,
+    pub prepared_key_wait_nanos_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeLocalFlushMetrics {
     pub loop_iterations: u64,
     pub accept_drain_runs: u64,
@@ -297,6 +319,24 @@ pub struct RuntimeMetricsSnapshot {
     pub overload_read_disabled_connections_peak: u64,
     pub overload_deferred_commands: u64,
     pub overload_deferred_commands_peak: u64,
+    pub shared_nothing_accepted_remote: u64,
+    pub shared_nothing_remote_backpressure: u64,
+    pub shared_nothing_reply_backpressure: u64,
+    pub shared_nothing_deferred_replies: u64,
+    pub shared_nothing_wakeups_sent: u64,
+    pub shared_nothing_wakeup_failures: u64,
+    pub shared_nothing_aggregates_accepted: u64,
+    pub shared_nothing_aggregate_width_max: u64,
+    pub shared_nothing_txns_accepted: u64,
+    pub shared_nothing_txn_prepare_messages: u64,
+    pub shared_nothing_txn_commit_messages: u64,
+    pub shared_nothing_txn_abort_messages: u64,
+    pub shared_nothing_txn_condition_aborts: u64,
+    pub shared_nothing_txn_conflict_aborts: u64,
+    pub shared_nothing_prepared_key_waits: u64,
+    pub shared_nothing_prepared_key_retries: u64,
+    pub shared_nothing_prepared_key_wait_nanos_total: u64,
+    pub shared_nothing_prepared_key_wait_nanos_max: u64,
     pub close_drain_nanos_total: u64,
     pub close_drain_nanos_max: u64,
     pub active_expiry_runs: u64,
@@ -498,6 +538,24 @@ pub(super) struct RuntimeMetrics {
     overload_maintenance_debt: RuntimeGaugeSlots,
     overload_read_disabled_connections: RuntimeGaugeSlots,
     overload_deferred_commands: RuntimeGaugeSlots,
+    shared_nothing_accepted_remote: RuntimeGaugeSlots,
+    shared_nothing_remote_backpressure: RuntimeGaugeSlots,
+    shared_nothing_reply_backpressure: RuntimeGaugeSlots,
+    shared_nothing_deferred_replies: RuntimeGaugeSlots,
+    shared_nothing_wakeups_sent: RuntimeGaugeSlots,
+    shared_nothing_wakeup_failures: RuntimeGaugeSlots,
+    shared_nothing_aggregates_accepted: RuntimeGaugeSlots,
+    shared_nothing_aggregate_width_max: RuntimeGaugeSlots,
+    shared_nothing_txns_accepted: RuntimeGaugeSlots,
+    shared_nothing_txn_prepare_messages: RuntimeGaugeSlots,
+    shared_nothing_txn_commit_messages: RuntimeGaugeSlots,
+    shared_nothing_txn_abort_messages: RuntimeGaugeSlots,
+    shared_nothing_txn_condition_aborts: RuntimeGaugeSlots,
+    shared_nothing_txn_conflict_aborts: RuntimeGaugeSlots,
+    shared_nothing_prepared_key_waits: RuntimeGaugeSlots,
+    shared_nothing_prepared_key_retries: RuntimeGaugeSlots,
+    shared_nothing_prepared_key_wait_nanos_total: RuntimeGaugeSlots,
+    shared_nothing_prepared_key_wait_nanos_max: RuntimeMaxSlots,
     #[cfg(feature = "profile-telemetry")]
     maintenance_nanos_total: ShardedCounter,
     #[cfg(feature = "profile-telemetry")]
@@ -631,6 +689,24 @@ impl RuntimeMetrics {
             overload_maintenance_debt: RuntimeGaugeSlots::new(slot_count),
             overload_read_disabled_connections: RuntimeGaugeSlots::new(slot_count),
             overload_deferred_commands: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_accepted_remote: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_remote_backpressure: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_reply_backpressure: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_deferred_replies: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_wakeups_sent: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_wakeup_failures: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_aggregates_accepted: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_aggregate_width_max: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_txns_accepted: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_txn_prepare_messages: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_txn_commit_messages: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_txn_abort_messages: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_txn_condition_aborts: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_txn_conflict_aborts: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_prepared_key_waits: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_prepared_key_retries: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_prepared_key_wait_nanos_total: RuntimeGaugeSlots::new(slot_count),
+            shared_nothing_prepared_key_wait_nanos_max: RuntimeMaxSlots::new(slot_count),
             #[cfg(feature = "profile-telemetry")]
             maintenance_nanos_total: ShardedCounter::new(slot_count),
             #[cfg(feature = "profile-telemetry")]
@@ -1066,6 +1142,50 @@ impl RuntimeMetrics {
     }
 
     #[inline]
+    pub(super) fn publish_shared_nothing_telemetry(
+        &self,
+        slot: usize,
+        telemetry: RuntimeSharedNothingTelemetry,
+    ) {
+        self.shared_nothing_accepted_remote
+            .store(slot, telemetry.accepted_remote);
+        self.shared_nothing_remote_backpressure
+            .store(slot, telemetry.remote_backpressure);
+        self.shared_nothing_reply_backpressure
+            .store(slot, telemetry.reply_backpressure);
+        self.shared_nothing_deferred_replies
+            .store(slot, telemetry.deferred_replies);
+        self.shared_nothing_wakeups_sent
+            .store(slot, telemetry.wakeups_sent);
+        self.shared_nothing_wakeup_failures
+            .store(slot, telemetry.wakeup_failures);
+        self.shared_nothing_aggregates_accepted
+            .store(slot, telemetry.aggregates_accepted);
+        self.shared_nothing_aggregate_width_max
+            .store(slot, telemetry.aggregate_width_max);
+        self.shared_nothing_txns_accepted
+            .store(slot, telemetry.txns_accepted);
+        self.shared_nothing_txn_prepare_messages
+            .store(slot, telemetry.txn_prepare_messages);
+        self.shared_nothing_txn_commit_messages
+            .store(slot, telemetry.txn_commit_messages);
+        self.shared_nothing_txn_abort_messages
+            .store(slot, telemetry.txn_abort_messages);
+        self.shared_nothing_txn_condition_aborts
+            .store(slot, telemetry.txn_condition_aborts);
+        self.shared_nothing_txn_conflict_aborts
+            .store(slot, telemetry.txn_conflict_aborts);
+        self.shared_nothing_prepared_key_waits
+            .store(slot, telemetry.prepared_key_waits);
+        self.shared_nothing_prepared_key_retries
+            .store(slot, telemetry.prepared_key_retries);
+        self.shared_nothing_prepared_key_wait_nanos_total
+            .store(slot, telemetry.prepared_key_wait_nanos_total);
+        self.shared_nothing_prepared_key_wait_nanos_max
+            .record(slot, telemetry.prepared_key_wait_nanos_max);
+    }
+
+    #[inline]
     pub(super) fn record_close_drain_nanos(&self, slot: usize, nanos: u64) {
         #[cfg(feature = "profile-telemetry")]
         {
@@ -1318,6 +1438,28 @@ impl RuntimeMetrics {
                 .max(),
             overload_deferred_commands: self.overload_deferred_commands.sum(),
             overload_deferred_commands_peak: self.overload_deferred_commands_peak.max(),
+            shared_nothing_accepted_remote: self.shared_nothing_accepted_remote.sum(),
+            shared_nothing_remote_backpressure: self.shared_nothing_remote_backpressure.sum(),
+            shared_nothing_reply_backpressure: self.shared_nothing_reply_backpressure.sum(),
+            shared_nothing_deferred_replies: self.shared_nothing_deferred_replies.sum(),
+            shared_nothing_wakeups_sent: self.shared_nothing_wakeups_sent.sum(),
+            shared_nothing_wakeup_failures: self.shared_nothing_wakeup_failures.sum(),
+            shared_nothing_aggregates_accepted: self.shared_nothing_aggregates_accepted.sum(),
+            shared_nothing_aggregate_width_max: self.shared_nothing_aggregate_width_max.max(),
+            shared_nothing_txns_accepted: self.shared_nothing_txns_accepted.sum(),
+            shared_nothing_txn_prepare_messages: self.shared_nothing_txn_prepare_messages.sum(),
+            shared_nothing_txn_commit_messages: self.shared_nothing_txn_commit_messages.sum(),
+            shared_nothing_txn_abort_messages: self.shared_nothing_txn_abort_messages.sum(),
+            shared_nothing_txn_condition_aborts: self.shared_nothing_txn_condition_aborts.sum(),
+            shared_nothing_txn_conflict_aborts: self.shared_nothing_txn_conflict_aborts.sum(),
+            shared_nothing_prepared_key_waits: self.shared_nothing_prepared_key_waits.sum(),
+            shared_nothing_prepared_key_retries: self.shared_nothing_prepared_key_retries.sum(),
+            shared_nothing_prepared_key_wait_nanos_total: self
+                .shared_nothing_prepared_key_wait_nanos_total
+                .sum(),
+            shared_nothing_prepared_key_wait_nanos_max: self
+                .shared_nothing_prepared_key_wait_nanos_max
+                .max(),
             close_drain_nanos_total: {
                 #[cfg(feature = "profile-telemetry")]
                 {
@@ -1868,6 +2010,16 @@ impl ConcurrentKeyspace {
     ) {
         self.runtime_metrics
             .publish_overload_telemetry(reactor_id, telemetry);
+    }
+
+    #[inline(always)]
+    pub fn publish_reactor_shared_nothing_telemetry(
+        &self,
+        reactor_id: usize,
+        telemetry: RuntimeSharedNothingTelemetry,
+    ) {
+        self.runtime_metrics
+            .publish_shared_nothing_telemetry(reactor_id, telemetry);
     }
 
     #[inline(always)]

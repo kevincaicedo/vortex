@@ -1,0 +1,62 @@
+schema_version: 1
+name: shared-nothing-aof-off-server-compare
+description: >
+  SN-006D engineering gate. Compares Vortex shared-keyspace and shared-nothing
+  production server paths with AOF disabled, identical request shapes, and
+  explicit read-only multi-key width rows.
+databases:
+  - vortex-shared-keyspace
+  - vortex-shared-nothing
+commands:
+  - GET
+  - SET
+  - DEL
+  - EXISTS
+  - TTL
+  - PTTL
+  - TYPE
+backends:
+  - redis-benchmark
+  - custom-rust
+workloads:
+  - mget_width_1
+  - mget_width_16
+  - mget_width_64
+  - mget_width_256
+  - exists_width_1
+  - exists_width_16
+  - exists_width_64
+  - exists_width_256
+repeat: 1
+duration: 10s
+environment:
+  mode: native
+  port_base: 20679
+resource_config:
+  cpus: 8
+  memory: 2g
+  threads: 8
+  service_cpus: "0,2,4,6,8,10,12,14"
+  load_cpus: "1,3,5,7,9,11,13,15"
+runtime_config:
+  aof_enabled: false
+  shard_count: 4096
+  maxmemory: 1800mb
+  eviction_policy: noeviction
+  io_backend: uring
+  telemetry_mode: minimal
+  fixed_buffers: 1024
+  fixed_buffer_registration: auto
+settings:
+  redis-benchmark:
+    requests: 30000
+    clients: 100
+    pipeline: 1
+    keyspace_size: 50000
+  custom-rust:
+    profile: release
+    thread_sweep: [1, 2, 4, 8]
+    keyspace_size: 20000
+    ops_per_thread: 5000
+    warmup_ops: 500
+    value_size: 64

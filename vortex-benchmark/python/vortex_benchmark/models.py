@@ -4,8 +4,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-SUPPORTED_DATABASES = ("vortex", "redis", "dragonfly", "valkey")
-NATIVE_DATABASES = ("vortex", "redis")
+SUPPORTED_DATABASES = (
+    "vortex",
+    "vortex-shared-keyspace",
+    "vortex-shared-nothing",
+    "redis",
+    "dragonfly",
+    "valkey",
+)
+NATIVE_DATABASES = ("vortex", "vortex-shared-keyspace", "vortex-shared-nothing", "redis")
 CONTAINER_DATABASES = SUPPORTED_DATABASES
 DEFAULT_PORT_BASE = 16379
 DEFAULT_CPUS = 4

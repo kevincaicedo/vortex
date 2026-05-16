@@ -47,6 +47,7 @@ fn shutdown_timeout_forces_exit() {
         telemetry_mode: Default::default(),
         max_memory: 0,
         eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
+        engine_topology: Default::default(),
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -125,6 +126,7 @@ fn zero_timeout_triggers_force_kill() {
         telemetry_mode: Default::default(),
         max_memory: 0,
         eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
+        engine_topology: Default::default(),
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

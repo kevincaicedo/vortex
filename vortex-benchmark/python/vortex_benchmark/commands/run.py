@@ -15,6 +15,7 @@ from vortex_benchmark.telemetry import capture_host_metadata, capture_run_validi
 
 VORTEX_ONLY_RUNTIME_KEYS = {
     "io_backend",
+    "engine_topology",
     "telemetry_mode",
     "shard_count",
     "ring_size",

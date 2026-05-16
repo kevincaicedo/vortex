@@ -17,6 +17,7 @@ use vortex_engine::eviction::EvictionPolicy;
 use vortex_engine::keyspace::{
     ConcurrentKeyspace, DEFAULT_SHARD_COUNT, RuntimeTelemetryMode, ServerMemoryAttributionSnapshot,
 };
+use vortex_engine::owner::TopologyConfig;
 use vortex_memory::BufferPool;
 use vortex_persist::aof::AofManifest;
 use vortex_persist::aof::reader::AofReader;
@@ -27,6 +28,17 @@ use crate::reactor::{
     ReactorOverloadPolicy,
 };
 use crate::shutdown::ShutdownCoordinator;
+
+/// Engine execution topology selected for pool-managed reactors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineTopologyMode {
+    /// Current alpha topology: all reactors execute against a shared keyspace.
+    #[default]
+    SharedKeyspace,
+    /// Research topology: each reactor owns one keyspace partition and uses
+    /// bounded reactor-to-reactor message passing for remote keys.
+    SharedNothing,
+}
 
 /// I/O backend selection for pool-managed reactors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +99,8 @@ pub struct ReactorPoolConfig {
     pub max_memory: usize,
     /// Runtime eviction policy for the shared keyspace.
     pub eviction_policy: EvictionPolicy,
+    /// Engine execution topology.
+    pub engine_topology: EngineTopologyMode,
     /// I/O backend selection.
     pub io_backend: IoBackendMode,
     /// io_uring submission queue size.
@@ -116,6 +130,7 @@ impl Default for ReactorPoolConfig {
             shard_count: DEFAULT_SHARD_COUNT,
             max_memory: 0,
             eviction_policy: EvictionPolicy::NoEviction,
+            engine_topology: EngineTopologyMode::SharedKeyspace,
             io_backend: IoBackendMode::Auto,
             ring_size: 4096,
             sqpoll_idle_ms: 0,
@@ -195,6 +210,10 @@ fn reactor_resource_share(
     (reactor_connections, reactor_buffers)
 }
 
+fn shared_nothing_capacity_per_owner(max_connections: usize, owner_count: usize) -> usize {
+    share_evenly(max_connections, owner_count.max(1), 0).max(1024)
+}
+
 fn join_handles(handles: &mut [ReactorHandle]) {
     for handle in handles {
         if let Some(thread) = handle.thread.take() {
@@ -240,6 +259,14 @@ impl ReactorPool {
                 ),
             ));
         }
+        if config.engine_topology == EngineTopologyMode::SharedNothing
+            && config.aof_config.is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VORTEX_ENGINE_TOPOLOGY=shared-nothing rejects AOF until SN-010 per-owner AOF is implemented",
+            ));
+        }
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
         let aof_coordinator = Arc::new(AofCoordinator::new(num_reactors));
@@ -281,6 +308,38 @@ impl ReactorPool {
             eviction_policy = config.eviction_policy.as_str(),
             "shared ConcurrentKeyspace created"
         );
+
+        let shared_nothing = if config.engine_topology == EngineTopologyMode::SharedNothing {
+            let topology_config =
+                TopologyConfig::new(num_reactors, config.shard_count).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid shared-nothing topology: {error}"),
+                    )
+                })?;
+            let fabric = Arc::new(
+                crate::reactor::shared_nothing::SharedNothingServerFabric::<
+                    { crate::reactor::shared_nothing::SHARED_NOTHING_MAILBOX_RING_SLOTS },
+                >::new(topology_config)
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid shared-nothing mailbox fabric: {error:?}"),
+                    )
+                })?,
+            );
+            let capacity_per_owner =
+                shared_nothing_capacity_per_owner(config.max_connections, num_reactors);
+            tracing::warn!(
+                owners = num_reactors,
+                capsules = config.shard_count,
+                capacity_per_owner,
+                "shared-nothing research topology enabled; unsupported commands fail closed"
+            );
+            Some((fabric, capacity_per_owner))
+        } else {
+            None
+        };
 
         // ── AOF replay into shared keyspace ─────────────────────────
         // Collect all per-reactor AOF file paths, then replay via K-Way
@@ -343,6 +402,9 @@ impl ReactorPool {
             let coord_clone = Arc::clone(&coordinator);
             let ks_clone = Arc::clone(&keyspace);
             let aof_coordinator_clone = Arc::clone(&aof_coordinator);
+            let shared_nothing_clone = shared_nothing
+                .as_ref()
+                .map(|(fabric, capacity)| (Arc::clone(fabric), *capacity));
             let gate_clone = Arc::clone(&startup_gate);
             let startup_tx = startup_tx.clone();
 
@@ -399,6 +461,14 @@ impl ReactorPool {
                             return;
                         }
                     };
+
+                    if let Some((fabric, capacity_per_owner)) = shared_nothing_clone
+                        && let Err(e) = reactor.enable_shared_nothing(fabric, capacity_per_owner)
+                    {
+                        let _ = startup_tx.send((i, Err(e)));
+                        coord_clone.reactor_finished(i);
+                        return;
+                    }
 
                     if startup_tx.send((i, Ok(()))).is_err() {
                         coord_clone.reactor_finished(i);
@@ -630,5 +700,34 @@ mod tests {
 
         assert!(error.to_string().contains("failed to open AOF file"));
         assert!(error.to_string().contains("reactor pool startup failed"));
+    }
+
+    #[test]
+    fn shared_nothing_startup_rejects_aof_until_owner_aof_lands() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = match ReactorPool::spawn(ReactorPoolConfig {
+            bind_addr,
+            threads: 2,
+            max_connections: 2,
+            buffer_count: 2,
+            aof_config: Some(AofConfig {
+                path: std::env::temp_dir().join("vortex-sn-aof-rejected.aof"),
+                fsync_policy: vortex_persist::aof::AofFsyncPolicy::No,
+                max_pending_fsync_bytes:
+                    vortex_persist::aof::writer::DEFAULT_EVERYSEC_MAX_PENDING_BYTES,
+            }),
+            engine_topology: EngineTopologyMode::SharedNothing,
+            io_backend: IoBackendMode::Polling,
+            ..ReactorPoolConfig::default()
+        }) {
+            Ok(_) => panic!("shared-nothing AOF startup must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("SN-010 per-owner AOF"));
     }
 }

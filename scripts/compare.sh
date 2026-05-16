@@ -494,7 +494,7 @@ if [[ "$DOCKER_ALL" == true ]]; then
 else
     log_info "Starting VortexDB (native) on port $PORT..."
     VORTEX_LOG="$RESULTS_DIR/vortex.log"
-    "$PROJECT_ROOT/target/release/vortex-server" --threads "$DOCKER_CPUS" --bind "127.0.0.1:$PORT" >"$VORTEX_LOG" 2>&1 &
+    "$PROJECT_ROOT/target/release/vortex-server" --engine-topology shared-nothing --threads "$DOCKER_CPUS" --bind "127.0.0.1:$PORT" >"$VORTEX_LOG" 2>&1 &
     VORTEX_PID=$!
     kv_set "port_vortex" "$PORT"
     PORT=$((PORT + 1))

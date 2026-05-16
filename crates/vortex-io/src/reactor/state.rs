@@ -680,6 +680,8 @@ impl Reactor {
                 .collect(),
             command_router: CommandRouter::new(),
             command_executor: SharedKeyspaceExecutor::new(Arc::clone(&keyspace)),
+            shared_nothing: None,
+            shared_nothing_flush_ids: Vec::with_capacity(256),
             keyspace,
             cached_nanos,
             cached_unix_nanos,
@@ -699,5 +701,37 @@ impl Reactor {
             overload: ReactorOverloadState::with_capacity(max_conn),
             parse_entries: Vec::with_capacity(64),
         })
+    }
+
+    pub(crate) fn enable_shared_nothing(
+        &mut self,
+        fabric: Arc<SharedNothingServerFabric<SHARED_NOTHING_MAILBOX_RING_SLOTS>>,
+        capacity_per_owner: usize,
+    ) -> std::io::Result<()> {
+        let runtime = SharedNothingServerRuntime::new(
+            fabric,
+            self.id,
+            self.config.max_connections,
+            capacity_per_owner,
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid shared-nothing topology for reactor {}: {error}",
+                    self.id
+                ),
+            )
+        })?;
+        tracing::info!(
+            reactor_id = self.id,
+            owner = runtime.local_owner().get(),
+            "shared-nothing owner runtime enabled"
+        );
+        if let Some(waker) = self.backend.waker() {
+            runtime.register_waker(waker);
+        }
+        self.shared_nothing = Some(runtime);
+        Ok(())
     }
 }

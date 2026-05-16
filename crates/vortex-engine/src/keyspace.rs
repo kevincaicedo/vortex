@@ -76,7 +76,7 @@ use metrics::{EvictionMetrics, RuntimeMetrics};
 pub use metrics::{
     EvictionMetricsSnapshot, RuntimeAofTelemetry, RuntimeBackendMode, RuntimeBackendSnapshot,
     RuntimeLocalFlushMetrics, RuntimeMetricsSnapshot, RuntimeOverloadTelemetry,
-    RuntimeTelemetryMode,
+    RuntimeSharedNothingTelemetry, RuntimeTelemetryMode,
 };
 pub use persistence::{AofLsn, EntryLsn, Lsn, LsnOverflow, LsnRestoreError, ReplayModeGuard};
 use shards::{MultiReadGuards, MultiWriteGuards, Shard, ShardId, ShardReadGuards};
