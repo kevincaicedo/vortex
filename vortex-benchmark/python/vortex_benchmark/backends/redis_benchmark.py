@@ -15,6 +15,7 @@ from vortex_benchmark.backends.base import (
     DEFAULT_REDIS_PIPELINE,
     DEFAULT_REDIS_REQUESTS,
     apply_load_affinity,
+    coerce_int_list,
     coerce_positive_int,
     get_setting,
     quote_command,
@@ -94,6 +95,10 @@ RAW_ITEMS = {
     "UNLINK": RedisBenchmarkItem("UNLINK", "raw", command_args=("UNLINK", "bench:unlink:__rand_int__"), benchmark_args=("-r", "1000")),
 }
 
+SAME_KEY_COUNTERS = {
+    ("INCRBY", "bench:counter:incrby", "1"): "bench:counter:incrby",
+}
+
 
 def _redis_cli(service, args: list[str], *, input_text: Optional[str] = None) -> subprocess.CompletedProcess[str]:
     command = ["redis-cli", "-h", service.host, "-p", str(service.port), *args]
@@ -138,6 +143,43 @@ def _reset_and_seed(service, *, keyspace_size: int) -> None:
     )
 
     send_resp_pipeline(service.host, service.port, commands)
+
+
+def _read_integer_key(service, key: str) -> Optional[int]:
+    result = _redis_cli(service, ["GET", key])
+    raw = result.stdout.strip()
+    if not raw or raw == "(nil)":
+        return None
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise BackendError(f"expected integer value for {key}, got {raw!r}") from error
+
+
+def _counter_validation_for_item(
+    service,
+    item: RedisBenchmarkItem,
+    *,
+    requests: int,
+) -> Optional[dict[str, object]]:
+    key = SAME_KEY_COUNTERS.get(item.command_args)
+    if key is None:
+        return None
+
+    final_value = _read_integer_key(service, key)
+    expected = requests
+    matches = final_value == expected
+    return {
+        "kind": "same_key_integer_counter",
+        "key": key,
+        "status": "passed" if matches else "failed",
+        "expected_final_value": expected,
+        "final_value": final_value,
+        "final_value_matches": matches,
+        "notes": []
+        if matches
+        else ["final counter value does not match redis-benchmark request count"],
+    }
 
 
 def _resolve_items(commands: list[str]) -> tuple[list[RedisBenchmarkItem], list[str]]:
@@ -203,6 +245,16 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
         label="redis-benchmark.pipeline",
         default=DEFAULT_REDIS_PIPELINE,
     )
+    client_sweep = coerce_int_list(
+        get_setting(context.spec.settings, "redis-benchmark", "clients_sweep"),
+        label="redis-benchmark.clients_sweep",
+        default=(clients,),
+    )
+    pipeline_sweep = coerce_int_list(
+        get_setting(context.spec.settings, "redis-benchmark", "pipeline_sweep"),
+        label="redis-benchmark.pipeline_sweep",
+        default=(pipeline,),
+    )
     keyspace_size = coerce_positive_int(
         get_setting(context.spec.settings, "redis-benchmark", "keyspace_size"),
         label="redis-benchmark.keyspace_size",
@@ -235,74 +287,94 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
             + ", ".join(unsupported)
         )
 
+    validation_failed = False
     for item in items:
-        _reset_and_seed(context.service, keyspace_size=keyspace_size)
+        for current_clients in client_sweep:
+            for current_pipeline in pipeline_sweep:
+                _reset_and_seed(context.service, keyspace_size=keyspace_size)
 
-        slug = sanitize_identifier(item.label.lower())
-        stdout_path = backend_dir / f"{slug}.csv"
-        stderr_path = backend_dir / f"{slug}.stderr.log"
+                item_requests = requests
+                item_clients = current_clients
+                item_pipeline = current_pipeline
+                if item.slow:
+                    item_requests = min(requests, 10_000)
+                    item_clients = min(current_clients, 10)
+                    item_pipeline = 1
 
-        item_requests = requests
-        item_clients = clients
-        item_pipeline = pipeline
-        if item.slow:
-            item_requests = min(requests, 10_000)
-            item_clients = min(clients, 10)
-            item_pipeline = 1
+                slug = sanitize_identifier(
+                    f"{item.label.lower()}-c{item_clients}-p{item_pipeline}"
+                )
+                stdout_path = backend_dir / f"{slug}.csv"
+                stderr_path = backend_dir / f"{slug}.stderr.log"
 
-        command = [
-            "redis-benchmark",
-            "-h",
-            context.service.host,
-            "-p",
-            str(context.service.port),
-            "-n",
-            str(item_requests),
-            "-c",
-            str(item_clients),
-            "-P",
-            str(item_pipeline),
-            "--precision",
-            "3",
-            "--csv",
-            *item.benchmark_args,
-        ]
-        if item.mode == "builtin":
-            command.extend(["-t", item.builtin_test or item.label])
-        else:
-            command.extend(item.command_args)
-        command = apply_load_affinity(context, command)
+                command = [
+                    "redis-benchmark",
+                    "-h",
+                    context.service.host,
+                    "-p",
+                    str(context.service.port),
+                    "-n",
+                    str(item_requests),
+                    "-c",
+                    str(item_clients),
+                    "-P",
+                    str(item_pipeline),
+                    "--precision",
+                    "3",
+                    "--csv",
+                    *item.benchmark_args,
+                ]
+                if item.mode == "builtin":
+                    command.extend(["-t", item.builtin_test or item.label])
+                else:
+                    command.extend(item.command_args)
+                command = apply_load_affinity(context, command)
 
-        snapshot_before = capture_service_snapshot(context.service)
-        host_telemetry = None
-        telemetry = start_host_telemetry_capture(
-            backend_dir,
-            label=slug,
-            service=context.service,
-        )
-        try:
-            _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
-        finally:
-            host_telemetry = telemetry.stop()
-        snapshot_after = capture_service_snapshot(context.service)
-        metrics = _parse_csv_metrics(stdout_path, label=item.label)
-        result_items.append(
-            {
-                "label": item.label,
-                "mode": item.mode,
-                "command": quote_command(command),
-                "duration_seconds": round(elapsed, 6),
-                "stdout_path": str(stdout_path),
-                "stderr_path": str(stderr_path),
-                "metrics": metrics,
-                "observability": {
-                    "before": snapshot_before,
-                    "after": snapshot_after,
-                    "delta": diff_service_snapshots(snapshot_before, snapshot_after),
-                    "host_telemetry": host_telemetry,
-                },
-            }
-        )
+                snapshot_before = capture_service_snapshot(context.service)
+                host_telemetry = None
+                telemetry = start_host_telemetry_capture(
+                    backend_dir,
+                    label=slug,
+                    service=context.service,
+                )
+                try:
+                    _, elapsed = run_process(
+                        command,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                    )
+                finally:
+                    host_telemetry = telemetry.stop()
+                snapshot_after = capture_service_snapshot(context.service)
+                metrics = _parse_csv_metrics(stdout_path, label=item.label)
+                counter_validation = _counter_validation_for_item(
+                    context.service,
+                    item,
+                    requests=item_requests,
+                )
+                if counter_validation and counter_validation["status"] != "passed":
+                    validation_failed = True
+                result_items.append(
+                    {
+                        "label": item.label,
+                        "mode": item.mode,
+                        "clients": item_clients,
+                        "pipeline": item_pipeline,
+                        "requests": item_requests,
+                        "command": quote_command(command),
+                        "duration_seconds": round(elapsed, 6),
+                        "stdout_path": str(stdout_path),
+                        "stderr_path": str(stderr_path),
+                        "metrics": metrics,
+                        "counter_validation": counter_validation,
+                        "observability": {
+                            "before": snapshot_before,
+                            "after": snapshot_after,
+                            "delta": diff_service_snapshots(snapshot_before, snapshot_after),
+                            "host_telemetry": host_telemetry,
+                        },
+                    }
+                )
 
     completed_at = utc_now()
     result_path = context.layout.results_dir / f"{context.run_id}-{context.service.database}-redis-benchmark.json"
@@ -318,12 +390,18 @@ def run_redis_benchmark_backend(context: BackendRunContext) -> BackendExecutionR
             "requests": requests,
             "clients": clients,
             "pipeline": pipeline,
+            "clients_sweep": client_sweep,
+            "pipeline_sweep": pipeline_sweep,
             "keyspace_size": keyspace_size,
         },
         "items": result_items,
         "notes": notes,
     }
     write_json(result_path, summary)
+    if validation_failed:
+        raise BackendError(
+            f"redis-benchmark counter validation failed; inspect {result_path}"
+        )
 
     return BackendExecutionRecord(
         backend="redis-benchmark",

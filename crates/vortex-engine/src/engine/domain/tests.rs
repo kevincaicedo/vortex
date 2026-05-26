@@ -449,7 +449,7 @@ fn increment_by_revalidates_after_delete_and_fill() {
     let keyspace = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
     let key = fixed_key("incr", 0);
     let filler = fixed_key("incr", 1);
-    let old_value = VortexValue::from(0_i64);
+    let old_value = VortexValue::from_bytes(b"0");
 
     insert_raw(&keyspace, key.clone(), old_value.clone());
     configure_noeviction_at_current_usage(&keyspace);
@@ -471,6 +471,43 @@ fn increment_by_revalidates_after_delete_and_fill() {
     assert_oom(result);
     assert!(keyspace.get_value(&key, 0).is_none());
     assert!(keyspace.get_value(&filler, 0).is_some());
+}
+
+#[test]
+fn increment_by_existing_integer_preserves_watch_aof_and_ttl() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+    let key = fixed_key("incr-fast", 0);
+    let deadline = 10_000;
+    keyspace
+        .set_value_with_ttl(key.clone(), VortexValue::Integer(10), deadline, 0)
+        .expect("seed SETEX should succeed");
+    keyspace.enable_aof_recording();
+    let epoch = keyspace.current_watch_epoch();
+    let watched = keyspace.watch_key(key.clone());
+
+    let outcome = keyspace
+        .increment_by(key.clone(), 5, 0)
+        .expect("integer increment should succeed");
+
+    let aof_lsn = outcome
+        .aof_lsn
+        .map(|lsn| lsn.get())
+        .expect("AOF-enabled increment should allocate an LSN");
+    assert_eq!(outcome.value, 15);
+    assert_eq!(keyspace.get_value(&key, 0), Some(VortexValue::Integer(15)));
+    assert_eq!(entry_lsn(&keyspace, key.as_bytes()), Some(aof_lsn));
+    assert!(
+        keyspace.watched_keys_changed(epoch, std::slice::from_ref(&watched)),
+        "integer fast path should invalidate WATCH state"
+    );
+    assert_eq!(keyspace.total_expiry_keys(), 1);
+    assert_eq!(
+        keyspace.get_value(&key, deadline - 1),
+        Some(VortexValue::Integer(15))
+    );
+    assert_eq!(keyspace.get_value(&key, deadline), None);
+    keyspace.unwatch_keys(std::iter::once(watched));
+    keyspace.disable_aof_recording();
 }
 
 #[test]

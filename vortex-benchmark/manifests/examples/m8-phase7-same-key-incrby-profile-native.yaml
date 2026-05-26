@@ -1,0 +1,30 @@
+schema_version: 1
+name: m8-phase7-same-key-incrby-profile-native
+description: Native Vortex-only same-key INCRBY profiler bridge workload for M8 Phase 7 engine/keyspace isolation.
+databases:
+  - vortex
+backends:
+  - redis-benchmark
+commands:
+  - INCRBY
+duration: 10s
+repeat: 1
+environment:
+  mode: native
+  port_base: 19179
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  io_backend: polling
+  telemetry_mode: minimal
+settings:
+  redis-benchmark:
+    requests: 20000000
+    clients: 32
+    pipeline: 16
+    keyspace_size: 1000

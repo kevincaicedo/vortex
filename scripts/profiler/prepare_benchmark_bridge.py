@@ -14,6 +14,7 @@ if str(VORTEX_BENCHMARK_PYTHON) not in sys.path:
     sys.path.insert(0, str(VORTEX_BENCHMARK_PYTHON))
 
 from vortex_benchmark.manifests.loader import load_manifest  # noqa: E402
+from vortex_benchmark.db.base import parse_size_literal_to_bytes  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +46,15 @@ def parse_duration_seconds(raw: str | None) -> int | None:
 def shell_assign(name: str, value: str | None) -> str:
     safe = "" if value is None else value
     return f"{name}={shlex.quote(safe)}"
+
+
+def maxmemory_for_server(runtime_config: dict[str, object]) -> str:
+    raw = runtime_config.get("maxmemory")
+    if raw is None:
+        raw = runtime_config.get("maxmemory_bytes")
+    if raw is None:
+        return ""
+    return str(parse_size_literal_to_bytes(str(raw), label="runtime_config.maxmemory"))
 
 
 def manifest_description(path: Path) -> tuple[str, str | None, str | None, dict[str, object], dict[str, object]]:
@@ -112,11 +122,13 @@ def main() -> int:
     print(shell_assign("BENCH_RESOURCE_THREADS", str(resource_config.get("threads", ""))))
     print(shell_assign("BENCH_RUNTIME_AOF_ENABLED", "" if "aof_enabled" not in runtime_config else str(runtime_config.get("aof_enabled")).lower()))
     print(shell_assign("BENCH_RUNTIME_MAXMEMORY", str(runtime_config.get("maxmemory", ""))))
+    print(shell_assign("BENCH_SERVER_MAXMEMORY", maxmemory_for_server(runtime_config)))
     print(shell_assign("BENCH_RUNTIME_EVICTION_POLICY", str(runtime_config.get("eviction_policy", ""))))
     print(shell_assign("BENCH_RUNTIME_IO_BACKEND", str(runtime_config.get("io_backend", ""))))
     print(shell_assign("BENCH_RUNTIME_RING_SIZE", str(runtime_config.get("ring_size", ""))))
     print(shell_assign("BENCH_RUNTIME_FIXED_BUFFERS", str(runtime_config.get("fixed_buffers", ""))))
     print(shell_assign("BENCH_RUNTIME_SQPOLL_IDLE_MS", str(runtime_config.get("sqpoll_idle_ms", ""))))
+    print(shell_assign("BENCH_RUNTIME_TELEMETRY_MODE", str(runtime_config.get("telemetry_mode", ""))))
     return 0
 
 

@@ -107,6 +107,13 @@ Common combinations:
 - Eviction scenario: `--maxmemory 64mb --eviction-policy allkeys-lru`
 - Repeat-aware scenario: `--repeat 3` or manifest `repeat: 3`
 
+The `custom-rust` backend also supports `pipeline_depth` and
+`pipeline_depth_sweep` for pure `hot_counter` rows. This is an isolation knob
+for benchmark-client shape, not a general workload feature. Mixed counter rows
+with GET, SET/DEL barriers, TTL, WATCH, transactions, or multi-key commands
+should stay one-request-at-a-time until response-aware pipelining is explicitly
+implemented and tested.
+
 Key rule: when comparing databases, keep command/workload, thread count, duration, runtime policy, and environment mode identical. If you aggregate summaries that violate that rule, the report marks those scenario groups invalid instead of pretending the comparison is fair.
 
 Native runs must start on free ports. Vortex uses `SO_REUSEPORT` for per-reactor listeners, so an old Vortex process can otherwise share the same benchmark port and corrupt both traffic distribution and `INFO runtime` before/after deltas. The native harness now fails setup when the requested host/port is already bound; stop the stale listener or choose a different `port_base` instead of accepting a run with negative monotonic telemetry deltas.
@@ -272,6 +279,14 @@ just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/l
 ```
 
 This uses `vortex_bench attach` and writes benchmark-side artifacts under the profiler session `bench/` subtree.
+
+The profiler benchmark bridge resolves the same Python virtualenv locations as
+`vortex_bench`, so manifest parsing uses the benchmark toolchain dependencies
+instead of the system Python by accident. For benchmark manifests with size
+literals such as `maxmemory: 1800mb`, the bridge starts `vortex-server` with the
+byte-normalized value and records the original manifest literal in the attached
+benchmark state. It also forwards manifest `telemetry_mode` into the attach
+state. This keeps runtime validation fair while still satisfying the server CLI.
 
 ### BPF Escalation And Session Diffs
 

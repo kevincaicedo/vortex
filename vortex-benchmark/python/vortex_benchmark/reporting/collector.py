@@ -178,10 +178,16 @@ def _workload_contract_fields(
         or settings.get("value_size_bytes")
         or settings.get("data_size")
     )
+    pipeline = (
+        item.get("pipeline")
+        or item.get("pipeline_depth")
+        or settings.get("pipeline")
+        or settings.get("pipeline_depth")
+    )
     return {
-        "workload_request_count": settings.get("requests"),
-        "workload_client_count": settings.get("clients"),
-        "workload_pipeline": settings.get("pipeline"),
+        "workload_request_count": item.get("requests") or settings.get("requests"),
+        "workload_client_count": item.get("clients") or settings.get("clients"),
+        "workload_pipeline": pipeline,
         "workload_key_count": settings.get("keyspace_size"),
         "workload_value_size": value_size,
         "workload_rate_limit": settings.get("rate_limiting"),
@@ -189,6 +195,7 @@ def _workload_contract_fields(
         "workload_ops_per_thread": settings.get("ops_per_thread"),
         "workload_warmup_ops": settings.get("warmup_ops"),
         "workload_duration_seconds": request.get("duration"),
+        "workload_latency_sample_unit": item.get("latency_sample_unit"),
         "load_threads": _coerce_int(item.get("thread_count")),
     }
 
@@ -691,6 +698,7 @@ def _normalize_redis_rows(
     for index, item in enumerate(result.get("items", [])):
         record_item = record_items[index] if index < len(record_items) else {}
         metrics = item.get("metrics") or {}
+        counter_validation = item.get("counter_validation") or {}
         rows.append(
             {
                 "run_id": (_replicate_fields(record, record_item).get("replicate_run_id") or summary.get("run_id")),
@@ -712,6 +720,11 @@ def _normalize_redis_rows(
                 "p99_9_latency_ms": _coerce_float(metrics.get("p99_9_latency_ms")),
                 "p99_99_latency_ms": _coerce_float(metrics.get("p99_99_latency_ms")),
                 "p99_999_latency_ms": _coerce_float(metrics.get("p99_999_latency_ms")),
+                "counter_kind": counter_validation.get("kind"),
+                "counter_validation_status": counter_validation.get("status"),
+                "counter_expected_final_value": _coerce_int(counter_validation.get("expected_final_value")),
+                "counter_final_value": _coerce_int(counter_validation.get("final_value")),
+                "counter_final_value_matches": counter_validation.get("final_value_matches"),
                 "workload_details": None,
                 "host_os": (request.get("host_metadata") or {}).get("os"),
                 "host_architecture": (request.get("host_metadata") or {}).get("architecture"),
@@ -803,6 +816,10 @@ def _normalize_custom_rows(
     for index, item in enumerate(result.get("items", [])):
         record_item = record_items[index] if index < len(record_items) else {}
         metrics = item.get("metrics") or {}
+        counter = item.get("counter") or {}
+        counter_validation = counter.get("validation") or {}
+        counter_measured = counter.get("measured") or {}
+        counter_total = counter.get("total") or {}
         workload = item.get("workload")
         rows.append(
             {
@@ -825,6 +842,18 @@ def _normalize_custom_rows(
                 "p99_9_latency_ms": _coerce_float(metrics.get("p99_9_ns")) / 1_000_000.0 if metrics.get("p99_9_ns") is not None else None,
                 "p99_99_latency_ms": None,
                 "p99_999_latency_ms": _coerce_float(metrics.get("p99_999_ns")) / 1_000_000.0 if metrics.get("p99_999_ns") is not None else None,
+                "counter_kind": counter.get("kind"),
+                "counter_validation_status": counter_validation.get("status"),
+                "counter_expected_final_value": _coerce_int(counter_validation.get("expected_final_value")),
+                "counter_final_value": _coerce_int(counter_validation.get("final_value")),
+                "counter_final_value_matches": counter_validation.get("final_value_matches"),
+                "counter_ttl_seconds": _coerce_int(counter_validation.get("ttl_seconds")),
+                "counter_ttl_live": counter_validation.get("ttl_live"),
+                "counter_measured_applied_increments": _coerce_int(counter_measured.get("applied_increments")),
+                "counter_total_applied_increments": _coerce_int(counter_total.get("applied_increments")),
+                "counter_transaction_commits": _coerce_int(counter_total.get("transaction_commits")),
+                "counter_transaction_aborts": _coerce_int(counter_total.get("transaction_aborts")),
+                "counter_barrier_ops": _coerce_int(counter_total.get("barrier_ops")),
                 "workload_details": definitions.get(workload),
                 "host_os": (request.get("host_metadata") or {}).get("os"),
                 "host_architecture": (request.get("host_metadata") or {}).get("architecture"),

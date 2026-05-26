@@ -292,10 +292,10 @@ def _section_workloads(
     )
     for wk in workloads:
         lines.append(
-            f"| {wk.get('name') or 'n/a'} "
-            f"| {wk.get('distribution') or 'n/a'} "
-            f"| {wk.get('read_ratio') or 'n/a'} "
-            f"| {wk.get('write_ratio') or 'n/a'} "
+            f"| {_md_cell(wk.get('name'))} "
+            f"| {_md_cell(wk.get('distribution'))} "
+            f"| {_md_cell(wk.get('read_ratio'))} "
+            f"| {_md_cell(wk.get('write_ratio'))} "
             f"| {wk.get('multi_key')!s} "
             f"| {wk.get('transactional')!s} "
             f"| {wk.get('hot_key')!s} |"
@@ -1300,6 +1300,35 @@ def _section_detailed_results(
             "| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
         )
     lines.append("")
+
+    counter_rows = [row for row in rows if row.get("counter_validation_status")]
+    if counter_rows:
+        lines.append("### Counter Correctness")
+        lines.append("")
+        lines.append(
+            "| Database | Backend | Series | Threads | Status | Expected | Final | Match | TTL s | TTL Live | Measured Incr | Tx Commits | Tx Aborts | Barriers |"
+        )
+        lines.append(
+            "|----------|---------|--------|--------:|--------|---------:|------:|-------|------:|----------|--------------:|-----------:|----------:|---------:|"
+        )
+        for row in counter_rows:
+            lines.append(
+                f"| {_md_cell(row.get('database'))} "
+                f"| {_md_cell(row.get('backend'))} "
+                f"| {_md_cell(row.get('series_label'))} "
+                f"| {_md_cell(row.get('thread_count'))} "
+                f"| {_md_cell(row.get('counter_validation_status'))} "
+                f"| {_md_cell(row.get('counter_expected_final_value'))} "
+                f"| {_md_cell(row.get('counter_final_value'))} "
+                f"| {_md_cell(row.get('counter_final_value_matches'))} "
+                f"| {_md_cell(row.get('counter_ttl_seconds'))} "
+                f"| {_md_cell(row.get('counter_ttl_live'))} "
+                f"| {_md_cell(row.get('counter_measured_applied_increments'))} "
+                f"| {_md_cell(row.get('counter_transaction_commits'))} "
+                f"| {_md_cell(row.get('counter_transaction_aborts'))} "
+                f"| {_md_cell(row.get('counter_barrier_ops'))} |"
+            )
+        lines.append("")
 
     lines.append("### Cache And Keyspace")
     lines.append("")

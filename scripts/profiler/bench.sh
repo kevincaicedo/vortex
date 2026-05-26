@@ -15,11 +15,13 @@ BENCH_EFFECTIVE_DURATION_SECONDS=""
 BENCH_RESOURCE_THREADS=""
 BENCH_RUNTIME_AOF_ENABLED=""
 BENCH_RUNTIME_MAXMEMORY=""
+BENCH_SERVER_MAXMEMORY=""
 BENCH_RUNTIME_EVICTION_POLICY=""
 BENCH_RUNTIME_IO_BACKEND=""
 BENCH_RUNTIME_RING_SIZE=""
 BENCH_RUNTIME_FIXED_BUFFERS=""
 BENCH_RUNTIME_SQPOLL_IDLE_MS=""
+BENCH_RUNTIME_TELEMETRY_MODE=""
 BENCH_OUTPUT_DIR=""
 BENCH_STATE_FILE=""
 
@@ -31,8 +33,21 @@ benchmark_wrapper_path() {
     printf '%s' "${REPO_ROOT}/vortex-benchmark/bin/vortex_bench"
 }
 
+benchmark_python_path() {
+    if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+        printf '%s' "${REPO_ROOT}/.venv/bin/python"
+    elif [[ -x "${REPO_ROOT}/vortex-benchmark/python/.venv/bin/python" ]]; then
+        printf '%s' "${REPO_ROOT}/vortex-benchmark/python/.venv/bin/python"
+    elif [[ -x "${REPO_ROOT}/../.venv/bin/python" ]]; then
+        printf '%s' "${REPO_ROOT}/../.venv/bin/python"
+    else
+        printf '%s' "python3"
+    fi
+}
+
 resolve_benchmark_bridge() {
     local session_dir="$1"
+    local python_bin=""
 
     benchmark_bridge_enabled || return 0
 
@@ -47,6 +62,7 @@ resolve_benchmark_bridge() {
         fatal "vortex_bench wrapper not found at $(benchmark_wrapper_path)"
     fi
 
+    python_bin="$(benchmark_python_path)"
     local args=(--output-dir "$BENCH_OUTPUT_DIR")
     if [[ -n "$BENCH_MANIFEST" ]]; then
         args+=(--manifest "$BENCH_MANIFEST")
@@ -55,7 +71,7 @@ resolve_benchmark_bridge() {
         args+=(--request "$BENCH_REQUEST")
     fi
 
-    eval "$(python3 "${PROFILER_SCRIPT_DIR}/prepare_benchmark_bridge.py" "${args[@]}")"
+    eval "$("$python_bin" "${PROFILER_SCRIPT_DIR}/prepare_benchmark_bridge.py" "${args[@]}")"
 
     if [[ "$AOF_SET_BY_CLI" != "true" && -n "$BENCH_RUNTIME_AOF_ENABLED" ]]; then
         if [[ "$BENCH_RUNTIME_AOF_ENABLED" == "true" ]]; then
@@ -64,7 +80,7 @@ resolve_benchmark_bridge() {
             AOF=false
         fi
     fi
-    [[ -z "$MAXMEMORY" && -n "$BENCH_RUNTIME_MAXMEMORY" ]] && MAXMEMORY="$BENCH_RUNTIME_MAXMEMORY"
+    [[ -z "$MAXMEMORY" && -n "$BENCH_SERVER_MAXMEMORY" ]] && MAXMEMORY="$BENCH_SERVER_MAXMEMORY"
     [[ -z "$EVICTION" && -n "$BENCH_RUNTIME_EVICTION_POLICY" ]] && EVICTION="$BENCH_RUNTIME_EVICTION_POLICY"
     [[ -z "$IO_BACKEND" && -n "$BENCH_RUNTIME_IO_BACKEND" ]] && IO_BACKEND="$BENCH_RUNTIME_IO_BACKEND"
     [[ -z "$RING_SIZE" && -n "$BENCH_RUNTIME_RING_SIZE" ]] && RING_SIZE="$BENCH_RUNTIME_RING_SIZE"
@@ -95,6 +111,7 @@ benchmark_workload_description_text() {
 generate_benchmark_load() {
     local host="$1" port="$2" duration="$3" logfile="$4"
     local pid=""
+    local attach_maxmemory=""
     local attach_cmd=()
     local run_cmd=()
 
@@ -128,13 +145,15 @@ generate_benchmark_load() {
     else
         attach_cmd+=(--aof-disabled)
     fi
+    attach_maxmemory="${BENCH_RUNTIME_MAXMEMORY:-$MAXMEMORY}"
     [[ -n "$THREADS" ]] && attach_cmd+=(--threads "$THREADS")
-    [[ -n "$MAXMEMORY" ]] && attach_cmd+=(--maxmemory "$MAXMEMORY")
+    [[ -n "$attach_maxmemory" ]] && attach_cmd+=(--maxmemory "$attach_maxmemory")
     [[ -n "$EVICTION" ]] && attach_cmd+=(--eviction-policy "$EVICTION")
     [[ -n "$IO_BACKEND" ]] && attach_cmd+=(--io-backend "$IO_BACKEND")
     [[ -n "$RING_SIZE" ]] && attach_cmd+=(--ring-size "$RING_SIZE")
     [[ -n "$FIXED_BUFFERS" ]] && attach_cmd+=(--fixed-buffers "$FIXED_BUFFERS")
     [[ -n "$SQPOLL_IDLE_MS" ]] && attach_cmd+=(--sqpoll-idle-ms "$SQPOLL_IDLE_MS")
+    [[ -n "$BENCH_RUNTIME_TELEMETRY_MODE" ]] && attach_cmd+=(--telemetry-mode "$BENCH_RUNTIME_TELEMETRY_MODE")
 
     info "Attaching profiler session to vortex_bench artifact root"
     "${attach_cmd[@]}" >"${BENCH_OUTPUT_DIR}/attach.log" 2>&1 \

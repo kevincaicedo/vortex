@@ -5,7 +5,9 @@ import sys
 from typing import Optional
 
 from vortex_benchmark.commands import (
+    CounterReplayCheckError,
     execute_attach,
+    execute_counter_replay_check,
     execute_report,
     execute_run,
     execute_setup,
@@ -242,6 +244,51 @@ def add_attach_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_counter_replay_check_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--artifact-root",
+        required=True,
+        help="Completed benchmark artifact root that contains environments/, backend-runs/, and runtime/.",
+    )
+    parser.add_argument(
+        "--workload",
+        default="hot_counter",
+        help="Counter workload to verify. Defaults to hot_counter.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        help="Specific load-thread row to verify. Defaults to the highest available thread row.",
+    )
+    parser.add_argument(
+        "--key",
+        default="bench:counter:0",
+        help="Counter key to read after replay. Defaults to bench:counter:0.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=19680,
+        help="Temporary localhost port for the replay server. Defaults to 19680.",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Time to wait for replay startup before failing. Defaults to 30 seconds.",
+    )
+    parser.add_argument(
+        "--threads-for-replay",
+        type=int,
+        default=4,
+        help="Vortex service threads used for replay. Defaults to 4.",
+    )
+    parser.add_argument(
+        "--vortex-binary",
+        help="Optional vortex-server binary override. Defaults to the binary recorded in the environment state.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vortex_bench",
@@ -298,6 +345,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_report_arguments(report_parser)
 
+    counter_replay_parser = subparsers.add_parser(
+        "counter-replay-check",
+        help="Replay a completed Vortex AOF artifact and verify the final counter value.",
+    )
+    add_counter_replay_check_arguments(counter_replay_parser)
+
     return parser
 
 
@@ -320,6 +373,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if args.subcommand == "report":
         execute_report(args)
+        return 0
+
+    if args.subcommand == "counter-replay-check":
+        execute_counter_replay_check(args)
         return 0
 
     if args.setup and args.teardown:
@@ -352,7 +409,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         return dispatch(args)
-    except (SetupError, ValueError, RuntimeError) as error:
+    except (SetupError, CounterReplayCheckError, ValueError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

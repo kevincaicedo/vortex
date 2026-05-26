@@ -751,6 +751,11 @@ impl ConcurrentKeyspace {
         let key_bytes = key.as_bytes();
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
+        if let Some(outcome) =
+            self.increment_existing_integer_by(&key, delta, now_nanos, shard_index, table_hash)?
+        {
+            return Ok(outcome);
+        }
         let eviction = self.eviction_config();
         let read_guard = self.read_shard_by_index(shard_index);
         let projected_delta = projected_increment_delta(&read_guard, &key, delta, now_nanos)?;
@@ -787,6 +792,51 @@ impl ConcurrentKeyspace {
         self.publish_deferred_effects(effects);
         reservation.settle();
         Ok(mutation_outcome_with_evictions(result, aof_lsn, evicted))
+    }
+
+    fn increment_existing_integer_by(
+        &self,
+        key: &VortexKey,
+        delta: i64,
+        now_nanos: u64,
+        shard_index: usize,
+        table_hash: TableHash,
+    ) -> Result<Option<MutationOutcome<i64>>, MutationError> {
+        if !self.optimistic_value_mutations_enabled() {
+            return Ok(None);
+        }
+
+        let mut guard = self.write_shard_by_index(shard_index);
+        let live = match guard.slot_cursor_prehashed(key.as_bytes(), table_hash, now_nanos) {
+            SlotCursor::Live(live) => live,
+            SlotCursor::Expired(_) | SlotCursor::Vacant(_) => return Ok(None),
+        };
+        let current = match live.value() {
+            VortexValue::Integer(number) => *number,
+            _ => return Ok(None),
+        };
+        let result = current
+            .checked_add(delta)
+            .ok_or(MutationErrorKind::Overflow)?;
+        let publish_features = self.mutation_features();
+        let watched_key = publish_features.watch().then(|| key.clone());
+        let (entry_lsn, aof_lsn) =
+            self.allocate_observed_mutation_lsn_with_features(publish_features);
+        let report = live.replace_value(
+            VortexValue::Integer(result),
+            MutationPolicy::preserve_ttl(entry_lsn),
+        );
+        let effects = MutationEffects::none()
+            .with_ttl(
+                shard_index,
+                ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl()),
+            )
+            .with_frequency(table_hash)
+            .with_optional_watch_key(watched_key.as_ref())
+            .defer();
+        drop(guard);
+        self.publish_deferred_effects(effects);
+        Ok(Some(MutationOutcome::new(result, aof_lsn)))
     }
 
     #[inline]

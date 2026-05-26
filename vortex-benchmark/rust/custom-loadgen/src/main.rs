@@ -38,6 +38,8 @@ struct Cli {
     warmup_ops: u64,
     #[arg(long, default_value_t = 64)]
     value_size: usize,
+    #[arg(long, default_value_t = 1)]
+    pipeline_depth: usize,
     #[arg(long)]
     duration_ms: Option<u64>,
     #[arg(long)]
@@ -52,6 +54,7 @@ struct WorkloadSpec {
     multi_key: bool,
     transactional: bool,
     hot_key: bool,
+    counter: Option<CounterKind>,
     pressure: Option<PressureKind>,
 }
 
@@ -71,6 +74,27 @@ impl WorkloadSpec {
             multi_key,
             transactional,
             hot_key,
+            counter: None,
+            pressure: None,
+        }
+    }
+
+    fn counter(
+        canonical_name: &'static str,
+        read_weight: u32,
+        write_weight: u32,
+        multi_key: bool,
+        transactional: bool,
+        counter: CounterKind,
+    ) -> Self {
+        Self {
+            canonical_name,
+            read_weight,
+            write_weight,
+            multi_key,
+            transactional,
+            hot_key: true,
+            counter: Some(counter),
             pressure: None,
         }
     }
@@ -83,8 +107,49 @@ impl WorkloadSpec {
             multi_key: false,
             transactional: false,
             hot_key: false,
+            counter: None,
             pressure: Some(pressure),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterKind {
+    Hot,
+    HotWithGet,
+    HotWithSetDel,
+    HotTtl,
+    HotTransaction,
+    HotWatchTransaction,
+    HotMultiKey,
+}
+
+impl CounterKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            CounterKind::Hot => "hot_counter",
+            CounterKind::HotWithGet => "hot_counter_with_get",
+            CounterKind::HotWithSetDel => "hot_counter_with_set_del",
+            CounterKind::HotTtl => "hot_counter_ttl",
+            CounterKind::HotTransaction => "hot_counter_transaction",
+            CounterKind::HotWatchTransaction => "hot_counter_watch_transaction",
+            CounterKind::HotMultiKey => "hot_counter_multikey",
+        }
+    }
+
+    fn validates_final_value(self) -> bool {
+        matches!(
+            self,
+            CounterKind::Hot
+                | CounterKind::HotWithGet
+                | CounterKind::HotTtl
+                | CounterKind::HotTransaction
+                | CounterKind::HotWatchTransaction
+        )
+    }
+
+    fn validates_live_ttl(self) -> bool {
+        matches!(self, CounterKind::HotTtl)
     }
 }
 
@@ -126,6 +191,8 @@ struct BenchmarkResult {
     ops_per_thread: u64,
     warmup_ops: u64,
     value_size: usize,
+    pipeline_depth: usize,
+    latency_sample_unit: &'static str,
     total_ops: u64,
     total_duration_ns: u64,
     aggregate_throughput_ops_sec: f64,
@@ -137,17 +204,76 @@ struct BenchmarkResult {
     max_ns: u64,
     mean_ns: f64,
     thread_results: Vec<ThreadResult>,
+    counter: Option<CounterBenchmarkStats>,
 }
 
 struct ThreadOutcome {
     result: ThreadResult,
     latencies_ns: Vec<u64>,
+    counter_warmup: CounterOperationStats,
+    counter_measured: CounterOperationStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct CounterOperationStats {
+    incrby_ops: u64,
+    get_ops: u64,
+    set_ops: u64,
+    del_ops: u64,
+    ttl_ops: u64,
+    mget_ops: u64,
+    mset_ops: u64,
+    transaction_attempts: u64,
+    transaction_commits: u64,
+    transaction_aborts: u64,
+    applied_increments: u64,
+    barrier_ops: u64,
+}
+
+impl CounterOperationStats {
+    fn add_assign(&mut self, other: &Self) {
+        self.incrby_ops += other.incrby_ops;
+        self.get_ops += other.get_ops;
+        self.set_ops += other.set_ops;
+        self.del_ops += other.del_ops;
+        self.ttl_ops += other.ttl_ops;
+        self.mget_ops += other.mget_ops;
+        self.mset_ops += other.mset_ops;
+        self.transaction_attempts += other.transaction_attempts;
+        self.transaction_commits += other.transaction_commits;
+        self.transaction_aborts += other.transaction_aborts;
+        self.applied_increments += other.applied_increments;
+        self.barrier_ops += other.barrier_ops;
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CounterBenchmarkStats {
+    kind: &'static str,
+    warmup: CounterOperationStats,
+    measured: CounterOperationStats,
+    total: CounterOperationStats,
+    validation: CounterValidation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CounterValidation {
+    status: &'static str,
+    expected_final_value: Option<i64>,
+    final_value: Option<i64>,
+    final_value_matches: Option<bool>,
+    ttl_seconds: Option<i64>,
+    ttl_live: Option<bool>,
+    notes: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     if cli.threads.is_empty() {
         return Err("at least one thread count is required".into());
+    }
+    if cli.pipeline_depth == 0 {
+        return Err("pipeline depth must be positive".into());
     }
 
     std::fs::create_dir_all(&cli.output_dir)?;
@@ -166,8 +292,11 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
     if spec.pressure.is_some() {
         return run_pressure_workload(cli, spec, num_threads);
     }
+    if cli.pipeline_depth > 1 && spec.counter != Some(CounterKind::Hot) {
+        return Err("pipeline depth greater than 1 is only supported for hot_counter".into());
+    }
 
-    flush_and_preload(&cli.host, cli.port, cli.num_keys, cli.value_size)?;
+    prepare_workload(&cli.host, cli.port, spec, cli.num_keys, cli.value_size)?;
 
     let barrier = Arc::new(Barrier::new(num_threads));
     let mut handles = Vec::with_capacity(num_threads);
@@ -179,6 +308,7 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
         let ops_per_thread = cli.ops_per_thread;
         let warmup_ops = cli.warmup_ops;
         let num_keys = cli.num_keys;
+        let pipeline_depth = cli.pipeline_depth;
         handles.push(thread::spawn(move || {
             run_thread(
                 &host,
@@ -188,6 +318,7 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
                 value_size,
                 ops_per_thread,
                 warmup_ops,
+                pipeline_depth,
                 thread_id,
                 barrier,
             )
@@ -196,11 +327,15 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
 
     let mut thread_results = Vec::with_capacity(num_threads);
     let mut all_latencies = Vec::new();
+    let mut counter_warmup = CounterOperationStats::default();
+    let mut counter_measured = CounterOperationStats::default();
     for handle in handles {
         let outcome = handle
             .join()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "benchmark worker panicked"))??;
         all_latencies.extend_from_slice(&outcome.latencies_ns);
+        counter_warmup.add_assign(&outcome.counter_warmup);
+        counter_measured.add_assign(&outcome.counter_measured);
         thread_results.push(outcome.result);
     }
 
@@ -220,6 +355,17 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
         total_ops as f64 / (total_duration_ns as f64 / 1_000_000_000.0)
     };
     let mean_ns = mean_latency(&all_latencies);
+    let counter = build_counter_benchmark_stats(
+        &cli.host,
+        cli.port,
+        spec.counter,
+        counter_warmup,
+        counter_measured,
+    )?;
+    let counter_failed = counter
+        .as_ref()
+        .is_some_and(|stats| stats.validation.status == "failed");
+
     let result = BenchmarkResult {
         server: cli.server.clone(),
         workload: spec.canonical_name.to_string(),
@@ -230,6 +376,12 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
         ops_per_thread: cli.ops_per_thread,
         warmup_ops: cli.warmup_ops,
         value_size: cli.value_size,
+        pipeline_depth: cli.pipeline_depth,
+        latency_sample_unit: if cli.pipeline_depth > 1 {
+            "pipeline_batch_assigned_to_each_operation"
+        } else {
+            "operation"
+        },
         total_ops,
         total_duration_ns,
         aggregate_throughput_ops_sec,
@@ -241,15 +393,24 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
         max_ns: all_latencies.last().copied().unwrap_or(0),
         mean_ns,
         thread_results,
+        counter,
     };
 
     let output_path = cli.output_dir.join(format!(
-        "{}-{}-{}t.json",
+        "{}-{}-{}t-p{}.json",
         sanitize_identifier(&cli.server),
         sanitize_identifier(spec.canonical_name),
-        num_threads
+        num_threads,
+        cli.pipeline_depth
     ));
     std::fs::write(output_path, serde_json::to_string_pretty(&result)?)?;
+    if counter_failed {
+        return Err(format!(
+            "counter correctness validation failed for {} with {} thread(s)",
+            spec.canonical_name, num_threads
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -345,6 +506,8 @@ fn run_pressure_workload(
         ops_per_thread: cli.ops_per_thread,
         warmup_ops: cli.warmup_ops,
         value_size: cli.value_size,
+        pipeline_depth: 1,
+        latency_sample_unit: "operation",
         total_ops,
         total_duration_ns,
         aggregate_throughput_ops_sec,
@@ -356,6 +519,7 @@ fn run_pressure_workload(
         max_ns: all_latencies.last().copied().unwrap_or(0),
         mean_ns,
         thread_results,
+        counter: None,
     };
 
     let output_path = cli.output_dir.join(format!(
@@ -405,6 +569,8 @@ fn run_pressure_latency_thread(
     Ok(ThreadOutcome {
         result: metrics,
         latencies_ns,
+        counter_warmup: CounterOperationStats::default(),
+        counter_measured: CounterOperationStats::default(),
     })
 }
 
@@ -609,6 +775,7 @@ fn run_thread(
     value_size: usize,
     ops_per_thread: u64,
     warmup_ops: u64,
+    pipeline_depth: usize,
     thread_id: usize,
     barrier: Arc<Barrier>,
 ) -> io::Result<ThreadOutcome> {
@@ -617,9 +784,31 @@ fn run_thread(
     let mut reader = BufReader::new(writer.try_clone()?);
     let value = "x".repeat(value_size);
     let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(thread_id as u64 * 104_729));
+    let mut counter_warmup = CounterOperationStats::default();
+    let mut counter_measured = CounterOperationStats::default();
+
+    if spec.counter == Some(CounterKind::Hot) && pipeline_depth > 1 {
+        return run_pipelined_hot_counter_thread(
+            writer,
+            reader,
+            ops_per_thread,
+            warmup_ops,
+            pipeline_depth,
+            thread_id,
+            barrier,
+        );
+    }
 
     for _ in 0..warmup_ops {
-        execute_operation(&mut writer, &mut reader, spec, &value, num_keys, &mut rng)?;
+        execute_operation(
+            &mut writer,
+            &mut reader,
+            spec,
+            &value,
+            num_keys,
+            &mut rng,
+            Some(&mut counter_warmup),
+        )?;
     }
 
     barrier.wait();
@@ -627,7 +816,15 @@ fn run_thread(
     let mut latencies_ns = Vec::with_capacity(ops_per_thread as usize);
     for _ in 0..ops_per_thread {
         let op_start = Instant::now();
-        execute_operation(&mut writer, &mut reader, spec, &value, num_keys, &mut rng)?;
+        execute_operation(
+            &mut writer,
+            &mut reader,
+            spec,
+            &value,
+            num_keys,
+            &mut rng,
+            Some(&mut counter_measured),
+        )?;
         latencies_ns.push(op_start.elapsed().as_nanos() as u64);
     }
     let duration_ns = start.elapsed().as_nanos() as u64;
@@ -636,6 +833,50 @@ fn run_thread(
     Ok(ThreadOutcome {
         result: metrics,
         latencies_ns,
+        counter_warmup,
+        counter_measured,
+    })
+}
+
+fn run_pipelined_hot_counter_thread(
+    mut writer: TcpStream,
+    mut reader: BufReader<TcpStream>,
+    ops_per_thread: u64,
+    warmup_ops: u64,
+    pipeline_depth: usize,
+    thread_id: usize,
+    barrier: Arc<Barrier>,
+) -> io::Result<ThreadOutcome> {
+    let mut counter_warmup = CounterOperationStats::default();
+    let mut counter_measured = CounterOperationStats::default();
+
+    execute_counter_incr_pipeline(&mut writer, &mut reader, warmup_ops, pipeline_depth)?;
+    counter_warmup.incrby_ops = warmup_ops;
+    counter_warmup.applied_increments = warmup_ops;
+
+    barrier.wait();
+    let start = Instant::now();
+    let mut latencies_ns = Vec::with_capacity(ops_per_thread as usize);
+    let mut remaining = ops_per_thread;
+    while remaining > 0 {
+        let batch = remaining.min(pipeline_depth as u64);
+        let op_start = Instant::now();
+        execute_counter_incr_pipeline(&mut writer, &mut reader, batch, pipeline_depth)?;
+        let elapsed = op_start.elapsed().as_nanos() as u64;
+        latencies_ns.extend(std::iter::repeat_n(elapsed, batch as usize));
+        remaining -= batch;
+    }
+    let duration_ns = start.elapsed().as_nanos() as u64;
+    let metrics = latency_summary(thread_id, ops_per_thread, duration_ns, &mut latencies_ns);
+
+    counter_measured.incrby_ops = ops_per_thread;
+    counter_measured.applied_increments = ops_per_thread;
+
+    Ok(ThreadOutcome {
+        result: metrics,
+        latencies_ns,
+        counter_warmup,
+        counter_measured,
     })
 }
 
@@ -646,7 +887,19 @@ fn execute_operation(
     value: &str,
     num_keys: u64,
     rng: &mut StdRng,
+    counter_stats: Option<&mut CounterOperationStats>,
 ) -> io::Result<()> {
+    if let Some(counter) = spec.counter {
+        return execute_counter_operation(
+            writer,
+            reader,
+            counter,
+            value,
+            rng,
+            counter_stats.expect("counter workload records counter stats"),
+        );
+    }
+
     if spec.transactional {
         return execute_transaction(writer, reader, spec, value, num_keys, rng);
     }
@@ -688,6 +941,168 @@ fn execute_operation(
             reader,
             &["SET".to_string(), key_name(key), value.to_string()],
         )
+    }
+}
+
+fn execute_counter_operation(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    counter: CounterKind,
+    value: &str,
+    rng: &mut StdRng,
+    stats: &mut CounterOperationStats,
+) -> io::Result<()> {
+    let key = counter_key(0);
+    match counter {
+        CounterKind::Hot => {
+            execute_counter_incr(writer, reader, key)?;
+            stats.incrby_ops += 1;
+            stats.applied_increments += 1;
+            Ok(())
+        }
+        CounterKind::HotWithGet => {
+            if rng.gen_ratio(1, 10) {
+                execute_command(writer, reader, &["GET".to_string(), key])?;
+                stats.get_ops += 1;
+            } else {
+                execute_counter_incr(writer, reader, key)?;
+                stats.incrby_ops += 1;
+                stats.applied_increments += 1;
+            }
+            Ok(())
+        }
+        CounterKind::HotWithSetDel => {
+            let roll = rng.gen_range(0..100);
+            if roll < 80 {
+                execute_counter_incr(writer, reader, key)?;
+                stats.incrby_ops += 1;
+                stats.applied_increments += 1;
+            } else if roll < 90 {
+                execute_command(writer, reader, &["SET".to_string(), key, "0".to_string()])?;
+                stats.set_ops += 1;
+                stats.barrier_ops += 1;
+            } else {
+                execute_command(writer, reader, &["DEL".to_string(), key])?;
+                stats.del_ops += 1;
+                stats.barrier_ops += 1;
+            }
+            Ok(())
+        }
+        CounterKind::HotTtl => {
+            if rng.gen_ratio(1, 10) {
+                execute_command(writer, reader, &["TTL".to_string(), key])?;
+                stats.ttl_ops += 1;
+            } else {
+                execute_counter_incr(writer, reader, key)?;
+                stats.incrby_ops += 1;
+                stats.applied_increments += 1;
+            }
+            Ok(())
+        }
+        CounterKind::HotTransaction => execute_counter_transaction(writer, reader, false, stats),
+        CounterKind::HotWatchTransaction => {
+            execute_counter_transaction(writer, reader, true, stats)
+        }
+        CounterKind::HotMultiKey => {
+            let roll = rng.gen_range(0..100);
+            let side_key = counter_key(1);
+            if roll < 80 {
+                execute_counter_incr(writer, reader, key)?;
+                stats.incrby_ops += 1;
+                stats.applied_increments += 1;
+            } else if roll < 90 {
+                execute_command(writer, reader, &["MGET".to_string(), key, side_key])?;
+                stats.mget_ops += 1;
+            } else {
+                execute_command(
+                    writer,
+                    reader,
+                    &[
+                        "MSET".to_string(),
+                        key,
+                        "0".to_string(),
+                        side_key,
+                        value.to_string(),
+                    ],
+                )?;
+                stats.mset_ops += 1;
+                stats.barrier_ops += 1;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn execute_counter_incr(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    key: String,
+) -> io::Result<()> {
+    execute_command(
+        writer,
+        reader,
+        &["INCRBY".to_string(), key, "1".to_string()],
+    )
+}
+
+fn execute_counter_incr_pipeline(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    total: u64,
+    pipeline_depth: usize,
+) -> io::Result<()> {
+    if total == 0 {
+        return Ok(());
+    }
+
+    let key = counter_key(0);
+    let command = ["INCRBY", key.as_str(), "1"];
+    let mut remaining = total;
+    while remaining > 0 {
+        let batch = remaining.min(pipeline_depth as u64);
+        for _ in 0..batch {
+            write_command_unflushed(writer, &command)?;
+        }
+        writer.flush()?;
+        for _ in 0..batch {
+            read_response(reader)?;
+        }
+        remaining -= batch;
+    }
+    Ok(())
+}
+
+fn execute_counter_transaction(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    watch: bool,
+    stats: &mut CounterOperationStats,
+) -> io::Result<()> {
+    let key = counter_key(0);
+    stats.transaction_attempts += 1;
+    if watch {
+        execute_command(writer, reader, &["WATCH".to_string(), key.clone()])?;
+    }
+    execute_command(writer, reader, &["MULTI".to_string()])?;
+    execute_command(
+        writer,
+        reader,
+        &["INCRBY".to_string(), key, "1".to_string()],
+    )?;
+    match execute_command_value(writer, reader, &["EXEC".to_string()])? {
+        RespValue::Array(None) => {
+            stats.transaction_aborts += 1;
+            Ok(())
+        }
+        RespValue::Array(Some(_)) => {
+            stats.transaction_commits += 1;
+            stats.applied_increments += 1;
+            Ok(())
+        }
+        response => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected EXEC response for counter transaction: {response:?}"),
+        )),
     }
 }
 
@@ -750,6 +1165,180 @@ fn execute_transaction(
     execute_command(writer, reader, &["EXEC".to_string()])
 }
 
+fn prepare_workload(
+    host: &str,
+    port: u16,
+    spec: WorkloadSpec,
+    num_keys: u64,
+    value_size: usize,
+) -> io::Result<()> {
+    match spec.counter {
+        Some(counter) => flush_and_preload_counter(host, port, counter),
+        None => flush_and_preload(host, port, num_keys, value_size),
+    }
+}
+
+fn flush_and_preload_counter(host: &str, port: u16, counter: CounterKind) -> io::Result<()> {
+    let mut writer = TcpStream::connect((host, port))?;
+    writer.set_nodelay(true)?;
+    let mut reader = BufReader::new(writer.try_clone()?);
+    execute_command(&mut writer, &mut reader, &["FLUSHALL".to_string()])?;
+
+    match counter {
+        CounterKind::HotTtl => execute_command(
+            &mut writer,
+            &mut reader,
+            &[
+                "SETEX".to_string(),
+                counter_key(0),
+                "3600".to_string(),
+                "0".to_string(),
+            ],
+        )?,
+        CounterKind::HotMultiKey => {
+            execute_command(
+                &mut writer,
+                &mut reader,
+                &["SET".to_string(), counter_key(0), "0".to_string()],
+            )?;
+            execute_command(
+                &mut writer,
+                &mut reader,
+                &["SET".to_string(), counter_key(1), "side".to_string()],
+            )?;
+        }
+        _ => execute_command(
+            &mut writer,
+            &mut reader,
+            &["SET".to_string(), counter_key(0), "0".to_string()],
+        )?,
+    }
+
+    Ok(())
+}
+
+fn build_counter_benchmark_stats(
+    host: &str,
+    port: u16,
+    counter: Option<CounterKind>,
+    warmup: CounterOperationStats,
+    measured: CounterOperationStats,
+) -> io::Result<Option<CounterBenchmarkStats>> {
+    let Some(kind) = counter else {
+        return Ok(None);
+    };
+    let mut total = warmup.clone();
+    total.add_assign(&measured);
+    let validation = validate_counter_workload(host, port, kind, &total)?;
+    Ok(Some(CounterBenchmarkStats {
+        kind: kind.as_str(),
+        warmup,
+        measured,
+        total,
+        validation,
+    }))
+}
+
+fn validate_counter_workload(
+    host: &str,
+    port: u16,
+    kind: CounterKind,
+    total: &CounterOperationStats,
+) -> io::Result<CounterValidation> {
+    let mut status = "passed";
+    let mut notes = Vec::new();
+    let mut expected_final_value = None;
+    let mut final_value = None;
+    let mut final_value_matches = None;
+    let mut ttl_seconds = None;
+    let mut ttl_live = None;
+
+    if kind.validates_final_value() {
+        let expected = i64::try_from(total.applied_increments).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "applied increment count exceeded i64 range",
+            )
+        })?;
+        let actual = read_counter_value(host, port)?;
+        let matches = actual == Some(expected);
+        expected_final_value = Some(expected);
+        final_value = actual;
+        final_value_matches = Some(matches);
+        if !matches {
+            status = "failed";
+            notes.push("final counter value does not match applied increment count".to_string());
+        }
+    } else {
+        status = "not_applicable";
+        notes.push(
+            "final counter value is not deterministic because this workload includes barrier writes"
+                .to_string(),
+        );
+    }
+
+    if kind.validates_live_ttl() {
+        let ttl = read_counter_ttl(host, port)?;
+        let live = ttl > 0;
+        ttl_seconds = Some(ttl);
+        ttl_live = Some(live);
+        if !live {
+            status = "failed";
+            notes.push("counter key TTL was not live after the run".to_string());
+        }
+    }
+
+    Ok(CounterValidation {
+        status,
+        expected_final_value,
+        final_value,
+        final_value_matches,
+        ttl_seconds,
+        ttl_live,
+        notes,
+    })
+}
+
+fn read_counter_value(host: &str, port: u16) -> io::Result<Option<i64>> {
+    let mut writer = TcpStream::connect((host, port))?;
+    writer.set_nodelay(true)?;
+    let mut reader = BufReader::new(writer.try_clone()?);
+    match execute_command_value(
+        &mut writer,
+        &mut reader,
+        &["GET".to_string(), counter_key(0)],
+    )? {
+        RespValue::Bulk(Some(value)) => value.parse::<i64>().map(Some).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("counter value was not an integer: {error}"),
+            )
+        }),
+        RespValue::Bulk(None) => Ok(None),
+        response => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected GET response for counter value: {response:?}"),
+        )),
+    }
+}
+
+fn read_counter_ttl(host: &str, port: u16) -> io::Result<i64> {
+    let mut writer = TcpStream::connect((host, port))?;
+    writer.set_nodelay(true)?;
+    let mut reader = BufReader::new(writer.try_clone()?);
+    match execute_command_value(
+        &mut writer,
+        &mut reader,
+        &["TTL".to_string(), counter_key(0)],
+    )? {
+        RespValue::Integer(value) => Ok(value),
+        response => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected TTL response for counter key: {response:?}"),
+        )),
+    }
+}
+
 fn flush_and_preload(host: &str, port: u16, num_keys: u64, value_size: usize) -> io::Result<()> {
     let mut writer = TcpStream::connect((host, port))?;
     writer.set_nodelay(true)?;
@@ -791,6 +1380,15 @@ fn execute_command(
     read_response(reader)
 }
 
+fn execute_command_value(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    parts: &[String],
+) -> io::Result<RespValue> {
+    write_command(writer, parts)?;
+    read_response_value(reader)
+}
+
 fn execute_pressure_command(
     writer: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
@@ -801,13 +1399,27 @@ fn execute_pressure_command(
 }
 
 fn write_command(writer: &mut TcpStream, parts: &[String]) -> io::Result<()> {
+    write_command_unflushed(writer, parts)?;
+    writer.flush()
+}
+
+fn write_command_unflushed<S: AsRef<str>>(writer: &mut TcpStream, parts: &[S]) -> io::Result<()> {
     write!(writer, "*{}\r\n", parts.len())?;
     for part in parts {
+        let part = part.as_ref();
         write!(writer, "${}\r\n", part.as_bytes().len())?;
         writer.write_all(part.as_bytes())?;
         writer.write_all(b"\r\n")?;
     }
-    writer.flush()
+    Ok(())
+}
+
+#[derive(Debug)]
+enum RespValue {
+    Simple,
+    Integer(i64),
+    Bulk(Option<String>),
+    Array(Option<Vec<RespValue>>),
 }
 
 fn read_response(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
@@ -841,6 +1453,67 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
                 }
             }
             Ok(())
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported RESP prefix byte: {}", other as char),
+        )),
+    }
+}
+
+fn read_response_value(reader: &mut BufReader<TcpStream>) -> io::Result<RespValue> {
+    let mut prefix = [0_u8; 1];
+    reader.read_exact(&mut prefix)?;
+    match prefix[0] {
+        b'+' => {
+            let _ = read_line(reader)?;
+            Ok(RespValue::Simple)
+        }
+        b':' => Ok(RespValue::Integer(parse_i64(read_line(reader)?)?)),
+        b'-' => {
+            let message = read_line(reader)?;
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("server returned error: {message}"),
+            ))
+        }
+        b'$' => {
+            let length = parse_i64(read_line(reader)?)?;
+            if length < 0 {
+                return Ok(RespValue::Bulk(None));
+            }
+            let mut payload = vec![0_u8; length as usize];
+            reader.read_exact(&mut payload)?;
+            let mut crlf = [0_u8; 2];
+            reader.read_exact(&mut crlf)?;
+            if crlf != *b"\r\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bulk string was not terminated by CRLF",
+                ));
+            }
+            let value = String::from_utf8(payload).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bulk string was not valid UTF-8: {error}"),
+                )
+            })?;
+            Ok(RespValue::Bulk(Some(value)))
+        }
+        b'*' => {
+            let length = parse_i64(read_line(reader)?)?;
+            if length < 0 {
+                return Ok(RespValue::Array(None));
+            }
+            let mut items = Vec::with_capacity(length as usize);
+            for _ in 0..length {
+                items.push(read_response_value(reader)?);
+            }
+            Ok(RespValue::Array(Some(items)))
+        }
+        b'_' => {
+            let _ = read_line(reader)?;
+            Ok(RespValue::Bulk(None))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -937,6 +1610,10 @@ fn key_name(id: u64) -> String {
     format!("bench:key:{id}")
 }
 
+fn counter_key(id: u64) -> String {
+    format!("bench:counter:{id}")
+}
+
 fn latency_summary(
     thread_id: usize,
     ops_completed: u64,
@@ -1009,6 +1686,52 @@ fn resolve_workload(name: &str) -> Result<WorkloadSpec, Box<dyn Error>> {
         }
         "zipfian-mixed" => WorkloadSpec::standard("zipfian-mixed", 70, 30, false, false, true),
         "hot-key" => WorkloadSpec::standard("hot-key", 85, 15, false, false, true),
+        "hot-counter" => {
+            WorkloadSpec::counter("hot_counter", 0, 100, false, false, CounterKind::Hot)
+        }
+        "hot-counter-with-get" => WorkloadSpec::counter(
+            "hot_counter_with_get",
+            10,
+            90,
+            false,
+            false,
+            CounterKind::HotWithGet,
+        ),
+        "hot-counter-with-set-del" => WorkloadSpec::counter(
+            "hot_counter_with_set_del",
+            0,
+            100,
+            false,
+            false,
+            CounterKind::HotWithSetDel,
+        ),
+        "hot-counter-ttl" => {
+            WorkloadSpec::counter("hot_counter_ttl", 10, 90, false, false, CounterKind::HotTtl)
+        }
+        "hot-counter-transaction" => WorkloadSpec::counter(
+            "hot_counter_transaction",
+            0,
+            100,
+            false,
+            true,
+            CounterKind::HotTransaction,
+        ),
+        "hot-counter-watch-transaction" => WorkloadSpec::counter(
+            "hot_counter_watch_transaction",
+            0,
+            100,
+            false,
+            true,
+            CounterKind::HotWatchTransaction,
+        ),
+        "hot-counter-multikey" => WorkloadSpec::counter(
+            "hot_counter_multikey",
+            10,
+            90,
+            true,
+            false,
+            CounterKind::HotMultiKey,
+        ),
         "single-key-mixed" => {
             WorkloadSpec::standard("single_key_mixed", 60, 40, false, false, false)
         }
@@ -1068,4 +1791,78 @@ fn sanitize_identifier(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_phase7_counter_workloads() {
+        let cases = [
+            ("hot_counter", "hot_counter", CounterKind::Hot),
+            (
+                "hot_counter_with_get",
+                "hot_counter_with_get",
+                CounterKind::HotWithGet,
+            ),
+            (
+                "hot_counter_with_set_del",
+                "hot_counter_with_set_del",
+                CounterKind::HotWithSetDel,
+            ),
+            ("hot_counter_ttl", "hot_counter_ttl", CounterKind::HotTtl),
+            (
+                "hot_counter_transaction",
+                "hot_counter_transaction",
+                CounterKind::HotTransaction,
+            ),
+            (
+                "hot_counter_watch_transaction",
+                "hot_counter_watch_transaction",
+                CounterKind::HotWatchTransaction,
+            ),
+            (
+                "hot_counter_multikey",
+                "hot_counter_multikey",
+                CounterKind::HotMultiKey,
+            ),
+        ];
+
+        for (input, canonical, counter) in cases {
+            let spec = resolve_workload(input).expect("counter workload should resolve");
+            assert_eq!(spec.canonical_name, canonical);
+            assert!(matches!(spec.counter, Some(actual) if actual == counter));
+            assert!(spec.pressure.is_none());
+            assert!(spec.hot_key);
+        }
+    }
+
+    #[test]
+    fn aggregates_counter_stats_without_shared_state() {
+        let mut left = CounterOperationStats {
+            incrby_ops: 1,
+            get_ops: 2,
+            transaction_commits: 3,
+            applied_increments: 4,
+            ..CounterOperationStats::default()
+        };
+        let right = CounterOperationStats {
+            incrby_ops: 5,
+            get_ops: 6,
+            transaction_aborts: 7,
+            applied_increments: 8,
+            barrier_ops: 9,
+            ..CounterOperationStats::default()
+        };
+
+        left.add_assign(&right);
+
+        assert_eq!(left.incrby_ops, 6);
+        assert_eq!(left.get_ops, 8);
+        assert_eq!(left.transaction_commits, 3);
+        assert_eq!(left.transaction_aborts, 7);
+        assert_eq!(left.applied_increments, 12);
+        assert_eq!(left.barrier_ops, 9);
+    }
 }
