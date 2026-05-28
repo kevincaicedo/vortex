@@ -80,26 +80,11 @@ fn distinct_guard_tables_mut<'g>(
     }
 }
 
-fn take_live_value(
-    table: &mut SwissTable,
-    key: &VortexKey,
-    now_nanos: u64,
-) -> (Option<VortexValue>, ExpiryTransition) {
-    let hash = table.table_hash_key_bytes(key.as_bytes());
-    match table.slot_cursor_prehashed(key.as_bytes(), hash, now_nanos) {
-        SlotCursor::Live(live) => match live.remove() {
-            Some(removed) => {
-                let transition = ExpiryTransition::remove(removed.old_had_ttl());
-                (Some(removed.into_value()), transition)
-            }
-            None => (None, ExpiryTransition::default()),
-        },
-        SlotCursor::Expired(expired) => match expired.remove() {
-            Some(removed) => (None, ExpiryTransition::remove(removed.old_had_ttl())),
-            None => (None, ExpiryTransition::default()),
-        },
-        SlotCursor::Vacant(_) => (None, ExpiryTransition::default()),
-    }
+fn key_is_live(table: &SwissTable, key_bytes: &[u8], hash: TableHash, now_nanos: u64) -> bool {
+    matches!(
+        table.get_with_ttl_prehashed(key_bytes, hash),
+        Some((_, ttl)) if ttl == 0 || ttl > now_nanos
+    )
 }
 
 fn delete_live_key_bytes(
@@ -193,13 +178,30 @@ impl ConcurrentKeyspace {
         &self,
         key: &VortexKey,
         now_nanos: u64,
-    ) -> MutationOutcome<Option<VortexValue>> {
+    ) -> MutationResult<Option<VortexValue>> {
         let shard_index = self.shard_index(key.as_bytes());
+        let table_hash = self.table_hash_key(key.as_bytes());
         let mut guard = self.write_shard_by_index(shard_index);
-        let (removed, transition) = take_live_value(&mut guard, key, now_nanos);
+        let (removed, transition, aof_lsn) =
+            match guard.slot_cursor_prehashed(key.as_bytes(), table_hash, now_nanos) {
+                SlotCursor::Live(live) => {
+                    let reserved_aof_lsn = self.next_aof_lsn()?;
+                    match live.remove() {
+                        Some(removed) => {
+                            let transition = ExpiryTransition::remove(removed.old_had_ttl());
+                            (Some(removed.into_value()), transition, reserved_aof_lsn)
+                        }
+                        None => (None, ExpiryTransition::default(), None),
+                    }
+                }
+                SlotCursor::Expired(expired) => match expired.remove() {
+                    Some(removed) => (None, ExpiryTransition::remove(removed.old_had_ttl()), None),
+                    None => (None, ExpiryTransition::default(), None),
+                },
+                SlotCursor::Vacant(_) => (None, ExpiryTransition::default(), None),
+            };
         let changed = removed.is_some();
         let publish_features = self.mutation_features();
-        let aof_lsn = changed.then(|| self.next_aof_lsn()).flatten();
         let effects = MutationEffects::none()
             .with_ttl(shard_index, transition)
             .with_watch_key_if(changed && publish_features.watch(), key)
@@ -207,21 +209,26 @@ impl ConcurrentKeyspace {
             .defer();
         drop(guard);
         let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
-        MutationOutcome::new(removed, aof_lsn)
+        Ok(MutationOutcome::new(removed, aof_lsn))
     }
 
     pub(crate) fn delete_key_bytes(
         &self,
         key_bytes: &[u8],
         now_nanos: u64,
-    ) -> MutationOutcome<bool> {
+    ) -> MutationResult<bool> {
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
         let mut guard = self.write_shard_by_index(shard_index);
+        let reserved_aof_lsn = if key_is_live(&guard, key_bytes, table_hash, now_nanos) {
+            self.next_aof_lsn()?
+        } else {
+            None
+        };
         let (deleted, transition) =
             delete_live_key_bytes(&mut guard, key_bytes, table_hash, now_nanos);
         let publish_features = self.mutation_features();
-        let aof_lsn = deleted.then(|| self.next_aof_lsn()).flatten();
+        let aof_lsn = deleted.then_some(reserved_aof_lsn).flatten();
         let mut effects = MutationEffects::none()
             .with_ttl(shard_index, transition)
             .with_aof_lsn(aof_lsn);
@@ -231,25 +238,34 @@ impl ConcurrentKeyspace {
         let effects = effects.defer();
         drop(guard);
         let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
-        MutationOutcome::new(deleted, aof_lsn)
+        Ok(MutationOutcome::new(deleted, aof_lsn))
     }
 
     pub(crate) fn delete_key_bytes_batch(
         &self,
         keys: &[&[u8]],
         now_nanos: u64,
-    ) -> MutationOutcome<i64> {
+    ) -> MutationResult<i64> {
         if keys.is_empty() {
-            return MutationOutcome::new(0, None);
+            return Ok(MutationOutcome::new(0, None));
         }
         if keys.len() == 1 {
-            let outcome = self.delete_key_bytes(keys[0], now_nanos);
+            let outcome = self.delete_key_bytes(keys[0], now_nanos)?;
             let deleted = outcome.value;
-            return outcome.map_value(i64::from(deleted));
+            return Ok(outcome.map_value(i64::from(deleted)));
         }
 
         let plan = self.prehashed_plan(keys.iter().copied().enumerate());
         let mut guards = self.multi_write_prehashed(&plan);
+        let will_delete = plan.entries().iter().any(|lookup| {
+            let table = &*guards[lookup.guard_index().get()].1;
+            key_is_live(table, lookup.key_bytes(), lookup.table_hash(), now_nanos)
+        });
+        let reserved_aof_lsn = if will_delete {
+            self.next_aof_lsn()?
+        } else {
+            None
+        };
         let mut deleted = 0i64;
         let publish_features = self.mutation_features();
         let mut effects: SmallVec<[DeferredEffects<'_>; 16]> = SmallVec::with_capacity(plan.len());
@@ -272,10 +288,10 @@ impl ConcurrentKeyspace {
         for effect in effects {
             self.publish_deferred_effects(effect);
         }
-        MutationOutcome::new(
+        Ok(MutationOutcome::new(
             deleted,
-            (deleted != 0).then(|| self.next_aof_lsn()).flatten(),
-        )
+            (deleted != 0).then_some(reserved_aof_lsn).flatten(),
+        ))
     }
 
     pub(crate) fn count_existing_key_bytes(&self, keys: &[&[u8]], now_nanos: u64) -> i64 {
@@ -360,7 +376,7 @@ impl ConcurrentKeyspace {
         deadline_nanos: u64,
         now_nanos: u64,
         options: ExpireOptions,
-    ) -> MutationOutcome<bool> {
+    ) -> MutationResult<bool> {
         let key_bytes = key.as_bytes();
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
@@ -378,21 +394,22 @@ impl ConcurrentKeyspace {
                 });
                 drop(guard);
                 self.publish_optional_deferred_effects(effects);
-                return MutationOutcome::new(false, None);
+                return Ok(MutationOutcome::new(false, None));
             }
-            SlotCursor::Vacant(_) => return MutationOutcome::new(false, None),
+            SlotCursor::Vacant(_) => return Ok(MutationOutcome::new(false, None)),
         };
 
         let current_ttl = live.ttl_deadline();
         if !options.permits(current_ttl, deadline_nanos) {
-            return MutationOutcome::new(false, None);
+            return Ok(MutationOutcome::new(false, None));
         }
 
         if deadline_nanos <= now_nanos {
+            let reserved_aof_lsn = self.next_aof_lsn()?;
             let removed = live.remove();
             let changed = removed.is_some();
             let publish_features = self.mutation_features();
-            let aof_lsn = changed.then(|| self.next_aof_lsn()).flatten();
+            let aof_lsn = changed.then_some(reserved_aof_lsn).flatten();
             let effects = MutationEffects::none()
                 .with_ttl(
                     shard_index,
@@ -407,12 +424,12 @@ impl ConcurrentKeyspace {
                 .defer();
             drop(guard);
             let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
-            return MutationOutcome::new(changed, aof_lsn);
+            return Ok(MutationOutcome::new(changed, aof_lsn));
         }
 
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let report = live.set_ttl(deadline_nanos, entry_lsn);
         let effects = MutationEffects::none()
             .with_ttl(
@@ -424,10 +441,10 @@ impl ConcurrentKeyspace {
             .defer();
         drop(guard);
         let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
-        MutationOutcome::new(true, aof_lsn)
+        Ok(MutationOutcome::new(true, aof_lsn))
     }
 
-    pub(crate) fn persist_key(&self, key: &VortexKey, now_nanos: u64) -> MutationOutcome<bool> {
+    pub(crate) fn persist_key(&self, key: &VortexKey, now_nanos: u64) -> MutationResult<bool> {
         let key_bytes = key.as_bytes();
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
@@ -452,18 +469,18 @@ impl ConcurrentKeyspace {
                     .defer();
                 drop(guard);
                 self.publish_deferred_effects(effects);
-                return MutationOutcome::new(false, None);
+                return Ok(MutationOutcome::new(false, None));
             }
-            SlotCursor::Vacant(_) => return MutationOutcome::new(false, None),
+            SlotCursor::Vacant(_) => return Ok(MutationOutcome::new(false, None)),
         };
 
         if !live.had_ttl() {
-            return MutationOutcome::new(false, None);
+            return Ok(MutationOutcome::new(false, None));
         }
 
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let report = live.clear_ttl(entry_lsn);
         let effects = MutationEffects::none()
             .with_ttl(
@@ -475,7 +492,7 @@ impl ConcurrentKeyspace {
             .defer();
         drop(guard);
         let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
-        MutationOutcome::new(true, aof_lsn)
+        Ok(MutationOutcome::new(true, aof_lsn))
     }
 
     pub(crate) fn ttl_state_bytes(&self, key_bytes: &[u8], now_nanos: u64) -> TtlState {
@@ -584,6 +601,29 @@ impl ConcurrentKeyspace {
             let old_had_ttl = ttl_present(guard.get_entry_ttl(old_key));
             let new_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
             let same_key = old_key == &destination;
+            if !guard.contains_key(old_key) {
+                drop(guard);
+                for effect in effects {
+                    self.publish_deferred_effects(effect);
+                }
+                return Err(MutationError::with_evictions(
+                    MutationErrorKind::NoSuchKey,
+                    evicted,
+                ));
+            }
+            if nx && !same_key && guard.contains_key(&destination) {
+                drop(guard);
+                for effect in effects {
+                    self.publish_deferred_effects(effect);
+                }
+                reservation.settle();
+                return Ok(mutation_outcome_with_evictions(false, None, evicted));
+            }
+            let reserved_lsn = if same_key {
+                None
+            } else {
+                Some(self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?)
+            };
             let renamed = rename_within_table(&mut guard, old_key, new_key, now_nanos, nx);
             let old_has_ttl = ttl_present(guard.get_entry_ttl(old_key));
             let new_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
@@ -618,7 +658,7 @@ impl ConcurrentKeyspace {
             let changed = renamed && !same_key;
             let aof_lsn = if changed {
                 let (entry_lsn, aof_lsn) =
-                    self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
+                    reserved_lsn.expect("changed same-shard RENAME must reserve an LSN");
                 stamp_entry_lsn_if(&mut guard, destination.as_bytes(), new_hash, entry_lsn);
                 aof_lsn
             } else {
@@ -716,6 +756,8 @@ impl ConcurrentKeyspace {
             return Ok(mutation_outcome_with_evictions(false, None, evicted));
         }
 
+        let (entry_lsn, aof_lsn) =
+            self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?;
         let (value, ttl) = src_table
             .remove_with_ttl(old_key)
             .expect("source key must exist after contains_key check");
@@ -725,8 +767,6 @@ impl ConcurrentKeyspace {
         } else {
             dst_table.insert(new_key, value);
         }
-        let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
         stamp_entry_lsn_if(dst_table, destination_key.as_bytes(), new_hash, entry_lsn);
         effects.push(
             MutationEffects::none()
@@ -822,6 +862,16 @@ impl ConcurrentKeyspace {
                 }
             }
             let dst_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
+            let source_live = match guard.get_with_ttl(src) {
+                Some((_, ttl)) => ttl == 0 || ttl > now_nanos,
+                None => false,
+            };
+            let destination_blocks_copy = !replace && guard.contains_key(&destination);
+            let reserved_lsn = if source_live && !destination_blocks_copy {
+                Some(self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?)
+            } else {
+                None
+            };
             let copied = copy_within_table(&mut guard, src, dst, replace, now_nanos);
             let dst_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
             effects.push(
@@ -834,7 +884,7 @@ impl ConcurrentKeyspace {
             );
             let aof_lsn = if copied {
                 let (entry_lsn, aof_lsn) =
-                    self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
+                    reserved_lsn.expect("changed same-shard COPY must reserve an LSN");
                 stamp_entry_lsn_if(&mut guard, destination.as_bytes(), dst_hash, entry_lsn);
                 aof_lsn
             } else {
@@ -949,13 +999,13 @@ impl ConcurrentKeyspace {
             return Ok(mutation_outcome_with_evictions(false, None, evicted));
         }
 
+        let (entry_lsn, aof_lsn) =
+            self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?;
         if ttl != 0 && ttl > now_nanos {
             dst_table.insert_with(dst, value_clone, ttl, None);
         } else {
             dst_table.insert(dst, value_clone);
         }
-        let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
         stamp_entry_lsn_if(dst_table, destination.as_bytes(), dst_hash, entry_lsn);
         effects.push(
             MutationEffects::none()

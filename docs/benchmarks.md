@@ -2,6 +2,8 @@
 
 Current tool note: the active operator workflow for `vortex_bench`, `just profiler`, manifest authoring, artifact layout, and optimization practice is documented in `docs/performance-tooling-guide.md`. This file remains useful as historical benchmark context and comparative-methodology background.
 
+> **Release evidence warning:** the numeric tables below are historical engineering snapshots. They are not release-grade performance claims unless a row is explicitly linked from the active Phase 3.5 release evidence ledger with workload contract, repeat count, backend mode, telemetry mode, memory attribution, client saturation verdict, and claim decision.
+
 This document describes how VortexDB benchmarks are conducted, what hardware is used, and how to reproduce results independently. The benchmark program now has two complementary layers: `redis-benchmark` for point-command throughput and `memtier_benchmark` for mixed Gaussian workloads.
 
 ---
@@ -15,7 +17,7 @@ This document describes how VortexDB benchmarks are conducted, what hardware is 
 | CPU | Apple M4 Pro (12-core: 4P + 8E) |
 | RAM | Unified memory, ~200 GB/s bandwidth |
 | OS | macOS 15 (Sequoia) |
-| I/O Backend | kqueue via `polling` crate |
+| I/O Backend | Cross-platform polling backend via `polling` crate |
 | Rust | nightly-2026-03-15 |
 
 ### Linux CI / Bare-Metal
@@ -83,7 +85,7 @@ The `vortex-bench` crate contains 69 Criterion benchmarks measuring individual o
 
 | Database | Version | Configuration |
 |----------|---------|---------------|
-| **VortexDB** | 0.1.0-alpha | Default (auto-detect threads, kqueue/io_uring) |
+| **VortexDB** | 0.1.0-alpha | Default (auto-detect threads, polling or io_uring effective backend reported per run) |
 | **Redis** | 8.6.2-alpine | `io-threads 4`, `io-threads-do-reads yes` |
 | **Dragonfly** | Latest (v1.27.1) | `--proactor_threads 4`, `--pipeline_squash 10` |
 | **Valkey** | 9.1-alpine | `io-threads 4`, `io-threads-do-reads yes` |
@@ -122,13 +124,13 @@ just compare-full  # 3 runs, JSON + Markdown, latency, custom commands, memtier 
 
 ### Native Mode (VortexDB native + Redis native with io-threads 4)
 
-Both servers natively on macOS, kqueue I/O backend, Redis configured with `io-threads 4`.
+Both servers natively on macOS, Vortex polling backend, Redis configured with `io-threads 4`.
 
 These tables are **point-workload** results from `redis-benchmark`. The automated report can also include a `memtier_benchmark` mixed-workload section when run with `--memtier`.
 
 | Command | VortexDB | Redis 8 | vs Redis | Notes |
 |---------|----------|---------|----------|-------|
-| SET | 1,923,076 | 1,960,784 | **1.0×** | I/O-bound on kqueue |
+| SET | 1,923,076 | 1,960,784 | **1.0×** | I/O-bound on polling backend |
 | GET | 2,272,727 | 1,923,076 | **1.2×** | |
 | INCR | 2,325,581 | 1,960,784 | **1.2×** | |
 | MSET (10 keys) | 1,470,588 | 598,802 | **2.5×** | Batch-prefetch advantage |
@@ -166,7 +168,7 @@ These tables are **point-workload** results from `redis-benchmark`. The automate
 1. **Multi-key batch commands** (MSET, MSETNX) show the largest advantage (3–3.7×) thanks to SwissTable batch-prefetch pipeline and zero-copy RESP serializer.
 2. **Single-key read commands** (GET, INCR) show 1.0–1.5× — the advantage is real but modest since Redis with io-threads is already highly optimized.
 3. **PING_INLINE** is consistently 0.5× Redis — this is pure I/O round-trip latency with no engine work, indicating VortexDB's event loop has higher per-round-trip overhead than Redis's epoll loop for tiny responses.
-4. **macOS kqueue** shows lower advantage than Linux io_uring because kqueue uses synchronous I/O with polling, while io_uring provides true asynchronous completions.
+4. **macOS polling** shows lower advantage than Linux io_uring in this historical run. Current release evidence must compare effective backend modes on the same workload and host before making a backend claim.
 
 ---
 
@@ -275,9 +277,9 @@ just bench-validate
 
 ## Known Limitations
 
-1. **Docker Desktop on macOS** — VortexDB measures ~0.7× Redis when all databases are containerized on Docker Desktop macOS. The Apple Virtualization Framework adds overhead to VortexDB's async I/O path disproportionately. Use `--native` mode for accurate macOS comparisons. On bare-metal Linux Docker the same containerized setup shows 1.0–3.7× advantage.
+1. **Docker Desktop on macOS** — Historical Docker Desktop rows showed VortexDB behind Redis when all databases were containerized. Treat Docker Desktop, Linux Docker, and native rows as separate evidence surfaces.
 
-2. **macOS kqueue vs Linux io_uring** — VortexDB's polling backend (kqueue) performs synchronous I/O with event notification, while the io_uring backend uses truly asynchronous completions. macOS native results show 1.0–2.5× Redis on single/batch commands; Linux shows 1.0–3.7×.
+2. **macOS polling vs Linux io_uring** — VortexDB's polling backend and io_uring backend have different semantics and capabilities. Do not generalize macOS polling rows into Linux io_uring claims, or Linux io_uring rows into macOS claims.
 
 3. **PING_INLINE overhead** — VortexDB consistently shows 0.5–1.0× Redis on PING_INLINE. This is pure I/O round-trip cost with zero engine work. It reflects event-loop per-round-trip overhead, not engine performance. All engine-touching commands show higher ratios.
 

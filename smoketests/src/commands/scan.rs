@@ -62,13 +62,37 @@ fn scan_match_filters_results(ctx: &mut SmokeContext) -> Result<()> {
     Ok(())
 }
 
+fn scan_rejects_malformed_arguments(ctx: &mut SmokeContext) -> Result<()> {
+    for args in [
+        &["SCAN", "-1"][..],
+        &["SCAN", "0", "COUNT"][..],
+        &["SCAN", "0", "COUNT", "0"][..],
+        &["SCAN", "0", "COUNT", "nope"][..],
+    ] {
+        let err = ctx.exec_error(args)?;
+        assert!(err.to_string().contains("integer"));
+    }
+
+    for args in [
+        &["SCAN", "0", "MATCH"][..],
+        &["SCAN", "0", "TYPE"][..],
+        &["SCAN", "0", "UNKNOWN"][..],
+    ] {
+        let err = ctx.exec_error(args)?;
+        assert!(err.to_string().contains("syntax"));
+    }
+
+    Ok(())
+}
+
 pub fn spec() -> CommandSpec {
     CommandSpec::new("SCAN", CommandGroup::Key, SupportLevel::Supported)
         .summary("Incrementally iterates the keyspace using a Redis-compatible cursor.")
-        .syntax(&["SCAN cursor [MATCH pattern] [COUNT count]"])
+        .syntax(&["SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]"])
         .tested(&[
             "Cursor iteration reaches all inserted keys",
             "MATCH filtering",
+            "Malformed cursor and option arguments are rejected",
         ])
         .not_tested(&["Cursor stability across concurrent writes"])
         .case(CaseDef::new(
@@ -80,5 +104,10 @@ pub fn spec() -> CommandSpec {
             "match filters results",
             "SCAN MATCH should return only keys that satisfy the pattern.",
             scan_match_filters_results,
+        ))
+        .case(CaseDef::new(
+            "rejects malformed arguments",
+            "SCAN should reject negative cursors, invalid COUNT values, missing option values, and unknown options.",
+            scan_rejects_malformed_arguments,
         ))
 }

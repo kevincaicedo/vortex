@@ -96,6 +96,33 @@ pub(crate) fn deadline_nanos_to_absolute_unix_nanos(
     )
 }
 
+#[inline]
+pub(crate) fn relative_deadline_nanos(amount: u64, unit_nanos: u64, now_nanos: u64) -> Option<u64> {
+    amount
+        .checked_mul(unit_nanos)
+        .and_then(|delta| now_nanos.checked_add(delta))
+}
+
+#[inline]
+pub(crate) fn absolute_deadline_nanos(
+    amount: u64,
+    unit_nanos: u64,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> Option<u64> {
+    let absolute_unix_nanos = amount.checked_mul(unit_nanos)?;
+    Some(absolute_unix_nanos_to_deadline_nanos(
+        absolute_unix_nanos,
+        now_nanos,
+        unix_now_nanos,
+    ))
+}
+
+#[inline]
+pub(crate) fn seconds_to_millis(seconds: u64) -> Option<u64> {
+    seconds.checked_mul(1_000)
+}
+
 /// The result of executing a command.
 ///
 /// `Static` avoids allocation entirely for pre-computed wire bytes.
@@ -264,6 +291,7 @@ pub(crate) const fn mutation_error_response(kind: MutationErrorKind) -> &'static
         MutationErrorKind::NotInteger => ERR_NOT_INTEGER,
         MutationErrorKind::NotFloat => ERR_NOT_FLOAT,
         MutationErrorKind::Overflow => ERR_OVERFLOW,
+        MutationErrorKind::LsnOverflow => ERR_LSN_OVERFLOW,
         MutationErrorKind::OutOfMemory => ERR_OOM,
         MutationErrorKind::NoSuchKey => ERR_NO_SUCH_KEY,
     }
@@ -368,6 +396,7 @@ pub static ERR_SYNTAX: &[u8] = b"-ERR syntax error\r\n";
 pub static ERR_NOT_INTEGER: &[u8] = b"-ERR value is not an integer or out of range\r\n";
 pub static ERR_NOT_FLOAT: &[u8] = b"-ERR value is not a valid float\r\n";
 pub static ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
+pub static ERR_LSN_OVERFLOW: &[u8] = b"-ERR mutation sequence number exhausted\r\n";
 pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of range\r\n";
 pub static ERR_OOM: &[u8] = b"-OOM command not allowed when used memory > 'maxmemory'.\r\n";
 pub static ERR_NO_SUCH_KEY: &[u8] = b"-ERR no such key\r\n";
@@ -774,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn string_and_generic_commands_stay_parse_reply_only() {
+    fn command_modules_stay_parse_reply_or_domain_only() {
         let forbidden = [
             "crate::table",
             "crate::entry",
@@ -802,16 +831,32 @@ mod tests {
             "ensure_memory_for_snapshot",
         ];
 
-        assert_forbidden_tokens_absent(
-            "commands/string.rs",
-            production_region(include_str!("string.rs")),
-            &forbidden,
-        );
-        assert_forbidden_tokens_absent(
-            "commands/generic.rs",
-            production_region(include_str!("generic.rs")),
-            &forbidden,
-        );
+        let files = [
+            (
+                "commands/connection.rs",
+                production_region(include_str!("connection.rs")),
+            ),
+            (
+                "commands/generic.rs",
+                production_region(include_str!("generic.rs")),
+            ),
+            (
+                "commands/server.rs",
+                production_region(include_str!("server.rs")),
+            ),
+            (
+                "commands/string.rs",
+                production_region(include_str!("string.rs")),
+            ),
+            (
+                "commands/transaction.rs",
+                production_region(include_str!("transaction.rs")),
+            ),
+        ];
+
+        for (name, source) in files {
+            assert_forbidden_tokens_absent(name, source, &forbidden);
+        }
     }
 
     #[test]

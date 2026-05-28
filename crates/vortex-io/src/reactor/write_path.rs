@@ -149,6 +149,16 @@ impl Reactor {
         };
 
         let bytes_written = cqe.result as usize;
+        if bytes_written > total {
+            tracing::warn!(
+                conn_id,
+                bytes_written,
+                total,
+                "write completion exceeded pending write length, closing connection"
+            );
+            self.close_connection(conn_id);
+            return;
+        }
 
         if bytes_written < total {
             let remaining = total - bytes_written;

@@ -393,6 +393,22 @@ impl BackendQueueStatus {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+#[inline]
+fn preserve_reaped_completion_count(
+    start_len: usize,
+    out_len: usize,
+    post_drain_submit: io::Result<usize>,
+) -> io::Result<usize> {
+    debug_assert!(out_len >= start_len);
+    let reaped = out_len - start_len;
+    if reaped == 0 {
+        post_drain_submit.map(|_| 0)
+    } else {
+        Ok(reaped)
+    }
+}
+
 /// Static capability bits for a selected backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackendCapabilities {
@@ -431,7 +447,7 @@ impl BackendCapabilities {
             fixed_buffers: true,
             sqpoll,
             multishot_accept: false,
-            accept4: false,
+            accept4: true,
             close_opcode: true,
             async_cancel: true,
             nonblocking_drain: true,
@@ -538,13 +554,17 @@ pub(crate) struct ReadLease {
 }
 
 impl ReadLease {
+    /// Maximum byte count representable by the signed backend completion result.
+    pub(crate) const MAX_LEN: usize = i32::MAX as usize;
+
     /// Creates a read lease for an async backend submission.
     ///
     /// # Safety
     ///
-    /// `ptr..ptr+len` must identify writable memory owned by the reactor and
-    /// remain valid until the completion for `token` is handled. If `fixed` is
-    /// present, it must name the registered buffer containing the range.
+    /// For accepted leases, `ptr..ptr+len` must identify writable memory owned
+    /// by the reactor and remain valid until the completion for `token` is
+    /// handled. If `fixed` is present, it must name the registered buffer
+    /// containing the range.
     #[inline]
     pub(crate) unsafe fn new(
         fd: ConnFd,
@@ -552,6 +572,14 @@ impl ReadLease {
         len: usize,
         fixed: Option<FixedBufferId>,
     ) -> Result<Self, SubmitError> {
+        if len == 0 {
+            return Err(SubmitError::Unsupported("empty read buffer"));
+        }
+        if len > Self::MAX_LEN {
+            return Err(SubmitError::Unsupported(
+                "read buffer exceeds completion result range",
+            ));
+        }
         let ptr = NonNull::new(ptr).ok_or(SubmitError::Unsupported("null read buffer"))?;
         Ok(Self {
             fd,
@@ -595,13 +623,17 @@ pub(crate) struct WriteLease {
 }
 
 impl WriteLease {
+    /// Maximum byte count representable by the signed backend completion result.
+    pub(crate) const MAX_LEN: usize = i32::MAX as usize;
+
     /// Creates a write lease for an async backend submission.
     ///
     /// # Safety
     ///
-    /// `ptr..ptr+len` must identify readable memory owned by the reactor and
-    /// remain valid until the completion for `token` is handled. If `fixed` is
-    /// present, it must name the registered buffer containing the range.
+    /// For accepted leases, `ptr..ptr+len` must identify readable memory owned
+    /// by the reactor and remain valid until the completion for `token` is
+    /// handled. If `fixed` is present, it must name the registered buffer
+    /// containing the range.
     #[inline]
     pub(crate) unsafe fn new(
         fd: ConnFd,
@@ -609,6 +641,14 @@ impl WriteLease {
         len: usize,
         fixed: Option<FixedBufferId>,
     ) -> Result<Self, SubmitError> {
+        if len == 0 {
+            return Err(SubmitError::Unsupported("empty write buffer"));
+        }
+        if len > Self::MAX_LEN {
+            return Err(SubmitError::Unsupported(
+                "write buffer exceeds completion result range",
+            ));
+        }
         let ptr =
             NonNull::new(ptr.cast_mut()).ok_or(SubmitError::Unsupported("null write buffer"))?;
         Ok(Self {
@@ -1135,6 +1175,24 @@ mod tests {
     }
 
     #[test]
+    fn reaped_completion_count_survives_post_drain_submit_error() {
+        let error = io::Error::from_raw_os_error(libc::EIO);
+
+        let count = preserve_reaped_completion_count(3, 5, Err(error)).unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn empty_drain_surfaces_post_drain_submit_error() {
+        let error = io::Error::from_raw_os_error(libc::EIO);
+
+        let error = preserve_reaped_completion_count(3, 3, Err(error)).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
     fn completion_token_is_zero_cost_u64_wrapper() {
         assert_eq!(
             std::mem::size_of::<CompletionToken>(),
@@ -1174,6 +1232,36 @@ mod tests {
             unsafe { WriteLease::new(ConnFd::new(1), std::ptr::null(), 1, None) },
             Err(SubmitError::Unsupported(_))
         ));
+        let mut byte = 0u8;
+        assert!(matches!(
+            // SAFETY: The pointer is valid, but zero bytes is not a valid
+            // async read submission.
+            unsafe { ReadLease::new(ConnFd::new(1), &mut byte, 0, None) },
+            Err(SubmitError::Unsupported(_))
+        ));
+        assert!(matches!(
+            // SAFETY: The pointer is valid, but zero bytes is not a valid
+            // async write submission.
+            unsafe { WriteLease::new(ConnFd::new(1), &byte, 0, None) },
+            Err(SubmitError::Unsupported(_))
+        ));
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr();
+            assert!(matches!(
+                // SAFETY: Oversized lengths are rejected before constructing a
+                // lease, and this test never submits or dereferences the pointer.
+                unsafe { ReadLease::new(ConnFd::new(1), ptr, ReadLease::MAX_LEN + 1, None) },
+                Err(SubmitError::Unsupported(_))
+            ));
+            assert!(matches!(
+                // SAFETY: Oversized lengths are rejected before constructing a
+                // lease, and this test never submits or dereferences the pointer.
+                unsafe { WriteLease::new(ConnFd::new(1), ptr, WriteLease::MAX_LEN + 1, None) },
+                Err(SubmitError::Unsupported(_))
+            ));
+        }
 
         let iovecs = [libc::iovec {
             iov_base: std::ptr::null_mut(),

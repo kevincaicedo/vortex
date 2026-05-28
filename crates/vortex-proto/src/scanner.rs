@@ -280,6 +280,7 @@ fn sse2_scan_crlf(buf: &[u8]) -> CrlfPositions {
     let mut offset = 0;
     let mut pending_cr = NO_PENDING_CR;
     let ptr = buf.as_ptr();
+    // SAFETY: SSE2 is baseline on x86_64; this intrinsic only creates a vector constant.
     let cr = unsafe { _mm_set1_epi8(b'\r' as i8) };
 
     while offset + CHUNK <= buf.len() {

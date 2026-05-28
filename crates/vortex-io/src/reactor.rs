@@ -169,6 +169,10 @@ pub struct Reactor {
     cqe_buf: Vec<Completion>,
     /// Completion overflow kept in reactor order after a budgeted slice yields.
     pending_completions: VecDeque<Completion>,
+    /// Whether the backend currently owns an accept submission.
+    accept_inflight: bool,
+    /// Whether the backend currently owns a cancel request for the accept submission.
+    accept_cancel_inflight: bool,
     /// Reactor-local high-frequency runtime counters flushed on the cold
     /// metrics maintenance cadence.
     local_metrics: ReactorLocalMetrics,

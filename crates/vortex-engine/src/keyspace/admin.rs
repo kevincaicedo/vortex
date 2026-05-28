@@ -1,11 +1,13 @@
-use std::ffi::{CString, c_void};
 use std::sync::atomic::Ordering;
 
+#[cfg(not(miri))]
+use std::ffi::{CString, c_void};
+#[cfg(not(miri))]
 use tikv_jemalloc_sys::mallctl;
 
 use crate::table::SwissTable;
 
-use super::{AofLsn, ConcurrentKeyspace};
+use super::{AofLsn, ConcurrentKeyspace, LsnOverflow};
 
 /// Best-effort jemalloc cache and arena purge after FLUSHDB/FLUSHALL.
 ///
@@ -28,6 +30,10 @@ use super::{AofLsn, ConcurrentKeyspace};
 /// Purge failures are non-fatal: the allocator will reclaim pages through
 /// its normal background decay. Logging is omitted to avoid pulling I/O
 /// dependencies into the engine crate.
+#[cfg(miri)]
+fn purge_allocator_after_flush() {}
+
+#[cfg(not(miri))]
 fn purge_allocator_after_flush() {
     // SAFETY: All `mallctl` calls use well-known jemalloc 5.x MIB names via
     // valid null-terminated `CString` pointers. Pointer arguments are either
@@ -129,13 +135,18 @@ impl ConcurrentKeyspace {
     /// Outstanding memory reservations are intentionally left untouched. A
     /// [`MemoryReservation`] is an owning token; only that token may release its
     /// bytes from `memory_reserved`.
-    pub(crate) fn flush_all_with_lsn(&self) -> Option<AofLsn> {
+    pub(crate) fn flush_all_with_lsn(&self) -> Result<Option<AofLsn>, LsnOverflow> {
         let mut guards = Vec::with_capacity(self.shards.len());
         for shard in self.shards.iter() {
             guards.push(shard.write());
         }
 
         let had_entries = guards.iter().any(|guard| !guard.is_empty());
+        let aof_lsn = if had_entries {
+            self.next_aof_lsn()?
+        } else {
+            None
+        };
         for guard in &mut guards {
             **guard = SwissTable::with_hasher(self.table_hasher.clone());
         }
@@ -144,14 +155,13 @@ impl ConcurrentKeyspace {
         }
         self.expiry_key_total.store(0, Ordering::Relaxed);
         self.global_memory_used.store(0, Ordering::Relaxed);
-        let aof_lsn = had_entries.then(|| self.next_aof_lsn()).flatten();
         drop(guards);
         purge_allocator_after_flush();
         if had_entries {
             self.bump_all_watches();
         }
 
-        aof_lsn
+        Ok(aof_lsn)
     }
 
     /// Returns the exact memory usage across all shards.

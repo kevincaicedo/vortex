@@ -24,7 +24,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use vortex_common::{
     Timestamp, VortexValue, current_unix_time_nanos, deadline_nanos_to_absolute_unix_nanos,
@@ -82,6 +82,10 @@ pub struct AofManifest {
 
 impl AofManifest {
     /// Return the manifest path associated with one legacy AOF path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `aof_path` has no file name.
     pub fn path_for_aof(aof_path: &Path) -> io::Result<PathBuf> {
         let file_name = aof_path.file_name().ok_or_else(|| {
             io::Error::new(
@@ -95,15 +99,32 @@ impl AofManifest {
     }
 
     /// Load the manifest associated with one legacy AOF path.
+    ///
+    /// Returns `Ok(None)` when the sidecar manifest does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` when the sidecar path cannot be derived, manifest
+    /// metadata cannot be checked, or the manifest exists but fails validation.
     pub fn load_for_aof(aof_path: &Path) -> io::Result<Option<Self>> {
         let manifest_path = Self::path_for_aof(aof_path)?;
-        if !manifest_path.exists() {
+        if !manifest_path.try_exists()? {
             return Ok(None);
         }
         Self::load(&manifest_path).map(Some)
     }
 
     /// Load a manifest by exact path.
+    ///
+    /// The loader accepts only manifest-local file names for `base`, `tail`,
+    /// and `legacy` entries. Absolute paths, path separators, traversal, and
+    /// duplicate scalar fields fail closed as unsupported format errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` with [`AofErrorKind::UnsupportedFormat`] for
+    /// malformed or unsupported manifest content, and propagates filesystem
+    /// read errors with AOF context.
     pub fn load(path: &Path) -> io::Result<Self> {
         let data = fs::read_to_string(path).map_err(|error| {
             aof_io_error(
@@ -140,8 +161,22 @@ impl AofManifest {
                 ));
             };
             match key {
-                "state" => state = Some(AofManifestState::parse(value)?),
+                "state" => {
+                    if state.is_some() {
+                        return Err(aof_error(
+                            AofErrorKind::UnsupportedFormat,
+                            "duplicate AOF manifest state",
+                        ));
+                    }
+                    state = Some(AofManifestState::parse(value)?);
+                }
                 "epoch" => {
+                    if epoch.is_some() {
+                        return Err(aof_error(
+                            AofErrorKind::UnsupportedFormat,
+                            "duplicate AOF manifest epoch",
+                        ));
+                    }
                     epoch = Some(value.parse::<u64>().map_err(|error| {
                         aof_error(
                             AofErrorKind::UnsupportedFormat,
@@ -149,9 +184,9 @@ impl AofManifest {
                         )
                     })?);
                 }
-                "base" => base_files.push(parent.join(value)),
-                "tail" => tail_files.push(parent.join(value)),
-                "legacy" => legacy_files.push(parent.join(value)),
+                "base" => base_files.push(manifest_entry_path(parent, key, value)?),
+                "tail" => tail_files.push(manifest_entry_path(parent, key, value)?),
+                "legacy" => legacy_files.push(manifest_entry_path(parent, key, value)?),
                 _ => {
                     return Err(aof_error(
                         AofErrorKind::UnsupportedFormat,
@@ -294,13 +329,21 @@ impl AofManifest {
 /// Result of a manifest-backed rewrite.
 #[derive(Clone, Debug)]
 pub struct AofRewriteOutcome {
+    /// Durable sidecar manifest path.
     pub manifest_path: PathBuf,
+    /// Base snapshot file written by the rewrite.
     pub base_path: PathBuf,
+    /// New active tail file used after writer swap.
     pub tail_path: PathBuf,
+    /// Previous active AOF path.
     pub old_path: PathBuf,
+    /// Number of keys serialized into the base snapshot.
     pub keys_written: u64,
+    /// Number of bytes copied from the old active AOF into the new tail.
     pub tail_bytes_copied: u64,
+    /// Rewrite epoch that was validated against the writer epoch.
     pub epoch: u64,
+    /// Whether best-effort cleanup removed the previous active AOF.
     pub old_file_removed: bool,
 }
 
@@ -368,6 +411,31 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.tmp"))
 }
 
+fn is_manifest_file_name(value: &str) -> bool {
+    if value.is_empty()
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return false;
+    }
+
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn manifest_entry_path(parent: &Path, key: &str, value: &str) -> io::Result<PathBuf> {
+    if is_manifest_file_name(value) {
+        return Ok(parent.join(value));
+    }
+
+    Err(aof_error(
+        AofErrorKind::UnsupportedFormat,
+        format!("AOF manifest {key} entry must be a file name, got {value:?}"),
+    ))
+}
+
 fn manifest_file_name(path: &Path) -> io::Result<String> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -375,14 +443,22 @@ fn manifest_file_name(path: &Path) -> io::Result<String> {
             format!("AOF manifest entry has no file name: {}", path.display()),
         )
     })?;
-    let name = file_name.to_string_lossy();
-    if name.contains('\n') || name.contains('\r') {
+    let name = file_name.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("AOF manifest entry is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    if !is_manifest_file_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("AOF manifest entry contains a newline: {}", path.display()),
+            format!(
+                "AOF manifest entry must be a single file name: {}",
+                path.display()
+            ),
         ));
     }
-    Ok(name.into_owned())
+    Ok(name.to_owned())
 }
 
 fn rewrite_component_path(aof_path: &Path, component: &str, epoch: u64) -> io::Result<PathBuf> {
@@ -448,6 +524,12 @@ impl AofRewriter {
     ///
     /// This helper is safe for offline tests/tools: it refuses to replace an
     /// existing file. Live rewrite handoff must use [`Self::rewrite_with_writer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `aof_path` already exists, the snapshot cannot be
+    /// written or synced, the parent directory cannot be synced, or any live
+    /// value cannot be encoded into an AOF record.
     pub fn rewrite(
         keyspace: &ConcurrentKeyspace,
         aof_path: &Path,
@@ -462,6 +544,19 @@ impl AofRewriter {
     /// `expected_epoch` must match `writer_epoch`, mirroring the pool-owned
     /// AOF coordinator epoch. This keeps stale rewrite requests from swapping
     /// a writer generation that is no longer active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the epoch check fails, the active writer cannot be
+    /// flushed/synced, the base or tail file cannot be written and synced, the
+    /// preparing or active manifest cannot be published durably, the writer swap
+    /// fails, or any live value cannot be encoded into an AOF record.
+    ///
+    /// On error, recovery must load the manifest associated with the original
+    /// AOF path and replay according to its state. A `preparing` manifest keeps
+    /// recovery on the legacy AOF; an `active` manifest selects the base/tail
+    /// set. Live server exposure remains gated separately until non-blocking
+    /// rewrite handoff is implemented and measured.
     pub fn rewrite_with_writer(
         keyspace: &ConcurrentKeyspace,
         writer: &mut AofFileWriter,
@@ -1315,6 +1410,79 @@ mod tests {
             assert!(label.contains("seed-0000000000005eed"));
             assert!(!rewrite_point.as_str().is_empty());
         }
+    }
+
+    #[test]
+    fn manifest_load_rejects_path_traversal_and_nested_entries() {
+        let path = temp_path("manifest-path-validation");
+        let manifest_path = AofManifest::path_for_aof(&path).unwrap();
+        let invalid_entries = [
+            "../escape.aof",
+            "/tmp/escape.aof",
+            "nested/base.aof",
+            "nested\\base.aof",
+            ".",
+            "",
+        ];
+
+        for entry in invalid_entries {
+            let manifest = format!(
+                "{MANIFEST_MAGIC} {MANIFEST_VERSION}\nstate active\nepoch 1\nbase {entry}\ntail tail.aof\n"
+            );
+            fs::write(&manifest_path, manifest).unwrap();
+
+            let error = AofManifest::load(&manifest_path).unwrap_err();
+            assert_eq!(
+                crate::aof::aof_error_kind(&error),
+                Some(AofErrorKind::UnsupportedFormat),
+                "entry {entry:?}"
+            );
+            assert!(
+                error.to_string().contains("must be a file name"),
+                "entry {entry:?}: {error}"
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn manifest_load_for_aof_missing_manifest_returns_none() {
+        let path = temp_path("manifest-missing");
+        assert!(AofManifest::load_for_aof(&path).unwrap().is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn manifest_load_rejects_duplicate_scalar_keys() {
+        let path = temp_path("manifest-duplicate-scalars");
+        let manifest_path = AofManifest::path_for_aof(&path).unwrap();
+        let cases = [
+            (
+                format!(
+                    "{MANIFEST_MAGIC} {MANIFEST_VERSION}\nstate active\nstate preparing\nepoch 1\nbase base.aof\ntail tail.aof\nlegacy old.aof\n"
+                ),
+                "duplicate AOF manifest state",
+            ),
+            (
+                format!(
+                    "{MANIFEST_MAGIC} {MANIFEST_VERSION}\nstate active\nepoch 1\nepoch 2\nbase base.aof\ntail tail.aof\n"
+                ),
+                "duplicate AOF manifest epoch",
+            ),
+        ];
+
+        for (manifest, expected) in cases {
+            fs::write(&manifest_path, manifest).unwrap();
+            let error = AofManifest::load(&manifest_path).unwrap_err();
+            assert_eq!(
+                crate::aof::aof_error_kind(&error),
+                Some(AofErrorKind::UnsupportedFormat)
+            );
+            assert!(error.to_string().contains(expected));
+        }
+
+        cleanup(&path);
     }
 
     #[test]

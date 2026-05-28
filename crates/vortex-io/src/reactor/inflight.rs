@@ -54,6 +54,16 @@ impl InflightSet {
     }
 
     #[inline]
+    pub(super) fn cancel_inflight(&self, op: OpType) -> bool {
+        match op {
+            OpType::Read => self.cancel_read,
+            OpType::Write => self.cancel_write,
+            OpType::Writev => self.cancel_writev,
+            OpType::Close => self.cancel_close,
+        }
+    }
+
+    #[inline]
     pub(super) fn has(&self, op: OpType) -> bool {
         match op {
             OpType::Read => self.read,

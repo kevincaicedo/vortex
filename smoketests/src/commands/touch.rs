@@ -16,7 +16,7 @@ pub fn spec() -> CommandSpec {
         .summary("Counts existing keys without modifying their values.")
         .syntax(&["TOUCH key [key ...]"])
         .tested(&["Count semantics across existing and missing keys"])
-        .not_tested(&["LRU/LFU side effects because eviction is not implemented yet"])
+        .not_tested(&["LRU/LFU metadata side effects; covered by engine eviction tests"])
         .case(CaseDef::new(
             "counts existing keys",
             "TOUCH should count only keys that currently exist.",

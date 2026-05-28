@@ -1,12 +1,15 @@
 use super::*;
 use crate::shutdown::ShutdownCoordinator;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::os::fd::IntoRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use vortex_engine::commands::execute_command;
 use vortex_persist::aof::{
-    AOF_HEADER_SIZE, AofFsyncPolicy, reader::AofReader, writer::AofFileWriter,
+    AOF_HEADER_SIZE, AofErrorKind, AofFsyncPolicy, aof_error_kind, reader::AofReader,
+    writer::AofFileWriter,
 };
 use vortex_proto::RespTape;
 
@@ -300,12 +303,51 @@ fn resp_command(parts: &[&[u8]]) -> Vec<u8> {
     wire
 }
 
+fn keys_for_shards(keyspace: &ConcurrentKeyspace, shards: &[usize]) -> Vec<Vec<u8>> {
+    let mut keys = vec![Vec::new(); shards.len()];
+    let mut found = vec![false; shards.len()];
+
+    for candidate in 0..200_000usize {
+        let key = format!("reactor-shard:{candidate:06}").into_bytes();
+        let shard_idx = keyspace.shard_index(&key);
+        for (position, target) in shards.iter().enumerate() {
+            if !found[position] && *target == shard_idx {
+                keys[position] = key.clone();
+                found[position] = true;
+            }
+        }
+        if found.iter().all(|flag| *flag) {
+            return keys;
+        }
+    }
+
+    panic!("failed to find keys for requested shards");
+}
+
 fn socket_pair() -> (RawFd, RawFd) {
     let mut fds = [0; 2];
     // SAFETY: `fds` points to two valid integers for libc to initialize.
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     assert_eq!(rc, 0, "socketpair failed: {}", io::Error::last_os_error());
     (fds[0], fds[1])
+}
+
+fn socket_addr_v4_for_fd(fd: RawFd) -> SocketAddrV4 {
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: fd is a live listener and addr/len are valid output storage.
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut addr as *mut libc::sockaddr_in).cast::<libc::sockaddr>(),
+            &mut len,
+        )
+    };
+    assert_eq!(rc, 0, "getsockname failed: {}", io::Error::last_os_error());
+    SocketAddrV4::new(
+        Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+        u16::from_be(addr.sin_port),
+    )
 }
 
 fn peer_observes_eof(peer_fd: RawFd) -> bool {
@@ -695,6 +737,52 @@ fn multi_exec_handles_cross_key_and_duplicate_key_plans() {
     );
     assert_eq!(
         keyspace_get_response(&reactor.keyspace, b"beta"),
+        b"$3\r\ntwo\r\n"
+    );
+}
+
+#[test]
+fn multi_exec_handles_multi_shard_keys() {
+    let mut reactor = test_reactor();
+    let keys = keys_for_shards(&reactor.keyspace, &[0, 1]);
+    assert_ne!(
+        reactor.keyspace.shard_index(&keys[0]),
+        reactor.keyspace.shard_index(&keys[1])
+    );
+
+    assert_eq!(
+        response_bytes(dispatch_reactor_wire(&mut reactor, &resp_command(&[b"MULTI"])).0),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        response_bytes(
+            dispatch_reactor_wire(
+                &mut reactor,
+                &resp_command(&[b"SET", keys[0].as_slice(), b"one"])
+            )
+            .0
+        ),
+        b"+QUEUED\r\n"
+    );
+    assert_eq!(
+        response_bytes(
+            dispatch_reactor_wire(
+                &mut reactor,
+                &resp_command(&[b"SET", keys[1].as_slice(), b"two"])
+            )
+            .0
+        ),
+        b"+QUEUED\r\n"
+    );
+
+    let (resp, _) = dispatch_reactor_wire(&mut reactor, &resp_command(&[b"EXEC"]));
+    assert_eq!(response_bytes(resp), b"*2\r\n+OK\r\n+OK\r\n");
+    assert_eq!(
+        keyspace_get_response(&reactor.keyspace, keys[0].as_slice()),
+        b"$3\r\none\r\n"
+    );
+    assert_eq!(
+        keyspace_get_response(&reactor.keyspace, keys[1].as_slice()),
         b"$3\r\ntwo\r\n"
     );
 }
@@ -1240,6 +1328,24 @@ fn fatal_aof_state_rejects_writes_before_mutation() {
 }
 
 #[test]
+fn empty_aof_payload_returns_typed_error_without_panicking() {
+    let path = temp_aof_path("empty-aof-payload");
+    let mut reactor = test_reactor();
+    enable_test_aof(&mut reactor, &path);
+
+    let lsn = AofLsn::try_from_raw(1).unwrap();
+    let error = reactor
+        .append_aof_payload(AofCommitEffect::new(lsn), b"")
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(aof_error_kind(&error), Some(AofErrorKind::CorruptRecord));
+    assert!(error.to_string().contains("must not be empty"));
+
+    cleanup(&path);
+}
+
+#[test]
 fn aof_append_failure_enters_write_stop_for_normal_write() {
     let path = temp_aof_path("normal-append-failure");
     let mut reactor = test_reactor();
@@ -1599,6 +1705,80 @@ fn reactor_rejects_buffer_count_below_connection_minimum() {
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("buffer_count"));
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn reactor_rejects_config_values_that_do_not_fit_connection_metadata() {
+    let config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: u32::MAX as usize + 1,
+        buffer_count: u32::MAX as usize + 1,
+        ..Default::default()
+    };
+
+    let error = match Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))) {
+        Ok(_) => panic!("reactor creation should fail before metadata indexes can truncate"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("max_connections"));
+
+    let config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: 1,
+        buffer_count: u32::MAX as usize + 1,
+        ..Default::default()
+    };
+
+    let error = match Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))) {
+        Ok(_) => panic!("reactor creation should fail before buffer indexes can truncate"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("buffer_count"));
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn reactor_rejects_buffer_size_that_does_not_fit_backend_read_len() {
+    let config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: 1,
+        buffer_count: 1,
+        buffer_size: ReadLease::MAX_LEN + 1,
+        max_request_bytes: ReadLease::MAX_LEN + 1,
+        ..Default::default()
+    };
+
+    let error = match Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))) {
+        Ok(_) => panic!("reactor creation should fail before read lengths can narrow"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("buffer_size"));
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn reactor_rejects_pending_response_cap_that_cannot_fit_completion_result() {
+    let config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: 1,
+        buffer_count: 1,
+        connection_caps: ConnectionMemoryCaps {
+            max_pending_response_bytes: WriteLease::MAX_LEN + 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let error = match Reactor::new(0, config, Arc::new(ShutdownCoordinator::new(1))) {
+        Ok(_) => panic!("reactor creation should fail before write lengths can narrow"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("max_pending_response_bytes"));
 }
 
 #[test]
@@ -2208,6 +2388,92 @@ fn overload_accept_threshold_drops_new_connection_without_slot() {
 }
 
 #[test]
+fn accepted_fd_is_nonblocking_cloexec_before_read_arm() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let (server_fd, peer_fd) = socket_pair();
+
+    reactor.handle_accepted_fd(server_fd);
+
+    assert_eq!(reactor.connection_count(), 1);
+    assert_eq!(state.lock().unwrap().reads.len(), 1);
+    let conn_id = reactor
+        .connections
+        .ids()
+        .next()
+        .expect("accepted connection is registered");
+    let fd = reactor.connections.get(conn_id).expect("connection").fd;
+    let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(status_flags >= 0);
+    assert_ne!(status_flags & libc::O_NONBLOCK, 0);
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(fd_flags >= 0);
+    assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+
+    unsafe {
+        libc::close(fd);
+        libc::close(peer_fd);
+    }
+}
+
+#[test]
+fn accept_drain_uses_nonblocking_cloexec_fd() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    reactor.close_listener_fd();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    reactor.listener_fd = listener.into_raw_fd();
+    let addr = socket_addr_v4_for_fd(reactor.listener_fd);
+    let client = TcpStream::connect(addr).unwrap();
+
+    let (accepted, exhausted) = reactor.drain_ready_accepts();
+
+    assert_eq!(accepted, 1);
+    assert!(!exhausted);
+    assert_eq!(reactor.connection_count(), 1);
+    assert_eq!(state.lock().unwrap().reads.len(), 1);
+
+    let conn_id = reactor
+        .connections
+        .ids()
+        .next()
+        .expect("accepted connection is registered");
+    let fd = reactor.connections.get(conn_id).expect("connection").fd;
+    let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(status_flags >= 0);
+    assert_ne!(status_flags & libc::O_NONBLOCK, 0);
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(fd_flags >= 0);
+    assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+
+    unsafe {
+        libc::close(fd);
+    }
+    drop(client);
+}
+
+#[test]
+fn accepted_fd_configuration_failure_drops_without_connection_slot() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+
+    reactor.handle_accepted_fd(-1);
+
+    assert_eq!(reactor.connection_count(), 0);
+    assert_eq!(reactor.buffer_pool.outstanding(), 0);
+    assert!(state.lock().unwrap().reads.is_empty());
+    assert_eq!(
+        reactor
+            .keyspace
+            .runtime_metrics()
+            .overload_connections_dropped,
+        1
+    );
+}
+
+#[test]
 fn overload_aof_backlog_defers_write_but_allows_read() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let config = ReactorConfig {
@@ -2655,6 +2921,30 @@ fn writev_eagain_completion_resubmits_without_advancing() {
 }
 
 #[test]
+fn oversized_write_completion_closes_before_clearing_pending_response() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let conn_id = insert_test_connection(&mut reactor, 123, &resp_command(&[b"PING"]));
+
+    reactor.process_commands(conn_id, 123);
+    let write_token = state.lock().unwrap().writevs[0].0;
+    let total = reactor.connections.get(conn_id).unwrap().write_buf_len;
+
+    reactor.handle_completion(&Completion {
+        token: write_token,
+        result: total.saturating_add(1) as i32,
+        flags: 0,
+    });
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert_eq!(
+        reactor.connections.get(conn_id).unwrap().write_buf_len,
+        total
+    );
+    assert_eq!(state.lock().unwrap().closes.len(), 1);
+}
+
+#[test]
 fn pending_writev_reuses_raw_iovec_capacity_after_finalize() {
     let mut pending = PendingWritev::new();
     pending.push_static(b"+PONG\r\n");
@@ -3031,6 +3321,87 @@ fn shutdown_drain_waits_for_terminal_cqes_before_releasing_buffers() {
 }
 
 #[test]
+fn shutdown_drain_processes_accept_completion_without_connections() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    reactor.submit_accept_rearm().unwrap();
+
+    let (accepted_fd, peer_fd) = socket_pair();
+    let accept_token = CompletionToken::accept();
+    let cancel_token = CompletionToken::cancel(accept_token).unwrap();
+    {
+        let mut state = state.lock().unwrap();
+        state.completions.push_back(Completion {
+            token: accept_token,
+            result: accepted_fd,
+            flags: 0,
+        });
+        state.completions.push_back(Completion {
+            token: cancel_token,
+            result: 0,
+            flags: 0,
+        });
+    }
+
+    reactor.drain_inflight_io();
+
+    assert!(!reactor.accept_inflight);
+    assert!(!reactor.accept_cancel_inflight);
+    assert!(reactor.connections.is_empty());
+    assert!(peer_observes_eof(peer_fd));
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.cancels, vec![(accept_token, cancel_token)]);
+
+    unsafe {
+        libc::close(peer_fd);
+    }
+}
+
+#[test]
+fn shutdown_drain_does_not_duplicate_accept_cancel_after_enter_drain() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    reactor.submit_accept_rearm().unwrap();
+
+    let accept_token = CompletionToken::accept();
+    let cancel_token = CompletionToken::cancel(accept_token).unwrap();
+
+    reactor.enter_drain_mode();
+    assert!(reactor.accept_inflight);
+    assert!(reactor.accept_cancel_inflight);
+
+    let (accepted_fd, peer_fd) = socket_pair();
+    {
+        let mut state = state.lock().unwrap();
+        state.completions.push_back(Completion {
+            token: accept_token,
+            result: accepted_fd,
+            flags: 0,
+        });
+        state.completions.push_back(Completion {
+            token: cancel_token,
+            result: 0,
+            flags: 0,
+        });
+    }
+
+    reactor.drain_inflight_io();
+
+    assert!(!reactor.accept_inflight);
+    assert!(!reactor.accept_cancel_inflight);
+    assert!(reactor.connections.is_empty());
+    assert!(peer_observes_eof(peer_fd));
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.cancels, vec![(accept_token, cancel_token)]);
+
+    unsafe {
+        libc::close(peer_fd);
+    }
+}
+
+#[test]
 fn cancel_completion_does_not_release_buffer_before_target_terminal() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(state);
@@ -3057,6 +3428,85 @@ fn cancel_completion_does_not_release_buffer_before_target_terminal() {
     assert!(reactor.inflight_ops[conn_id].read);
     assert!(!reactor.inflight_ops[conn_id].cancel_read);
     assert_eq!(reactor.buffer_pool.outstanding(), 2);
+}
+
+#[test]
+fn cancel_enoent_does_not_release_buffer_before_target_terminal() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(state);
+
+    let read_idx = reactor.buffer_pool.lease_index().unwrap();
+    let write_idx = reactor.buffer_pool.lease_index().unwrap();
+    let mut meta = ConnectionMeta::new(123, 0);
+    meta.read_buf_offset = read_idx as u32;
+    meta.write_buf_offset = write_idx as u32;
+    let conn_id = reactor.connections.insert(meta);
+    reactor.generations[conn_id] = 15;
+    reactor.inflight_ops[conn_id].read = true;
+
+    reactor.close_connection(conn_id);
+
+    let read_token = encode_token(conn_id, reactor.generations[conn_id], OpType::Read).unwrap();
+    reactor.handle_completion(&Completion {
+        token: CompletionToken::cancel(read_token).unwrap(),
+        result: -libc::ENOENT,
+        flags: 0,
+    });
+
+    assert!(reactor.connections.get(conn_id).is_some());
+    assert!(reactor.inflight_ops[conn_id].read);
+    assert!(!reactor.inflight_ops[conn_id].cancel_read);
+    assert_eq!(reactor.buffer_pool.outstanding(), 2);
+
+    reactor.handle_completion(&Completion {
+        token: read_token,
+        result: -libc::ECANCELED,
+        flags: 0,
+    });
+    reactor.handle_completion(&Completion {
+        token: encode_token(conn_id, reactor.generations[conn_id], OpType::Close).unwrap(),
+        result: 0,
+        flags: 0,
+    });
+
+    reactor.drain_close_finalization_until_idle();
+
+    assert!(reactor.connections.get(conn_id).is_none());
+    assert_eq!(reactor.buffer_pool.outstanding(), 0);
+}
+
+#[test]
+fn accept_cancel_enoent_keeps_accept_inflight_until_accept_cqe() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(state);
+    reactor.submit_accept_rearm().unwrap();
+    reactor.enter_drain_mode();
+
+    let accept_token = CompletionToken::accept();
+    reactor.handle_completion(&Completion {
+        token: CompletionToken::cancel(accept_token).unwrap(),
+        result: -libc::ENOENT,
+        flags: 0,
+    });
+
+    assert!(reactor.accept_inflight);
+    assert!(!reactor.accept_cancel_inflight);
+    assert!(reactor.connections.is_empty());
+
+    let (accepted_fd, peer_fd) = socket_pair();
+    reactor.handle_completion(&Completion {
+        token: accept_token,
+        result: accepted_fd,
+        flags: 0,
+    });
+
+    assert!(!reactor.accept_inflight);
+    assert!(reactor.connections.is_empty());
+    assert!(peer_observes_eof(peer_fd));
+
+    unsafe {
+        libc::close(peer_fd);
+    }
 }
 
 #[test]
@@ -3116,7 +3566,7 @@ fn stale_slot_reuse_cqes_are_dropped_by_generation() {
     ];
 
     reactor.buffer_pool.release_index(old_read_idx);
-    reactor.connections.remove(conn_id);
+    let _ = reactor.connections.remove(conn_id);
 
     let new_read_idx = reactor.buffer_pool.lease_index().unwrap();
     let new_meta = ConnectionMeta::new(124, new_read_idx as u32);
@@ -3156,6 +3606,47 @@ fn same_generation_completion_without_inflight_state_is_dropped() {
     assert_eq!(reactor.unexpected_completion_tokens, 1);
     assert_eq!(reactor.connections.get(conn_id).unwrap().read_buf_len, 0);
     assert!(reactor.connections.get(conn_id).is_some());
+}
+
+#[test]
+fn oversized_read_completion_closes_before_extending_read_cursor() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let conn_id = insert_test_connection(&mut reactor, 123, b"");
+    let cursor = reactor.buffer_pool.buffer_size() - 1;
+    reactor.connections.get_mut(conn_id).unwrap().read_buf_len = cursor as u32;
+    reactor.inflight_ops[conn_id].read = true;
+    let token = encode_token(conn_id, reactor.generations[conn_id], OpType::Read).unwrap();
+
+    reactor.handle_completion(&Completion {
+        token,
+        result: 2,
+        flags: 0,
+    });
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert_eq!(
+        reactor.connections.get(conn_id).unwrap().read_buf_len,
+        cursor as u32
+    );
+    assert!(!reactor.inflight_ops[conn_id].read);
+    assert!(reactor.inflight_ops[conn_id].close);
+    assert_eq!(state.lock().unwrap().closes.len(), 1);
+}
+
+#[test]
+fn submit_read_rejects_corrupt_cursor_above_buffer_capacity() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let conn_id = insert_test_connection(&mut reactor, 123, b"");
+    reactor.connections.get_mut(conn_id).unwrap().read_buf_len =
+        (reactor.buffer_pool.buffer_size() + 1) as u32;
+
+    reactor.submit_read_for(conn_id, 123);
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert!(state.lock().unwrap().reads.is_empty());
+    assert_eq!(state.lock().unwrap().closes.len(), 1);
 }
 
 #[test]

@@ -64,6 +64,10 @@ pub(crate) fn aof_error(kind: AofErrorKind, message: impl Into<String>) -> io::E
     io::Error::new(io::ErrorKind::InvalidData, AofError::new(kind, message))
 }
 
+pub(crate) fn aof_invalid_input(kind: AofErrorKind, message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, AofError::new(kind, message))
+}
+
 pub(crate) fn aof_io_error(
     kind: AofErrorKind,
     message: impl Into<String>,

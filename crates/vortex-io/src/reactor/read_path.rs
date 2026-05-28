@@ -22,18 +22,36 @@ impl Reactor {
         }
 
         let bytes_read = cqe.result as usize;
-        let fd = match self.connections.get(conn_id) {
-            Some(c) => c.fd,
+        let buffer_size = self.buffer_pool.buffer_size();
+        let (fd, cursor) = match self.connections.get(conn_id) {
+            Some(c) => (c.fd, c.read_buf_len as usize),
             None => return, // Connection already removed.
         };
+        let Some(next_cursor) = cursor.checked_add(bytes_read) else {
+            tracing::warn!(
+                conn_id,
+                cursor,
+                bytes_read,
+                "read completion length overflow, closing connection"
+            );
+            self.close_connection(conn_id);
+            return;
+        };
+        if next_cursor > buffer_size || next_cursor > u32::MAX as usize {
+            tracing::warn!(
+                conn_id,
+                cursor,
+                bytes_read,
+                buffer_size,
+                "read completion exceeded leased buffer, closing connection"
+            );
+            self.close_connection(conn_id);
+            return;
+        }
 
         // Advance read cursor in ConnectionMeta.
         if let Some(c) = self.connections.get_mut(conn_id) {
-            c.read_buf_len += bytes_read as u32;
-        }
-
-        // Update last_active after successful read progress.
-        if let Some(c) = self.connections.get_mut(conn_id) {
+            c.read_buf_len = next_cursor as u32;
             c.last_active = self.now_secs;
         }
 

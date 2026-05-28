@@ -573,24 +573,66 @@ pub(super) fn msetnx_cleanup_and_all_absent_locked(
     true
 }
 
-pub(super) fn set_with_options_on_table(
+pub(super) fn set_with_options_on_table<F>(
     table: &mut SwissTable,
     key: VortexKey,
     value: VortexValue,
     options: SetOptions,
     now_nanos: u64,
-) -> (SetResult, ExpiryTransition, Option<SlotMutationReport>) {
+    mut allocate_lsn: F,
+) -> Result<(SetResult, ExpiryTransition, Option<AofLsn>), LsnOverflow>
+where
+    F: FnMut() -> Result<(Option<u64>, Option<AofLsn>), LsnOverflow>,
+{
     let table_hash = table.table_hash_key_bytes(key.as_bytes());
     match table.slot_cursor_prehashed(key.as_bytes(), table_hash, now_nanos) {
-        SlotCursor::Live(live) => set_live_with_options(live, value, options),
+        SlotCursor::Live(live) => {
+            if options.nx {
+                let had_ttl = live.had_ttl();
+                let existing_ttl = live.ttl_deadline();
+                let previous = options.get.then(|| live.cloned_value());
+                let result = if options.get {
+                    SetResult::NotSetGet(previous)
+                } else {
+                    SetResult::NotSet
+                };
+                return Ok((
+                    result,
+                    ExpiryTransition::new(had_ttl, existing_ttl != 0),
+                    None,
+                ));
+            }
+            let (entry_lsn, aof_lsn) = allocate_lsn()?;
+            Ok(set_live_with_options(
+                live, value, options, entry_lsn, aof_lsn,
+            ))
+        }
         SlotCursor::Expired(expired) => {
+            if !options.xx {
+                let (entry_lsn, aof_lsn) = allocate_lsn()?;
+                let had_ttl = expired
+                    .remove()
+                    .map(|removed| removed.old_had_ttl())
+                    .unwrap_or(false);
+                return Ok(set_absent_after_cursor_probe(
+                    table, key, value, table_hash, options, had_ttl, entry_lsn, aof_lsn,
+                ));
+            }
             let had_ttl = expired
                 .remove()
                 .map(|removed| removed.old_had_ttl())
                 .unwrap_or(false);
-            set_absent_after_cursor_probe(table, key, value, table_hash, options, had_ttl)
+            Ok(set_absent_after_cursor_probe_noop(options, had_ttl))
         }
-        SlotCursor::Vacant(vacant) => set_vacant_with_options(vacant, key, value, options, false),
+        SlotCursor::Vacant(vacant) => {
+            if options.xx {
+                return Ok(set_vacant_noop(options, false));
+            }
+            let (entry_lsn, aof_lsn) = allocate_lsn()?;
+            Ok(set_vacant_with_options(
+                vacant, key, value, options, false, entry_lsn, aof_lsn,
+            ))
+        }
     }
 }
 
@@ -598,22 +640,10 @@ fn set_live_with_options(
     live: crate::table::LiveSlotCursor<'_>,
     value: VortexValue,
     options: SetOptions,
-) -> (SetResult, ExpiryTransition, Option<SlotMutationReport>) {
-    let had_ttl = live.had_ttl();
+    entry_lsn: Option<u64>,
+    aof_lsn: Option<AofLsn>,
+) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
     let existing_ttl = live.ttl_deadline();
-    if options.nx {
-        let previous = options.get.then(|| live.cloned_value());
-        let result = if options.get {
-            SetResult::NotSetGet(previous)
-        } else {
-            SetResult::NotSet
-        };
-        return (
-            result,
-            ExpiryTransition::new(had_ttl, existing_ttl != 0),
-            None,
-        );
-    }
 
     let effective_ttl = if options.keepttl {
         existing_ttl
@@ -621,9 +651,9 @@ fn set_live_with_options(
         options.ttl_deadline
     };
     let policy = if effective_ttl != 0 {
-        MutationPolicy::set(effective_ttl, None)
+        MutationPolicy::set(effective_ttl, entry_lsn)
     } else {
-        MutationPolicy::clear(None)
+        MutationPolicy::clear(entry_lsn)
     };
     let mut report = live.replace_value(value, policy);
     let transition = ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl());
@@ -632,7 +662,7 @@ fn set_live_with_options(
     } else {
         SetResult::Ok
     };
-    (result, transition, Some(report))
+    (result, transition, aof_lsn)
 }
 
 fn set_vacant_with_options(
@@ -641,25 +671,18 @@ fn set_vacant_with_options(
     value: VortexValue,
     options: SetOptions,
     had_ttl: bool,
-) -> (SetResult, ExpiryTransition, Option<SlotMutationReport>) {
-    if options.xx {
-        let result = if options.get {
-            SetResult::NotSetGet(None)
-        } else {
-            SetResult::NotSet
-        };
-        return (result, ExpiryTransition::remove(had_ttl), None);
-    }
-
+    entry_lsn: Option<u64>,
+    aof_lsn: Option<AofLsn>,
+) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
     let effective_ttl = if options.keepttl {
         0
     } else {
         options.ttl_deadline
     };
     let policy = if effective_ttl != 0 {
-        MutationPolicy::set(effective_ttl, None)
+        MutationPolicy::set(effective_ttl, entry_lsn)
     } else {
-        MutationPolicy::clear(None)
+        MutationPolicy::clear(entry_lsn)
     };
     let report = vacant.insert(key, value, policy);
     let has_ttl_after = report.new_has_ttl();
@@ -671,8 +694,20 @@ fn set_vacant_with_options(
     (
         result,
         ExpiryTransition::new(had_ttl, has_ttl_after),
-        Some(report),
+        aof_lsn,
     )
+}
+
+fn set_vacant_noop(
+    options: SetOptions,
+    had_ttl: bool,
+) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
+    let result = if options.get {
+        SetResult::NotSetGet(None)
+    } else {
+        SetResult::NotSet
+    };
+    (result, ExpiryTransition::remove(had_ttl), None)
 }
 
 fn set_absent_after_cursor_probe(
@@ -682,25 +717,18 @@ fn set_absent_after_cursor_probe(
     table_hash: TableHash,
     options: SetOptions,
     had_ttl: bool,
-) -> (SetResult, ExpiryTransition, Option<SlotMutationReport>) {
-    if options.xx {
-        let result = if options.get {
-            SetResult::NotSetGet(None)
-        } else {
-            SetResult::NotSet
-        };
-        return (result, ExpiryTransition::remove(had_ttl), None);
-    }
-
+    entry_lsn: Option<u64>,
+    aof_lsn: Option<AofLsn>,
+) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
     let effective_ttl = if options.keepttl {
         0
     } else {
         options.ttl_deadline
     };
     let policy = if effective_ttl != 0 {
-        MutationPolicy::set(effective_ttl, None)
+        MutationPolicy::set(effective_ttl, entry_lsn)
     } else {
-        MutationPolicy::clear(None)
+        MutationPolicy::clear(entry_lsn)
     };
     let result = if options.get {
         SetResult::OkGet(None)
@@ -711,8 +739,15 @@ fn set_absent_after_cursor_probe(
     (
         result,
         ExpiryTransition::new(had_ttl, effective_ttl != 0),
-        None,
+        aof_lsn,
     )
+}
+
+fn set_absent_after_cursor_probe_noop(
+    options: SetOptions,
+    had_ttl: bool,
+) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
+    set_vacant_noop(options, had_ttl)
 }
 
 pub(super) fn increment_table_by(

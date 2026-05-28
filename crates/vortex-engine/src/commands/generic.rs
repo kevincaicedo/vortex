@@ -14,9 +14,9 @@ use vortex_proto::{FrameRef, RespFrame};
 use super::ERR_NO_SUCH_KEY;
 use super::{
     CmdResult, CommandArgs, ExecutedCommand, MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE,
-    RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_unix_nanos_to_deadline_nanos,
-    arg_bytes, deadline_nanos_to_absolute_unix_nanos, encode_aof_pexpireat, int_resp,
-    key_from_bytes,
+    RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_deadline_nanos, arg_bytes,
+    deadline_nanos_to_absolute_unix_nanos, encode_aof_pexpireat, int_resp, key_from_bytes,
+    relative_deadline_nanos,
 };
 use crate::ConcurrentKeyspace;
 use crate::engine::domain::{ExpireOptions, MutationOutcome, TtlState};
@@ -24,6 +24,7 @@ use crate::engine::domain::{ExpireOptions, MutationOutcome, TtlState};
 // ── Error constants ─────────────────────────────────────────────────
 
 static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
+static ERR_DB_INDEX: &[u8] = b"-ERR DB index is out of range\r\n";
 
 // ── DEL / UNLINK / EXISTS ───────────────────────────────────────────
 
@@ -45,7 +46,10 @@ pub fn cmd_del(
     // Single-key fast path: skip CommandArgs::collect SmallVec allocation.
     if argc == 2 {
         if let Some(kb) = arg_bytes(frame, 1) {
-            let outcome = keyspace.delete_key_bytes(kb, now_nanos);
+            let outcome = match keyspace.delete_key_bytes(kb, now_nanos) {
+                Ok(outcome) => outcome,
+                Err(err) => return err.into_executed(),
+            };
             return ExecutedCommand::with_aof_lsn(
                 int_resp(i64::from(outcome.value)),
                 outcome.aof_lsn,
@@ -64,7 +68,10 @@ pub fn cmd_del(
         };
         keys.push(kb);
     }
-    let outcome = keyspace.delete_key_bytes_batch(&keys, now_nanos);
+    let outcome = match keyspace.delete_key_bytes_batch(&keys, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn)
 }
 
@@ -240,7 +247,10 @@ pub fn cmd_persist(
         return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
     };
     let key = key_from_bytes(kb);
-    let outcome = keyspace.persist_key(&key, now_nanos);
+    let outcome = match keyspace.persist_key(&key, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
@@ -281,11 +291,18 @@ fn expire_generic(
 
     // Parse optional flags (NX, XX, GT, LT).
     let mut options = ExpireOptions::default();
+    let mut condition_seen = false;
     for i in 3..argc {
         if let Some(flag) = args.get(i) {
             match flag.len() {
                 2 => {
                     let upper = [flag[0] | 0x20, flag[1] | 0x20];
+                    if matches!(&upper, b"nx" | b"xx" | b"gt" | b"lt") {
+                        if condition_seen {
+                            return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX));
+                        }
+                        condition_seen = true;
+                    }
                     match &upper {
                         b"nx" => options.nx = true,
                         b"xx" => options.xx = true,
@@ -305,31 +322,57 @@ fn expire_generic(
             if time_val <= 0 {
                 0
             } else {
-                now_nanos + (time_val as u64) * NS_PER_SEC
+                let Some(deadline) =
+                    relative_deadline_nanos(time_val as u64, NS_PER_SEC, now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
             }
         }
         ExpireMode::RelativeMillis => {
             if time_val <= 0 {
                 0
             } else {
-                now_nanos + (time_val as u64) * NS_PER_MS
+                let Some(deadline) = relative_deadline_nanos(time_val as u64, NS_PER_MS, now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
             }
         }
-        ExpireMode::AbsoluteSeconds => absolute_unix_nanos_to_deadline_nanos(
-            (time_val as u64) * NS_PER_SEC,
-            now_nanos,
-            unix_now_nanos,
-        ),
-        ExpireMode::AbsoluteMillis => absolute_unix_nanos_to_deadline_nanos(
-            (time_val as u64) * NS_PER_MS,
-            now_nanos,
-            unix_now_nanos,
-        ),
+        ExpireMode::AbsoluteSeconds => {
+            if time_val <= 0 {
+                0
+            } else {
+                let Some(deadline) =
+                    absolute_deadline_nanos(time_val as u64, NS_PER_SEC, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
+            }
+        }
+        ExpireMode::AbsoluteMillis => {
+            if time_val <= 0 {
+                0
+            } else {
+                let Some(deadline) =
+                    absolute_deadline_nanos(time_val as u64, NS_PER_MS, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
+            }
+        }
     };
 
     let key = key_from_bytes(kb);
 
-    let outcome = keyspace.expire_key_with_options(&key, deadline_nanos, now_nanos, options);
+    let outcome = match keyspace.expire_key_with_options(&key, deadline_nanos, now_nanos, options) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = if outcome.value {
         CmdResult::Static(RESP_ONE)
     } else {
@@ -549,6 +592,9 @@ pub fn cmd_scan(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
     let Some(cursor_val) = args.i64(1) else {
         return CmdResult::Static(super::ERR_NOT_INTEGER);
     };
+    if cursor_val < 0 {
+        return CmdResult::Static(super::ERR_NOT_INTEGER);
+    }
     let cursor = cursor_val as u64;
 
     // Parse optional arguments.
@@ -558,21 +604,35 @@ pub fn cmd_scan(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
 
     let mut i = 2;
     while i < argc {
-        if let Some(opt) = args.get(i) {
-            if eq_ci(opt, b"MATCH") {
-                i += 1;
-                pattern = args.get(i);
-            } else if eq_ci(opt, b"COUNT") {
-                i += 1;
-                if let Some(n) = args.i64(i) {
-                    if n > 0 {
-                        count = n as usize;
-                    }
-                }
-            } else if eq_ci(opt, b"TYPE") {
-                i += 1;
-                type_filter = args.get(i);
+        let Some(opt) = args.get(i) else {
+            return CmdResult::Static(super::ERR_SYNTAX);
+        };
+        if eq_ci(opt, b"MATCH") {
+            i += 1;
+            let Some(value) = args.get(i) else {
+                return CmdResult::Static(super::ERR_SYNTAX);
+            };
+            pattern = Some(value);
+        } else if eq_ci(opt, b"COUNT") {
+            i += 1;
+            let Some(n) = args.i64(i) else {
+                return CmdResult::Static(super::ERR_NOT_INTEGER);
+            };
+            let Ok(parsed_count) = usize::try_from(n) else {
+                return CmdResult::Static(super::ERR_NOT_INTEGER);
+            };
+            if parsed_count == 0 {
+                return CmdResult::Static(super::ERR_NOT_INTEGER);
             }
+            count = parsed_count;
+        } else if eq_ci(opt, b"TYPE") {
+            i += 1;
+            let Some(value) = args.get(i) else {
+                return CmdResult::Static(super::ERR_SYNTAX);
+            };
+            type_filter = Some(value);
+        } else {
+            return CmdResult::Static(super::ERR_SYNTAX);
         }
         i += 1;
     }
@@ -670,13 +730,21 @@ pub fn cmd_copy(
     let mut replace = false;
     let mut i = 3;
     while i < argc {
-        if let Some(opt) = args.get(i) {
-            if eq_ci(opt, b"REPLACE") {
-                replace = true;
-            } else if eq_ci(opt, b"DB") {
-                // DB selection not supported in Phase 3 (single-shard).
-                i += 1; // Skip the DB number.
+        let Some(opt) = args.get(i) else {
+            return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX));
+        };
+        if eq_ci(opt, b"REPLACE") {
+            replace = true;
+        } else if eq_ci(opt, b"DB") {
+            i += 1;
+            let Some(db) = args.i64(i) else {
+                return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+            };
+            if db != 0 {
+                return ExecutedCommand::from(CmdResult::Static(ERR_DB_INDEX));
             }
+        } else {
+            return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX));
         }
         i += 1;
     }
@@ -1006,6 +1074,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expireat_nonpositive_timestamp_deletes_key() {
+        let h = new_harness();
+        let key = VortexKey::from("ea-negative");
+        h.set(key.clone(), VortexValue::from("v"));
+
+        let data = make_resp(&[b"EXPIREAT", b"ea-negative", b"-1"]);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
+        let frame = tape.iter().next().unwrap();
+        let r =
+            cmd_expireat_with_clock(&h.keyspace, &frame, NOW, 1_750_000_000 * NS_PER_SEC).response;
+
+        assert_static(r, RESP_ONE);
+        assert!(!h.exists(&key, NOW));
+    }
+
+    #[test]
+    fn expire_deadline_overflow_is_rejected_without_mutating_ttl() {
+        let h = new_harness();
+        h.set(VortexKey::from("expire-overflow"), VortexValue::from("v"));
+        let huge = i64::MAX.to_string();
+
+        let r = exec(
+            &h.keyspace,
+            cmd_expire,
+            &[b"EXPIRE", b"expire-overflow", huge.as_bytes()],
+            NOW,
+        );
+
+        assert_static(r, crate::commands::ERR_NOT_INTEGER);
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"expire-overflow"], NOW);
+        assert_static(r, RESP_NEG_ONE);
+    }
+
+    #[test]
+    fn expire_rejects_conflicting_condition_options_without_mutating() {
+        let h = new_harness();
+        h.set(VortexKey::from("expire-conflict"), VortexValue::from("v"));
+
+        for parts in [
+            &[
+                b"EXPIRE".as_slice(),
+                b"expire-conflict".as_slice(),
+                b"60".as_slice(),
+                b"NX".as_slice(),
+                b"XX".as_slice(),
+            ][..],
+            &[
+                b"EXPIRE".as_slice(),
+                b"expire-conflict".as_slice(),
+                b"60".as_slice(),
+                b"GT".as_slice(),
+                b"LT".as_slice(),
+            ][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_expire, parts, NOW);
+            assert_static(r, crate::commands::ERR_SYNTAX);
+        }
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"expire-conflict"], NOW);
+        assert_static(r, RESP_NEG_ONE);
+    }
+
     // ── TYPE ────────────────────────────────────────────────────────
 
     #[test]
@@ -1219,6 +1350,91 @@ mod tests {
         assert!(matched.contains(&"user:2".to_string()));
     }
 
+    #[test]
+    fn scan_omits_expired_keys() {
+        let h = new_harness();
+        h.set(VortexKey::from("scan:live"), VortexValue::from("v"));
+        h.set_with_ttl(
+            VortexKey::from("scan:expired"),
+            VortexValue::from("v"),
+            NOW - 1,
+        );
+
+        let mut returned: Vec<String> = Vec::new();
+        let mut cursor: u64 = 0;
+        loop {
+            let cur_str = cursor.to_string();
+            let data = make_resp(&[b"SCAN", cur_str.as_bytes(), b"COUNT", b"10"]);
+            let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
+            let frame = tape.iter().next().unwrap();
+            let result = cmd_scan(&h.keyspace, &frame, NOW);
+
+            match result {
+                CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                    if let RespFrame::BulkString(Some(c)) = &arr[0] {
+                        cursor = std::str::from_utf8(c).unwrap().parse().unwrap();
+                    }
+                    if let RespFrame::Array(Some(keys)) = &arr[1] {
+                        for k in keys {
+                            if let RespFrame::BulkString(Some(kb)) = k {
+                                returned.push(String::from_utf8(kb.to_vec()).unwrap());
+                            }
+                        }
+                    }
+                }
+                _ => panic!("Expected Array"),
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        returned.sort();
+        returned.dedup();
+        assert!(returned.contains(&"scan:live".to_string()));
+        assert!(!returned.contains(&"scan:expired".to_string()));
+    }
+
+    #[test]
+    fn scan_rejects_malformed_cursor_and_options() {
+        let h = new_harness();
+
+        for parts in [
+            &[b"SCAN".as_slice(), b"-1".as_slice()][..],
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"COUNT".as_slice()][..],
+            &[
+                b"SCAN".as_slice(),
+                b"0".as_slice(),
+                b"COUNT".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"SCAN".as_slice(),
+                b"0".as_slice(),
+                b"COUNT".as_slice(),
+                b"-5".as_slice(),
+            ][..],
+            &[
+                b"SCAN".as_slice(),
+                b"0".as_slice(),
+                b"COUNT".as_slice(),
+                b"nope".as_slice(),
+            ][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_scan, parts, NOW);
+            assert_static(r, crate::commands::ERR_NOT_INTEGER);
+        }
+
+        for parts in [
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"MATCH".as_slice()][..],
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"TYPE".as_slice()][..],
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"UNKNOWN".as_slice()][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_scan, parts, NOW);
+            assert_static(r, crate::commands::ERR_SYNTAX);
+        }
+    }
+
     // ── KEYS ────────────────────────────────────────────────────────
 
     #[test]
@@ -1314,6 +1530,56 @@ mod tests {
             NOW,
         );
         assert_static(r, RESP_ONE);
+    }
+
+    #[test]
+    fn copy_accepts_db_zero_and_rejects_malformed_options() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("value"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst", b"DB", b"0"],
+            NOW,
+        );
+        assert_static(r, RESP_ONE);
+        assert!(h.exists(&VortexKey::from("dst"), NOW));
+
+        for parts in [
+            &[
+                b"COPY".as_slice(),
+                b"src".as_slice(),
+                b"dst2".as_slice(),
+                b"DB".as_slice(),
+            ][..],
+            &[
+                b"COPY".as_slice(),
+                b"src".as_slice(),
+                b"dst2".as_slice(),
+                b"DB".as_slice(),
+                b"nope".as_slice(),
+            ][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_copy, parts, NOW);
+            assert_static(r, crate::commands::ERR_NOT_INTEGER);
+        }
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst2", b"DB", b"1"],
+            NOW,
+        );
+        assert_static(r, ERR_DB_INDEX);
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst2", b"UNKNOWN"],
+            NOW,
+        );
+        assert_static(r, crate::commands::ERR_SYNTAX);
     }
 
     #[test]

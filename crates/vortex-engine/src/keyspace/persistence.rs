@@ -53,12 +53,8 @@ impl AofLsn {
     }
 
     #[inline]
-    pub(crate) fn from_allocated_lsn(lsn: u64) -> Self {
-        Self(
-            EntryLsn::try_from_raw(lsn)
-                .expect("global LSN exceeds AOF replay storage range")
-                .get(),
-        )
+    pub(crate) fn from_allocated_lsn(lsn: u64) -> Result<Self, LsnOverflow> {
+        EntryLsn::try_from_raw(lsn).map(|entry_lsn| Self(entry_lsn.get()))
     }
 }
 
@@ -103,19 +99,26 @@ impl ConcurrentKeyspace {
     /// necessary acquire/release synchronization. The atomic itself only needs
     /// monotonicity, which `fetch_add` guarantees on all architectures.
     #[inline(always)]
-    pub(crate) fn next_lsn(&self) -> u64 {
-        let raw = self.global_lsn.fetch_add(1, Ordering::Relaxed);
-        EntryLsn::try_from_raw(raw)
-            .expect("global LSN exceeds 48-bit entry version storage")
-            .get()
+    pub(crate) fn next_lsn(&self) -> Result<u64, LsnOverflow> {
+        match self
+            .global_lsn
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current <= EntryLsn::MAX).then_some(current + 1)
+            }) {
+            Ok(raw) => EntryLsn::try_from_raw(raw).map(EntryLsn::get),
+            Err(attempted) => Err(LsnOverflow {
+                attempted,
+                max: EntryLsn::MAX,
+            }),
+        }
     }
 
     #[inline(always)]
-    fn next_watch_visible_lsn(&self) -> u64 {
+    fn next_watch_visible_lsn(&self) -> Result<u64, LsnOverflow> {
         loop {
-            let lsn = self.next_lsn();
+            let lsn = self.next_lsn()?;
             if lsn != 0 {
-                return lsn;
+                return Ok(lsn);
             }
         }
     }
@@ -147,29 +150,35 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
-    pub(crate) fn next_aof_lsn(&self) -> Option<AofLsn> {
-        self.aof_recording_enabled()
-            .then(|| AofLsn::from_allocated_lsn(self.next_lsn()))
+    pub(crate) fn next_aof_lsn(&self) -> Result<Option<AofLsn>, LsnOverflow> {
+        if !self.aof_recording_enabled() {
+            return Ok(None);
+        }
+        AofLsn::from_allocated_lsn(self.next_lsn()?).map(Some)
     }
 
     #[inline(always)]
     pub(crate) fn allocate_observed_mutation_lsn_with_features(
         &self,
         features: MutationFeatures,
-    ) -> (Option<u64>, Option<AofLsn>) {
+    ) -> Result<(Option<u64>, Option<AofLsn>), LsnOverflow> {
         if !features.entry_lsn_observed() {
-            return (None, None);
+            return Ok((None, None));
         }
 
         let lsn = if features.watch() {
-            self.next_watch_visible_lsn()
+            self.next_watch_visible_lsn()?
         } else {
-            self.next_lsn()
+            self.next_lsn()?
         };
-        (
+        Ok((
             Some(lsn),
-            features.aof().then(|| AofLsn::from_allocated_lsn(lsn)),
-        )
+            if features.aof() {
+                Some(AofLsn::from_allocated_lsn(lsn)?)
+            } else {
+                None
+            },
+        ))
     }
 
     /// Read the current LSN value (the next LSN to be assigned).

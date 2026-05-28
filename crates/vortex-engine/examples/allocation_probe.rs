@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clap::{Parser, ValueEnum};
 use vortex_common::{VortexKey, VortexValue};
 use vortex_engine::commands::{CommandClock, execute_command};
+use vortex_engine::keyspace::ShardCount;
 use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_proto::RespTape;
 
@@ -149,11 +150,10 @@ fn main() -> Result<(), String> {
     if args.iterations == 0 {
         return Err("--iterations must be greater than zero".to_string());
     }
-    if args.shards == 0 || !args.shards.is_power_of_two() {
-        return Err("--shards must be a non-zero power of two".to_string());
-    }
+    ShardCount::try_new(args.shards).map_err(|error| format!("--shards {error}"))?;
 
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, args.width.max(128));
+    let keyspace = ConcurrentKeyspace::try_with_capacity(args.shards, args.width.max(128))
+        .map_err(|error| format!("failed to create keyspace: {error}"))?;
     keyspace.configure_eviction(usize::MAX, EvictionPolicy::NoEviction);
     let parts = command_parts(args.workload, args.width);
     let wire = make_resp(&parts);

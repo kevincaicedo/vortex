@@ -200,7 +200,6 @@ impl SlotRemoval {
 /// Metadata emitted by cursor mutations.
 #[allow(dead_code)]
 pub(crate) struct SlotMutationReport {
-    live_slot: Option<LiveSlot>,
     previous: Option<VortexValue>,
     old_ttl: u64,
     new_ttl: u64,
@@ -212,14 +211,8 @@ pub(crate) struct SlotMutationReport {
 #[allow(dead_code)]
 impl SlotMutationReport {
     #[inline]
-    fn inserted(
-        live_slot: LiveSlot,
-        new_ttl: u64,
-        new_memory_bytes: usize,
-        entry_lsn_stamped: bool,
-    ) -> Self {
+    fn inserted(new_ttl: u64, new_memory_bytes: usize, entry_lsn_stamped: bool) -> Self {
         Self {
-            live_slot: Some(live_slot),
             previous: None,
             old_ttl: 0,
             new_ttl,
@@ -231,7 +224,6 @@ impl SlotMutationReport {
 
     #[inline]
     fn replaced(
-        live_slot: LiveSlot,
         previous: Option<VortexValue>,
         old_ttl: u64,
         new_ttl: u64,
@@ -240,7 +232,6 @@ impl SlotMutationReport {
         entry_lsn_stamped: bool,
     ) -> Self {
         Self {
-            live_slot: Some(live_slot),
             previous,
             old_ttl,
             new_ttl,
@@ -251,15 +242,8 @@ impl SlotMutationReport {
     }
 
     #[inline]
-    fn ttl_only(
-        live_slot: LiveSlot,
-        old_ttl: u64,
-        new_ttl: u64,
-        memory_bytes: usize,
-        entry_lsn_stamped: bool,
-    ) -> Self {
+    fn ttl_only(old_ttl: u64, new_ttl: u64, memory_bytes: usize, entry_lsn_stamped: bool) -> Self {
         Self {
-            live_slot: Some(live_slot),
             previous: None,
             old_ttl,
             new_ttl,
@@ -516,10 +500,6 @@ struct TableLayout {
 }
 
 impl TableLayout {
-    fn for_capacity(cap: usize) -> Self {
-        Self::try_for_capacity(cap).expect("SwissTable: capacity overflow")
-    }
-
     fn try_for_capacity(cap: usize) -> Option<Self> {
         let min_slots = if cap == 0 { GROUP_SIZE } else { cap };
         let required = min_slots.checked_mul(LOAD_FACTOR_D)? / LOAD_FACTOR_N;
@@ -565,6 +545,31 @@ impl TableLayout {
         })
     }
 }
+
+/// Capacity validation error returned by fallible SwissTable constructors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCapacityError {
+    requested: usize,
+}
+
+impl TableCapacityError {
+    #[inline]
+    pub const fn requested(self) -> usize {
+        self.requested
+    }
+}
+
+impl std::fmt::Display for TableCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "table capacity exceeds addressable layout, requested {}",
+            self.requested
+        )
+    }
+}
+
+impl std::error::Error for TableCapacityError {}
 
 #[inline]
 fn align_up_to(size: usize, align: usize) -> Option<usize> {
@@ -766,6 +771,12 @@ impl SwissTable {
         Self::with_capacity_and_hasher(cap, RandomState::new())
     }
 
+    /// Creates a new table pre-sized for `cap` entries, returning an error if
+    /// the requested capacity cannot be represented by the table layout.
+    pub fn try_with_capacity(cap: usize) -> Result<Self, TableCapacityError> {
+        Self::try_with_capacity_and_hasher(cap, RandomState::new())
+    }
+
     /// Creates a new table pre-sized for `cap` entries with an explicit hasher.
     /// `cap` is the expected number of live entries; actual allocation accounts for
     /// load factor and rounds up to the next power-of-two group count.
@@ -773,9 +784,23 @@ impl SwissTable {
     /// # Panics
     /// Panics if `cap` is so large that the required allocation size exceeds `usize::MAX`.
     pub fn with_capacity_and_hasher(cap: usize, hasher: RandomState) -> Self {
-        let layout = TableLayout::for_capacity(cap);
-        let num_slots = layout.num_slots;
+        Self::try_with_capacity_and_hasher(cap, hasher).unwrap_or_else(|error| panic!("{error}"))
+    }
 
+    /// Creates a new table pre-sized for `cap` entries with an explicit hasher,
+    /// returning an error if the requested capacity cannot be represented by the
+    /// table layout.
+    pub fn try_with_capacity_and_hasher(
+        cap: usize,
+        hasher: RandomState,
+    ) -> Result<Self, TableCapacityError> {
+        let layout =
+            TableLayout::try_for_capacity(cap).ok_or(TableCapacityError { requested: cap })?;
+        Ok(Self::from_layout(layout, hasher))
+    }
+
+    fn from_layout(layout: TableLayout, hasher: RandomState) -> Self {
+        let num_slots = layout.num_slots;
         Self {
             raw: RawTable::allocate(layout),
             hasher,
@@ -1372,13 +1397,7 @@ impl<'a> LiveSlotCursor<'a> {
             entry.set_lsn_version(lsn);
         }
         self.ttl_deadline = deadline_nanos;
-        SlotMutationReport::ttl_only(
-            self.slot,
-            old_ttl,
-            deadline_nanos,
-            memory_bytes,
-            lsn.is_some(),
-        )
+        SlotMutationReport::ttl_only(old_ttl, deadline_nanos, memory_bytes, lsn.is_some())
     }
 
     #[inline]
@@ -1402,7 +1421,6 @@ impl<'a> LiveSlotCursor<'a> {
         self.table
             .record_memory_delta(SwissTable::memory_delta_between(new_bytes, old_bytes));
         SlotMutationReport::replaced(
-            self.slot,
             previous,
             old_ttl,
             new_ttl,
@@ -1453,7 +1471,6 @@ impl<'a> VacantSlot<'a> {
             .live_slot(slot)
             .expect("inserted slot must be live");
         SlotMutationReport::inserted(
-            live_slot,
             ttl,
             self.table.slot_memory_usage(live_slot),
             policy.lsn.is_some(),
@@ -2093,26 +2110,6 @@ impl SwissTable {
         })
     }
 
-    /// Stamp the slot referenced by a cursor mutation report without another
-    /// key probe.
-    #[inline]
-    pub(crate) fn stamp_report_lsn(
-        &mut self,
-        report: &mut SlotMutationReport,
-        lsn: Option<u64>,
-    ) -> bool {
-        let (Some(slot), Some(lsn)) = (report.live_slot, lsn) else {
-            return false;
-        };
-        debug_assert!(
-            self.live_slot(slot.index()).is_some(),
-            "cursor mutation report must reference a live slot"
-        );
-        self.raw.entry_mut(slot).set_lsn_version(lsn);
-        report.entry_lsn_stamped = true;
-        true
-    }
-
     /// Like `get_or_expire` but uses a pre-computed hash.
     #[allow(dead_code)]
     pub(crate) fn get_or_expire_prehashed(
@@ -2313,13 +2310,13 @@ mod tests {
         table.insert_with(key.clone(), VortexValue::from("old"), 123, Some(7));
         let hash = table.table_hash_key_bytes(key.as_bytes());
 
-        let mut report = match table.slot_cursor_prehashed(key.as_bytes(), hash, 100) {
+        let report = match table.slot_cursor_prehashed(key.as_bytes(), hash, 100) {
             SlotCursor::Live(live) => {
                 assert_eq!(live.ttl_deadline(), 123);
                 assert_eq!(live.lsn_version(), 7);
                 live.replace_value(
                     VortexValue::from("new-value"),
-                    MutationPolicy::preserve_ttl(None),
+                    MutationPolicy::preserve_ttl(Some(99)),
                 )
             }
             SlotCursor::Expired(_) | SlotCursor::Vacant(_) => panic!("expected live cursor"),
@@ -2329,8 +2326,6 @@ mod tests {
         assert_eq!(report.new_ttl(), 123);
         assert!(report.old_memory_bytes() > 0);
         assert!(report.new_memory_bytes() >= report.old_memory_bytes());
-        assert!(!report.entry_lsn_stamped());
-        assert!(table.stamp_report_lsn(&mut report, Some(99)));
         assert!(report.entry_lsn_stamped());
         assert_eq!(
             table.get_lsn_version_prehashed(key.as_bytes(), hash),
@@ -2465,6 +2460,16 @@ mod tests {
         }
 
         panic!("expected a checked layout rejection before usize group overflow");
+    }
+
+    #[test]
+    fn try_with_capacity_rejects_overflowing_capacities_without_panic() {
+        let error = match SwissTable::try_with_capacity(usize::MAX) {
+            Ok(_) => panic!("oversized table capacity should return an error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.requested(), usize::MAX);
     }
 
     #[test]

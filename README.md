@@ -3,53 +3,27 @@
 [![CI](https://github.com/kevincaicedo/vortex/actions/workflows/ci.yml/badge.svg)](https://github.com/kevincaicedo/vortex/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> Next-generation, Redis-compatible in-memory database written in Rust. Built for raw throughput with io_uring, SIMD parsing, and a cache-line-optimized Swiss Table engine.
+> Alpha-stage Redis-compatible in-memory database written in Rust. Built around thread-per-core reactors, Linux io_uring or cross-platform polling, SIMD parsing, and a Swiss Table engine.
 
-VortexDB is a high-performance, drop-in Redis replacement built from the ground up in Rust. It uses a thread-per-core architecture, io_uring (Linux) / kqueue (macOS), SIMD-accelerated RESP parsing, and a cache-line-optimized Swiss Table hash map. On Linux with io_uring it delivers 1.0–3.7× throughput improvements over Redis depending on command type, with the largest gains on multi-key batch operations (MSET, MSETNX).
+VortexDB is a Redis-compatible in-memory data engine built from the ground up in Rust. It uses a thread-per-core reactor architecture, a shared concurrent keyspace, Linux io_uring when available, a cross-platform polling backend as the fallback/default portability path, SIMD-accelerated RESP parsing, and a Swiss Table hash map. Performance claims for the alpha release are evidence-gated; public numbers must come from the release evidence ledger, not from old single-run engineering snapshots.
 
-## Benchmark Results
+## Benchmark Status
 
-The headline tables below use `redis-benchmark` point workloads (100K requests, 50 clients, pipeline 16). The automated benchmark suite also runs `memtier_benchmark` mixed Gaussian workloads and publishes both harnesses in the same JSON/Markdown report. Redis 8.6.2 is configured with `io-threads 4`.
+Benchmarking is active work for the alpha release. The current toolchain runs `redis-benchmark`, `memtier_benchmark`, and custom Rust workloads, then writes JSON/CSV/Markdown reports with workload contracts, repeat counts, backend mode, telemetry mode, memory attribution, and validity warnings.
 
-### Linux (Docker-All, i7-13700KF, identical containers, 4 CPUs / 2 GB each)
+Historical benchmark reports and methodology notes live in [docs/benchmarks.md](docs/benchmarks.md). Treat them as engineering evidence unless a row is explicitly marked release-grade by the active pre-release evidence ledger. Linux, macOS, Docker, polling, and io_uring rows are separate evidence surfaces and must not be mixed into one public claim.
 
-| Command | VortexDB | Redis 8 | vs Redis |
-|---------|----------|---------|----------|
-| SET | 3,448,276 | 2,325,581 | **1.5×** |
-| GET | 3,571,429 | 3,225,806 | **1.1×** |
-| INCR | 3,448,276 | 3,030,303 | **1.1×** |
-| MSET (10) | 2,941,176 | 892,857 | **3.3×** |
-| MSETNX (10) | 3,448,276 | 980,392 | **3.5×** |
-| INCRBYFLOAT | 3,333,333 | 1,369,863 | **2.4×** |
-| PING_INLINE | 1,612,903 | 3,225,806 | **0.5×** |
-
-### macOS (Native, Apple M4 Pro, both VortexDB and Redis native, kqueue)
-
-| Command | VortexDB | Redis 8 | vs Redis |
-|---------|----------|---------|----------|
-| SET | 1,923,076 | 1,960,784 | **1.0×** |
-| GET | 2,272,727 | 1,923,076 | **1.2×** |
-| INCR | 2,325,581 | 1,960,784 | **1.2×** |
-| MSET (10) | 1,470,588 | 598,802 | **2.5×** |
-| MSETNX (10) | 2,000,000 | 917,431 | **2.2×** |
-| INCRBYFLOAT | 2,325,581 | 1,612,903 | **1.4×** |
-| PING_INLINE | 1,923,076 | 2,000,000 | **1.0×** |
-
-> **Key insight:** VortexDB's engine excels at multi-key batch operations (MSET 2–3.5×) where the SwissTable's batch-prefetch pipeline and zero-copy serializer shine. Single-key reads (GET, PING) are at parity on macOS/kqueue and 1.0–1.5× on Linux/io_uring. PING_INLINE is I/O-bound and does not reflect engine performance.
-
-Full results with 50+ commands, latency percentiles, Docker-all / native modes, mixed-workload memtier runs, and methodology: [docs/benchmarks.md](docs/benchmarks.md)
-
-## Why VortexDB is Fast
+## Performance Design
 
 | Technique | Impact |
 |-----------|--------|
-| **Thread-per-core** — no mutexes on hot path | Eliminates lock contention |
-| **io_uring** — zero-syscall I/O on Linux | Removes read/write system call overhead |
-| **SIMD Swiss Table** — single instruction probes 16 slots | GET in ~5 ns |
-| **64-byte cache-line entries** — key + value + TTL inline | 2 cache lines per lookup, zero pointer chasing |
-| **SIMD RESP parser** — AVX2/NEON CRLF scanning | >2 GB/s parse throughput per core |
-| **SWAR command dispatch** — branchless uppercase + PHF lookup | ~8.7 ns per command dispatch |
-| **jemalloc** — thread-local caching, zero malloc contention | Predictable allocation latency |
+| **Thread-per-core reactors** | Keeps socket, parser, write, and maintenance work local to a reactor while sharing a typed concurrent keyspace. |
+| **Linux io_uring backend** | Available on Linux when the feature and kernel support it; release use is gated by correctness, fairness, and same-workload evidence. |
+| **Cross-platform polling backend** | Portable fallback path used for macOS and generic Unix validation through the `polling` crate. |
+| **SIMD RESP parser and SWAR dispatch** | Keeps parser and command lookup work compact; malformed-frame and boundary coverage remain release gates. |
+| **Swiss Table engine** | Uses grouped probing and explicit memory accounting; table payload and memory-footprint work remains a pre-release gate. |
+| **Minimal telemetry mode** | Default release path avoids profile-only phase timers; profiling builds can enable more expensive diagnostics. |
+| **jemalloc integration** | Provides allocator stats and purge hooks; per-reactor arena policy remains experiment-gated. |
 
 ## Quick Start
 
@@ -121,7 +95,7 @@ graph TD
     sync[vortex-sync<br><i>lock-free queues</i>]
     proto[vortex-proto<br><i>SIMD RESP parser</i>]
     engine[vortex-engine<br><i>Swiss Table, commands</i>]
-    io[vortex-io<br><i>io_uring / kqueue reactor</i>]
+    io[vortex-io<br><i>io_uring / polling reactor</i>]
     config[vortex-config<br><i>CLI + TOML config</i>]
     server[vortex-server<br><i>binary entry point</i>]
 
@@ -141,7 +115,7 @@ graph TD
     server --> memory
 ```
 
-**Request path:** Client → io_uring/kqueue CQE → SIMD RESP parse → SWAR command dispatch → Swiss Table SIMD probe → pre-computed RESP response → io_uring/writev write
+**Request path:** Client -> backend completion/event -> SIMD RESP parse -> SWAR command dispatch -> Swiss Table probe -> RESP response -> writev or io_uring writev
 
 Full architecture guide: [docs/architecture.md](docs/architecture.md)
 
@@ -159,7 +133,7 @@ Full architecture guide: [docs/architecture.md](docs/architecture.md)
 ## Prerequisites
 
 - **Rust nightly** — pinned via `rust-toolchain.toml` (nightly-2026-03-15)
-- **Linux** recommended for `io_uring` support; macOS uses `kqueue` fallback
+- **Linux** recommended for `io_uring` support; macOS uses the cross-platform polling backend
 - **redis-cli** / **redis-benchmark** / **memtier_benchmark** — for client testing and benchmarks
 
 ```sh
@@ -182,15 +156,15 @@ vortex/
 │   ├── vortex-sync/         # Lock-free SPSC/MPSC, sharded counters
 │   ├── vortex-proto/        # SIMD RESP2/RESP3 parser & serializer
 │   ├── vortex-engine/       # Swiss Table, shard, 55 command handlers
-│   ├── vortex-io/           # Thread-per-core reactor (io_uring/kqueue)
+│   ├── vortex-io/           # Thread-per-core reactor (io_uring/polling)
 │   ├── vortex-config/       # CLI + TOML + env configuration
-│   ├── vortex-persist/      # AOF, VXF snapshots (planned)
+│   ├── vortex-persist/      # AOF; VXF snapshots planned
 │   ├── vortex-cluster/      # Cluster protocol, gossip (planned)
 │   ├── vortex-replication/  # Leader-follower replication (planned)
 │   ├── vortex-pubsub/       # Pub/Sub (planned)
 │   ├── vortex-scripting/    # Lua scripting (planned)
 │   ├── vortex-acl/          # Access control (planned)
-│   ├── vortex-metrics/      # Prometheus metrics (planned)
+│   ├── vortex-metrics/      # Metrics support surfaces
 │   └── vortex-server/       # Server binary entry point
 ├── tools/
 │   ├── vortex-cli/          # Interactive CLI client

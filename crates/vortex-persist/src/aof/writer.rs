@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use vortex_engine::keyspace::AofLsn;
 
 use super::contract::{AofAppendOutcome, AofCommitPoint, AofDurabilityRequirement};
-use super::error::{AofErrorKind, aof_io_error};
+use super::error::{AofErrorKind, aof_invalid_input, aof_io_error};
 use super::format::{AofFsyncPolicy, AofHeader, AofReactorId, AofWriterMode};
 
 /// Userspace write buffer size (64 KB).
@@ -147,10 +147,35 @@ impl<'a> AofRecordBytes<'a> {
     /// This wrapper is intentionally zero-cost: command logging already owns
     /// complete RESP bytes, so the writer must not re-parse, clone, or allocate
     /// on the append hot path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bytes` is empty. Use [`Self::try_from_resp`] when the
+    /// payload comes from a fallible boundary.
     #[inline]
     pub fn from_resp(bytes: &'a [u8]) -> Self {
-        debug_assert!(!bytes.is_empty(), "AOF records must not be empty");
+        assert!(!bytes.is_empty(), "AOF records must not be empty");
         Self { bytes }
+    }
+
+    /// Borrow a complete RESP mutation record from a fallible boundary.
+    ///
+    /// This performs only the invariant check needed to keep the AOF replay
+    /// format recoverable: empty records would encode an LSN with no command
+    /// bytes and replay would treat it as a truncated tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `bytes` is empty.
+    #[inline]
+    pub fn try_from_resp(bytes: &'a [u8]) -> io::Result<Self> {
+        if bytes.is_empty() {
+            return Err(aof_invalid_input(
+                AofErrorKind::CorruptRecord,
+                "AOF records must not be empty",
+            ));
+        }
+        Ok(Self { bytes })
     }
 
     #[inline]
@@ -615,6 +640,26 @@ impl AofFileWriter {
         Ok(outcome)
     }
 
+    #[inline]
+    fn validate_append_lsn(&self, lsn: AofLsn) -> io::Result<()> {
+        let Some(previous) = self.last_appended_lsn else {
+            return Ok(());
+        };
+
+        if lsn > previous {
+            return Ok(());
+        }
+
+        Err(aof_invalid_input(
+            AofErrorKind::CorruptRecord,
+            format!(
+                "AOF append LSN order violation: previous={}, current={}",
+                previous.get(),
+                lsn.get()
+            ),
+        ))
+    }
+
     /// Append a mutation command to the AOF with an LSN prefix (v2 format).
     ///
     /// Writes `[LSN: 8 bytes LE] [RESP bytes]` as a single record.
@@ -628,6 +673,7 @@ impl AofFileWriter {
         lsn: AofLsn,
         record: AofRecordBytes<'_>,
     ) -> io::Result<AofAppendOutcome> {
+        self.validate_append_lsn(lsn)?;
         self.writer
             .write_all(&lsn.get().to_le_bytes())
             .map_err(|error| {
@@ -947,6 +993,17 @@ mod tests {
         AofRecordBytes::from_resp(bytes)
     }
 
+    #[test]
+    fn aof_record_try_from_resp_rejects_empty_without_panic() {
+        let error = AofRecordBytes::try_from_resp(b"").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            crate::aof::aof_error_kind(&error),
+            Some(AofErrorKind::CorruptRecord)
+        );
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
     fn replayed_commands(path: &Path) -> u64 {
         let keyspace = ConcurrentKeyspace::new(64);
         AofReader::new(path)
@@ -1020,6 +1077,42 @@ mod tests {
         // DEL x: *2\r\n$3\r\nDEL\r\n$1\r\nx\r\n = 20 bytes
         assert_eq!(data.len(), AOF_HEADER_SIZE + 8 + 14 + 8 + 20);
         assert_eq!(&data[0..6], b"VXAOF\x00");
+    }
+
+    #[test]
+    fn append_rejects_duplicate_or_decreasing_lsn_before_writing() {
+        let path = temp_aof_path();
+        let _cleanup = scopeguard(path.clone());
+
+        let mut writer = AofFileWriter::open(&path, rid(0), AofFsyncPolicy::No).unwrap();
+        writer
+            .append_with_lsn(lsn(2), record(b"*1\r\n$8\r\nFLUSHALL\r\n"))
+            .unwrap();
+
+        let duplicate = writer
+            .append_with_lsn(lsn(2), record(b"*1\r\n$8\r\nFLUSHALL\r\n"))
+            .unwrap_err();
+        assert_eq!(duplicate.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            crate::aof::aof_error_kind(&duplicate),
+            Some(AofErrorKind::CorruptRecord)
+        );
+        assert!(duplicate.to_string().contains("LSN order violation"));
+
+        let decreasing = writer
+            .append_with_lsn(lsn(1), record(b"*1\r\n$8\r\nFLUSHALL\r\n"))
+            .unwrap_err();
+        assert_eq!(decreasing.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(writer.total_writes(), 1);
+        writer.flush_buffer().unwrap();
+        drop(writer);
+
+        let keyspace = ConcurrentKeyspace::new(64);
+        let stats = AofReader::new(&path)
+            .replay_into_keyspace(&keyspace)
+            .expect("valid prefix still replays");
+        assert_eq!(stats.commands_replayed, 1);
+        assert_eq!(stats.max_lsn, 2);
     }
 
     #[test]

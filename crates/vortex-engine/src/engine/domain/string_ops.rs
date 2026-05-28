@@ -59,86 +59,87 @@ impl ConcurrentKeyspace {
         key: &VortexKey,
         option: GetExOption,
         now_nanos: u64,
-    ) -> MutationOutcome<Option<VortexValue>> {
+    ) -> MutationResult<Option<VortexValue>> {
         if option == GetExOption::None {
-            return MutationOutcome::new(self.get_value(key, now_nanos), None);
+            return Ok(MutationOutcome::new(self.get_value(key, now_nanos), None));
         }
 
         let key_bytes = key.as_bytes();
         let shard_index = self.shard_index(key_bytes);
         let table_hash = self.table_hash_key(key_bytes);
         let mut guard = self.write_shard_by_index(shard_index);
-        let (value, changed, transition, mut mutation_report) =
-            match guard.slot_cursor_prehashed(key_bytes, table_hash, now_nanos) {
-                SlotCursor::Vacant(_) => return MutationOutcome::new(None, None),
-                SlotCursor::Expired(expired) => {
-                    let removed = expired.remove();
-                    debug_assert!(removed.is_some(), "expired GETEX key must be removable");
-                    let effects = MutationEffects::none()
-                        .with_ttl(
-                            shard_index,
-                            removed
-                                .as_ref()
-                                .map_or(ExpiryTransition::default(), |removed| {
-                                    ExpiryTransition::remove(removed.old_had_ttl())
-                                }),
+        let (value, changed, transition, aof_lsn) = match guard
+            .slot_cursor_prehashed(key_bytes, table_hash, now_nanos)
+        {
+            SlotCursor::Vacant(_) => return Ok(MutationOutcome::new(None, None)),
+            SlotCursor::Expired(expired) => {
+                let removed = expired.remove();
+                debug_assert!(removed.is_some(), "expired GETEX key must be removable");
+                let effects = MutationEffects::none()
+                    .with_ttl(
+                        shard_index,
+                        removed
+                            .as_ref()
+                            .map_or(ExpiryTransition::default(), |removed| {
+                                ExpiryTransition::remove(removed.old_had_ttl())
+                            }),
+                    )
+                    .with_watch_key(key)
+                    .defer();
+                drop(guard);
+                self.publish_deferred_effects(effects);
+                return Ok(MutationOutcome::new(None, None));
+            }
+            SlotCursor::Live(mut live) => {
+                let value = live.cloned_value();
+                match option {
+                    GetExOption::None => unreachable!("GETEX none exits through get_value"),
+                    GetExOption::ExpireAt(deadline) if deadline <= now_nanos => {
+                        let aof_lsn = self.next_aof_lsn()?;
+                        let removed = live.remove();
+                        let transition = removed
+                            .as_ref()
+                            .map_or(ExpiryTransition::default(), |removed| {
+                                ExpiryTransition::remove(removed.old_had_ttl())
+                            });
+                        (
+                            value,
+                            removed.is_some(),
+                            transition,
+                            removed.is_some().then_some(aof_lsn).flatten(),
                         )
-                        .with_watch_key(key)
-                        .defer();
-                    drop(guard);
-                    self.publish_deferred_effects(effects);
-                    return MutationOutcome::new(None, None);
-                }
-                SlotCursor::Live(mut live) => {
-                    let value = live.cloned_value();
-                    match option {
-                        GetExOption::None => unreachable!("GETEX none exits through get_value"),
-                        GetExOption::ExpireAt(deadline) if deadline <= now_nanos => {
-                            let removed = live.remove();
-                            let transition = removed
-                                .as_ref()
-                                .map_or(ExpiryTransition::default(), |removed| {
-                                    ExpiryTransition::remove(removed.old_had_ttl())
-                                });
-                            (value, removed.is_some(), transition, None)
-                        }
-                        GetExOption::ExpireAt(deadline) => {
-                            let report = live.set_ttl(deadline, None);
+                    }
+                    GetExOption::ExpireAt(deadline) => {
+                        let (entry_lsn, aof_lsn) = self
+                            .allocate_observed_mutation_lsn_with_features(
+                                self.mutation_features(),
+                            )?;
+                        let report = live.set_ttl(deadline, entry_lsn);
+                        let transition =
+                            ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl());
+                        (value, true, transition, aof_lsn)
+                    }
+                    GetExOption::Persist => {
+                        if !live.had_ttl() {
+                            (value, false, ExpiryTransition::default(), None)
+                        } else {
+                            let (entry_lsn, aof_lsn) = self
+                                .allocate_observed_mutation_lsn_with_features(
+                                    self.mutation_features(),
+                                )?;
+                            let report = live.clear_ttl(entry_lsn);
                             let transition =
                                 ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl());
-                            (value, true, transition, Some(report))
-                        }
-                        GetExOption::Persist => {
-                            let report = live.clear_ttl(None);
-                            let changed = report.old_had_ttl();
-                            let transition =
-                                ExpiryTransition::new(report.old_had_ttl(), report.new_has_ttl());
-                            (value, changed, transition, Some(report))
+                            (value, true, transition, aof_lsn)
                         }
                     }
                 }
-            };
+            }
+        };
         if !matches!(option, GetExOption::ExpireAt(deadline) if deadline <= now_nanos) {
             self.record_access_prehashed(&guard, key_bytes, table_hash);
         }
 
-        let aof_lsn = if changed {
-            match option {
-                GetExOption::ExpireAt(deadline) if deadline <= now_nanos => self.next_aof_lsn(),
-                _ => {
-                    let (entry_lsn, aof_lsn) =
-                        self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
-                    if let Some(report) = mutation_report.as_mut() {
-                        let _ = guard.stamp_report_lsn(report, entry_lsn);
-                    } else {
-                        stamp_entry_lsn_if(&mut guard, key_bytes, table_hash, entry_lsn);
-                    }
-                    aof_lsn
-                }
-            }
-        } else {
-            None
-        };
         let effects = MutationEffects::none()
             .with_ttl(shard_index, transition)
             .with_watch_key_if(changed, key)
@@ -146,7 +147,7 @@ impl ConcurrentKeyspace {
             .defer();
         drop(guard);
         let aof_lsn = self.publish_deferred_effects(effects).into_lsn();
-        MutationOutcome::new(Some(value), aof_lsn)
+        Ok(MutationOutcome::new(Some(value), aof_lsn))
     }
 
     pub(crate) fn set_value_with_ttl(
@@ -186,7 +187,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let previous = guard.insert_with(key, value, ttl_deadline_nanos, entry_lsn);
         let effects = MutationEffects::none()
             .with_ttl(shard_index, ExpiryTransition::new(had_ttl, true))
@@ -311,7 +312,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let old_had_ttl = guard
             .mutate_prehashed(key, value, table_hash, MutationPolicy::clear(entry_lsn))
             .had_ttl();
@@ -367,28 +368,21 @@ impl ConcurrentKeyspace {
             evicted,
             ..
         } = state;
-        let (result, transition, mut mutation_report) =
-            set_with_options_on_table(&mut guard, key.clone(), value, options, now_nanos);
+        let publish_features = self.mutation_features();
+        let watched_key = publish_features.watch().then(|| key.clone());
+        let (result, transition, aof_lsn) =
+            set_with_options_on_table(&mut guard, key.clone(), value, options, now_nanos, || {
+                self.allocate_observed_mutation_lsn_with_features(publish_features)
+            })?;
         let changed = matches!(&result, SetResult::Ok | SetResult::OkGet(_));
         let table_hash = self.table_hash_key(key.as_bytes());
-        let aof_lsn = if changed {
-            let key_bytes = key.as_bytes();
-            let (entry_lsn, aof_lsn) =
-                self.allocate_observed_mutation_lsn_with_features(self.mutation_features());
-            if let Some(report) = mutation_report.as_mut() {
-                let _ = guard.stamp_report_lsn(report, entry_lsn);
-            } else {
-                stamp_entry_lsn_if(&mut guard, key_bytes, table_hash, entry_lsn);
-            }
-            aof_lsn
-        } else {
-            None
-        };
         let mut effects = MutationEffects::none()
             .with_ttl(shard_index, transition)
             .with_aof_lsn(aof_lsn);
         if changed {
-            effects = effects.with_frequency(table_hash).with_watch_key(&key);
+            effects = effects
+                .with_frequency(table_hash)
+                .with_optional_watch_key(watched_key.as_ref());
         }
         let effects = effects.defer();
         drop(guard);
@@ -564,7 +558,7 @@ impl ConcurrentKeyspace {
             pairs.into_iter().map(Some).collect();
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let record_frequency = publish_features.maxmemory();
         let mut effects: SmallVec<[DeferredEffects<'static>; 16]> =
             SmallVec::with_capacity(lookup_count);
@@ -696,7 +690,7 @@ impl ConcurrentKeyspace {
             pairs.into_iter().map(Some).collect();
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let record_frequency = publish_features.maxmemory();
         let mut effects: SmallVec<[DeferredEffects<'static>; 16]> =
             SmallVec::with_capacity(lookup_count);
@@ -777,7 +771,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let (result, transition) =
             match increment_table_by(&mut guard, key, delta, entry_lsn, now_nanos) {
                 Ok(result) => result,
@@ -821,7 +815,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let report = live.replace_value(
             VortexValue::Integer(result),
             MutationPolicy::preserve_ttl(entry_lsn),
@@ -880,7 +874,7 @@ impl ConcurrentKeyspace {
         let _projected_delta = prepared.projected_delta();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let value = prepared.into_value();
 
         if was_missing {
@@ -934,7 +928,7 @@ impl ConcurrentKeyspace {
                     break;
                 };
                 drop(read_guard);
-                maybe_pause_after_optimistic_prepare("increment_by_float");
+                maybe_pause_after_optimistic_prepare(self, "increment_by_float");
 
                 let ttl_after = match prepared.mutation().snapshot().ttl_deadline() {
                     Some(deadline) if deadline > now_nanos => TtlState::Deadline(deadline),
@@ -991,7 +985,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let result =
             match increment_table_by_float(&mut guard, key, increment, entry_lsn, now_nanos) {
                 Ok(result) => result,
@@ -1057,7 +1051,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let (length, transition) =
             match append_to_table(&mut guard, key, append_bytes, entry_lsn, now_nanos) {
                 Ok(result) => result,
@@ -1156,7 +1150,7 @@ impl ConcurrentKeyspace {
                     break;
                 };
                 drop(read_guard);
-                maybe_pause_after_optimistic_prepare("setrange_value");
+                maybe_pause_after_optimistic_prepare(self, "setrange_value");
 
                 let length = prepared.length();
                 if let Some(outcome) = self.commit_prepared_value_mutation(
@@ -1206,7 +1200,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
-            self.allocate_observed_mutation_lsn_with_features(publish_features);
+            self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let (length, transition) =
             match setrange_in_table(&mut guard, key, offset, new_bytes, entry_lsn, now_nanos) {
                 Ok(result) => result,

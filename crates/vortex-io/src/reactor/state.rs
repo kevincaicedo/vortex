@@ -87,10 +87,28 @@ impl Reactor {
         max_connections: usize,
         buffer_count: usize,
     ) -> io::Result<()> {
+        if max_connections > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "max_connections ({max_connections}) exceeds connection metadata range ({})",
+                    u32::MAX
+                ),
+            ));
+        }
         if buffer_count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "buffer_count must be greater than zero",
+            ));
+        }
+        if buffer_count > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "buffer_count ({buffer_count}) exceeds connection metadata buffer index range ({})",
+                    u32::MAX
+                ),
             ));
         }
 
@@ -113,6 +131,15 @@ impl Reactor {
         caps: ConnectionMemoryCaps,
         overload_policy: ReactorOverloadPolicy,
     ) -> io::Result<()> {
+        if buffer_size > ReadLease::MAX_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "buffer_size ({buffer_size}) exceeds backend read length range ({})",
+                    ReadLease::MAX_LEN
+                ),
+            ));
+        }
         if max_request_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -137,6 +164,16 @@ impl Reactor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "max_pending_response_bytes must be greater than zero",
+            ));
+        }
+        if caps.max_pending_response_bytes > WriteLease::MAX_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "max_pending_response_bytes ({}) exceeds backend write completion range ({})",
+                    caps.max_pending_response_bytes,
+                    WriteLease::MAX_LEN
+                ),
             ));
         }
         if caps.max_multi_queue_commands == 0 {
@@ -540,7 +577,7 @@ impl Reactor {
         let connection_timeout = config.connection_timeout;
 
         // `buffer_count` is validated up-front and remains authoritative here.
-        let buffer_pool = BufferPool::new(config.buffer_count, config.buffer_size);
+        let buffer_pool = BufferPool::new(config.buffer_count, config.buffer_size)?;
 
         let fixed_buffers_enabled = match fixed_buffer_policy {
             FixedBufferPolicy::Disabled => false,
@@ -651,6 +688,8 @@ impl Reactor {
             generations: vec![0u32; max_conn],
             cqe_buf: Vec::with_capacity(config.budgets.completion.get()),
             pending_completions: VecDeque::new(),
+            accept_inflight: false,
+            accept_cancel_inflight: false,
             local_metrics: ReactorLocalMetrics::default(),
             invalid_completion_tokens: 0,
             unexpected_completion_tokens: 0,

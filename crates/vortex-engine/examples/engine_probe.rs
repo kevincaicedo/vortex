@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use tikv_jemallocator::Jemalloc;
 use vortex_common::{MAX_INLINE_VALUE_LEN, VortexKey, VortexValue};
 use vortex_engine::commands::{CommandClock, NS_PER_MS, execute_command};
-use vortex_engine::keyspace::LockProfileSnapshot;
+use vortex_engine::keyspace::{LockProfileSnapshot, ShardCount};
 use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_proto::RespTape;
 
@@ -246,9 +246,7 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.keys == 0 {
         return Err("--keys must be greater than zero".to_string());
     }
-    if args.shards == 0 || !args.shards.is_power_of_two() {
-        return Err("--shards must be a non-zero power of two".to_string());
-    }
+    ShardCount::try_new(args.shards).map_err(|error| format!("--shards {error}"))?;
     if args.multi_key_width == 0 {
         return Err("--multi-key-width must be greater than zero".to_string());
     }
@@ -291,7 +289,7 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
 }
 
 fn run_set_inline_int(args: &Args) -> Result<ProbeSummary, String> {
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = begin_measurement(args, &keyspace);
 
@@ -318,7 +316,7 @@ fn run_set_inline_int(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_set_inline_string(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = begin_measurement(args, &keyspace);
 
@@ -345,7 +343,7 @@ fn run_set_inline_string(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_set_inline_string_command(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = begin_measurement(args, &keyspace);
 
@@ -371,7 +369,7 @@ fn run_set_inline_string_command(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_set_inline_string_watched(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
     let watched = (0..args.keys)
         .map(|index| keyspace.watch_key(VortexKey::from(make_key(index))))
@@ -403,7 +401,7 @@ fn run_set_inline_string_watched(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_set_inline_string_ttl(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     let ttl_text = args.ttl_ms.to_string();
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = begin_measurement(args, &keyspace);
@@ -436,7 +434,7 @@ fn run_set_inline_string_ttl(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_set_heap_string(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.max(MAX_INLINE_VALUE_LEN + 1);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = begin_measurement(args, &keyspace);
 
@@ -463,7 +461,7 @@ fn run_set_heap_string(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_get_hit(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -515,7 +513,7 @@ fn run_get_hit(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_get_miss(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -568,7 +566,7 @@ fn run_get_miss(args: &Args) -> Result<ProbeSummary, String> {
 fn run_mget(args: &Args) -> Result<ProbeSummary, String> {
     let width = args.multi_key_width.min(args.keys).max(1);
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -611,7 +609,7 @@ fn run_mget(args: &Args) -> Result<ProbeSummary, String> {
 fn run_mset(args: &Args) -> Result<ProbeSummary, String> {
     let width = args.multi_key_width.min(args.keys).max(1);
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -654,7 +652,7 @@ fn run_mset(args: &Args) -> Result<ProbeSummary, String> {
 fn run_msetnx(args: &Args) -> Result<ProbeSummary, String> {
     let width = args.multi_key_width.min(args.keys).max(1);
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys.saturating_mul(2));
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2))?;
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
     let started = begin_measurement(args, &keyspace);
@@ -696,7 +694,7 @@ fn run_msetnx(args: &Args) -> Result<ProbeSummary, String> {
 fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
     let width = args.multi_key_width.min(args.keys).max(1);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -729,7 +727,7 @@ fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_append(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
     let append = make_value_bytes(0, value_size.clamp(1, 8));
 
@@ -776,7 +774,7 @@ fn run_append(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_setrange(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
     let offset = value_size.saturating_sub(1).min(value_size / 2);
     let offset_text = offset.to_string();
@@ -835,7 +833,7 @@ fn run_setrange(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_incrbyfloat(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = b"1.25".len();
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_float_strings(&keyspace, args.keys);
 
     let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
@@ -882,7 +880,7 @@ fn run_incrbyfloat(args: &Args) -> Result<ProbeSummary, String> {
 fn run_value_mutation_mixed(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
     let partition_keys = (args.keys / 3).max(1);
-    let keyspace = new_keyspace(args, partition_keys * 3);
+    let keyspace = new_keyspace(args, partition_keys * 3)?;
     prefill_named_strings(&keyspace, b"a", partition_keys, value_size);
     prefill_named_strings(&keyspace, b"r", partition_keys, value_size);
     prefill_named_float_strings(&keyspace, b"f", partition_keys);
@@ -957,7 +955,7 @@ fn run_value_mutation_mixed(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_expire_persist(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
     let ttl_text = args.ttl_ms.to_string();
 
@@ -1008,7 +1006,7 @@ fn run_expire_persist(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_ttl_expire(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys);
+    let keyspace = new_keyspace(args, args.keys)?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let ttl_text = args.ttl_ms.to_string();
@@ -1054,7 +1052,7 @@ fn run_ttl_expire(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_eviction_headroom(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys.saturating_mul(2));
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2))?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
 
     let estimated_growth = args.keys.saturating_mul(estimate_insert_bytes(value_size));
@@ -1089,7 +1087,7 @@ fn run_eviction_headroom(args: &Args) -> Result<ProbeSummary, String> {
 
 fn run_eviction_pressure(args: &Args) -> Result<ProbeSummary, String> {
     let value_size = args.value_size.clamp(1, MAX_INLINE_VALUE_LEN);
-    let keyspace = new_keyspace(args, args.keys.saturating_mul(2));
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2))?;
     prefill_inline_strings(&keyspace, args.keys, value_size);
     keyspace.configure_eviction(keyspace.memory_used(), args.eviction_policy.into_engine());
     preheat_eviction_candidates(&keyspace, args.keys)?;
@@ -1117,15 +1115,16 @@ fn run_eviction_pressure(args: &Args) -> Result<ProbeSummary, String> {
     ))
 }
 
-fn new_keyspace(args: &Args, capacity: usize) -> ConcurrentKeyspace {
-    let keyspace = ConcurrentKeyspace::with_capacity(args.shards, capacity);
+fn new_keyspace(args: &Args, capacity: usize) -> Result<ConcurrentKeyspace, String> {
+    let keyspace = ConcurrentKeyspace::try_with_capacity(args.shards, capacity)
+        .map_err(|error| format!("failed to create keyspace: {error}"))?;
     if args.aof_recording {
         keyspace.enable_aof_recording();
     }
     if args.lock_profile || std::env::var_os("VORTEX_LOCK_PROFILE").is_some() {
         keyspace.set_lock_profile_enabled(true);
     }
-    keyspace
+    Ok(keyspace)
 }
 
 fn begin_measurement(args: &Args, keyspace: &ConcurrentKeyspace) -> Instant {

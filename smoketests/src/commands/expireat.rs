@@ -31,6 +31,59 @@ fn stores_dynamic_unix_seconds_deadline(ctx: &mut SmokeContext) -> Result<()> {
     Ok(())
 }
 
+fn option_variants_are_routed(ctx: &mut SmokeContext) -> Result<()> {
+    let (now_secs, _): (String, String) = ctx.exec(&["TIME"])?;
+    let now_secs = now_secs.parse::<i64>()?;
+    let plus_30 = (now_secs + 30).to_string();
+    let plus_60 = (now_secs + 60).to_string();
+    let plus_90 = (now_secs + 90).to_string();
+    let plus_120 = (now_secs + 120).to_string();
+
+    ctx.set("expireat:nx", "token")?;
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:nx", &plus_60, "NX"])?,
+        1
+    );
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:nx", &plus_90, "NX"])?,
+        0
+    );
+
+    ctx.set("expireat:xx", "token")?;
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:xx", &plus_60, "XX"])?,
+        0
+    );
+    assert_eq!(ctx.exec::<i64>(&["EXPIREAT", "expireat:xx", &plus_60])?, 1);
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:xx", &plus_90, "XX"])?,
+        1
+    );
+
+    ctx.set("expireat:gtlt", "token")?;
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:gtlt", &plus_60])?,
+        1
+    );
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:gtlt", &plus_30, "GT"])?,
+        0
+    );
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:gtlt", &plus_90, "GT"])?,
+        1
+    );
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:gtlt", &plus_120, "LT"])?,
+        0
+    );
+    assert_eq!(
+        ctx.exec::<i64>(&["EXPIREAT", "expireat:gtlt", &plus_30, "LT"])?,
+        1
+    );
+    Ok(())
+}
+
 pub fn spec() -> CommandSpec {
     CommandSpec::new("EXPIREAT", CommandGroup::Key, SupportLevel::Supported)
         .summary("Sets an absolute second-based expiration deadline.")
@@ -38,8 +91,8 @@ pub fn spec() -> CommandSpec {
         .tested(&[
             "Future absolute expiry is stored exactly",
             "Dynamic absolute expiry from TIME reports the same deadline",
+            "NX / XX / GT / LT option routing",
         ])
-        .not_tested(&["Option variants NX / XX / GT / LT"])
         .case(CaseDef::new(
             "stores future unix second deadline",
             "EXPIREAT should persist the exact absolute second deadline.",
@@ -49,5 +102,10 @@ pub fn spec() -> CommandSpec {
             "stores dynamic unix second deadline",
             "EXPIREAT should apply a positive TTL and EXPIRETIME should report the requested deadline.",
             stores_dynamic_unix_seconds_deadline,
+        ))
+        .case(CaseDef::new(
+            "condition options are routed",
+            "EXPIREAT should accept NX, XX, GT, and LT through the normal client dispatch path.",
+            option_variants_are_routed,
         ))
 }

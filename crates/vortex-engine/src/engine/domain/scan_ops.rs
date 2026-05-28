@@ -13,7 +13,10 @@ fn scan_table_slots(
     results: &mut Vec<VortexKey>,
 ) -> usize {
     let total_slots = table.total_slots();
-    let match_all = pattern.is_none() || pattern == Some(b"*");
+    let pattern_filter = match pattern {
+        Some(b"*") | None => None,
+        Some(pattern) => Some(pattern),
+    };
 
     for slot in start_slot..total_slots {
         let Some((key, value)) = table.slot_key_value(slot) else {
@@ -24,8 +27,10 @@ fn scan_table_slots(
             continue;
         }
 
-        if !match_all && !glob_match(pattern.expect("pattern checked above"), key.as_bytes()) {
-            continue;
+        if let Some(pattern) = pattern_filter {
+            if !glob_match(pattern, key.as_bytes()) {
+                continue;
+            }
         }
         if let Some(filter) = type_filter {
             if !filter.eq_ignore_ascii_case(value.type_name().as_bytes()) {

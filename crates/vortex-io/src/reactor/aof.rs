@@ -1,5 +1,37 @@
 use super::*;
 
+#[inline]
+fn validated_aof_writer_slot(
+    slot: &Option<AofWriterSlot>,
+    epoch: AofEpoch,
+) -> io::Result<&AofWriterSlot> {
+    match slot.as_ref() {
+        Some(slot) if slot.epoch == epoch => Ok(slot),
+        Some(_) => Err(io::Error::other(
+            "AOF writer epoch changed after validation",
+        )),
+        None => Err(io::Error::other(
+            "AOF LSN allocated without a reactor writer",
+        )),
+    }
+}
+
+#[inline]
+fn validated_aof_writer_slot_mut(
+    slot: &mut Option<AofWriterSlot>,
+    epoch: AofEpoch,
+) -> io::Result<&mut AofWriterSlot> {
+    match slot.as_mut() {
+        Some(slot) if slot.epoch == epoch => Ok(slot),
+        Some(_) => Err(io::Error::other(
+            "AOF writer epoch changed after validation",
+        )),
+        None => Err(io::Error::other(
+            "AOF LSN allocated without a reactor writer",
+        )),
+    }
+}
+
 impl Reactor {
     /// Append a mutation command to the AOF file with its global LSN.
     ///
@@ -11,12 +43,9 @@ impl Reactor {
         lsn: AofLsn,
         key: &[u8],
     ) -> io::Result<AofAppendOutcome> {
-        self.validate_aof_writer_epoch()?;
+        let epoch = self.validate_aof_writer_epoch()?;
         self.maybe_inject_aof_append_failure()?;
-        let requirement = self
-            .aof_writer
-            .as_ref()
-            .expect("validated AOF writer")
+        let requirement = validated_aof_writer_slot(&self.aof_writer, epoch)?
             .writer
             .durability_requirement();
 
@@ -25,12 +54,10 @@ impl Reactor {
         push_resp_array_len(&mut self.aof_scratch, 2);
         push_resp_bulk_string(&mut self.aof_scratch, b"DEL");
         push_resp_bulk_string(&mut self.aof_scratch, key);
-        let outcome = self
-            .aof_writer
-            .as_mut()
-            .expect("validated AOF writer")
+        let record = AofRecordBytes::try_from_resp(&self.aof_scratch)?;
+        let outcome = validated_aof_writer_slot_mut(&mut self.aof_writer, epoch)?
             .writer
-            .append_with_lsn(lsn, AofRecordBytes::from_resp(&self.aof_scratch))?;
+            .append_with_lsn(lsn, record)?;
         if outcome.durable_lsn().is_some() {
             self.maybe_inject_aof_fsync_failure()?;
         }
@@ -51,22 +78,17 @@ impl Reactor {
         effect: AofCommitEffect,
         payload: &[u8],
     ) -> io::Result<AofAppendOutcome> {
-        self.validate_aof_writer_epoch()?;
+        let epoch = self.validate_aof_writer_epoch()?;
         self.maybe_inject_aof_append_failure()?;
-        let requirement = self
-            .aof_writer
-            .as_ref()
-            .expect("validated AOF writer")
+        let requirement = validated_aof_writer_slot(&self.aof_writer, epoch)?
             .writer
             .durability_requirement();
 
         let append_start = self.profile_metric_start();
-        let outcome = self
-            .aof_writer
-            .as_mut()
-            .expect("validated AOF writer")
+        let record = AofRecordBytes::try_from_resp(payload)?;
+        let outcome = validated_aof_writer_slot_mut(&mut self.aof_writer, epoch)?
             .writer
-            .append_with_lsn(effect.lsn(), AofRecordBytes::from_resp(payload))?;
+            .append_with_lsn(effect.lsn(), record)?;
         if outcome.durable_lsn().is_some() {
             self.maybe_inject_aof_fsync_failure()?;
         }
@@ -116,12 +138,9 @@ impl Reactor {
         frame: &FrameRef<'_>,
         aof_payload: Option<&[u8]>,
     ) -> io::Result<AofAppendOutcome> {
-        self.validate_aof_writer_epoch()?;
+        let epoch = self.validate_aof_writer_epoch()?;
         self.maybe_inject_aof_append_failure()?;
-        let requirement = self
-            .aof_writer
-            .as_ref()
-            .expect("validated AOF writer")
+        let requirement = validated_aof_writer_slot(&self.aof_writer, epoch)?
             .writer
             .durability_requirement();
 
@@ -150,12 +169,10 @@ impl Reactor {
             &self.aof_scratch[..written]
         };
 
-        let outcome = self
-            .aof_writer
-            .as_mut()
-            .expect("validated AOF writer")
+        let record = AofRecordBytes::try_from_resp(payload)?;
+        let outcome = validated_aof_writer_slot_mut(&mut self.aof_writer, epoch)?
             .writer
-            .append_with_lsn(effect.lsn(), AofRecordBytes::from_resp(payload))?;
+            .append_with_lsn(effect.lsn(), record)?;
         if outcome.durable_lsn().is_some() {
             self.maybe_inject_aof_fsync_failure()?;
         }

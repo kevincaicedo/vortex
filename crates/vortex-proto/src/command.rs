@@ -112,12 +112,14 @@ pub fn uppercase_inplace(buf: &mut [u8]) {
         // SAFETY: i + 8 <= len, so ptr.add(i) points to 8 valid bytes.
         let word = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
         let uppercased = swar_upper_u64(word);
+        // SAFETY: i + 8 <= len, so ptr.add(i) points to 8 writable bytes.
         unsafe { (ptr.add(i) as *mut u64).write_unaligned(uppercased) };
         i += 8;
     }
 
     // Scalar tail for remaining bytes.
     while i < len {
+        // SAFETY: i < len, so ptr.add(i) points to one valid writable byte.
         unsafe {
             let b = *ptr.add(i);
             // Branchless: if b is in a-z range, clear bit 5.
@@ -483,6 +485,30 @@ mod tests {
         assert!(matches!(
             dispatch_wire(&mut router, b"*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"),
             DispatchResult::Dispatch { .. }
+        ));
+    }
+
+    #[test]
+    fn dispatch_expire_accepts_optional_condition_arity() {
+        let mut router = CommandRouter::new();
+
+        for wire in [
+            b"*3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n".as_slice(),
+            b"*4\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n$2\r\nNX\r\n".as_slice(),
+            b"*4\r\n$7\r\nPEXPIRE\r\n$3\r\nkey\r\n$3\r\n100\r\n$2\r\nGT\r\n".as_slice(),
+            b"*4\r\n$8\r\nEXPIREAT\r\n$3\r\nkey\r\n$10\r\n1760000000\r\n$2\r\nLT\r\n".as_slice(),
+            b"*4\r\n$9\r\nPEXPIREAT\r\n$3\r\nkey\r\n$13\r\n1760000000000\r\n$2\r\nXX\r\n"
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                dispatch_wire(&mut router, wire),
+                DispatchResult::Dispatch { .. }
+            ));
+        }
+
+        assert!(matches!(
+            dispatch_wire(&mut router, b"*2\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n"),
+            DispatchResult::WrongArity { .. }
         ));
     }
 

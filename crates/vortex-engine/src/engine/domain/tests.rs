@@ -74,7 +74,8 @@ where
     let _test_lock = PROJECTION_ADMISSION_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (entered_rx, release_tx) = install_projection_admission_test_hook(label);
+    let keyspace_id = Arc::as_ptr(&keyspace) as usize;
+    let (entered_rx, release_tx) = install_projection_admission_test_hook(keyspace_id, label);
     let writer_keyspace = Arc::clone(&keyspace);
     let handle = thread::spawn(move || writer(writer_keyspace));
 
@@ -108,7 +109,8 @@ where
     let _test_lock = OPTIMISTIC_PREPARE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (entered_rx, release_tx) = install_optimistic_prepare_test_hook(label);
+    let keyspace_id = Arc::as_ptr(&keyspace) as usize;
+    let (entered_rx, release_tx) = install_optimistic_prepare_test_hook(keyspace_id, label);
     let writer_keyspace = Arc::clone(&keyspace);
     let handle = thread::spawn(move || writer(writer_keyspace));
 
@@ -376,7 +378,13 @@ fn set_value_plain_revalidates_after_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.set_value_plain(writer_key, writer_value, 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -405,7 +413,13 @@ fn append_value_revalidates_after_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.append_value(writer_key, b"", 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -434,7 +448,13 @@ fn setrange_value_revalidates_after_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.setrange_value(writer_key, 0, b"z", 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -463,7 +483,13 @@ fn increment_by_revalidates_after_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.increment_by(writer_key, 0, 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -529,7 +555,13 @@ fn increment_by_float_revalidates_after_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.increment_by_float(writer_key, 0.0, 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -552,7 +584,13 @@ fn optimistic_setrange_retries_after_concurrent_delete() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.setrange_value(writer_key, 1, b"YY", 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
         },
     )
     .expect("SETRANGE should retry stale optimistic prepare");
@@ -582,6 +620,7 @@ fn optimistic_incrbyfloat_retries_after_concurrent_expire() {
             assert!(
                 keyspace
                     .expire_key_with_options(&stale_key, 1, 0, ExpireOptions::default())
+                    .expect("stale expire should succeed")
                     .value
             );
         },
@@ -694,7 +733,13 @@ fn mset_values_revalidates_after_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.mset_values(vec![(writer_key, writer_value)], 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_key, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_key, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -802,7 +847,13 @@ fn rename_key_revalidates_after_destination_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.rename_key(&writer_old, writer_new, 0, false),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_new, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_new, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );
@@ -852,7 +903,13 @@ fn copy_key_revalidates_after_destination_delete_and_fill() {
         Arc::clone(&keyspace),
         move |keyspace| keyspace.copy_key(&writer_src, writer_dst, true, 0),
         move |keyspace| {
-            assert!(keyspace.remove_value(&stale_dst, 0).value.is_some());
+            assert!(
+                keyspace
+                    .remove_value(&stale_dst, 0)
+                    .expect("stale remove should succeed")
+                    .value
+                    .is_some()
+            );
             insert_raw(keyspace, stale_filler, stale_value);
         },
     );

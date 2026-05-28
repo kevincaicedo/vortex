@@ -5,10 +5,10 @@
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
 use super::{
-    CmdResult, CommandArgs, ExecutedCommand, NS_PER_SEC, RESP_EMPTY_ARRAY, RESP_OK,
-    resolve_unix_time_now_nanos,
+    CmdResult, CommandArgs, ERR_SYNTAX, ExecutedCommand, NS_PER_SEC, RESP_EMPTY_ARRAY, RESP_OK,
+    mutation_error_response, resolve_unix_time_now_nanos,
 };
-use crate::{ConcurrentKeyspace, keyspace::RuntimeMetricsSnapshot};
+use crate::{ConcurrentKeyspace, effects::MutationErrorKind, keyspace::RuntimeMetricsSnapshot};
 
 /// Alpha-visible command set. This excludes commands that are still stubs,
 /// unsupported, or intentionally disabled for the alpha release.
@@ -112,10 +112,18 @@ pub fn cmd_dbsize(
 #[inline]
 pub fn cmd_flushdb(
     keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
+    frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> ExecutedCommand {
-    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), keyspace.cmd_flush_all())
+    if !valid_flush_args(frame) {
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    }
+    match keyspace.cmd_flush_all() {
+        Ok(aof_lsn) => ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), aof_lsn),
+        Err(error) => ExecutedCommand::from(CmdResult::Static(mutation_error_response(
+            MutationErrorKind::from(error),
+        ))),
+    }
 }
 
 /// FLUSHALL [ASYNC|SYNC]
@@ -124,10 +132,32 @@ pub fn cmd_flushdb(
 #[inline]
 pub fn cmd_flushall(
     keyspace: &ConcurrentKeyspace,
-    _frame: &FrameRef<'_>,
+    frame: &FrameRef<'_>,
     _now_nanos: u64,
 ) -> ExecutedCommand {
-    ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), keyspace.cmd_flush_all())
+    if !valid_flush_args(frame) {
+        return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
+    }
+    match keyspace.cmd_flush_all() {
+        Ok(aof_lsn) => ExecutedCommand::with_aof_lsn(CmdResult::Static(RESP_OK), aof_lsn),
+        Err(error) => ExecutedCommand::from(CmdResult::Static(mutation_error_response(
+            MutationErrorKind::from(error),
+        ))),
+    }
+}
+
+fn valid_flush_args(frame: &FrameRef<'_>) -> bool {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return false;
+    };
+
+    match args.len() {
+        1 => true,
+        2 => args
+            .get(1)
+            .is_some_and(|mode| eq_ci(mode, b"sync") || eq_ci(mode, b"async")),
+        _ => false,
+    }
 }
 
 /// INFO [section]
@@ -1387,11 +1417,49 @@ mod tests {
     }
 
     #[test]
+    fn flushdb_rejects_malformed_options_without_mutating() {
+        let h = TestHarness::new();
+        use vortex_common::{VortexKey, VortexValue};
+        h.set(VortexKey::from("a"), VortexValue::from_bytes(b"1"));
+
+        let r = exec(&h, &[b"FLUSHDB", b"later"]);
+        assert_static(&r, ERR_SYNTAX);
+        assert_eq!(h.len(), 1);
+
+        let r = exec(&h, &[b"FLUSHDB", b"SYNC", b"extra"]);
+        assert_static(&r, ERR_SYNTAX);
+        assert_eq!(h.len(), 1);
+
+        let r = exec(&h, &[b"FLUSHDB", b"ASYNC"]);
+        assert_static(&r, RESP_OK);
+        assert_eq!(h.len(), 0);
+    }
+
+    #[test]
     fn flushall_empties_shard() {
         let h = TestHarness::new();
         use vortex_common::{VortexKey, VortexValue};
         h.set(VortexKey::from("x"), VortexValue::from_bytes(b"val"));
         let r = exec(&h, &[b"FLUSHALL"]);
+        assert_static(&r, RESP_OK);
+        assert_eq!(h.len(), 0);
+    }
+
+    #[test]
+    fn flushall_rejects_malformed_options_without_mutating() {
+        let h = TestHarness::new();
+        use vortex_common::{VortexKey, VortexValue};
+        h.set(VortexKey::from("x"), VortexValue::from_bytes(b"val"));
+
+        let r = exec(&h, &[b"FLUSHALL", b"eventually"]);
+        assert_static(&r, ERR_SYNTAX);
+        assert_eq!(h.len(), 1);
+
+        let r = exec(&h, &[b"FLUSHALL", b"async", b"extra"]);
+        assert_static(&r, ERR_SYNTAX);
+        assert_eq!(h.len(), 1);
+
+        let r = exec(&h, &[b"FLUSHALL", b"SYNC"]);
         assert_static(&r, RESP_OK);
         assert_eq!(h.len(), 0);
     }

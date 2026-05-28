@@ -16,6 +16,7 @@ use std::time::Duration;
 use vortex_engine::eviction::EvictionPolicy;
 use vortex_engine::keyspace::{
     ConcurrentKeyspace, DEFAULT_SHARD_COUNT, RuntimeTelemetryMode, ServerMemoryAttributionSnapshot,
+    ShardCount,
 };
 use vortex_memory::BufferPool;
 use vortex_persist::aof::AofManifest;
@@ -240,6 +241,9 @@ impl ReactorPool {
                 ),
             ));
         }
+        let shard_count = ShardCount::try_new(config.shard_count).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
 
         let coordinator = Arc::new(ShutdownCoordinator::new(num_reactors));
         let aof_coordinator = Arc::new(AofCoordinator::new(num_reactors));
@@ -251,7 +255,7 @@ impl ReactorPool {
 
         // ── Create shared ConcurrentKeyspace ────────────────────────
         let keyspace = Arc::new(ConcurrentKeyspace::new_with_runtime_slots(
-            config.shard_count,
+            shard_count.get(),
             num_reactors,
         ));
         keyspace.set_runtime_telemetry_mode(config.telemetry_mode);
@@ -263,7 +267,21 @@ impl ReactorPool {
             );
         }
         let fixed_buffer_reserved_bytes =
-            BufferPool::reserved_bytes_for(config.buffer_count, config.buffer_size);
+            BufferPool::reserved_bytes_for(config.buffer_count, config.buffer_size).ok_or_else(
+                || {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "fixed buffer reserved byte count overflow",
+                    )
+                },
+            )?;
+        let fixed_buffer_size =
+            BufferPool::aligned_buffer_size(config.buffer_size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "fixed buffer size alignment overflow",
+                )
+            })?;
         keyspace.set_server_memory_attribution(ServerMemoryAttributionSnapshot {
             io_fixed_buffer_reserved_bytes: fixed_buffer_reserved_bytes,
             // BufferPool faults one byte per page during creation, so the pool
@@ -273,7 +291,7 @@ impl ReactorPool {
             per_connection_state_bytes: Reactor::per_connection_state_bytes(config.max_connections),
             connection_capacity: config.max_connections,
             fixed_buffer_count: config.buffer_count,
-            fixed_buffer_size: BufferPool::aligned_buffer_size(config.buffer_size),
+            fixed_buffer_size,
         });
         tracing::info!(
             shard_count = config.shard_count,
@@ -580,6 +598,28 @@ mod tests {
     }
 
     #[test]
+    fn spawn_returns_error_for_invalid_shard_count() {
+        let error = match ReactorPool::spawn(ReactorPoolConfig {
+            shard_count: 63,
+            threads: 1,
+            max_connections: 1,
+            buffer_count: 1,
+            io_backend: IoBackendMode::Polling,
+            ..ReactorPoolConfig::default()
+        }) {
+            Ok(_) => panic!("expected spawn to reject invalid shard count"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("num_shards must be a power of two")
+        );
+    }
+
+    #[test]
     fn spawn_returns_error_when_listener_port_is_already_bound() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let bind_addr = listener.local_addr().unwrap();
@@ -630,5 +670,49 @@ mod tests {
 
         assert!(error.to_string().contains("failed to open AOF file"));
         assert!(error.to_string().contains("reactor pool startup failed"));
+    }
+
+    #[test]
+    fn spawn_fails_closed_on_multi_reactor_active_aof_manifest() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "vortex-active-manifest-multi-reactor-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aof_path = dir.join("appendonly.aof");
+        let manifest_path = AofManifest::path_for_aof(&aof_path).unwrap();
+        std::fs::write(
+            &manifest_path,
+            "VXAOFMANIFEST 1\nstate active\nepoch 1\nbase base.aof\ntail tail.aof\n",
+        )
+        .unwrap();
+
+        let error = match ReactorPool::spawn(ReactorPoolConfig {
+            bind_addr,
+            threads: 2,
+            max_connections: 2,
+            buffer_count: 2,
+            aof_config: Some(AofConfig {
+                path: aof_path,
+                fsync_policy: vortex_persist::aof::AofFsyncPolicy::No,
+                max_pending_fsync_bytes:
+                    vortex_persist::aof::writer::DEFAULT_EVERYSEC_MAX_PENDING_BYTES,
+            }),
+            io_backend: IoBackendMode::Polling,
+            ..ReactorPoolConfig::default()
+        }) {
+            Ok(_) => panic!("expected multi-reactor active AOF manifest to fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("requires manifest-aware replay"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

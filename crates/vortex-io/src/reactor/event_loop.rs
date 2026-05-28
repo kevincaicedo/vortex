@@ -250,7 +250,10 @@ impl Reactor {
 
     pub(super) fn handle_completion(&mut self, cqe: &Completion) {
         match cqe.token.decode() {
-            Ok(DecodedCompletionToken::Accept) => self.handle_accept(cqe),
+            Ok(DecodedCompletionToken::Accept) => {
+                self.accept_inflight = false;
+                self.handle_accept(cqe);
+            }
             Ok(DecodedCompletionToken::Cancel { target }) => {
                 self.handle_cancel_completion(target, cqe);
             }
@@ -299,8 +302,12 @@ impl Reactor {
 
     pub(super) fn handle_cancel_completion(&mut self, target: CompletionToken, cqe: &Completion) {
         let result = self.classify_cancel_completion(target, cqe.result);
-        let cancel_conn_id = self.mark_cancel_completed_for_target(target);
-        let mut terminal_conn_id = None;
+        let cancel_conn_id = if target == CompletionToken::accept() {
+            self.accept_cancel_inflight = false;
+            None
+        } else {
+            self.mark_cancel_completed_for_target(target)
+        };
 
         match result {
             CancelResult::Canceled | CancelResult::AlreadyTerminal => {}
@@ -308,12 +315,8 @@ impl Reactor {
                 tracing::warn!(
                     target = target.raw(),
                     result = cqe.result,
-                    "cancel target not found; treating tracked target as terminal"
+                    "cancel target not found while still tracked; waiting for target terminal completion"
                 );
-                if let Some((conn_id, op)) = self.live_conn_token(target) {
-                    self.mark_inflight_completed(conn_id, op);
-                    terminal_conn_id = Some(conn_id);
-                }
             }
             CancelResult::BackendError { errno } => {
                 tracing::warn!(
@@ -324,7 +327,7 @@ impl Reactor {
             }
         }
 
-        if let Some(conn_id) = cancel_conn_id.or(terminal_conn_id) {
+        if let Some(conn_id) = cancel_conn_id {
             self.maybe_finalize_close(conn_id);
         }
     }
@@ -339,6 +342,10 @@ impl Reactor {
     }
 
     pub(super) fn cancel_target_inflight(&self, target: CompletionToken) -> bool {
+        if target == CompletionToken::accept() {
+            return self.accept_inflight;
+        }
+
         self.live_conn_token(target).is_some_and(|(id, op)| {
             self.inflight_ops
                 .get(id)

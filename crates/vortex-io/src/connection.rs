@@ -278,12 +278,14 @@ impl ConnectionSlab {
     }
 
     /// Removes a connection by slot token.
-    pub fn remove(&mut self, token: usize) -> ConnectionMeta {
-        match self.take_slot(token) {
-            ConnSlot::Active(conn) => conn.into_meta(),
-            ConnSlot::Closing(conn) => conn.into_meta(),
-            ConnSlot::Drained(conn) => conn.into_meta(),
-            ConnSlot::Vacant => panic!("attempted to remove vacant connection slot"),
+    ///
+    /// Returns `None` when the token is out of range or already vacant.
+    pub fn remove(&mut self, token: usize) -> Option<ConnectionMeta> {
+        match self.take_slot(token)? {
+            ConnSlot::Active(conn) => Some(conn.into_meta()),
+            ConnSlot::Closing(conn) => Some(conn.into_meta()),
+            ConnSlot::Drained(conn) => Some(conn.into_meta()),
+            ConnSlot::Vacant => None,
         }
     }
 
@@ -393,17 +395,15 @@ impl ConnectionSlab {
             .count()
     }
 
-    fn take_slot(&mut self, token: usize) -> ConnSlot {
-        let slot = self
-            .slots
-            .get_mut(token)
-            .expect("connection slot token out of range");
+    fn take_slot(&mut self, token: usize) -> Option<ConnSlot> {
+        let slot = self.slots.get_mut(token)?;
         let previous = std::mem::replace(slot, ConnSlot::Vacant);
         if !matches!(previous, ConnSlot::Vacant) {
             self.len -= 1;
             self.free.push(token);
+            return Some(previous);
         }
-        previous
+        None
     }
 }
 
@@ -476,9 +476,21 @@ mod tests {
         assert_eq!(conn.fd, 42);
         assert_eq!(slab.state(token), ConnectionState::Active);
 
-        slab.remove(token);
+        let removed = slab.remove(token).unwrap();
+        assert_eq!(removed.fd, 42);
         assert!(slab.is_empty());
         assert_eq!(slab.state(token), ConnectionState::Vacant);
+    }
+
+    #[test]
+    fn slab_remove_returns_none_for_invalid_or_vacant_token() {
+        let mut slab = ConnectionSlab::with_capacity(16);
+        let token = slab.insert(ConnectionMeta::new(42, 0));
+
+        assert!(slab.remove(token).is_some());
+        assert!(slab.remove(token).is_none());
+        assert!(slab.remove(token + 1).is_none());
+        assert!(slab.is_empty());
     }
 
     #[test]

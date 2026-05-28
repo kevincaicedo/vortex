@@ -12,7 +12,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::Deserialize;
 
 /// I/O backend selection.
@@ -116,7 +117,7 @@ pub const MAX_SHARD_COUNT: usize = 131_072;
 #[derive(Debug, Clone, Parser, Deserialize)]
 #[command(
     name = "vortex-server",
-    about = "VortexDB — Next-generation in-memory data engine",
+    about = "VortexDB — alpha in-memory data engine",
     version = env!("CARGO_PKG_VERSION"),
 )]
 #[serde(default)]
@@ -136,7 +137,8 @@ pub struct VortexConfig {
     /// Maximum number of client connections.
     ///
     /// The server may cap the effective active-client budget further when the
-    /// configured fixed buffer pool cannot supply two buffers per connection.
+    /// configured fixed buffer pool cannot supply one read buffer per
+    /// connection.
     #[arg(long, default_value = "10000", env = "VORTEX_MAX_CLIENTS")]
     pub max_clients: usize,
 
@@ -156,10 +158,11 @@ pub struct VortexConfig {
     #[arg(long, default_value = "4096", env = "VORTEX_RING_SIZE")]
     pub ring_size: u32,
 
-    /// Number of fixed I/O buffers pre-registered with io_uring.
+    /// Number of reactor I/O staging buffers.
     ///
-    /// Each active connection leases one read buffer and one write buffer, so
-    /// the fixed-buffer pool can sustain `fixed_buffers / 2` active clients.
+    /// Each active connection leases one read buffer, so the configured pool
+    /// can sustain at most `fixed_buffers` active clients. io_uring fixed-buffer
+    /// registration is controlled separately by `fixed_buffer_registration`.
     #[arg(long, default_value = "1024", env = "VORTEX_FIXED_BUFFERS")]
     pub fixed_buffers: usize,
 
@@ -364,19 +367,19 @@ pub struct VortexConfig {
     )]
     pub aof_max_pending_fsync_bytes: u64,
 
-    /// Enable snapshot persistence.
+    /// Reserved VXF snapshot persistence flag (not release-supported yet).
     #[arg(long, env = "VORTEX_SNAPSHOT_ENABLED")]
     pub snapshot_enabled: bool,
 
-    /// Snapshot interval in seconds.
+    /// Reserved snapshot interval in seconds.
     #[arg(long, default_value = "3600", env = "VORTEX_SNAPSHOT_INTERVAL")]
     pub snapshot_interval: u64,
 
-    /// Snapshot file path.
+    /// Reserved snapshot file path.
     #[arg(long, default_value = "vortex.vxf", env = "VORTEX_SNAPSHOT_PATH")]
     pub snapshot_path: PathBuf,
 
-    /// Require authentication password (empty = no auth).
+    /// Reserved authentication password field; current alpha does not enforce it.
     #[arg(long, default_value = "", env = "VORTEX_REQUIREPASS")]
     pub requirepass: String,
 
@@ -388,13 +391,18 @@ pub struct VortexConfig {
     #[arg(long, short = 'c', env = "VORTEX_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Prometheus metrics port (None = disabled).
+    /// Reserved Prometheus metrics port; current alpha does not start a metrics listener.
     #[arg(long, env = "VORTEX_METRICS_PORT")]
     pub metrics_port: Option<u16>,
 
     /// Enable adaptive morphing structures (runtime encoding transitions).
     /// When `false`, data structures use Redis-compatible static thresholds.
-    #[arg(long, default_value = "true", env = "VORTEX_ADAPTIVE_STRUCTURES")]
+    #[arg(
+        long,
+        default_value = "true",
+        env = "VORTEX_ADAPTIVE_STRUCTURES",
+        action = ArgAction::Set
+    )]
     pub adaptive_structures: bool,
 }
 
@@ -453,33 +461,46 @@ impl Default for VortexConfig {
     }
 }
 
+#[inline]
+fn should_take_toml(matches: &ArgMatches, id: &'static str) -> bool {
+    matches!(
+        matches.value_source(id),
+        None | Some(ValueSource::DefaultValue)
+    )
+}
+
 impl VortexConfig {
     /// Load config from CLI args, falling back to TOML file + env vars.
     ///
     /// Priority: CLI args > env vars > TOML file > defaults.
     pub fn load() -> Result<Self, String> {
-        let mut config = Self::parse();
-
-        // If a config file is specified, merge TOML values for unset fields.
-        if let Some(ref path) = config.config {
-            let contents = std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read config file {}: {e}", path.display()))?;
-            let file_config: VortexConfig = toml::from_str(&contents)
-                .map_err(|e| format!("Failed to parse config file: {e}"))?;
-
-            // TOML values serve as defaults; CLI args take precedence.
-            config.merge_defaults(file_config);
-        }
-
-        config.resolve_threads();
-        config.validate()?;
-
-        Ok(config)
+        let matches = match Self::command().try_get_matches() {
+            Ok(matches) => matches,
+            Err(error) => error.exit(),
+        };
+        Self::from_matches(matches)
     }
 
     /// Load config from explicit args (for testing).
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let mut config = Self::try_parse_from(args).map_err(|error| error.to_string())?;
+        let matches = Self::command()
+            .try_get_matches_from(args)
+            .map_err(|error| error.to_string())?;
+        Self::from_matches(matches)
+    }
+
+    fn from_matches(matches: ArgMatches) -> Result<Self, String> {
+        let mut config = Self::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+
+        if let Some(path) = config.config.clone() {
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read config file {}: {e}", path.display()))?;
+            let file_config: VortexConfig = toml::from_str(&contents)
+                .map_err(|e| format!("Failed to parse config file: {e}"))?;
+
+            config.merge_defaults(file_config, &matches);
+        }
+
         config.resolve_threads();
         config.validate()?;
         Ok(config)
@@ -617,170 +638,82 @@ impl VortexConfig {
         Ok(())
     }
 
-    /// Merge fields from a TOML-loaded config into `self`.
+    /// Merge TOML fields into arguments whose source is still the clap default.
     ///
-    /// For each field: if the CLI-parsed value equals the `Default` sentinel,
-    /// take the TOML value instead. This implements CLI > TOML > defaults priority.
-    fn merge_defaults(&mut self, defaults: VortexConfig) {
-        let sentinel = VortexConfig::default();
-
-        // Numeric/enum fields: CLI default sentinel → take TOML value.
-        if self.threads == sentinel.threads {
-            self.threads = defaults.threads;
-        }
-        if self.shard_count == sentinel.shard_count {
-            self.shard_count = defaults.shard_count;
-        }
-        if self.max_clients == sentinel.max_clients {
-            self.max_clients = defaults.max_clients;
-        }
-        if self.max_memory == sentinel.max_memory {
-            self.max_memory = defaults.max_memory;
-        }
-        if self.io_backend == sentinel.io_backend {
-            self.io_backend = defaults.io_backend;
-        }
-        if self.ring_size == sentinel.ring_size {
-            self.ring_size = defaults.ring_size;
-        }
-        if self.fixed_buffers == sentinel.fixed_buffers {
-            self.fixed_buffers = defaults.fixed_buffers;
-        }
-        if self.fixed_buffer_registration == sentinel.fixed_buffer_registration {
-            self.fixed_buffer_registration = defaults.fixed_buffer_registration;
-        }
-        if self.buffer_size == sentinel.buffer_size {
-            self.buffer_size = defaults.buffer_size;
-        }
-        if self.max_request_bytes == sentinel.max_request_bytes {
-            self.max_request_bytes = defaults.max_request_bytes;
-        }
-        if self.max_parser_accumulator_bytes == sentinel.max_parser_accumulator_bytes {
-            self.max_parser_accumulator_bytes = defaults.max_parser_accumulator_bytes;
-        }
-        if self.max_pending_response_bytes == sentinel.max_pending_response_bytes {
-            self.max_pending_response_bytes = defaults.max_pending_response_bytes;
-        }
-        if self.max_multi_queue_commands == sentinel.max_multi_queue_commands {
-            self.max_multi_queue_commands = defaults.max_multi_queue_commands;
-        }
-        if self.max_multi_queue_bytes == sentinel.max_multi_queue_bytes {
-            self.max_multi_queue_bytes = defaults.max_multi_queue_bytes;
-        }
-        if self.max_watch_registrations == sentinel.max_watch_registrations {
-            self.max_watch_registrations = defaults.max_watch_registrations;
-        }
-        if self.max_writev_chunks == sentinel.max_writev_chunks {
-            self.max_writev_chunks = defaults.max_writev_chunks;
-        }
-        if self.reactor_overload_accept_connection_percent
-            == sentinel.reactor_overload_accept_connection_percent
-        {
-            self.reactor_overload_accept_connection_percent =
-                defaults.reactor_overload_accept_connection_percent;
-        }
-        if self.reactor_overload_pending_response_bytes
-            == sentinel.reactor_overload_pending_response_bytes
-        {
-            self.reactor_overload_pending_response_bytes =
-                defaults.reactor_overload_pending_response_bytes;
-        }
-        if self.reactor_overload_parser_accumulator_bytes
-            == sentinel.reactor_overload_parser_accumulator_bytes
-        {
-            self.reactor_overload_parser_accumulator_bytes =
-                defaults.reactor_overload_parser_accumulator_bytes;
-        }
-        if self.reactor_overload_aof_pending_bytes == sentinel.reactor_overload_aof_pending_bytes {
-            self.reactor_overload_aof_pending_bytes = defaults.reactor_overload_aof_pending_bytes;
-        }
-        if self.reactor_overload_writev_backlog_bytes
-            == sentinel.reactor_overload_writev_backlog_bytes
-        {
-            self.reactor_overload_writev_backlog_bytes =
-                defaults.reactor_overload_writev_backlog_bytes;
-        }
-        if self.reactor_overload_maintenance_debt == sentinel.reactor_overload_maintenance_debt {
-            self.reactor_overload_maintenance_debt = defaults.reactor_overload_maintenance_debt;
-        }
-        if self.connection_timeout_secs == sentinel.connection_timeout_secs {
-            self.connection_timeout_secs = defaults.connection_timeout_secs;
-        }
-        if self.sqpoll_idle_ms == sentinel.sqpoll_idle_ms {
-            self.sqpoll_idle_ms = defaults.sqpoll_idle_ms;
-        }
-        if self.telemetry_mode == sentinel.telemetry_mode {
-            self.telemetry_mode = defaults.telemetry_mode;
-        }
-        if self.reactor_completion_budget == sentinel.reactor_completion_budget {
-            self.reactor_completion_budget = defaults.reactor_completion_budget;
-        }
-        if self.reactor_command_budget == sentinel.reactor_command_budget {
-            self.reactor_command_budget = defaults.reactor_command_budget;
-        }
-        if self.reactor_accept_budget == sentinel.reactor_accept_budget {
-            self.reactor_accept_budget = defaults.reactor_accept_budget;
-        }
-        if self.reactor_writev_budget == sentinel.reactor_writev_budget {
-            self.reactor_writev_budget = defaults.reactor_writev_budget;
-        }
-        if self.reactor_maintenance_budget == sentinel.reactor_maintenance_budget {
-            self.reactor_maintenance_budget = defaults.reactor_maintenance_budget;
-        }
-        if self.reactor_time_budget_us == sentinel.reactor_time_budget_us {
-            self.reactor_time_budget_us = defaults.reactor_time_budget_us;
-        }
-        if self.aof_max_pending_fsync_bytes == sentinel.aof_max_pending_fsync_bytes {
-            self.aof_max_pending_fsync_bytes = defaults.aof_max_pending_fsync_bytes;
+    /// `ArgMatches::value_source` is required here. Comparing parsed values to
+    /// `Default` would let TOML override explicit CLI/env values that happen to
+    /// equal the release default.
+    fn merge_defaults(&mut self, defaults: VortexConfig, matches: &ArgMatches) {
+        macro_rules! merge_field {
+            ($id:literal, $field:ident) => {
+                if should_take_toml(matches, $id) {
+                    self.$field = defaults.$field;
+                }
+            };
         }
 
-        // String fields: check against default sentinel strings.
-        if self.eviction_policy == sentinel.eviction_policy {
-            self.eviction_policy = defaults.eviction_policy;
-        }
-        if self.aof_fsync == sentinel.aof_fsync {
-            self.aof_fsync = defaults.aof_fsync;
-        }
-        if self.log_level == sentinel.log_level {
-            self.log_level = defaults.log_level;
-        }
-        if self.requirepass == sentinel.requirepass {
-            self.requirepass = defaults.requirepass;
-        }
-
-        // Bool fields: only take TOML value if CLI didn't set them (bools default to false).
-        if !self.aof_enabled && defaults.aof_enabled {
-            self.aof_enabled = true;
-        }
-        if !self.snapshot_enabled && defaults.snapshot_enabled {
-            self.snapshot_enabled = true;
-        }
-
-        // Path fields.
-        if self.aof_path == sentinel.aof_path {
-            self.aof_path = defaults.aof_path;
-        }
-        if self.snapshot_path == sentinel.snapshot_path {
-            self.snapshot_path = defaults.snapshot_path;
-        }
-        if self.snapshot_interval == sentinel.snapshot_interval {
-            self.snapshot_interval = defaults.snapshot_interval;
-        }
-
-        // SocketAddr: compare to default bind address.
-        if self.bind == sentinel.bind {
-            self.bind = defaults.bind;
-        }
-
-        // Optional fields: take TOML value if CLI didn't set.
-        if self.metrics_port.is_none() {
-            self.metrics_port = defaults.metrics_port;
-        }
-
-        // Adaptive structures: CLI default is true; take TOML value if CLI matches default.
-        if self.adaptive_structures == sentinel.adaptive_structures {
-            self.adaptive_structures = defaults.adaptive_structures;
-        }
+        merge_field!("bind", bind);
+        merge_field!("threads", threads);
+        merge_field!("shard_count", shard_count);
+        merge_field!("max_clients", max_clients);
+        merge_field!("max_memory", max_memory);
+        merge_field!("eviction_policy", eviction_policy);
+        merge_field!("io_backend", io_backend);
+        merge_field!("ring_size", ring_size);
+        merge_field!("fixed_buffers", fixed_buffers);
+        merge_field!("fixed_buffer_registration", fixed_buffer_registration);
+        merge_field!("buffer_size", buffer_size);
+        merge_field!("max_request_bytes", max_request_bytes);
+        merge_field!("max_parser_accumulator_bytes", max_parser_accumulator_bytes);
+        merge_field!("max_pending_response_bytes", max_pending_response_bytes);
+        merge_field!("max_multi_queue_commands", max_multi_queue_commands);
+        merge_field!("max_multi_queue_bytes", max_multi_queue_bytes);
+        merge_field!("max_watch_registrations", max_watch_registrations);
+        merge_field!("max_writev_chunks", max_writev_chunks);
+        merge_field!(
+            "reactor_overload_accept_connection_percent",
+            reactor_overload_accept_connection_percent
+        );
+        merge_field!(
+            "reactor_overload_pending_response_bytes",
+            reactor_overload_pending_response_bytes
+        );
+        merge_field!(
+            "reactor_overload_parser_accumulator_bytes",
+            reactor_overload_parser_accumulator_bytes
+        );
+        merge_field!(
+            "reactor_overload_aof_pending_bytes",
+            reactor_overload_aof_pending_bytes
+        );
+        merge_field!(
+            "reactor_overload_writev_backlog_bytes",
+            reactor_overload_writev_backlog_bytes
+        );
+        merge_field!(
+            "reactor_overload_maintenance_debt",
+            reactor_overload_maintenance_debt
+        );
+        merge_field!("connection_timeout_secs", connection_timeout_secs);
+        merge_field!("sqpoll_idle_ms", sqpoll_idle_ms);
+        merge_field!("telemetry_mode", telemetry_mode);
+        merge_field!("reactor_completion_budget", reactor_completion_budget);
+        merge_field!("reactor_command_budget", reactor_command_budget);
+        merge_field!("reactor_accept_budget", reactor_accept_budget);
+        merge_field!("reactor_writev_budget", reactor_writev_budget);
+        merge_field!("reactor_maintenance_budget", reactor_maintenance_budget);
+        merge_field!("reactor_time_budget_us", reactor_time_budget_us);
+        merge_field!("aof_enabled", aof_enabled);
+        merge_field!("aof_fsync", aof_fsync);
+        merge_field!("aof_path", aof_path);
+        merge_field!("aof_max_pending_fsync_bytes", aof_max_pending_fsync_bytes);
+        merge_field!("snapshot_enabled", snapshot_enabled);
+        merge_field!("snapshot_interval", snapshot_interval);
+        merge_field!("snapshot_path", snapshot_path);
+        merge_field!("requirepass", requirepass);
+        merge_field!("log_level", log_level);
+        merge_field!("metrics_port", metrics_port);
+        merge_field!("adaptive_structures", adaptive_structures);
     }
 
     /// Returns the effective number of reactor threads.
@@ -802,6 +735,24 @@ impl VortexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_config_path(suffix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vortex-test-config-{}-{}-{suffix}.toml",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        path
+    }
+
+    fn write_temp_config(suffix: &str, contents: &str) -> PathBuf {
+        let path = temp_config_path(suffix);
+        std::fs::write(&path, contents).expect("test config should write");
+        path
+    }
 
     #[test]
     fn default_config() {
@@ -1028,6 +979,20 @@ mod tests {
     }
 
     #[test]
+    fn from_args_adaptive_structures_can_be_disabled() {
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--adaptive-structures".to_string(),
+            "false".to_string(),
+        ])
+        .unwrap();
+
+        assert!(!config.adaptive_structures);
+    }
+
+    #[test]
     fn validation_rejects_bad_ring_size() {
         let config = VortexConfig {
             threads: 1,
@@ -1118,57 +1083,80 @@ mod tests {
     }
 
     #[test]
-    fn merge_defaults_toml_fills_unset() {
-        // Simulate: CLI has defaults, TOML overrides some fields.
-        let mut cli = VortexConfig::default();
-        let toml_conf = VortexConfig {
-            threads: 8,
-            ring_size: 2048,
-            io_backend: IoBackendKind::Uring,
-            max_memory: 1_073_741_824,
-            ..VortexConfig::default()
-        };
+    fn config_file_fills_default_sourced_fields() {
+        let path = write_temp_config(
+            "fills-defaults",
+            r#"
+threads = 8
+ring_size = 2048
+io_backend = "uring"
+max_memory = 1073741824
+"#,
+        );
 
-        cli.merge_defaults(toml_conf);
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ])
+        .unwrap();
 
-        // TOML values should win over defaults.
-        assert_eq!(cli.threads, 8);
-        assert_eq!(cli.ring_size, 2048);
-        assert_eq!(cli.io_backend, IoBackendKind::Uring);
-        assert_eq!(cli.max_memory, 1_073_741_824);
+        assert_eq!(config.threads, 8);
+        assert_eq!(config.ring_size, 2048);
+        assert_eq!(config.io_backend, IoBackendKind::Uring);
+        assert_eq!(config.max_memory, 1_073_741_824);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn merge_defaults_cli_wins_over_toml() {
-        // Simulate: CLI explicitly set threads=4, TOML says threads=8.
-        let mut cli = VortexConfig {
-            threads: 4, // Differs from default 0 → CLI override.
-            ..VortexConfig::default()
-        };
-        let toml_conf = VortexConfig {
-            threads: 8,
-            ring_size: 2048,
-            ..VortexConfig::default()
-        };
+    fn config_file_does_not_override_explicit_cli_default_values() {
+        let path = write_temp_config(
+            "explicit-defaults",
+            r#"
+ring_size = 2048
+max_memory = 1073741824
+io_backend = "uring"
+"#,
+        );
 
-        cli.merge_defaults(toml_conf);
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--ring-size".to_string(),
+            "4096".to_string(),
+            "--max-memory".to_string(),
+            "0".to_string(),
+            "--io-backend".to_string(),
+            "auto".to_string(),
+        ])
+        .unwrap();
 
-        // CLI threads=4 should win because it differs from sentinel (0).
-        assert_eq!(cli.threads, 4);
-        // But ring_size should take TOML value because CLI was default.
-        assert_eq!(cli.ring_size, 2048);
+        assert_eq!(config.threads, 1);
+        assert_eq!(config.ring_size, 4096);
+        assert_eq!(config.max_memory, 0);
+        assert_eq!(config.io_backend, IoBackendKind::Auto);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn merge_defaults_untouched_stay_default() {
-        let mut cli = VortexConfig::default();
-        let toml_conf = VortexConfig::default();
+    fn config_file_untouched_fields_stay_default() {
+        let path = write_temp_config("untouched", "");
 
-        cli.merge_defaults(toml_conf);
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+        ])
+        .unwrap();
 
-        // All fields remain at defaults.
-        assert_eq!(cli.ring_size, 4096);
-        assert_eq!(cli.buffer_size, 16_384);
-        assert_eq!(cli.io_backend, IoBackendKind::Auto);
+        assert_eq!(config.ring_size, 4096);
+        assert_eq!(config.buffer_size, 16_384);
+        assert_eq!(config.io_backend, IoBackendKind::Auto);
+        let _ = std::fs::remove_file(path);
     }
 }

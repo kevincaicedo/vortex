@@ -1,5 +1,6 @@
 //! VortexDB — next-generation in-memory database server.
 
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,20 +26,12 @@ const BANNER: &str = r"
     \_/ \___/|_|   \__\___/_/\_\____/|____/
 ";
 
-fn invalid_budget(name: &'static str) -> ! {
-    tracing::error!(
-        budget = name,
-        "invalid zero reactor budget after config validation"
-    );
-    std::process::exit(1);
-}
-
-fn main() {
+fn main() -> ExitCode {
     let config = match vortex_config::VortexConfig::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("fatal: {e}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
@@ -92,17 +85,48 @@ fn main() {
         None
     };
 
+    let Some(completion_budget) = CompletionBudget::new(config.reactor_completion_budget) else {
+        tracing::error!(
+            budget = "completion",
+            "invalid zero reactor budget after config validation"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(command_budget) = CommandBudget::new(config.reactor_command_budget) else {
+        tracing::error!(
+            budget = "command",
+            "invalid zero reactor budget after config validation"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(accept_budget) = AcceptBudget::new(config.reactor_accept_budget) else {
+        tracing::error!(
+            budget = "accept",
+            "invalid zero reactor budget after config validation"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(writev_budget) = WritevBudget::new(config.reactor_writev_budget) else {
+        tracing::error!(
+            budget = "writev",
+            "invalid zero reactor budget after config validation"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(maintenance_budget) = MaintenanceBudget::new(config.reactor_maintenance_budget) else {
+        tracing::error!(
+            budget = "maintenance",
+            "invalid zero reactor budget after config validation"
+        );
+        return ExitCode::FAILURE;
+    };
+
     let budgets = ReactorBudgets {
-        completion: CompletionBudget::new(config.reactor_completion_budget)
-            .unwrap_or_else(|| invalid_budget("completion")),
-        command: CommandBudget::new(config.reactor_command_budget)
-            .unwrap_or_else(|| invalid_budget("command")),
-        accept: AcceptBudget::new(config.reactor_accept_budget)
-            .unwrap_or_else(|| invalid_budget("accept")),
-        writev: WritevBudget::new(config.reactor_writev_budget)
-            .unwrap_or_else(|| invalid_budget("writev")),
-        maintenance: MaintenanceBudget::new(config.reactor_maintenance_budget)
-            .unwrap_or_else(|| invalid_budget("maintenance")),
+        completion: completion_budget,
+        command: command_budget,
+        accept: accept_budget,
+        writev: writev_budget,
+        maintenance: maintenance_budget,
         time: TimeBudget::from_micros(config.reactor_time_budget_us),
     };
 
@@ -159,7 +183,7 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "failed to spawn reactor pool");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
@@ -174,7 +198,7 @@ fn main() {
     // delivery. Also add SIGHUP handler for config-reload stub.
     {
         let coordinator = Arc::clone(pool.coordinator());
-        ctrlc::set_handler(move || {
+        if let Err(error) = ctrlc::set_handler(move || {
             if coordinator.initiate() {
                 tracing::info!("shutdown signal received — draining connections");
             } else {
@@ -182,8 +206,16 @@ fn main() {
                 tracing::warn!("second signal received — forcing immediate shutdown");
                 coordinator.force_kill();
             }
-        })
-        .expect("failed to set signal handler");
+        }) {
+            tracing::error!(%error, "failed to set signal handler");
+            pool.shutdown();
+            let clean = pool.wait_for_shutdown(SHUTDOWN_TIMEOUT);
+            if !clean {
+                tracing::warn!("forced shutdown after signal handler setup failure");
+            }
+            pool.join();
+            return ExitCode::FAILURE;
+        }
     }
 
     // ── Wait for shutdown ──────────────────────────────────────────
@@ -198,21 +230,11 @@ fn main() {
         }
     }
 
-    // ── Persistence flush stub (1.4.5) ─────────────────────────────
-    persistence_flush();
-
     if clean {
         tracing::info!("VortexDB shutting down — goodbye");
-        std::process::exit(0);
+        ExitCode::SUCCESS
     } else {
         tracing::warn!("VortexDB forced shutdown — goodbye");
-        std::process::exit(1);
+        ExitCode::FAILURE
     }
-}
-
-/// Flush persistence state to disk before exit.
-///
-/// TODO(Phase 5): Replace with actual AOF flush and final snapshot write.
-fn persistence_flush() {
-    tracing::info!("persistence flush (stub) — no persistence configured yet");
 }

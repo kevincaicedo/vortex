@@ -315,6 +315,20 @@ impl From<MutationErrorKind> for MutationError {
     }
 }
 
+impl From<LsnOverflow> for MutationError {
+    #[inline(always)]
+    fn from(_: LsnOverflow) -> Self {
+        Self::new(MutationErrorKind::LsnOverflow)
+    }
+}
+
+impl From<LsnOverflow> for MutationErrorKind {
+    #[inline(always)]
+    fn from(_: LsnOverflow) -> Self {
+        Self::LsnOverflow
+    }
+}
+
 impl From<EvictionAdmissionError> for MutationError {
     #[inline(always)]
     fn from(error: EvictionAdmissionError) -> Self {
@@ -561,7 +575,7 @@ impl<'a> ReservationCoordinator<'a> {
             mut evicted,
         } = state;
 
-        maybe_pause_after_projection(hook_label);
+        maybe_pause_after_projection(self.keyspace, hook_label);
 
         loop {
             let guard = self.keyspace.write_shard_by_index(shard_index);
@@ -686,7 +700,7 @@ impl<'a> ReservationCoordinator<'a> {
             mut evicted,
         } = state;
 
-        maybe_pause_after_projection(hook_label);
+        maybe_pause_after_projection(self.keyspace, hook_label);
 
         loop {
             let (mut guards, plan) = self.keyspace.multi_write(key_refs);
@@ -758,7 +772,7 @@ impl<'a> ReservationCoordinator<'a> {
             mut evicted,
         } = state;
 
-        maybe_pause_after_projection(hook_label);
+        maybe_pause_after_projection(self.keyspace, hook_label);
 
         loop {
             let mut guards = self.keyspace.multi_write_prehashed(plan);
@@ -811,6 +825,7 @@ impl<'a> ReservationCoordinator<'a> {
 
 #[cfg(test)]
 pub(super) struct ProjectionAdmissionTestHook {
+    keyspace_id: usize,
     label: &'static str,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
@@ -826,6 +841,7 @@ pub(super) static PROJECTION_ADMISSION_TEST_LOCK: std::sync::Mutex<()> = std::sy
 
 #[cfg(test)]
 pub(super) struct OptimisticPrepareTestHook {
+    keyspace_id: usize,
     label: &'static str,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
@@ -900,6 +916,7 @@ pub(super) fn install_deferred_effect_publish_test_hook() -> (
 
 #[cfg(test)]
 pub(super) fn install_projection_admission_test_hook(
+    keyspace_id: usize,
     label: &'static str,
 ) -> (
     std::sync::mpsc::Receiver<()>,
@@ -915,6 +932,7 @@ pub(super) fn install_projection_admission_test_hook(
         "projection admission test hook already installed"
     );
     *slot = Some(ProjectionAdmissionTestHook {
+        keyspace_id,
         label,
         entered: entered_tx,
         release: release_rx,
@@ -924,6 +942,7 @@ pub(super) fn install_projection_admission_test_hook(
 
 #[cfg(test)]
 pub(super) fn install_optimistic_prepare_test_hook(
+    keyspace_id: usize,
     label: &'static str,
 ) -> (
     std::sync::mpsc::Receiver<()>,
@@ -939,6 +958,7 @@ pub(super) fn install_optimistic_prepare_test_hook(
         "optimistic prepare test hook already installed"
     );
     *slot = Some(OptimisticPrepareTestHook {
+        keyspace_id,
         label,
         entered: entered_tx,
         release: release_rx,
@@ -947,13 +967,14 @@ pub(super) fn install_optimistic_prepare_test_hook(
 }
 
 #[cfg(test)]
-fn maybe_pause_after_projection(label: &'static str) {
+fn maybe_pause_after_projection(keyspace: &ConcurrentKeyspace, label: &'static str) {
+    let keyspace_id = keyspace as *const ConcurrentKeyspace as usize;
     let hook = {
         let mut slot = PROJECTION_ADMISSION_TEST_HOOK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slot.as_ref() {
-            Some(hook) if hook.label == label => slot.take(),
+            Some(hook) if hook.keyspace_id == keyspace_id && hook.label == label => slot.take(),
             _ => None,
         }
     };
@@ -970,16 +991,20 @@ fn maybe_pause_after_projection(label: &'static str) {
 
 #[cfg(not(test))]
 #[inline(always)]
-fn maybe_pause_after_projection(_label: &'static str) {}
+fn maybe_pause_after_projection(_keyspace: &ConcurrentKeyspace, _label: &'static str) {}
 
 #[cfg(test)]
-pub(super) fn maybe_pause_after_optimistic_prepare(label: &'static str) {
+pub(super) fn maybe_pause_after_optimistic_prepare(
+    keyspace: &ConcurrentKeyspace,
+    label: &'static str,
+) {
+    let keyspace_id = keyspace as *const ConcurrentKeyspace as usize;
     let hook = {
         let mut slot = OPTIMISTIC_PREPARE_TEST_HOOK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slot.as_ref() {
-            Some(hook) if hook.label == label => slot.take(),
+            Some(hook) if hook.keyspace_id == keyspace_id && hook.label == label => slot.take(),
             _ => None,
         }
     };
@@ -996,7 +1021,11 @@ pub(super) fn maybe_pause_after_optimistic_prepare(label: &'static str) {
 
 #[cfg(not(test))]
 #[inline(always)]
-pub(super) fn maybe_pause_after_optimistic_prepare(_label: &'static str) {}
+pub(super) fn maybe_pause_after_optimistic_prepare(
+    _keyspace: &ConcurrentKeyspace,
+    _label: &'static str,
+) {
+}
 
 #[cfg(test)]
 fn maybe_pause_before_deferred_effect_publish() {

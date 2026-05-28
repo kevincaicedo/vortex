@@ -220,7 +220,6 @@ fn main() -> io::Result<()> {
         stats.peak_replay_buffer_bytes
     );
     println!("max_persisted_lsn={}", stats.max_persisted_lsn);
-    println!("corrupt_records={}", stats.corrupt_records);
 
     if !options.keep {
         for path in paths {

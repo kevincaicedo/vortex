@@ -9,11 +9,20 @@ impl Reactor {
     // ── Helpers ────────────────────────────────────────────────────
 
     pub(super) fn submit_accept_rearm(&mut self) -> Result<(), SubmitError> {
+        if self.accept_inflight {
+            tracing::warn!("accept submission skipped; accept already in flight");
+            return Ok(());
+        }
+
         let token = CompletionToken::accept();
         let listener_fd = self.listener_fd;
-        self.submit_backend_op("accept", |backend| {
+        let result = self.submit_backend_op("accept", |backend| {
             backend.submit_accept(ListenerFd::new(listener_fd), token)
-        })
+        });
+        if result.is_ok() {
+            self.accept_inflight = true;
+        }
+        result
     }
 
     #[inline]
@@ -49,7 +58,27 @@ impl Reactor {
         generation_valid.then_some((id, op))
     }
 
-    pub(super) fn submit_cancel_for(&mut self, target: CompletionToken) {
+    pub(super) fn cancel_already_submitted_for(&self, target: CompletionToken) -> bool {
+        if target == CompletionToken::accept() {
+            return self.accept_cancel_inflight;
+        }
+
+        self.live_conn_token(target).is_some_and(|(conn_id, op)| {
+            self.inflight_ops
+                .get(conn_id)
+                .is_some_and(|inflight| inflight.cancel_inflight(op))
+        })
+    }
+
+    pub(super) fn submit_cancel_for(&mut self, target: CompletionToken) -> bool {
+        if self.cancel_already_submitted_for(target) {
+            tracing::debug!(
+                target = target.raw(),
+                "cancel submission skipped; cancel already in flight"
+            );
+            return false;
+        }
+
         let cancel = match CompletionToken::cancel(target) {
             Ok(cancel) => cancel,
             Err(error) => {
@@ -58,15 +87,21 @@ impl Reactor {
                     ?error,
                     "failed to encode cancel token"
                 );
-                return;
+                return false;
             }
         };
         if self
             .submit_backend_op("cancel", |backend| backend.submit_cancel(target, cancel))
             .is_ok()
         {
-            self.mark_cancel_submitted_for_target(target);
+            if target == CompletionToken::accept() {
+                self.accept_cancel_inflight = true;
+            } else {
+                self.mark_cancel_submitted_for_target(target);
+            }
+            return true;
         }
+        false
     }
 
     pub(super) fn submit_backend_op<F>(
@@ -140,6 +175,16 @@ impl Reactor {
         };
 
         let buf_size = self.buffer_pool.buffer_size();
+        if cursor > buf_size {
+            tracing::warn!(
+                conn_id,
+                cursor,
+                buf_size,
+                "read cursor exceeds leased buffer, closing connection"
+            );
+            self.close_connection(conn_id);
+            return;
+        }
         let remaining = buf_size - cursor;
 
         if remaining == 0 {
@@ -437,7 +482,9 @@ impl Reactor {
     pub(super) fn enter_drain_mode(&mut self) {
         self.draining = true;
         tracing::info!(reactor_id = self.id, "entering drain mode");
-        self.submit_cancel_for(CompletionToken::accept());
+        if self.accept_inflight {
+            self.submit_cancel_for(CompletionToken::accept());
+        }
 
         // Graceful drain: flush connections with pending writes, close the rest.
         let conn_ids: Vec<usize> = self.connections.ids().collect();
@@ -489,12 +536,28 @@ impl Reactor {
             self.close_connection(conn_id);
         }
 
-        // Also cancel the accept token.
-        self.submit_cancel_for(CompletionToken::accept());
+        // Also cancel the accept token. Even when no connections exist, an
+        // accepted fd can be sitting behind a terminal accept CQE, so shutdown
+        // must drain accept/cancel completions before closing the listener.
+        if self.accept_inflight {
+            self.submit_cancel_for(CompletionToken::accept());
+        }
 
-        while !self.connections.is_empty() {
+        while !self.connections.is_empty()
+            || self.accept_inflight
+            || self.accept_cancel_inflight
+            || !self.pending_completions.is_empty()
+        {
+            while let Some(cqe) = self.pending_completions.pop_front() {
+                self.handle_completion(&cqe);
+            }
+
             self.drain_close_finalization_until_idle();
-            if self.connections.is_empty() {
+            if self.connections.is_empty()
+                && !self.accept_inflight
+                && !self.accept_cancel_inflight
+                && self.pending_completions.is_empty()
+            {
                 break;
             }
 

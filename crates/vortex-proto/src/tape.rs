@@ -214,6 +214,11 @@ fn parse_pipeline_entries(bytes: &[u8]) -> Result<(Vec<TapeEntry>, usize, usize)
     Ok((entries, frame_count, consumed))
 }
 
+#[inline(always)]
+fn tape_u32(value: usize) -> TapeResult<u32> {
+    u32::try_from(value).map_err(|_| ParseError::FrameTooLarge)
+}
+
 impl RespTape {
     /// Parse a pipeline from a byte slice (copies input into `Bytes`).
     pub fn parse_pipeline(buf: &[u8]) -> Result<Self, ParseError> {
@@ -695,6 +700,7 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     let end = buf.len().wrapping_sub(1);
     let mut i = from;
     while i < end {
+        // SAFETY: `i < buf.len() - 1`, so both `i` and `i + 1` are in bounds.
         if unsafe { *buf.get_unchecked(i) == b'\r' && *buf.get_unchecked(i + 1) == b'\n' } {
             return Some(i);
         }
@@ -792,11 +798,9 @@ fn tape_parse_simple_string(
     let start = *offset;
     let line_end = find_crlf(buf, start + 1).ok_or(ParseError::NeedMoreData)?;
     *offset = line_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_SIMPLE_STRING,
-        (start + 1) as u32,
-        line_end as u32,
-    ));
+    let data_start = tape_u32(start + 1)?;
+    let data_end = tape_u32(line_end)?;
+    entries.push(TapeEntry::new(TAG_SIMPLE_STRING, data_start, data_end));
     Ok(())
 }
 
@@ -810,11 +814,9 @@ fn tape_parse_error(
     let start = *offset;
     let line_end = find_crlf(buf, start + 1).ok_or(ParseError::NeedMoreData)?;
     *offset = line_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_ERROR,
-        (start + 1) as u32,
-        line_end as u32,
-    ));
+    let data_start = tape_u32(start + 1)?;
+    let data_end = tape_u32(line_end)?;
+    entries.push(TapeEntry::new(TAG_ERROR, data_start, data_end));
     Ok(())
 }
 
@@ -862,11 +864,9 @@ fn tape_parse_bulk_string(
         .ok_or(ParseError::FrameTooLarge)?;
     tape_validate_crlf(buf, data_end)?;
     *offset = data_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_BULK_STRING,
-        data_start as u32,
-        data_end as u32,
-    ));
+    let data_start = tape_u32(data_start)?;
+    let data_end = tape_u32(data_end)?;
+    entries.push(TapeEntry::new(TAG_BULK_STRING, data_start, data_end));
     Ok(())
 }
 
@@ -901,7 +901,8 @@ fn tape_parse_array(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -980,11 +981,9 @@ fn tape_parse_big_number(
         return Err(ParseError::InvalidFrame);
     }
     *offset = line_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_BIG_NUMBER,
-        (start + 1) as u32,
-        line_end as u32,
-    ));
+    let data_start = tape_u32(start + 1)?;
+    let data_end = tape_u32(line_end)?;
+    entries.push(TapeEntry::new(TAG_BIG_NUMBER, data_start, data_end));
     Ok(())
 }
 
@@ -1013,11 +1012,9 @@ fn tape_parse_bulk_error(
         .ok_or(ParseError::FrameTooLarge)?;
     tape_validate_crlf(buf, data_end)?;
     *offset = data_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_BULK_ERROR,
-        data_start as u32,
-        data_end as u32,
-    ));
+    let data_start = tape_u32(data_start)?;
+    let data_end = tape_u32(data_end)?;
+    entries.push(TapeEntry::new(TAG_BULK_ERROR, data_start, data_end));
     Ok(())
 }
 
@@ -1053,11 +1050,9 @@ fn tape_parse_verbatim_string(
     let mut encoding = [0u8; 3];
     encoding.copy_from_slice(&buf[data_start..data_start + 3]);
     *offset = data_end + 2;
-    let mut entry = TapeEntry::new(
-        TAG_VERBATIM_STRING,
-        (data_start + 4) as u32,
-        data_end as u32,
-    );
+    let payload_start = tape_u32(data_start + 4)?;
+    let data_end = tape_u32(data_end)?;
+    let mut entry = TapeEntry::new(TAG_VERBATIM_STRING, payload_start, data_end);
     entry.extra = encoding;
     entries.push(entry);
     Ok(())
@@ -1091,7 +1086,8 @@ fn tape_parse_map(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -1122,7 +1118,8 @@ fn tape_parse_set(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -1153,7 +1150,8 @@ fn tape_parse_push(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -1188,7 +1186,8 @@ fn tape_parse_attribute(
     // Data frame follows the pairs.
     tape_parse_frame(buf, offset, entries, depth + 1)?;
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -1219,12 +1218,13 @@ fn tape_parse_inline(
         while cursor < line_end && buf[cursor] != b' ' {
             cursor += 1;
         }
-        entries.push(TapeEntry::new(
-            TAG_BULK_STRING,
-            part_start as u32,
-            cursor as u32,
-        ));
-        count += 1;
+        let part_start = tape_u32(part_start)?;
+        let part_end = tape_u32(cursor)?;
+        entries.push(TapeEntry::new(TAG_BULK_STRING, part_start, part_end));
+        count = count.checked_add(1).ok_or(ParseError::FrameTooLarge)?;
+        if count as usize > MAX_ARRAY_ELEMENTS {
+            return Err(ParseError::FrameTooLarge);
+        }
     }
 
     if count == 0 {
@@ -1234,7 +1234,8 @@ fn tape_parse_inline(
 
     *offset = line_end + 2;
     entries[header_idx].a = count;
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -1245,6 +1246,16 @@ mod tests {
     use super::*;
     use crate::RespParser;
     use crate::frame::RespFrame;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn tape_offsets_reject_unrepresentable_values() {
+        assert_eq!(tape_u32(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(
+            tape_u32(u32::MAX as usize + 1),
+            Err(ParseError::FrameTooLarge)
+        );
+    }
 
     #[test]
     fn simple_string() {

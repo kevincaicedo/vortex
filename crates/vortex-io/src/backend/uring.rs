@@ -14,7 +14,7 @@ use io_uring::{IoUring, opcode, types::Fd};
 
 use super::{
     BackendDriver, BackendQueueStatus, Completion, CompletionToken, ConnFd, IovecBatch, ListenerFd,
-    ReadLease, SubmitError, WriteLease,
+    ReadLease, SubmitError, WriteLease, preserve_reaped_completion_count,
 };
 
 /// io_uring-based I/O backend for Linux.
@@ -75,10 +75,12 @@ impl BackendDriver for IoUringBackend {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
+        .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
         .build()
         .user_data(token.raw());
 
-        // SAFETY: The SQE is valid and the listener_fd is a bound, listening socket.
+        // SAFETY: The SQE is valid, listener_fd is a bound listening socket,
+        // and accepted descriptors inherit nonblocking/CLOEXEC atomically.
         unsafe {
             self.ring
                 .submission()
@@ -339,10 +341,10 @@ impl BackendDriver for IoUringBackend {
         if out.len() > start {
             // Non-SQPOLL explicitly submits pending SQEs. SQPOLL also needs
             // a tail sync to wake the kernel poll thread if it has gone idle.
-            let _ = self.ring.submit()?;
+            return preserve_reaped_completion_count(start, out.len(), self.ring.submit());
         }
 
-        Ok(out.len() - start)
+        Ok(0)
     }
 
     fn queue_status(&mut self) -> BackendQueueStatus {

@@ -12,7 +12,7 @@ use clap::{Parser, ValueEnum};
 use tikv_jemallocator::Jemalloc;
 use vortex_common::{MAX_INLINE_VALUE_LEN, VortexKey, VortexValue};
 use vortex_engine::commands::{CommandClock, execute_command};
-use vortex_engine::keyspace::LockProfileSnapshot;
+use vortex_engine::keyspace::{LockProfileSnapshot, ShardCount};
 use vortex_engine::{ConcurrentKeyspace, EvictionPolicy};
 use vortex_proto::RespTape;
 
@@ -120,9 +120,7 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.workers == 0 {
         return Err("--workers must be greater than zero".to_string());
     }
-    if args.shards == 0 || !args.shards.is_power_of_two() {
-        return Err("--shards must be a non-zero power of two".to_string());
-    }
+    ShardCount::try_new(args.shards).map_err(|error| format!("--shards {error}"))?;
     if args.keys == 0 {
         return Err("--keys must be greater than zero".to_string());
     }
@@ -139,7 +137,10 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
         .checked_mul(keys_per_worker)
         .and_then(|keys| keys.checked_mul(2))
         .ok_or_else(|| "probe capacity overflow".to_string())?;
-    let keyspace = Arc::new(ConcurrentKeyspace::with_capacity(args.shards, capacity));
+    let keyspace = Arc::new(
+        ConcurrentKeyspace::try_with_capacity(args.shards, capacity)
+            .map_err(|error| format!("failed to create keyspace: {error}"))?,
+    );
     setup_workload(args, &keyspace, keys_per_worker)?;
     let lock_profile_enabled =
         args.lock_profile || std::env::var_os("VORTEX_LOCK_PROFILE").is_some();

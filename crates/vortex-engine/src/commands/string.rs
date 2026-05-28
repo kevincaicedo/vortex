@@ -12,10 +12,11 @@ use vortex_common::{VortexKey, VortexValue};
 
 use super::{
     CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand,
-    MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO,
-    absolute_unix_nanos_to_deadline_nanos, arg_bytes, deadline_nanos_to_absolute_unix_nanos,
-    encode_aof_persist, encode_aof_pexpireat, encode_aof_set, encode_aof_set_pxat, int_resp,
-    key_from_bytes, mutation_error_response, owned_value_to_resp, value_from_bytes, value_to_resp,
+    MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, absolute_deadline_nanos,
+    arg_bytes, deadline_nanos_to_absolute_unix_nanos, encode_aof_persist, encode_aof_pexpireat,
+    encode_aof_set, encode_aof_set_pxat, int_resp, key_from_bytes, mutation_error_response,
+    owned_value_to_resp, relative_deadline_nanos, seconds_to_millis, value_from_bytes,
+    value_to_resp,
 };
 use crate::ConcurrentKeyspace;
 use crate::engine::domain::{GetExOption, MutationOutcome, SetOptions, SetResult, TtlState};
@@ -132,7 +133,10 @@ pub(crate) fn cmd_set_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                ttl_deadline = now_nanos + secs * NS_PER_SEC;
+                let Some(deadline) = relative_deadline_nanos(secs, NS_PER_SEC, now_nanos) else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
+                ttl_deadline = deadline;
                 has_explicit_ttl = true;
             }
             OptToken::PX => {
@@ -141,7 +145,10 @@ pub(crate) fn cmd_set_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                ttl_deadline = now_nanos + ms * NS_PER_MS;
+                let Some(deadline) = relative_deadline_nanos(ms, NS_PER_MS, now_nanos) else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
+                ttl_deadline = deadline;
                 has_explicit_ttl = true;
             }
             OptToken::EXAT => {
@@ -150,11 +157,12 @@ pub(crate) fn cmd_set_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                ttl_deadline = absolute_unix_nanos_to_deadline_nanos(
-                    secs * NS_PER_SEC,
-                    now_nanos,
-                    unix_now_nanos,
-                );
+                let Some(deadline) =
+                    absolute_deadline_nanos(secs, NS_PER_SEC, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
+                ttl_deadline = deadline;
                 has_explicit_ttl = true;
             }
             OptToken::PXAT => {
@@ -163,11 +171,12 @@ pub(crate) fn cmd_set_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                ttl_deadline = absolute_unix_nanos_to_deadline_nanos(
-                    ms * NS_PER_MS,
-                    now_nanos,
-                    unix_now_nanos,
-                );
+                let Some(deadline) =
+                    absolute_deadline_nanos(ms, NS_PER_MS, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
+                ttl_deadline = deadline;
                 has_explicit_ttl = true;
             }
             OptToken::NX => nx = true,
@@ -308,7 +317,9 @@ pub(crate) fn cmd_setex_with_clock(
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
-    let deadline = now_nanos + secs * NS_PER_SEC;
+    let Some(deadline) = relative_deadline_nanos(secs, NS_PER_SEC, now_nanos) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+    };
     let outcome = match keyspace.set_value_with_ttl(key, value, deadline, now_nanos) {
         Ok(outcome) => outcome,
         Err(err) => return err.into_executed(),
@@ -370,7 +381,9 @@ pub(crate) fn cmd_psetex_with_clock(
 
     let key = key_from_bytes(key_bytes);
     let value = value_from_bytes(val_bytes);
-    let deadline = now_nanos + ms * NS_PER_MS;
+    let Some(deadline) = relative_deadline_nanos(ms, NS_PER_MS, now_nanos) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+    };
     let outcome = match keyspace.set_value_with_ttl(key, value, deadline, now_nanos) {
         Ok(outcome) => outcome,
         Err(err) => return err.into_executed(),
@@ -592,7 +605,10 @@ pub fn cmd_getdel(
         None => return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX)),
     };
     let key = key_from_bytes(key_bytes);
-    let outcome = keyspace.remove_value(&key, now_nanos);
+    let outcome = match keyspace.remove_value(&key, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = match outcome.value {
         Some(val) => owned_value_to_resp(val),
         None => CmdResult::Static(RESP_NIL),
@@ -649,7 +665,9 @@ pub(crate) fn cmd_getex_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                let deadline = now_nanos + secs * NS_PER_SEC;
+                let Some(deadline) = relative_deadline_nanos(secs, NS_PER_SEC, now_nanos) else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
                 if unix_now_nanos != 0 {
                     let absolute_deadline_ms =
                         deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
@@ -666,7 +684,9 @@ pub(crate) fn cmd_getex_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                let deadline = now_nanos + ms * NS_PER_MS;
+                let Some(deadline) = relative_deadline_nanos(ms, NS_PER_MS, now_nanos) else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
                 if unix_now_nanos != 0 {
                     let absolute_deadline_ms =
                         deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
@@ -683,12 +703,15 @@ pub(crate) fn cmd_getex_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                let deadline = absolute_unix_nanos_to_deadline_nanos(
-                    secs * NS_PER_SEC,
-                    now_nanos,
-                    unix_now_nanos,
-                );
-                aof_payload = Some(encode_aof_pexpireat(key_bytes, secs * 1_000));
+                let Some(deadline) =
+                    absolute_deadline_nanos(secs, NS_PER_SEC, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
+                let Some(absolute_deadline_ms) = seconds_to_millis(secs) else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
+                aof_payload = Some(encode_aof_pexpireat(key_bytes, absolute_deadline_ms));
                 GetExOption::ExpireAt(deadline)
             }
             OptToken::PXAT => {
@@ -699,11 +722,11 @@ pub(crate) fn cmd_getex_with_clock(
                     Some(s) if s > 0 => s as u64,
                     _ => return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER)),
                 };
-                let deadline = absolute_unix_nanos_to_deadline_nanos(
-                    ms * NS_PER_MS,
-                    now_nanos,
-                    unix_now_nanos,
-                );
+                let Some(deadline) =
+                    absolute_deadline_nanos(ms, NS_PER_MS, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(ERR_NOT_INTEGER));
+                };
                 aof_payload = Some(encode_aof_pexpireat(key_bytes, ms));
                 GetExOption::ExpireAt(deadline)
             }
@@ -724,7 +747,10 @@ pub(crate) fn cmd_getex_with_clock(
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     };
 
-    let outcome = keyspace.get_value_with_expiry_option(&key, option, now_nanos);
+    let outcome = match keyspace.get_value_with_expiry_option(&key, option, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
     let response = match outcome.value {
         Some(value) => owned_value_to_resp(value),
         None => CmdResult::Static(RESP_NIL),
@@ -1320,6 +1346,20 @@ mod tests {
         let key = VortexKey::from(b"foo" as &[u8]);
         let val = h.get(&key, 0).unwrap();
         assert_eq!(val.as_string_bytes().unwrap(), b"bar");
+    }
+
+    #[test]
+    fn set_ttl_overflow_is_rejected_without_mutating() {
+        let h = TestHarness::new();
+        let huge = i64::MAX.to_string();
+        let cmd = make_resp(&[b"SET", b"ttl-overflow", b"value", b"EX", huge.as_bytes()]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+
+        let result = cmd_set(&h.keyspace, &frame, 0);
+
+        assert_static(&result, ERR_NOT_INTEGER);
+        assert!(h.get(&VortexKey::from("ttl-overflow"), 0).is_none());
     }
 
     #[test]
@@ -1997,6 +2037,25 @@ mod tests {
         let result = cmd_getex_with_clock(&h.keyspace, &frame, 20 * NS_PER_SEC, 20 * NS_PER_SEC);
         assert_eq!(resp_bytes(&result), b"old");
         assert!(h.get(&key, 20 * NS_PER_SEC).is_none());
+    }
+
+    #[test]
+    fn getex_absolute_deadline_overflow_is_rejected_without_mutating() {
+        let h = TestHarness::new();
+        let key = VortexKey::from(b"gx-overflow" as &[u8]);
+        h.set(key.clone(), VortexValue::from_bytes(b"old"));
+        let huge = i64::MAX.to_string();
+        let cmd = make_resp(&[b"GETEX", b"gx-overflow", b"EXAT", huge.as_bytes()]);
+        let tape = RespTape::parse_pipeline(&cmd).unwrap();
+        let frame = tape.iter().next().unwrap();
+
+        let result = cmd_getex_with_clock(&h.keyspace, &frame, NS_PER_SEC, 10 * NS_PER_SEC);
+
+        assert_static(&result, ERR_NOT_INTEGER);
+        assert_eq!(
+            h.get(&key, NS_PER_SEC),
+            Some(VortexValue::from_bytes(b"old"))
+        );
     }
 
     #[test]

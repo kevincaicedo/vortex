@@ -21,6 +21,23 @@ fn replace_flag_overwrites_existing_destination(ctx: &mut SmokeContext) -> Resul
     Ok(())
 }
 
+fn db_zero_copies_and_invalid_db_errors(ctx: &mut SmokeContext) -> Result<()> {
+    ctx.set("src", "value")?;
+    let copied: i64 = ctx.exec(&["COPY", "src", "dst", "DB", "0"])?;
+    assert_eq!(copied, 1);
+    assert_eq!(ctx.get("dst")?, Some("value".to_string()));
+
+    let err = ctx.exec_error(&["COPY", "src", "bad", "DB", "1"])?;
+    assert!(err.to_string().to_ascii_lowercase().contains("db index"));
+
+    let err = ctx.exec_error(&["COPY", "src", "bad", "DB"])?;
+    assert!(err.to_string().contains("integer"));
+
+    let err = ctx.exec_error(&["COPY", "src", "bad", "UNKNOWN"])?;
+    assert!(err.to_string().contains("syntax"));
+    Ok(())
+}
+
 pub fn spec() -> CommandSpec {
     CommandSpec::new("COPY", CommandGroup::Key, SupportLevel::Supported)
         .summary("Copies the value of one key to another key.")
@@ -28,8 +45,8 @@ pub fn spec() -> CommandSpec {
         .tested(&[
             "Copy to new destination",
             "REPLACE overwrites existing destination",
+            "DB 0 accepted and malformed DB options rejected",
         ])
-        .not_tested(&["DB option because Vortex currently supports only DB 0"])
         .case(CaseDef::new(
             "copies to new destination",
             "COPY should duplicate the value while preserving the source key.",
@@ -39,5 +56,10 @@ pub fn spec() -> CommandSpec {
             "replace overwrites existing destination",
             "COPY REPLACE should overwrite an existing destination key.",
             replace_flag_overwrites_existing_destination,
+        ))
+        .case(CaseDef::new(
+            "db option validation",
+            "COPY should accept DB 0 and reject malformed or non-zero DB options.",
+            db_zero_copies_and_invalid_db_errors,
         ))
 }

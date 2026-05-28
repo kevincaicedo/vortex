@@ -82,28 +82,20 @@ impl Reactor {
                 self.overload.mark_accept_rearm_deferred();
                 return (accepted, false);
             }
-            let result = unsafe {
-                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
-                let mut addr_len: libc::socklen_t =
-                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                libc::accept(
-                    self.listener_fd,
-                    &mut addr as *mut libc::sockaddr_storage as *mut libc::sockaddr,
-                    &mut addr_len,
-                )
-            };
-
-            if result >= 0 {
-                self.handle_accepted_fd(result);
-                accepted += 1;
-                continue;
+            match accept_ready_fd(self.listener_fd) {
+                Ok(fd) => {
+                    self.handle_accepted_fd(fd);
+                    accepted += 1;
+                    continue;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    return (accepted, false);
+                }
+                Err(err) => {
+                    tracing::warn!(errno = err.raw_os_error().unwrap_or(1), "accept failed");
+                    return (accepted, false);
+                }
             }
-
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                tracing::warn!(errno = err.raw_os_error().unwrap_or(1), "accept failed");
-            }
-            return (accepted, false);
         }
         (accepted, accepted == budget)
     }
@@ -132,23 +124,26 @@ impl Reactor {
             return;
         }
 
-        unsafe {
-            let nodelay: libc::c_int = 1;
-            libc::setsockopt(
-                new_fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                &nodelay as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            let flags = libc::fcntl(new_fd, libc::F_GETFL);
-            libc::fcntl(new_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
         if self.connections.len() >= self.config.max_connections {
             tracing::warn!("max connections reached, rejecting");
             self.keyspace
                 .record_reactor_overload_connection_dropped(self.id);
+            unsafe {
+                libc::close(new_fd);
+            }
+            return;
+        }
+
+        if let Err(error) = configure_accepted_fd(new_fd) {
+            tracing::warn!(
+                reactor_id = self.id,
+                error = %error,
+                "accepted fd configuration failed, rejecting connection"
+            );
+            self.keyspace
+                .record_reactor_overload_connection_dropped(self.id);
+            // SAFETY: `new_fd` has not been inserted into the connection slab,
+            // so this path still owns the descriptor.
             unsafe {
                 libc::close(new_fd);
             }
@@ -207,4 +202,92 @@ impl Reactor {
     }
 
     // ── Read handler ───────────────────────────────────────────────
+}
+
+fn configure_accepted_fd(fd: RawFd) -> io::Result<()> {
+    // Best-effort TCP latency hint. This can fail for non-TCP test sockets; the
+    // reactor requires only nonblocking and close-on-exec as hard invariants.
+    let nodelay: libc::c_int = 1;
+    // SAFETY: `fd` is an accepted descriptor not yet inserted into reactor state.
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &nodelay as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
+    // SAFETY: `fcntl` operates on the accepted descriptor only; errors are
+    // returned to the caller before the descriptor enters connection state.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `flags` came from `F_GETFL` for this descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: same descriptor; `F_GETFD`/`F_SETFD` do not touch memory.
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd_flags` came from `F_GETFD` for this descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn accept_ready_fd(listener_fd: RawFd) -> io::Result<RawFd> {
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addr_len: libc::socklen_t =
+        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: listener_fd is a valid nonblocking listener owned by the reactor,
+    // and addr/addr_len point to stack storage valid for the syscall.
+    let fd = unsafe {
+        accept_ready_syscall(
+            listener_fd,
+            &mut addr as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut addr_len,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+unsafe fn accept_ready_syscall(
+    listener_fd: RawFd,
+    addr: *mut libc::sockaddr,
+    addr_len: *mut libc::socklen_t,
+) -> RawFd {
+    // SAFETY: caller provides a valid listener fd and sockaddr storage.
+    unsafe {
+        libc::accept4(
+            listener_fd,
+            addr,
+            addr_len,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[inline]
+unsafe fn accept_ready_syscall(
+    listener_fd: RawFd,
+    addr: *mut libc::sockaddr,
+    addr_len: *mut libc::socklen_t,
+) -> RawFd {
+    // SAFETY: caller provides a valid listener fd and sockaddr storage. The
+    // accepted fd is configured by handle_accepted_fd before slab insertion.
+    unsafe { libc::accept(listener_fd, addr, addr_len) }
 }

@@ -633,7 +633,14 @@ impl ConcurrentKeyspace {
             return EvictionDeletion::default();
         };
         let key = (record_aof || track_watch).then(|| key.clone());
-        let aof_lsn = record_aof.then(|| AofLsn::from_allocated_lsn(self.next_lsn()));
+        let aof_lsn = if record_aof {
+            match self.next_lsn().and_then(AofLsn::from_allocated_lsn) {
+                Ok(lsn) => Some(lsn),
+                Err(_) => return EvictionDeletion::default(),
+            }
+        } else {
+            None
+        };
 
         let _ = table.delete_slot(slot);
         let mut effects = EvictionEffects::default();

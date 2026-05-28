@@ -24,6 +24,7 @@ pub enum MutationErrorKind {
     NotInteger,
     NotFloat,
     Overflow,
+    LsnOverflow,
     OutOfMemory,
     NoSuchKey,
 }

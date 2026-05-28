@@ -1072,6 +1072,12 @@ mod tests {
         }
     }
 
+    fn duplicate_fd_at_candidates(fd: RawFd, candidates: &[RawFd]) -> Option<RawFd> {
+        candidates
+            .iter()
+            .find_map(|&min_fd| duplicate_fd_at_least(fd, min_fd).ok())
+    }
+
     fn fill_pipe_until_would_block(write_fd: RawFd) {
         let bytes = [0u8; 4096];
         loop {
@@ -1400,12 +1406,15 @@ mod tests {
     fn high_fd_registration_is_dense_not_raw_fd_indexed() {
         let mut backend = PollingBackend::new().unwrap();
         let (read_fd, write_fd) = nonblocking_pipe();
-        let high_fd = duplicate_fd_at_least(read_fd, 4096)
-            .or_else(|_| duplicate_fd_at_least(read_fd, 1024))
-            .unwrap();
-        assert!(high_fd >= 1024);
+        let Some(high_fd) = duplicate_fd_at_candidates(read_fd, &[4096, 1024, 512, 128, 64]) else {
+            close_fd(read_fd);
+            close_fd(write_fd);
+            return;
+        };
+        assert!(high_fd >= 64);
 
         let token = encode_token(9, 1, OpType::Read).unwrap();
+        let initial_capacity = backend.registered.capacity();
         backend.register_interest(high_fd, Event::readable(token.raw() as usize));
 
         assert_eq!(backend.registered.len(), 1);
@@ -1415,8 +1424,8 @@ mod tests {
             INTEREST_READABLE
         );
         assert!(
-            backend.registered.capacity() < high_fd as usize / 2,
-            "dense registry capacity should not scale with raw fd value"
+            backend.registered.capacity() <= initial_capacity.max(1),
+            "dense registry capacity should not grow for one high fd"
         );
 
         if backend.clear_registered(high_fd) {

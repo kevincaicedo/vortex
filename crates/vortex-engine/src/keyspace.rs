@@ -40,7 +40,7 @@ use crate::eviction::{
     EvictionConfig, EvictionConfigState, EvictionPolicy, FrequencySketch, next_random_u64,
     should_sample_lfu_read,
 };
-use crate::table::{SwissTable, TableHash};
+use crate::table::{SwissTable, TableCapacityError, TableHash};
 
 mod admin;
 mod eviction_sweep;
@@ -103,6 +103,53 @@ const AHASH_SEED_1: u64 = 0x6c62_272e_07bb_0142;
 const AHASH_SEED_2: u64 = 0x8fbc_2d2b_9e3a_6ee8;
 const AHASH_SEED_3: u64 = 0xcf41_41b0_ed82_a837;
 const ABSENT_WATCH_SHARD_COUNT: usize = 256;
+
+/// Construction error returned by fallible keyspace constructors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyspaceCreateError {
+    /// The requested shard count is outside the keyspace routing contract.
+    ShardCount(ShardCountError),
+    /// The requested total capacity maps to an unrepresentable per-shard table layout.
+    TableCapacity {
+        /// User-requested total keyspace capacity.
+        total_capacity: usize,
+        /// Rounded per-shard capacity used for table preallocation.
+        per_shard_capacity: usize,
+        /// Underlying table capacity validation error.
+        source: TableCapacityError,
+    },
+}
+
+impl std::fmt::Display for KeyspaceCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShardCount(error) => error.fmt(f),
+            Self::TableCapacity {
+                total_capacity,
+                per_shard_capacity,
+                source,
+            } => write!(
+                f,
+                "{source}; total_capacity={total_capacity}, per_shard_capacity={per_shard_capacity}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KeyspaceCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ShardCount(error) => Some(error),
+            Self::TableCapacity { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<ShardCountError> for KeyspaceCreateError {
+    fn from(error: ShardCountError) -> Self {
+        Self::ShardCount(error)
+    }
+}
 #[cfg(feature = "lock-profile")]
 pub struct ShardReadGuard<'a> {
     guard: RwLockReadGuard<'a, SwissTable>,
@@ -305,16 +352,50 @@ impl ConcurrentKeyspace {
         Self::new_with_runtime_slots(num_shards, 1)
     }
 
+    /// Try to create a new keyspace with `num_shards` shards.
+    pub fn try_new(num_shards: usize) -> Result<Self, ShardCountError> {
+        Self::try_new_with_runtime_slots(num_shards, 1)
+    }
+
     /// Create a new keyspace with `num_shards` shards and `runtime_slots`
     /// contention-free runtime counter slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_shards` is zero, not a power of two, or outside
+    /// the range `[MIN_SHARD_COUNT, MAX_SHARD_COUNT]`.
     pub fn new_with_runtime_slots(num_shards: usize, runtime_slots: usize) -> Self {
-        let shard_count = ShardCount::try_new(num_shards).unwrap_or_else(|error| panic!("{error}"));
+        Self::try_new_with_runtime_slots(num_shards, runtime_slots)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Try to create a new keyspace with `num_shards` shards and
+    /// `runtime_slots` contention-free runtime counter slots.
+    pub fn try_new_with_runtime_slots(
+        num_shards: usize,
+        runtime_slots: usize,
+    ) -> Result<Self, ShardCountError> {
+        let shard_count = ShardCount::try_new(num_shards)?;
+        Ok(Self::new_from_shard_count(shard_count, runtime_slots))
+    }
+
+    fn new_from_shard_count(shard_count: ShardCount, runtime_slots: usize) -> Self {
         let num_shards = shard_count.get();
 
         let table_hasher = RandomState::new();
         let shards: Vec<Shard> = (0..num_shards)
             .map(|_| CachePadded::new(RwLock::new(SwissTable::with_hasher(table_hasher.clone()))))
             .collect();
+        Self::from_shards(shard_count, runtime_slots, table_hasher, shards)
+    }
+
+    fn from_shards(
+        shard_count: ShardCount,
+        runtime_slots: usize,
+        table_hasher: RandomState,
+        shards: Vec<Shard>,
+    ) -> Self {
+        let num_shards = shard_count.get();
         let clock_hands: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
@@ -361,60 +442,36 @@ impl ConcurrentKeyspace {
     ///
     /// # Panics
     ///
-    /// Same as [`new`](Self::new).
+    /// Panics if `num_shards` is invalid or if `total_capacity` requires an
+    /// unrepresentable table layout.
     pub fn with_capacity(num_shards: usize, total_capacity: usize) -> Self {
-        let shard_count = ShardCount::try_new(num_shards).unwrap_or_else(|error| panic!("{error}"));
+        Self::try_with_capacity(num_shards, total_capacity)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Try to create a keyspace pre-sized for `total_capacity` entries spread
+    /// evenly across `num_shards` shards.
+    pub fn try_with_capacity(
+        num_shards: usize,
+        total_capacity: usize,
+    ) -> Result<Self, KeyspaceCreateError> {
+        let shard_count = ShardCount::try_new(num_shards)?;
         let num_shards = shard_count.get();
 
         let per_shard = total_capacity.div_ceil(num_shards);
         let table_hasher = RandomState::new();
-        let shards: Vec<Shard> = (0..num_shards)
+        let shards: Result<Vec<Shard>, TableCapacityError> = (0..num_shards)
             .map(|_| {
-                CachePadded::new(RwLock::new(SwissTable::with_capacity_and_hasher(
-                    per_shard,
-                    table_hasher.clone(),
-                )))
+                SwissTable::try_with_capacity_and_hasher(per_shard, table_hasher.clone())
+                    .map(|table| CachePadded::new(RwLock::new(table)))
             })
             .collect();
-        let clock_hands: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
-            .map(|_| CachePadded::new(AtomicUsize::new(0)))
-            .collect();
-        let expiry_key_count: Vec<CachePadded<AtomicUsize>> = (0..num_shards)
-            .map(|_| CachePadded::new(AtomicUsize::new(0)))
-            .collect();
-        let transaction_gates: Vec<CachePadded<TransactionGate>> = (0..num_shards)
-            .map(|_| CachePadded::new(TransactionGate::default()))
-            .collect();
-        let absent_watch_shards = make_absent_watch_shards();
-
-        Self {
-            shards: shards.into_boxed_slice(),
-            clock_hands: clock_hands.into_boxed_slice(),
-            expiry_key_count: expiry_key_count.into_boxed_slice(),
-            expiry_key_total: AtomicUsize::new(0),
-            mask: shard_count.mask(),
-            hasher: RandomState::with_seeds(AHASH_SEED_0, AHASH_SEED_1, AHASH_SEED_2, AHASH_SEED_3),
-            table_hasher,
-            global_memory_used: AtomicUsize::new(0),
-            memory_reserved: CachePadded::new(AtomicUsize::new(0)),
-            strict_memory_accounting: AtomicBool::new(false),
-            mutation_features: AtomicUsize::new(MutationFeatures::empty().bits()),
-            replay_depth: AtomicUsize::new(0),
-            global_lsn: AtomicU64::new(0),
-            aof_recording_refs: AtomicUsize::new(0),
-            eviction: EvictionConfigState::new(),
-            frequency_sketch: FrequencySketch::new(),
-            eviction_metrics: EvictionMetrics::default(),
-            runtime_metrics: RuntimeMetrics::new(1),
-            server_memory_attribution: ServerMemoryAttribution::default(),
-            absent_watch_shards,
-            absent_watch_active: AtomicUsize::new(0),
-            watch_active: AtomicUsize::new(0),
-            watch_epoch: AtomicU64::new(0),
-            transaction_gates: transaction_gates.into_boxed_slice(),
-            #[cfg(feature = "lock-profile")]
-            lock_profile: LockProfileState::default(),
-        }
+        let shards = shards.map_err(|source| KeyspaceCreateError::TableCapacity {
+            total_capacity,
+            per_shard_capacity: per_shard,
+            source,
+        })?;
+        Ok(Self::from_shards(shard_count, 1, table_hasher, shards))
     }
 
     #[inline]
@@ -570,8 +627,12 @@ impl ConcurrentKeyspace {
         }
 
         // Step 1: Reserve the projected delta atomically.
-        self.memory_reserved
-            .fetch_add(additional_bytes, Ordering::Acquire);
+        if self.try_reserve_memory(additional_bytes).is_err() {
+            return Err(EvictionAdmissionError::new(
+                MutationErrorKind::OutOfMemory,
+                None,
+            ));
+        }
 
         // Step 2: Check whether the combined (published + reserved) fits.
         let committed = self.committed_memory_pressure();
@@ -656,6 +717,25 @@ impl ConcurrentKeyspace {
     fn committed_memory_pressure(&self) -> usize {
         self.published_memory_used()
             .saturating_add(self.memory_reserved.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn try_reserve_memory(&self, additional_bytes: usize) -> Result<(), ()> {
+        let mut current = self.memory_reserved.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(additional_bytes) else {
+                return Err(());
+            };
+            match self.memory_reserved.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     #[cfg(not(feature = "lock-profile"))]
@@ -1220,6 +1300,7 @@ impl ConcurrentKeyspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::domain::{SetOptions, SetResult};
     use crate::entry::MAX_STORED_LSN_VERSION;
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
@@ -1784,17 +1865,17 @@ mod tests {
     #[test]
     fn concurrent_runtime_max_preserves_largest_value() {
         const SLOT_COUNT: usize = 2;
-        const THREADS: usize = 8;
         const MAX_VALUE: u64 = 1_000;
-        const ITERATIONS: u64 = 2_000;
+        let threads = if cfg!(miri) { 4 } else { 8 };
+        let iterations = if cfg!(miri) { 64u64 } else { 2_000u64 };
 
         let ks = Arc::new(ConcurrentKeyspace::new_with_runtime_slots(
             TEST_SHARDS,
             SLOT_COUNT,
         ));
-        let barrier = Arc::new(Barrier::new(THREADS));
+        let barrier = Arc::new(Barrier::new(threads));
 
-        let handles: Vec<_> = (0..THREADS)
+        let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let ks = Arc::clone(&ks);
                 let barrier = Arc::clone(&barrier);
@@ -1805,7 +1886,7 @@ mod tests {
                     ks.record_reactor_command_batch(0, MAX_VALUE as usize);
                     // Then write many scrambled smaller values that could
                     // race with other threads' MAX_VALUE writes.
-                    for v in 1..=ITERATIONS {
+                    for v in 1..=iterations {
                         let width = ((v.wrapping_mul(31 + t as u64)) % (MAX_VALUE - 1)) + 1;
                         ks.record_reactor_completion_batch(0, width as usize);
                         ks.record_reactor_command_batch(0, width as usize);
@@ -1874,7 +1955,11 @@ mod tests {
 
         let lsn_before_flush = ks.current_lsn();
 
-        assert_eq!(ks.flush_all_with_lsn(), None);
+        assert_eq!(
+            ks.flush_all_with_lsn()
+                .expect("empty AOF-enabled flush should succeed"),
+            None
+        );
         assert_eq!(ks.current_lsn(), lsn_before_flush);
         assert_eq!(ks.dbsize(), 0);
     }
@@ -1899,7 +1984,9 @@ mod tests {
 
         assert!(!ks.watched_keys_changed(watch_epoch, &watched));
 
-        let flush_lsn = ks.flush_all_with_lsn();
+        let flush_lsn = ks
+            .flush_all_with_lsn()
+            .expect("non-empty AOF-enabled flush must allocate an LSN");
 
         assert_eq!(flush_lsn.map(AofLsn::get), Some(lsn_before_flush));
         assert_eq!(ks.current_lsn(), lsn_before_flush + 1);
@@ -1957,7 +2044,9 @@ mod tests {
         let (writer_tx, writer_rx) = mpsc::channel();
         let writer_handle = thread::spawn(move || {
             let mut guard = writer_ks.write_shard_by_index(0);
-            let lsn = writer_ks.next_lsn();
+            let lsn = writer_ks
+                .next_lsn()
+                .expect("writer should allocate an LSN after flush");
             guard.insert_with_lsn(
                 VortexKey::from_bytes(&writer_key),
                 VortexValue::from("after-flush"),
@@ -1981,6 +2070,7 @@ mod tests {
             .join()
             .expect("writer worker should not panic");
 
+        let flush_lsn = flush_lsn.expect("non-empty flush should allocate an LSN");
         assert!(
             flush_lsn.get() < writer_lsn,
             "post-FLUSH writer LSN must be greater than FLUSH LSN"
@@ -2035,7 +2125,9 @@ mod tests {
         assert_eq!(ks.memory_reserved(), 512);
 
         assert!(
-            ks.flush_all_with_lsn().is_some(),
+            ks.flush_all_with_lsn()
+                .expect("non-empty AOF-enabled flush should allocate an LSN")
+                .is_some(),
             "non-empty AOF-enabled flush should allocate an LSN"
         );
 
@@ -2054,17 +2146,21 @@ mod tests {
     #[test]
     fn watch_registration_and_bumps_release_all_refs_under_contention() {
         let ks = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
-        let barrier = Arc::new(Barrier::new(7));
+        let watcher_threads = if cfg!(miri) { 2 } else { 4 };
+        let bumper_threads = if cfg!(miri) { 1 } else { 2 };
+        let watcher_iters = if cfg!(miri) { 16 } else { 1_000 };
+        let bumper_iters = if cfg!(miri) { 32 } else { 2_000 };
+        let barrier = Arc::new(Barrier::new(watcher_threads + bumper_threads + 1));
         let key = VortexKey::from("watched:key");
         let mut handles = Vec::new();
 
-        for _ in 0..4 {
+        for _ in 0..watcher_threads {
             let ks = Arc::clone(&ks);
             let barrier = Arc::clone(&barrier);
             let key = key.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..1_000 {
+                for _ in 0..watcher_iters {
                     let watched = ks.watch_key(key.clone());
                     let epoch = ks.current_watch_epoch();
                     let _ = ks.watched_keys_changed(epoch, std::slice::from_ref(&watched));
@@ -2073,13 +2169,13 @@ mod tests {
             }));
         }
 
-        for _ in 0..2 {
+        for _ in 0..bumper_threads {
             let ks = Arc::clone(&ks);
             let barrier = Arc::clone(&barrier);
             let key = key.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..2_000 {
+                for _ in 0..bumper_iters {
                     ks.bump_watch_key(&key);
                 }
             }));
@@ -2124,23 +2220,67 @@ mod tests {
         std::panic::catch_unwind(|| ConcurrentKeyspace::new(0)).unwrap_err();
         std::panic::catch_unwind(|| ConcurrentKeyspace::new(32)).unwrap_err(); // below MIN_SHARD_COUNT
         // These should not panic:
-        let _ = ConcurrentKeyspace::new(64);
-        let _ = ConcurrentKeyspace::new(256);
-        let _ = ConcurrentKeyspace::new(4096);
-        let _ = ConcurrentKeyspace::new(65536);
+        let valid_counts: &[usize] = if cfg!(miri) {
+            &[64, 256]
+        } else {
+            &[64, 256, 4096, 65536]
+        };
+        for count in valid_counts {
+            let _ = ConcurrentKeyspace::new(*count);
+        }
+    }
+
+    #[test]
+    fn try_constructors_reject_invalid_shards_without_panic() {
+        for invalid in [0, 32, 100, MAX_SHARD_COUNT + 1] {
+            let error =
+                ConcurrentKeyspace::try_new(invalid).expect_err("invalid shard count is rejected");
+            assert_eq!(error.attempted(), invalid);
+
+            let error = ConcurrentKeyspace::try_new_with_runtime_slots(invalid, 4)
+                .expect_err("invalid shard count is rejected");
+            assert_eq!(error.attempted(), invalid);
+
+            let error = ConcurrentKeyspace::try_with_capacity(invalid, 1024)
+                .expect_err("invalid shard count is rejected");
+            assert!(matches!(error, KeyspaceCreateError::ShardCount(_)));
+        }
+    }
+
+    #[test]
+    fn try_with_capacity_rejects_unrepresentable_table_layout_without_panic() {
+        let error = ConcurrentKeyspace::try_with_capacity(TEST_SHARDS, usize::MAX)
+            .expect_err("oversized keyspace capacity should return an error");
+
+        match error {
+            KeyspaceCreateError::TableCapacity {
+                total_capacity,
+                per_shard_capacity,
+                source,
+            } => {
+                assert_eq!(total_capacity, usize::MAX);
+                assert_eq!(per_shard_capacity, usize::MAX.div_ceil(TEST_SHARDS));
+                assert_eq!(source.requested(), per_shard_capacity);
+            }
+            KeyspaceCreateError::ShardCount(error) => {
+                panic!("unexpected shard-count error: {error}");
+            }
+        }
     }
 
     #[test]
     fn with_capacity_pre_sizes_shards() {
-        let ks = ConcurrentKeyspace::with_capacity(TEST_SHARDS, 1_000_000);
-        for i in 0..10_000u64 {
+        let total_capacity = if cfg!(miri) { 1024 } else { 1_000_000 };
+        let inserted = if cfg!(miri) { 128u64 } else { 10_000u64 };
+        let ks = ConcurrentKeyspace::with_capacity(TEST_SHARDS, total_capacity);
+        for i in 0..inserted {
             let key_bytes = format!("k:{i:08}");
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
                 t.insert(key, VortexValue::from("value"));
             });
         }
-        assert_eq!(ks.dbsize(), 10_000);
+        assert_eq!(ks.dbsize(), inserted as usize);
     }
 
     #[test]
@@ -2165,13 +2305,8 @@ mod tests {
             });
         }
 
-        let keys: Vec<&[u8]> = (0..10)
-            .map(|i| {
-                let key = format!("mk:{i}");
-                // Leak the string for test simplicity — tests don't care about this.
-                key.into_bytes().leak() as &[u8]
-            })
-            .collect();
+        let key_buffers: Vec<Vec<u8>> = (0..10).map(|i| format!("mk:{i}").into_bytes()).collect();
+        let keys: Vec<&[u8]> = key_buffers.iter().map(Vec::as_slice).collect();
 
         let (guards, plan) = ks.multi_read(&keys);
 
@@ -2214,10 +2349,13 @@ mod tests {
 
     #[test]
     fn concurrent_reads_no_contention() {
-        let ks = Arc::new(ConcurrentKeyspace::new(256));
+        let shard_count = if cfg!(miri) { TEST_SHARDS } else { 256 };
+        let key_count = if cfg!(miri) { 64u64 } else { 1000u64 };
+        let reader_threads = if cfg!(miri) { 4 } else { 8 };
+        let ks = Arc::new(ConcurrentKeyspace::new(shard_count));
 
         // Pre-populate
-        for i in 0..1000u64 {
+        for i in 0..key_count {
             let key_bytes = format!("key:{i:06}");
             let key = VortexKey::from_bytes(key_bytes.as_bytes());
             ks.write(key_bytes.as_bytes(), |t| {
@@ -2225,14 +2363,14 @@ mod tests {
             });
         }
 
-        let barrier = Arc::new(Barrier::new(8));
-        let handles: Vec<_> = (0..8)
+        let barrier = Arc::new(Barrier::new(reader_threads));
+        let handles: Vec<_> = (0..reader_threads)
             .map(|_| {
                 let ks = Arc::clone(&ks);
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    for i in 0..1000u64 {
+                    for i in 0..key_count {
                         let key_bytes = format!("key:{i:06}");
                         let result = ks.read(key_bytes.as_bytes(), |t| {
                             t.get(&VortexKey::from_bytes(key_bytes.as_bytes())).cloned()
@@ -2250,17 +2388,22 @@ mod tests {
 
     #[test]
     fn concurrent_read_write_correctness() {
-        let ks = Arc::new(ConcurrentKeyspace::new(256));
+        let shard_count = if cfg!(miri) { TEST_SHARDS } else { 256 };
+        let writes_per_writer = if cfg!(miri) { 16 } else { 500 };
+        let reader_rounds = if cfg!(miri) { 2 } else { 100 };
+        let ks = Arc::new(ConcurrentKeyspace::new(shard_count));
         let barrier = Arc::new(Barrier::new(5));
         let mut handles = Vec::new();
 
-        // 2 writers — each writes 500 distinct keys
+        // 2 writers, each writing a distinct key range. The reduced Miri loop
+        // still exercises the same cross-thread lock paths without making the
+        // safety gate take minutes on this single test.
         for w in 0..2u64 {
             let ks = Arc::clone(&ks);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                for i in 0..500u64 {
+                for i in 0..writes_per_writer {
                     let key_bytes = format!("w{w}:{i}");
                     let key = VortexKey::from_bytes(key_bytes.as_bytes());
                     let val = VortexValue::from(i as i64);
@@ -2277,9 +2420,9 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..100 {
+                for _ in 0..reader_rounds {
                     for w in 0..2u64 {
-                        for i in 0..500u64 {
+                        for i in 0..writes_per_writer {
                             let key_bytes = format!("w{w}:{i}");
                             let _ = ks.read(key_bytes.as_bytes(), |t| {
                                 t.get(&VortexKey::from_bytes(key_bytes.as_bytes())).cloned()
@@ -2296,8 +2439,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        // Both writers wrote 500 keys each
-        assert_eq!(ks.dbsize(), 1000);
+        assert_eq!(ks.dbsize(), (2 * writes_per_writer) as usize);
     }
 
     #[test]
@@ -2305,15 +2447,17 @@ mod tests {
         // Verify that concurrent multi-key writes touching overlapping shards
         // don't deadlock thanks to ordered locking.
         let ks = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
-        let barrier = Arc::new(Barrier::new(8));
+        let thread_count = if cfg!(miri) { 4 } else { 8 };
+        let writes_per_thread = if cfg!(miri) { 8u64 } else { 100u64 };
+        let barrier = Arc::new(Barrier::new(thread_count));
 
-        let handles: Vec<_> = (0..8)
+        let handles: Vec<_> = (0..thread_count)
             .map(|t| {
                 let ks = Arc::clone(&ks);
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    for i in 0..100u64 {
+                    for i in 0..writes_per_thread {
                         let k1 = format!("t{t}:a:{i}");
                         let k2 = format!("t{t}:b:{i}");
                         let k3 = format!("t{t}:c:{i}");
@@ -2335,7 +2479,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert_eq!(ks.dbsize(), 8 * 100 * 3);
+        assert_eq!(ks.dbsize(), thread_count * writes_per_thread as usize * 3);
     }
 
     #[test]
@@ -2522,8 +2666,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "global LSN exceeds 48-bit entry version storage")]
-    fn next_lsn_panics_before_entry_stamp_when_counter_is_exhausted() {
+    fn next_lsn_returns_error_when_counter_is_exhausted() {
         let ks = ConcurrentKeyspace::new(TEST_SHARDS);
         let max = AofLsn::try_from_raw(MAX_STORED_LSN_VERSION).unwrap();
 
@@ -2532,17 +2675,88 @@ mod tests {
                 .expect("max restore should leave the next counter just past the entry bound");
         }
 
-        let _ = ks.next_lsn();
+        let error = ks
+            .next_lsn()
+            .expect_err("exhausted entry-stamp width must be reported");
+        assert_eq!(error.attempted, MAX_STORED_LSN_VERSION + 1);
+        assert_eq!(error.max, MAX_STORED_LSN_VERSION);
+    }
+
+    #[test]
+    fn aof_lsn_overflow_rejects_plain_set_before_mutating_keyspace() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let key = VortexKey::from("overflow:set");
+        ks.enable_aof_recording();
+        ks.global_lsn
+            .store(MAX_STORED_LSN_VERSION + 1, Ordering::Relaxed);
+
+        let error = ks
+            .set_value_plain_bytes(key.as_bytes(), b"value", 0)
+            .expect_err("AOF-visible SET must fail before mutating on LSN overflow");
+
+        assert_eq!(error.kind, MutationErrorKind::LsnOverflow);
+        assert_eq!(ks.get_value(&key, 0), None);
+    }
+
+    #[test]
+    fn aof_lsn_overflow_rejects_cross_shard_rename_before_mutating_keyspace() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let keys = keys_for_shards(&ks, &[0, 1]);
+        let old_key = VortexKey::from_bytes(&keys[0]);
+        let new_key = VortexKey::from_bytes(&keys[1]);
+        ks.write(&keys[0], |table| {
+            table.insert(old_key.clone(), VortexValue::from("value"));
+        });
+        ks.enable_aof_recording();
+        ks.global_lsn
+            .store(MAX_STORED_LSN_VERSION + 1, Ordering::Relaxed);
+
+        let error = ks
+            .rename_key(&old_key, new_key.clone(), 0, false)
+            .expect_err("AOF-visible RENAME must fail before moving keys on LSN overflow");
+
+        assert_eq!(error.kind, MutationErrorKind::LsnOverflow);
+        assert_eq!(ks.get_value(&old_key, 0), Some(VortexValue::from("value")));
+        assert_eq!(ks.get_value(&new_key, 0), None);
+    }
+
+    #[test]
+    fn set_nx_noop_does_not_allocate_lsn_when_counter_is_exhausted() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        let key = VortexKey::from("overflow:set:nx");
+        ks.set_value_plain_bytes(key.as_bytes(), b"old", 0)
+            .expect("seed SET should succeed");
+        ks.enable_aof_recording();
+        ks.global_lsn
+            .store(MAX_STORED_LSN_VERSION + 1, Ordering::Relaxed);
+
+        let result = ks
+            .set_value_with_options(
+                key.clone(),
+                VortexValue::from("new"),
+                SetOptions {
+                    nx: true,
+                    ..SetOptions::default()
+                },
+                0,
+            )
+            .expect("no-op SET NX must not allocate an observed LSN");
+
+        assert!(matches!(result.value, SetResult::NotSet));
+        assert_eq!(result.aof_lsn, None);
+        assert_eq!(ks.get_value(&key, 0), Some(VortexValue::from("old")));
     }
 
     #[test]
     fn stress_concurrent_mixed_operations() {
-        // Stress test: 16 threads doing mixed read/write/multi-key ops
-        let ks = Arc::new(ConcurrentKeyspace::new(256));
-        let barrier = Arc::new(Barrier::new(16));
-        let iters = 500u64;
+        // Stress test: many threads doing mixed read/write/multi-key ops.
+        let thread_count = if cfg!(miri) { 4 } else { 16 };
+        let shard_count = if cfg!(miri) { TEST_SHARDS } else { 256 };
+        let iters = if cfg!(miri) { 16u64 } else { 500u64 };
+        let ks = Arc::new(ConcurrentKeyspace::new(shard_count));
+        let barrier = Arc::new(Barrier::new(thread_count));
 
-        let handles: Vec<_> = (0..16)
+        let handles: Vec<_> = (0..thread_count)
             .map(|t| {
                 let ks = Arc::clone(&ks);
                 let barrier = Arc::clone(&barrier);
@@ -2937,6 +3151,19 @@ mod tests {
             0,
             "All reservations should be settled"
         );
+    }
+
+    #[test]
+    fn reservation_counter_overflow_fails_closed_without_wrapping() {
+        let ks = ConcurrentKeyspace::new(TEST_SHARDS);
+        ks.configure_eviction(1 << 20, EvictionPolicy::NoEviction);
+        ks.memory_reserved.store(usize::MAX - 8, Ordering::Release);
+
+        let error = ks.ensure_memory_for(0, 16, 0).unwrap_err();
+
+        assert_eq!(error.kind, MutationErrorKind::OutOfMemory);
+        assert!(error.evicted.is_none());
+        assert_eq!(ks.memory_reserved(), usize::MAX - 8);
     }
 
     #[test]

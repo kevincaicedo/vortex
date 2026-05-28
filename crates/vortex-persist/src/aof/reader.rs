@@ -37,6 +37,7 @@ use super::rewrite::{AofManifest, AofManifestState};
 
 const DEFAULT_REPLAY_READ_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_REPLAY_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const V1_SYNTHETIC_LSN_STRIDE: u64 = 1u64 << 48;
 
 /// Bounded AOF replay memory policy.
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +68,10 @@ impl AofReplayConfig {
     }
 }
 
-/// Statistics from an AOF replay.
+/// Statistics from a successful AOF replay.
+///
+/// Failed replays return an `io::Error` with an [`AofErrorKind`] classification
+/// and location context in the error message instead of partial statistics.
 #[derive(Debug, Clone)]
 pub struct ReplayStats {
     /// Number of commands successfully replayed.
@@ -90,8 +94,6 @@ pub struct ReplayStats {
     pub files_merged: usize,
     /// Peak bytes retained by replay cursors and queued records.
     pub peak_replay_buffer_bytes: usize,
-    /// Corrupt records observed before replay failed.
-    pub corrupt_records: u64,
 }
 
 /// AOF file reader for replaying persistence on startup.
@@ -156,7 +158,6 @@ impl ReplayStats {
             max_persisted_lsn: 0,
             files_merged: 0,
             peak_replay_buffer_bytes: 0,
-            corrupt_records: 0,
         }
     }
 }
@@ -400,7 +401,6 @@ fn merge_stats(total: &mut ReplayStats, part: ReplayStats) {
     total.peak_replay_buffer_bytes = total
         .peak_replay_buffer_bytes
         .max(part.peak_replay_buffer_bytes);
-    total.corrupt_records = total.corrupt_records.saturating_add(part.corrupt_records);
 }
 
 fn replay_lsn_order_error(
@@ -415,6 +415,38 @@ fn replay_lsn_order_error(
         Some(lsn),
         format!("AOF LSN order violation: previous={previous_lsn}, current={lsn}"),
     )
+}
+
+fn v1_synthetic_lsn(
+    path: &Path,
+    reactor_id: AofReactorId,
+    record_count: u64,
+    record_offset: usize,
+) -> io::Result<u64> {
+    if record_count >= V1_SYNTHETIC_LSN_STRIDE {
+        return Err(invalid_replay_record_error(
+            path,
+            record_offset,
+            None,
+            format!(
+                "AOF v1 synthetic LSN range exhausted for reactor {}",
+                reactor_id.get()
+            ),
+        ));
+    }
+
+    let base = u64::from(reactor_id.get()) * V1_SYNTHETIC_LSN_STRIDE;
+    base.checked_add(record_count).ok_or_else(|| {
+        invalid_replay_record_error(
+            path,
+            record_offset,
+            None,
+            format!(
+                "AOF v1 synthetic LSN overflow for reactor {}",
+                reactor_id.get()
+            ),
+        )
+    })
 }
 
 impl AofReader {
@@ -436,12 +468,27 @@ impl AofReader {
     /// Replay a single AOF file into a shared `ConcurrentKeyspace`.
     ///
     /// Handles both v1 (no LSN) and v2 (LSN-prefixed) formats.
-    /// For v2, also tracks the highest LSN replayed.
+    /// For v2, also tracks the highest LSN replayed. Returned
+    /// [`ReplayStats`] are success-only; failed replay returns an `io::Error`
+    /// and does not report partial counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` when the file header, record framing, LSN order,
+    /// RESP payload, command replay, tail truncation, or replay memory policy
+    /// fails. Errors that describe AOF format/replay failures carry an
+    /// [`AofErrorKind`] retrievable with [`crate::aof::aof_error_kind`].
+    /// Replay mutates the target keyspace incrementally, so startup callers
+    /// that require all-or-nothing recovery must discard the target keyspace
+    /// and fail closed on error.
     pub fn replay_into_keyspace(&self, keyspace: &ConcurrentKeyspace) -> io::Result<ReplayStats> {
         self.replay_into_keyspace_with_config(keyspace, AofReplayConfig::default())
     }
 
     /// Replay a single AOF file with an explicit bounded replay policy.
+    ///
+    /// See [`Self::replay_into_keyspace`] for failure and partial-application
+    /// semantics.
     pub fn replay_into_keyspace_with_config(
         &self,
         keyspace: &ConcurrentKeyspace,
@@ -453,7 +500,7 @@ impl AofReader {
             return Ok(ReplayStats::empty());
         }
 
-        let mut cursor = AofFileCursor::open(&self.path, 0, config)?;
+        let mut cursor = AofFileCursor::open(&self.path, config)?;
         let header = cursor.header;
 
         let now_nanos = Timestamp::now().as_nanos();
@@ -537,7 +584,6 @@ impl AofReader {
             max_persisted_lsn: max_lsn.map_or(0, AofLsn::get),
             files_merged: 1,
             peak_replay_buffer_bytes,
-            corrupt_records: 0,
         })
     }
 
@@ -550,6 +596,14 @@ impl AofReader {
     ///
     /// Returns aggregate replay statistics. Restores the keyspace's global
     /// LSN counter to `max_lsn + 1` after replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` when any input file is corrupt, truncated beyond
+    /// the recoverable tail boundary, has duplicate or decreasing persisted
+    /// LSNs, exceeds replay memory policy, or replays a command that fails.
+    /// Returned stats are success-only; callers must fail closed and discard
+    /// the target keyspace on error if partial replay is not acceptable.
     pub fn replay_merge(
         paths: &[PathBuf],
         keyspace: &ConcurrentKeyspace,
@@ -558,6 +612,9 @@ impl AofReader {
     }
 
     /// K-Way merge replay with an explicit bounded replay policy.
+    ///
+    /// See [`Self::replay_merge`] for failure and partial-application
+    /// semantics.
     pub fn replay_merge_with_config(
         paths: &[PathBuf],
         keyspace: &ConcurrentKeyspace,
@@ -568,11 +625,11 @@ impl AofReader {
         let mut cursors: Vec<AofFileCursor> = Vec::with_capacity(paths.len());
         let mut files_loaded = 0usize;
 
-        for (idx, path) in paths.iter().enumerate() {
+        for path in paths {
             if !path.exists() {
                 continue;
             }
-            let cursor = AofFileCursor::open(path, idx, config)?;
+            let cursor = AofFileCursor::open(path, config)?;
             cursors.push(cursor);
             files_loaded += 1;
         }
@@ -702,11 +759,20 @@ impl AofReader {
             max_persisted_lsn: max_lsn.map_or(0, AofLsn::get),
             files_merged: files_loaded,
             peak_replay_buffer_bytes,
-            corrupt_records: 0,
         })
     }
 
     /// Replay the file set described by an AOF rewrite manifest.
+    ///
+    /// A `preparing` manifest replays the legacy files and ignores candidate
+    /// rewrite outputs. An `active` manifest replays base snapshot files first
+    /// and then LSN-ordered tail files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the manifest-selected file set cannot be
+    /// replayed according to the same success-only and fail-closed rules as
+    /// [`Self::replay_merge`].
     pub fn replay_manifest(
         manifest: &AofManifest,
         keyspace: &ConcurrentKeyspace,
@@ -753,7 +819,7 @@ struct AofFileCursor {
     is_v2: bool,
     /// Base for synthetic LSN generation (v1 files only).
     /// Used only for merge ordering, never for restoring the engine LSN.
-    synthetic_lsn_base: u64,
+    synthetic_reactor_id: AofReactorId,
     /// Number of records read so far (for synthetic LSN generation).
     record_count: u64,
     /// Last v2 LSN observed in this file.
@@ -765,7 +831,7 @@ struct AofFileCursor {
 }
 
 impl AofFileCursor {
-    fn open(path: &Path, reactor_idx: usize, config: AofReplayConfig) -> io::Result<Self> {
+    fn open(path: &Path, config: AofReplayConfig) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < AOF_HEADER_SIZE as u64 {
@@ -790,7 +856,7 @@ impl AofFileCursor {
             buffer_start: 0,
             eof: file_data_len == 0,
             is_v2: header.is_v2(),
-            synthetic_lsn_base: (reactor_idx as u64) << 48,
+            synthetic_reactor_id: header.reactor_id(),
             record_count: 0,
             last_v2_lsn: None,
             truncated_bytes: 0,
@@ -903,6 +969,21 @@ impl AofFileCursor {
         Ok(true)
     }
 
+    fn read_lsn_prefix(&self, record_offset: usize) -> io::Result<u64> {
+        let Some(prefix) = self.unread().get(..LSN_SIZE) else {
+            return Err(invalid_replay_record_error(
+                &self.path,
+                record_offset,
+                None,
+                "AOF v2 record missing LSN prefix after availability check",
+            ));
+        };
+
+        let mut bytes = [0u8; LSN_SIZE];
+        bytes.copy_from_slice(prefix);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     /// Read the next record.
     ///
     /// For v2 files: reads the 8-byte LSN prefix, then parses to find the
@@ -923,7 +1004,7 @@ impl AofFileCursor {
                 self.mark_truncated_tail(record_offset);
                 return Ok(None);
             }
-            let lsn = u64::from_le_bytes(self.unread()[..LSN_SIZE].try_into().expect("8 bytes"));
+            let lsn = self.read_lsn_prefix(record_offset)?;
             if let Some(previous_lsn) = self.last_v2_lsn {
                 if lsn <= previous_lsn {
                     return Err(replay_lsn_order_error(
@@ -941,7 +1022,12 @@ impl AofFileCursor {
         } else {
             // v1: synthetic LSN preserving intra-file order and separating
             // per-reactor ranges to avoid collisions.
-            let lsn = self.synthetic_lsn_base + self.record_count;
+            let lsn = v1_synthetic_lsn(
+                &self.path,
+                self.synthetic_reactor_id,
+                self.record_count,
+                record_offset,
+            )?;
             (lsn, 0, None)
         };
 
@@ -1153,10 +1239,14 @@ mod tests {
     }
 
     fn write_v1_aof(path: &Path, records: &[&[u8]]) {
+        write_v1_aof_with_reactor(path, AofReactorId::from_u16(0), records);
+    }
+
+    fn write_v1_aof_with_reactor(path: &Path, reactor_id: AofReactorId, records: &[&[u8]]) {
         use std::io::Write;
 
         let mut file = File::create(path).unwrap();
-        let header = AofHeader::new(AofReactorId::from_u16(0), AofWriterMode::SnapshotRewrite);
+        let header = AofHeader::new(reactor_id, AofWriterMode::SnapshotRewrite);
         header.write_to(&mut file).unwrap();
         for record in records {
             file.write_all(record).unwrap();
@@ -1254,6 +1344,57 @@ mod tests {
     }
 
     #[test]
+    fn replay_v1_synthetic_order_uses_header_reactor_id_not_input_order() {
+        let path0 = temp_path("v1-synthetic-order-r0");
+        let path1 = temp_path("v1-synthetic-order-r1");
+        let key = b"legacy";
+        let first = b"reactor-0";
+        let second = b"reactor-1";
+
+        write_v1_aof_with_reactor(
+            &path0,
+            AofReactorId::from_u16(0),
+            &[&make_resp(&[b"SET", key, first])],
+        );
+        write_v1_aof_with_reactor(
+            &path1,
+            AofReactorId::from_u16(1),
+            &[&make_resp(&[b"SET", key, second])],
+        );
+
+        for paths in [
+            vec![path0.clone(), path1.clone()],
+            vec![path1.clone(), path0.clone()],
+        ] {
+            let ks = make_keyspace();
+            let stats = AofReader::replay_merge(&paths, &ks).unwrap();
+            assert_eq!(stats.commands_replayed, 2);
+            assert_eq!(stats.max_lsn, 0);
+            assert_eq!(stats.max_persisted_lsn, 0);
+            assert_eq!(get_value(&ks, key).as_deref(), Some(&second[..]));
+        }
+
+        cleanup(&path0);
+        cleanup(&path1);
+    }
+
+    #[test]
+    fn v1_synthetic_lsn_rejects_range_exhaustion_before_collision() {
+        let path = Path::new("synthetic-range.aof");
+        let reactor_id = AofReactorId::from_u16(1);
+
+        let first = v1_synthetic_lsn(path, reactor_id, 0, 0).unwrap();
+        assert_eq!(first, V1_SYNTHETIC_LSN_STRIDE);
+
+        let error = v1_synthetic_lsn(path, reactor_id, V1_SYNTHETIC_LSN_STRIDE, 0).unwrap_err();
+        assert_eq!(
+            crate::aof::aof_error_kind(&error),
+            Some(AofErrorKind::CorruptRecord)
+        );
+        assert!(error.to_string().contains("synthetic LSN range exhausted"));
+    }
+
+    #[test]
     fn replay_handles_truncated_file() {
         let path = temp_path("truncated");
         {
@@ -1293,6 +1434,84 @@ mod tests {
         let file_len = std::fs::metadata(&path).unwrap().len();
         let expected = AOF_HEADER_SIZE as u64 + stats.bytes_read;
         assert_eq!(file_len, expected);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_truncates_partial_lsn_tail() {
+        let path = temp_path("partial-lsn-tail");
+        let valid_len = {
+            let mut writer =
+                AofFileWriter::open(&path, AofReactorId::from_u16(0), AofFsyncPolicy::No).unwrap();
+            writer
+                .append_with_lsn(
+                    lsn(1),
+                    record(b"*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n"),
+                )
+                .unwrap();
+            writer.flush_buffer().unwrap();
+            std::fs::metadata(&path).unwrap().len()
+        };
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&2u64.to_le_bytes()[..4]).unwrap();
+        }
+
+        let ks = make_keyspace();
+        let stats = AofReader::new(&path).replay_into_keyspace(&ks).unwrap();
+
+        assert_eq!(stats.commands_replayed, 1);
+        assert_eq!(stats.bytes_truncated, 4);
+        assert_eq!(stats.max_lsn, 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
+        assert_eq!(get_value(&ks, b"key1").as_deref(), Some(&b"value1"[..]));
+        assert_eq!(ks.current_lsn(), 2);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_rejects_complete_invalid_tail() {
+        let path = temp_path("invalid-tail");
+        {
+            let mut writer =
+                AofFileWriter::open(&path, AofReactorId::from_u16(0), AofFsyncPolicy::No).unwrap();
+            writer
+                .append_with_lsn(
+                    lsn(1),
+                    record(b"*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n"),
+                )
+                .unwrap();
+            writer.flush_buffer().unwrap();
+        }
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&2u64.to_le_bytes()).unwrap();
+            file.write_all(b"!broken\r\n").unwrap();
+        }
+        let corrupt_len = std::fs::metadata(&path).unwrap().len();
+
+        let ks = make_keyspace();
+        let error = AofReader::new(&path).replay_into_keyspace(&ks).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::aof::aof_error_kind(&error),
+            Some(AofErrorKind::CorruptRecord)
+        );
+        assert!(error.to_string().contains("lsn=2"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), corrupt_len);
 
         cleanup(&path);
     }
@@ -1612,7 +1831,12 @@ mod tests {
         let error = AofReader::new(&path).replay_into_keyspace(&ks).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::aof::aof_error_kind(&error),
+            Some(AofErrorKind::CorruptRecord)
+        );
         let message = error.to_string();
+        assert!(message.contains(path.file_name().unwrap().to_string_lossy().as_ref()));
         assert!(message.contains("offset="));
         assert!(message.contains("lsn=7"));
         assert!(message.contains("command=SET"));
@@ -1815,7 +2039,12 @@ mod tests {
         let error = AofReader::replay_merge(&paths, &ks).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::aof::aof_error_kind(&error),
+            Some(AofErrorKind::CorruptRecord)
+        );
         let message = error.to_string();
+        assert!(message.contains("offset="));
         assert!(message.contains("lsn=2"));
         assert!(message.contains("command=SET"));
         assert!(message.contains(path1.file_name().unwrap().to_string_lossy().as_ref()));
@@ -1972,9 +2201,17 @@ mod tests {
                 AofFileWriter::open(&path, AofReactorId::from_u16(0), AofFsyncPolicy::No).unwrap();
             w.append_with_lsn(lsn(2), record(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"))
                 .unwrap();
-            w.append_with_lsn(lsn(1), record(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"))
-                .unwrap();
             w.flush_buffer().unwrap();
+            drop(w);
+
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&1u64.to_le_bytes()).unwrap();
+            file.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+                .unwrap();
         }
 
         let ks = make_keyspace();

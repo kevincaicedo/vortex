@@ -20,12 +20,10 @@ use crate::effects::{AofRecord, AofRecords, MutationErrorKind};
 use crate::entry::Entry;
 use crate::keyspace::{
     AofLsn, ConcurrentKeyspace, EvictedKey, EvictedKeys, EvictionAdmissionError, ExpiryTransition,
-    MemoryReservation, PositiveDelta, PrehashedKeyPlan, PrehashedShardPlan, ProjectedDelta,
-    ShardPlan, ShardWriteGuard, ShardWriteGuards,
+    LsnOverflow, MemoryReservation, PositiveDelta, PrehashedKeyPlan, PrehashedShardPlan,
+    ProjectedDelta, ShardPlan, ShardWriteGuard, ShardWriteGuards,
 };
-use crate::table::{
-    BorrowedKey, MutationPolicy, RawValueBytes, SlotCursor, SlotMutationReport, TableHash,
-};
+use crate::table::{BorrowedKey, MutationPolicy, RawValueBytes, SlotCursor, TableHash};
 
 use crate::commands::pattern::glob_match;
 
