@@ -17,7 +17,7 @@ use vortex_common::{VortexKey, VortexValue};
 use crate::EvictionConfig;
 use crate::SwissTable;
 use crate::effects::{AofRecord, AofRecords, MutationErrorKind};
-use crate::entry::Entry;
+use crate::entry::{Entry, EntryLsn};
 use crate::keyspace::{
     AofLsn, ConcurrentKeyspace, EvictedKey, EvictedKeys, EvictionAdmissionError, ExpiryTransition,
     LsnOverflow, MemoryReservation, PositiveDelta, PrehashedKeyPlan, PrehashedShardPlan,
@@ -40,3 +40,6 @@ mod tests;
 pub(crate) use mutation::{
     ExpireOptions, GetExOption, MutationError, MutationOutcome, SetOptions, SetResult, TtlState,
 };
+pub(crate) use scan_ops::KEYS_MAX_RESULTS_PER_CALL;
+#[cfg(test)]
+pub(crate) use scan_ops::{SCAN_MAX_RESULTS_PER_CALL, SCAN_MAX_SLOTS_PER_CALL};

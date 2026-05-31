@@ -98,6 +98,10 @@ pub struct ReactorPoolConfig {
     pub budgets: ReactorBudgets,
     /// Runtime telemetry policy for all reactors.
     pub telemetry_mode: RuntimeTelemetryMode,
+    /// Effective local diagnostic sample rate for all reactors.
+    pub telemetry_local_sample_rate: u32,
+    /// Cold metrics publication interval in monotonic nanoseconds.
+    pub telemetry_flush_interval_nanos: u64,
 }
 
 impl Default for ReactorPoolConfig {
@@ -122,6 +126,8 @@ impl Default for ReactorPoolConfig {
             sqpoll_idle_ms: 0,
             budgets: ReactorBudgets::default(),
             telemetry_mode: RuntimeTelemetryMode::Minimal,
+            telemetry_local_sample_rate: 0,
+            telemetry_flush_interval_nanos: crate::reactor::METRICS_FLUSH_INTERVAL_NANOS,
         }
     }
 }
@@ -259,6 +265,10 @@ impl ReactorPool {
             num_reactors,
         ));
         keyspace.set_runtime_telemetry_mode(config.telemetry_mode);
+        keyspace.set_runtime_local_flush_policy(
+            config.telemetry_local_sample_rate as u64,
+            config.telemetry_flush_interval_nanos / 1_000_000,
+        );
         #[cfg(feature = "lock-profile")]
         if std::env::var_os("VORTEX_LOCK_PROFILE").is_some() {
             keyspace.set_lock_profile_enabled(true);
@@ -380,6 +390,8 @@ impl ReactorPool {
                 sqpoll_idle_ms: config.sqpoll_idle_ms,
                 budgets: config.budgets,
                 telemetry_mode: config.telemetry_mode,
+                telemetry_local_sample_rate: config.telemetry_local_sample_rate,
+                telemetry_flush_interval_nanos: config.telemetry_flush_interval_nanos,
             };
 
             let thread = match std::thread::Builder::new()

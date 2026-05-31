@@ -12,6 +12,7 @@ pub struct SpawnOptions {
     pub vortex_bin: Option<PathBuf>,
     pub vortex_args: Vec<String>,
     pub ready_timeout: Duration,
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Default for SpawnOptions {
@@ -21,6 +22,7 @@ impl Default for SpawnOptions {
             vortex_bin: None,
             vortex_args: Vec::new(),
             ready_timeout: Duration::from_secs(20),
+            log_dir: None,
         }
     }
 }
@@ -65,7 +67,10 @@ pub fn spawn_vortex(options: &SpawnOptions) -> Result<SpawnedServer> {
         }
     };
 
-    let artifacts_dir = workspace_root.join("smoketests/.artifacts");
+    let artifacts_dir = options
+        .log_dir
+        .clone()
+        .unwrap_or_else(|| workspace_root.join("smoketests/.artifacts"));
     fs::create_dir_all(&artifacts_dir)
         .with_context(|| format!("failed to create artifacts dir {}", artifacts_dir.display()))?;
     let log_path = log_path_for(&artifacts_dir, "vortex-server", &bind);
@@ -117,7 +122,10 @@ pub fn spawn_redis(options: &SpawnOptions) -> Result<SpawnedServer> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("redis-server"));
 
-    let artifacts_dir = workspace_root.join("smoketests/.artifacts");
+    let artifacts_dir = options
+        .log_dir
+        .clone()
+        .unwrap_or_else(|| workspace_root.join("smoketests/.artifacts"));
     fs::create_dir_all(&artifacts_dir)
         .with_context(|| format!("failed to create artifacts dir {}", artifacts_dir.display()))?;
     let log_path = log_path_for(&artifacts_dir, "redis-server", &bind);

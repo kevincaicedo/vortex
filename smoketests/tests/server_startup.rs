@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -67,6 +68,68 @@ fn vortex_log_path(bind: &str) -> PathBuf {
     workspace_root()
         .join("smoketests/.artifacts")
         .join(format!("vortex-server-{}.log", sanitized_bind(bind)))
+}
+
+#[test]
+fn smoke_cli_host_port_attach_writes_artifact_contract() -> Result<()> {
+    let fixture = TestDir::new("host-port-artifacts")?;
+    let server = spawn_vortex(&SpawnOptions {
+        vortex_args: vec!["--threads".to_string(), "1".to_string()],
+        ready_timeout: Duration::from_secs(20),
+        ..SpawnOptions::default()
+    })?;
+    let artifact_root = fixture.path().join("smoke");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_vortex-smoketests"))
+        .args([
+            "run",
+            "--target-mode",
+            "host-port",
+            "--server-url",
+            server.url(),
+            "--command",
+            "PING",
+            "--fail-fast",
+            "--artifact-root",
+        ])
+        .arg(&artifact_root)
+        .status()
+        .context("failed to run host-port smoke CLI")?;
+
+    assert!(status.success(), "host-port smoke CLI failed: {status}");
+
+    let mode_dir = artifact_root.join("host-port");
+    let mut sessions = fs::read_dir(&mode_dir)
+        .with_context(|| format!("failed to read {}", mode_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| path.file_name().is_some_and(|name| name != "reports"))
+        .collect::<Vec<_>>();
+    sessions.sort();
+    assert_eq!(sessions.len(), 1, "expected one host-port smoke session");
+    let session_dir = &sessions[0];
+
+    for artifact in [
+        "session.json",
+        "report.md",
+        "report.json",
+        "logs/client.log",
+        "environment.json",
+        "runtime-config.txt",
+        "reproducers.md",
+    ] {
+        assert!(
+            session_dir.join(artifact).exists(),
+            "missing smoke artifact {}",
+            session_dir.join(artifact).display()
+        );
+    }
+    assert!(mode_dir.join("reports/latest/report.md").exists());
+    assert!(mode_dir.join("reports/latest/report.json").exists());
+    assert!(mode_dir.join("reports/latest/session.json").exists());
+
+    Ok(())
 }
 
 fn shard_aof_path(base: &Path, reactor_id: usize) -> PathBuf {

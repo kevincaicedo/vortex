@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import shlex
 import socket
 import subprocess
@@ -31,6 +32,21 @@ def _run_output(command: list[str], *, cwd: Optional[Path] = None) -> Optional[s
         return None
     output = (result.stdout or result.stderr or "").strip()
     return output or None
+
+
+def _discover_linux_pid_by_port(port: int) -> Optional[int]:
+    output = _run_output(["ss", "-ltnp"])
+    if not output:
+        return None
+
+    port_pattern = re.compile(rf":{port}\b")
+    for line in output.splitlines():
+        if not port_pattern.search(line):
+            continue
+        match = re.search(r"pid=(\d+)", line)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def _parse_int(value: Any) -> Optional[int]:
@@ -107,6 +123,412 @@ def capture_host_metadata() -> dict[str, Any]:
         "logical_cpus": os.cpu_count(),
         "cpu_model": _detect_cpu_model(),
         "total_memory_bytes": _detect_total_memory_bytes(),
+    }
+
+
+_PROFILER_PROBES = [
+    {
+        "name": "perf-stat-pmu",
+        "platforms": ("Linux",),
+        "command_groups": (("perf",),),
+        "question": "PMU counters, IPC, cycles/op, instructions/op, cache, branch, and TLB rates",
+    },
+    {
+        "name": "perf-record",
+        "platforms": ("Linux",),
+        "command_groups": (("perf",),),
+        "question": "Linux on-CPU sampling and perf.data flamegraph/report generation",
+    },
+    {
+        "name": "perf-c2c",
+        "platforms": ("Linux",),
+        "command_groups": (("perf",),),
+        "question": "Linux cache-line HITM and false-sharing escalation",
+    },
+    {
+        "name": "perf-sched",
+        "platforms": ("Linux",),
+        "command_groups": (("perf",),),
+        "question": "Linux scheduler latency and timehist evidence",
+    },
+    {
+        "name": "perf-trace",
+        "platforms": ("Linux",),
+        "command_groups": (("perf",),),
+        "question": "Linux syscall trace and syscall-rate investigation",
+    },
+    {
+        "name": "perf-lock",
+        "platforms": ("Linux",),
+        "command_groups": (("perf",),),
+        "question": "Linux kernel lock contention and lock wait investigation",
+    },
+    {
+        "name": "trace-cmd",
+        "platforms": ("Linux",),
+        "command_groups": (("trace-cmd",),),
+        "question": "Linux ftrace event capture when perf/BPF is not enough",
+    },
+    {
+        "name": "sysstat-low-overhead",
+        "platforms": ("Linux",),
+        "command_groups": (("vmstat",), ("mpstat",), ("pidstat",), ("iostat",), ("sar",)),
+        "question": "Linux low-overhead CPU, scheduler, process, disk, and network pack",
+    },
+    {
+        "name": "bpf-runqlat",
+        "platforms": ("Linux",),
+        "command_groups": (("runqlat", "runqlat-bpfcc", "/usr/share/bcc/tools/runqlat"),),
+        "question": "Linux runnable latency histogram for scheduler-focused rows",
+    },
+    {
+        "name": "bpf-biolatency",
+        "platforms": ("Linux",),
+        "command_groups": (("biolatency", "biolatency-bpfcc", "/usr/share/bcc/tools/biolatency"),),
+        "question": "Linux block-device latency histogram for AOF/disk rows",
+    },
+    {
+        "name": "bpf-offcpu",
+        "platforms": ("Linux",),
+        "command_groups": (
+            ("offcputime", "offcputime-bpfcc", "/usr/share/bcc/tools/offcputime"),
+            ("offwaketime", "offwaketime-bpfcc", "/usr/share/bcc/tools/offwaketime"),
+        ),
+        "question": "Linux off-CPU blocked stack and waker evidence",
+    },
+    {
+        "name": "bpftrace",
+        "platforms": ("Linux",),
+        "command_groups": (("bpftrace",),),
+        "question": "Linux futex, fsync, and TCP tracepoint probes",
+    },
+    {
+        "name": "procfs-host-telemetry",
+        "platforms": ("Linux",),
+        "command_groups": (),
+        "question": "Linux procfs CPU, memory, disk, process, socket, and TCP counters",
+    },
+    {
+        "name": "ss-socket-summary",
+        "platforms": ("Linux",),
+        "command_groups": (("ss",), ("nstat",)),
+        "question": "Linux socket queue and TCP socket detail snapshots",
+    },
+    {
+        "name": "instruments-xctrace",
+        "platforms": ("Darwin",),
+        "command_groups": (("xcrun",),),
+        "question": "macOS Instruments Time Profiler, System Trace, and Allocations capture",
+    },
+    {
+        "name": "samply",
+        "platforms": ("Linux", "Darwin"),
+        "command_groups": (("samply",),),
+        "question": "Cross-platform sampling profiler fallback",
+    },
+    {
+        "name": "macos-host-samplers",
+        "platforms": ("Darwin",),
+        "command_groups": (("vm_stat",), ("iostat",), ("netstat",), ("sysctl",)),
+        "question": "macOS host CPU, VM, disk, network, and system context snapshots",
+    },
+    {
+        "name": "macos-process-sampling",
+        "platforms": ("Darwin",),
+        "command_groups": (("sample",), ("ps",)),
+        "question": "macOS process-level sampling and RSS fallback",
+    },
+    {
+        "name": "macos-memory-tools",
+        "platforms": ("Darwin",),
+        "command_groups": (("vmmap", "leaks", "malloc_history", "xcrun"),),
+        "question": "macOS allocation and address-space investigation",
+    },
+    {
+        "name": "heaptrack",
+        "platforms": ("Linux", "Darwin"),
+        "command_groups": (("heaptrack",),),
+        "question": "Heap allocation tracing when available on the host",
+    },
+]
+
+_PROFILER_TOOL_CONTRACTS = {
+    "perf-stat-pmu": {
+        "mode": "--perf-stat",
+        "required_permission": "perf_event_open for PMU counters",
+        "expected_overhead": "low",
+        "outputs": ["perf-stat.txt"],
+        "parser_support": "summary-fields",
+        "fallback": "host/process telemetry without PMU counters",
+    },
+    "perf-record": {
+        "mode": "--flamegraph/--cpu",
+        "required_permission": "perf_event_open sampling",
+        "expected_overhead": "medium",
+        "outputs": ["perf.data", "flamegraph.svg", "perf-report.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "samply or notes-only hotspot summary",
+    },
+    "perf-c2c": {
+        "mode": "--c2c",
+        "required_permission": "PMU access, often root or perf_event_paranoid <= 1",
+        "expected_overhead": "high",
+        "outputs": ["perf-c2c.data", "perf-c2c-report.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "cachegrind or layout review",
+    },
+    "perf-sched": {
+        "mode": "--scheduler",
+        "required_permission": "perf sched tracepoint access",
+        "expected_overhead": "medium",
+        "outputs": ["perf-sched.data", "perf-sched-timehist.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "run queue and context-switch telemetry",
+    },
+    "perf-trace": {
+        "mode": "--network/--lock-offcpu",
+        "required_permission": "perf tracepoint access",
+        "expected_overhead": "medium-high",
+        "outputs": ["perf-trace.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "process syscall counters",
+    },
+    "perf-lock": {
+        "mode": "--lock-offcpu",
+        "required_permission": "kernel lock tracepoint access",
+        "expected_overhead": "medium-high",
+        "outputs": ["perf-lock.data", "perf-lock-report.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "off-CPU and scheduler notes",
+    },
+    "trace-cmd": {
+        "mode": "--lock-offcpu/--aof-disk",
+        "required_permission": "tracefs access, often root",
+        "expected_overhead": "hypothesis-dependent",
+        "outputs": ["trace.dat", "trace-report.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "perf trace or BPF tools",
+    },
+    "sysstat-low-overhead": {
+        "mode": "default diagnostic pack",
+        "required_permission": "ordinary sysstat command access",
+        "expected_overhead": "low",
+        "outputs": ["vmstat.txt", "mpstat.txt", "pidstat.txt", "iostat.txt", "sar-net.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "procfs host telemetry",
+    },
+    "bpf-runqlat": {
+        "mode": "--scheduler",
+        "required_permission": "BPF access, usually root",
+        "expected_overhead": "medium",
+        "outputs": ["bpf-runqlat.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "procfs scheduler telemetry",
+    },
+    "bpf-biolatency": {
+        "mode": "--aof-disk",
+        "required_permission": "BPF access, usually root",
+        "expected_overhead": "medium",
+        "outputs": ["bpf-biolatency.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "iostat and writeback telemetry",
+    },
+    "bpf-offcpu": {
+        "mode": "--lock-offcpu",
+        "required_permission": "BPF access, usually root",
+        "expected_overhead": "medium-high",
+        "outputs": ["bpf-offcpu.txt", "bpf-offwaketime.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "perf sched plus notes",
+    },
+    "bpftrace": {
+        "mode": "--lock-offcpu/--network",
+        "required_permission": "BPF tracepoint access, usually root",
+        "expected_overhead": "hypothesis-dependent",
+        "outputs": ["bpftrace-*.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "low-overhead host telemetry",
+    },
+    "procfs-host-telemetry": {
+        "mode": "default diagnostic pack",
+        "required_permission": "ordinary procfs read access",
+        "expected_overhead": "low",
+        "outputs": ["host-samples.jsonl", "host-summary.json"],
+        "parser_support": "summary-fields",
+        "fallback": "explicit unavailable fields",
+    },
+    "ss-socket-summary": {
+        "mode": "--network",
+        "required_permission": "ordinary socket diagnostic access",
+        "expected_overhead": "low",
+        "outputs": ["ss-*.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "network byte/error counters",
+    },
+    "instruments-xctrace": {
+        "mode": "--instruments",
+        "required_permission": "macOS developer tools and task inspection permission",
+        "expected_overhead": "medium",
+        "outputs": ["*.trace"],
+        "parser_support": "artifact-link",
+        "fallback": "samply or process sampling",
+    },
+    "samply": {
+        "mode": "--samply",
+        "required_permission": "platform sampling permission",
+        "expected_overhead": "medium",
+        "outputs": ["samply-profile.json"],
+        "parser_support": "artifact-link",
+        "fallback": "perf or Instruments where available",
+    },
+    "macos-host-samplers": {
+        "mode": "default diagnostic pack",
+        "required_permission": "ordinary macOS host command access",
+        "expected_overhead": "low",
+        "outputs": ["host-samples.jsonl", "host-summary.json"],
+        "parser_support": "summary-fields",
+        "fallback": "explicit unavailable fields",
+    },
+    "macos-process-sampling": {
+        "mode": "--cpu",
+        "required_permission": "macOS task inspection permission may be required",
+        "expected_overhead": "medium",
+        "outputs": ["sample.txt", "ps-rss.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "Instruments or Samply",
+    },
+    "macos-memory-tools": {
+        "mode": "--memory",
+        "required_permission": "task inspection permission may be required",
+        "expected_overhead": "medium-high",
+        "outputs": ["vmmap.txt", "leaks.txt"],
+        "parser_support": "artifact-link",
+        "fallback": "RSS and allocator INFO",
+    },
+    "heaptrack": {
+        "mode": "--memory",
+        "required_permission": "ptrace/task inspection permission",
+        "expected_overhead": "high",
+        "outputs": ["heaptrack.*.gz"],
+        "parser_support": "artifact-link",
+        "fallback": "RSS and allocator INFO",
+    },
+}
+
+
+def _platform_key(system: str) -> str:
+    if system == "Linux":
+        return "linux"
+    if system == "Darwin":
+        return "macos"
+    return "unsupported"
+
+
+def _probe_command(candidate: str) -> Optional[str]:
+    if "/" in candidate:
+        path = Path(candidate)
+        return str(path) if path.exists() and os.access(path, os.X_OK) else None
+    return shutil.which(candidate)
+
+
+def _read_perf_event_paranoid() -> Optional[int]:
+    try:
+        return int(Path("/proc/sys/kernel/perf_event_paranoid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _permission_status(name: str, current_system: str, status: str) -> tuple[str, Optional[str]]:
+    if current_system != "Linux" or status != "available":
+        return status, None
+
+    perf_event_paranoid = _read_perf_event_paranoid()
+    is_root = getattr(os, "geteuid", lambda: 1)() == 0
+    if name in {"perf-stat-pmu", "perf-record", "perf-sched", "perf-c2c", "perf-trace", "perf-lock"}:
+        if perf_event_paranoid is not None and perf_event_paranoid > 2 and not is_root:
+            return "permission-denied", f"perf_event_paranoid={perf_event_paranoid}; run with lower perf_event_paranoid or explicit privileged profiler mode"
+        if name == "perf-c2c" and perf_event_paranoid is not None and perf_event_paranoid > 1 and not is_root:
+            return "requires-root", f"perf c2c usually needs perf_event_paranoid <= 1 or root; current value is {perf_event_paranoid}"
+    if name.startswith("bpf-") or name in {"bpftrace", "trace-cmd"}:
+        if not is_root:
+            return "requires-root", "BPF probes normally require root or delegated BPF permissions"
+    return status, None
+
+
+def capture_profiler_preflight(system: Optional[str] = None) -> dict[str, Any]:
+    """Return platform/tool availability with explicit evidence boundaries."""
+
+    current_system = system or platform.system()
+    probes: list[dict[str, Any]] = []
+    unavailable_linux_only: list[str] = []
+    unavailable_macos_only: list[str] = []
+
+    for spec in _PROFILER_PROBES:
+        platforms = tuple(spec["platforms"])
+        command_groups = tuple(spec["command_groups"])
+        platform_supported = current_system in platforms
+        available_commands: list[str] = []
+        missing_groups: list[list[str]] = []
+
+        if not platform_supported:
+            status = "unsupported"
+            reason = f"supported only on {', '.join(platforms)}"
+            if platforms == ("Linux",) and current_system == "Darwin":
+                unavailable_linux_only.append(str(spec["name"]))
+            if platforms == ("Darwin",) and current_system == "Linux":
+                unavailable_macos_only.append(str(spec["name"]))
+        else:
+            for group in command_groups:
+                found = None
+                for candidate in group:
+                    found = _probe_command(candidate)
+                    if found is not None:
+                        break
+                if found is None:
+                    missing_groups.append(list(group))
+                else:
+                    available_commands.append(found)
+            status = "available" if not missing_groups else "unavailable"
+            reason = None
+            if missing_groups:
+                rendered = [" or ".join(group) for group in missing_groups]
+                reason = "missing command group(s): " + "; ".join(rendered)
+
+        status, permission_reason = _permission_status(str(spec["name"]), current_system, status)
+        if permission_reason:
+            reason = permission_reason
+        probes.append(
+            {
+                "name": spec["name"],
+                "status": status,
+                "platforms": list(platforms),
+                "question": spec["question"],
+                "available_commands": available_commands,
+                "missing_command_groups": missing_groups,
+                "reason": reason,
+                **_PROFILER_TOOL_CONTRACTS.get(str(spec["name"]), {}),
+            }
+        )
+
+    boundary = (
+        "Linux PMU, BPF, perf, procfs, and io_uring evidence does not prove macOS "
+        "polling behavior; macOS rows must be labeled platform evidence."
+    )
+    if current_system == "Darwin":
+        boundary = (
+            "macOS profiler rows must mark Linux-only PMU/BPF/perf/procfs probes as "
+            "unsupported and cannot be used as Linux io_uring evidence."
+        )
+
+    return {
+        "schema_version": 1,
+        "captured_at": utc_now(),
+        "platform": current_system,
+        "platform_key": _platform_key(current_system),
+        "evidence_boundary": boundary,
+        "unavailable_linux_only_probes": unavailable_linux_only,
+        "unavailable_macos_only_probes": unavailable_macos_only,
+        "probes": probes,
     }
 
 
@@ -969,10 +1391,19 @@ class HostTelemetryCollector:
             if should_try_runtime:
                 runtime_snapshot = _capture_runtime_snapshot(self.service)
                 sample.update(runtime_snapshot)
+                sample.update(_capture_memory_snapshot(self.service))
                 if _runtime_snapshot_available(runtime_snapshot):
                     self._runtime_snapshot_captured = True
                     self._runtime_snapshot_successes += 1
                     self._last_runtime_snapshot_index = len(self._samples)
+
+        if (
+            self.service is not None
+            and not self.service.pid
+            and self.service.port
+            and self.supported
+        ):
+            self.service.pid = _discover_linux_pid_by_port(self.service.port)
 
         if self.service is not None and self.service.pid and self.supported:
             proc_sample = {}
@@ -1008,6 +1439,7 @@ class HostTelemetryCollector:
                 "supported": False,
                 "platform": platform.system(),
                 "reason": "host telemetry collector currently supports Linux procfs only",
+                "profiler_preflight": capture_profiler_preflight(),
                 "sample_interval_seconds": self.interval_seconds,
                 "sample_count": 0,
                 "duration_seconds": duration_seconds,
@@ -1052,6 +1484,13 @@ class HostTelemetryCollector:
                 return None
             return min(series)
 
+        def latest(key: str) -> Optional[float]:
+            for sample in reversed(self._samples):
+                value = sample.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return None
+
         runtime_summary: dict[str, Any] = {
             "runtime_reactor_slots": peak("runtime_reactor_slots")
         }
@@ -1061,9 +1500,19 @@ class HostTelemetryCollector:
         for field in _RUNTIME_FLOAT_FIELDS:
             runtime_summary[f"{field}_peak"] = peak(field)
 
+        memory_summary: dict[str, Any] = {}
+        for field in _MEMORY_INFO_INT_FIELDS:
+            memory_summary[f"{field}_peak_bytes"] = peak(field)
+            memory_summary[f"{field}_final_bytes"] = latest(field)
+            memory_summary[f"{field}_delta_bytes"] = delta(field)
+        for field in _MEMORY_INFO_FLOAT_FIELDS:
+            memory_summary[f"{field}_peak"] = peak(field)
+            memory_summary[f"{field}_final"] = latest(field)
+
         return {
             "supported": True,
             "platform": "Linux",
+            "profiler_preflight": capture_profiler_preflight(),
             "sample_interval_seconds": self.interval_seconds,
             "sample_count": len(self._samples),
             "duration_seconds": duration_seconds,
@@ -1122,6 +1571,7 @@ class HostTelemetryCollector:
             "disk_io_in_progress_peak": peak("disk_io_in_progress"),
             "invalid_delta_fields": sorted(set(invalid_delta_fields)),
             **runtime_summary,
+            **memory_summary,
         }
 
 
@@ -1171,6 +1621,8 @@ def _parse_info_response(payload: str) -> dict[str, str]:
 _RUNTIME_INT_FIELDS = [
     "runtime_profile_timers_available",
     "runtime_local_flush_metrics_available",
+    "runtime_local_flush_sample_rate",
+    "runtime_metrics_flush_interval_ms",
     "backend_plan_mixed",
     "backend_fixed_buffers_capable",
     "backend_fixed_buffers_registered",
@@ -1308,6 +1760,41 @@ _RUNTIME_STRING_FIELDS = [
     "backend_effective",
 ]
 
+_MEMORY_INFO_INT_FIELDS = [
+    "used_memory",
+    "used_memory_rss",
+    "used_memory_peak",
+    "used_memory_dataset",
+    "used_memory_overhead",
+    "engine_logical_dataset_bytes",
+    "engine_table_allocated_bytes",
+    "io_fixed_buffer_reserved_bytes",
+    "io_fixed_buffer_committed_bytes",
+    "io_fixed_buffer_active_bytes",
+    "per_connection_state_bytes",
+    "client_retained_bytes",
+    "client_retained_bytes_max",
+    "client_retained_bytes_peak",
+    "full_server_process_rss_bytes",
+    "allocator_allocated",
+    "allocator_active",
+    "allocator_resident",
+    "allocator_mapped",
+    "allocator_retained",
+    "allocator_frag_bytes",
+    "allocator_rss_bytes",
+    "mem_fragmentation_bytes",
+    "total_system_memory",
+]
+
+_MEMORY_INFO_FLOAT_FIELDS = [
+    "engine_load_factor",
+    "engine_bytes_per_live_key",
+    "allocator_frag_ratio",
+    "allocator_rss_ratio",
+    "mem_fragmentation_ratio",
+]
+
 _RUNTIME_DELTA_FIELDS = [
     field
     for field in _RUNTIME_INT_FIELDS
@@ -1316,6 +1803,8 @@ _RUNTIME_DELTA_FIELDS = [
         "runtime_reactor_slots",
         "runtime_profile_timers_available",
         "runtime_local_flush_metrics_available",
+        "runtime_local_flush_sample_rate",
+        "runtime_metrics_flush_interval_ms",
     }
 ]
 
@@ -1445,6 +1934,18 @@ def _capture_runtime_snapshot(service: ServiceState) -> dict[str, Any]:
         {field: _parse_float(info.get(field)) for field in _RUNTIME_FLOAT_FIELDS}
     )
     snapshot.update({field: info.get(field) for field in _RUNTIME_STRING_FIELDS})
+    return snapshot
+
+
+def _capture_memory_snapshot(service: ServiceState) -> dict[str, Any]:
+    raw_info = _redis_cli(service, ["INFO", "memory"])
+    info = _parse_info_response(raw_info or "")
+    snapshot = {
+        field: _parse_int(info.get(field)) for field in _MEMORY_INFO_INT_FIELDS
+    }
+    snapshot.update(
+        {field: _parse_float(info.get(field)) for field in _MEMORY_INFO_FLOAT_FIELDS}
+    )
     return snapshot
 
 

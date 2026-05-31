@@ -1,6 +1,6 @@
 //! Server command handlers.
 //!
-//! DBSIZE, FLUSHDB, FLUSHALL, INFO, COMMAND, and TIME.
+//! DBSIZE, FLUSHDB, FLUSHALL, INFO, COMMAND, HELLO, CLIENT, and TIME.
 
 use vortex_proto::{CommandFlags, CommandMeta, FrameRef, RespFrame};
 
@@ -10,6 +10,10 @@ use super::{
 };
 use crate::{ConcurrentKeyspace, effects::MutationErrorKind, keyspace::RuntimeMetricsSnapshot};
 
+const ERR_CLIENT_UNSUPPORTED: &[u8] = b"-ERR unknown subcommand or wrong number of arguments\r\n";
+const ERR_HELLO_RESP3_UNSUPPORTED: &[u8] = b"-NOPROTO RESP3 is not supported by VortexDB alpha\r\n";
+const ERR_HELLO_PROTO_UNSUPPORTED: &[u8] = b"-NOPROTO unsupported protocol version\r\n";
+
 /// Alpha-visible command set. This excludes commands that are still stubs,
 /// unsupported, or intentionally disabled for the alpha release.
 const SUPPORTED_COMMANDS: &[&str] = &[
@@ -18,6 +22,8 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "ECHO",
     "QUIT",
     "SELECT",
+    "HELLO",
+    "CLIENT",
     // Server
     "COMMAND",
     "INFO",
@@ -158,6 +164,110 @@ fn valid_flush_args(frame: &FrameRef<'_>) -> bool {
             .is_some_and(|mode| eq_ci(mode, b"sync") || eq_ci(mode, b"async")),
         _ => false,
     }
+}
+
+/// HELLO [protover [SETNAME name]]
+///
+/// VortexDB alpha remains a RESP2 server. `HELLO` without a protocol version,
+/// and `HELLO 2`, return Redis-shaped RESP2 handshake metadata. RESP3 is
+/// rejected explicitly so clients do not assume RESP3 push/map semantics.
+#[inline]
+pub fn cmd_hello(
+    _keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_SYNTAX);
+    };
+
+    if args.len() == 1 {
+        return hello_resp2();
+    }
+
+    let Some(proto) = args.get(1).and_then(parse_i64_arg) else {
+        return CmdResult::Static(ERR_HELLO_PROTO_UNSUPPORTED);
+    };
+    match proto {
+        2 if valid_hello_resp2_options(&args) => hello_resp2(),
+        2 => CmdResult::Static(ERR_SYNTAX),
+        3 => CmdResult::Static(ERR_HELLO_RESP3_UNSUPPORTED),
+        _ => CmdResult::Static(ERR_HELLO_PROTO_UNSUPPORTED),
+    }
+}
+
+/// CLIENT SETINFO LIB-NAME name|LIB-VER version
+///
+/// Accepts modern client-library metadata setup as an alpha no-op. Broader
+/// CLIENT subcommands remain unsupported because the engine does not own
+/// per-connection identity, listing, kill, tracking, or naming state.
+#[inline]
+pub fn cmd_client(
+    _keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    _now_nanos: u64,
+) -> CmdResult {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_CLIENT_UNSUPPORTED);
+    };
+
+    if args.len() == 4
+        && args.get(1).is_some_and(|sub| eq_ci(sub, b"setinfo"))
+        && args
+            .get(2)
+            .is_some_and(|field| eq_ci(field, b"lib-name") || eq_ci(field, b"lib-ver"))
+    {
+        return CmdResult::Static(RESP_OK);
+    }
+
+    CmdResult::Static(ERR_CLIENT_UNSUPPORTED)
+}
+
+fn valid_hello_resp2_options(args: &CommandArgs<'_>) -> bool {
+    let mut index = 2usize;
+    while index < args.len() {
+        let Some(option) = args.get(index) else {
+            return false;
+        };
+        if eq_ci(option, b"setname") {
+            if args.get(index + 1).is_none() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn hello_resp2() -> CmdResult {
+    CmdResult::Resp(RespFrame::Array(Some(vec![
+        bulk_static(b"server"),
+        bulk_static(b"vortex"),
+        bulk_static(b"version"),
+        bulk_static(env!("CARGO_PKG_VERSION").as_bytes()),
+        bulk_static(b"proto"),
+        RespFrame::integer(2),
+        bulk_static(b"id"),
+        RespFrame::integer(0),
+        bulk_static(b"mode"),
+        bulk_static(b"standalone"),
+        bulk_static(b"role"),
+        bulk_static(b"master"),
+        bulk_static(b"modules"),
+        RespFrame::Array(Some(Vec::new())),
+    ])))
+}
+
+#[inline]
+fn bulk_static(value: &'static [u8]) -> RespFrame {
+    RespFrame::bulk_string(bytes::Bytes::from_static(value))
+}
+
+#[inline]
+fn parse_i64_arg(bytes: &[u8]) -> Option<i64> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 /// INFO [section]
@@ -530,6 +640,16 @@ fn write_info_runtime(buf: &mut Vec<u8>, runtime: RuntimeMetricsSnapshot) {
         buf,
         b"runtime_local_flush_metrics_available:",
         runtime.local_flush_metrics_available,
+    );
+    write_info_u64(
+        buf,
+        b"runtime_local_flush_sample_rate:",
+        runtime.local_flush_sample_rate,
+    );
+    write_info_u64(
+        buf,
+        b"runtime_metrics_flush_interval_ms:",
+        runtime.metrics_flush_interval_millis,
     );
     write_info_str(
         buf,
@@ -1296,6 +1416,7 @@ mod tests {
         match r {
             CmdResult::Static(s) => assert_eq!(*s, expected, "static mismatch"),
             CmdResult::Inline(_) => panic!("expected Static, got Inline"),
+            CmdResult::Owned(b) => panic!("expected Static, got Owned: {b:?}"),
             CmdResult::Resp(f) => panic!("expected Static, got Resp: {f:?}"),
         }
     }
@@ -1336,6 +1457,76 @@ mod tests {
         }
     }
 
+    fn bulk_string_text(r: &CmdResult) -> &str {
+        match r {
+            CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
+                std::str::from_utf8(b.as_ref()).expect("INFO response is UTF-8")
+            }
+            other => panic!("expected BulkString, got {other:?}"),
+        }
+    }
+
+    fn production_region(source: &str) -> &str {
+        source.split("\n#[cfg(test").next().unwrap_or(source)
+    }
+
+    fn production_function_body<'a>(source_name: &str, source: &'a str, function: &str) -> &'a str {
+        let source = production_region(source);
+        let start = source
+            .find(&format!("fn {function}"))
+            .unwrap_or_else(|| panic!("{source_name} must define `{function}`"));
+        let body = &source[start..];
+        body.split("\n    pub").next().unwrap_or(body)
+    }
+
+    fn production_function_after<'a>(
+        source_name: &str,
+        source: &'a str,
+        anchor: &str,
+        function: &str,
+    ) -> &'a str {
+        let source = production_region(source);
+        let anchor_start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{source_name} must contain `{anchor}`"));
+        let search = &source[anchor_start..];
+        let function_start = search
+            .find(&format!("fn {function}"))
+            .unwrap_or_else(|| panic!("{source_name} must define `{function}` after `{anchor}`"));
+        let body = &search[function_start..];
+        let open = body
+            .find('{')
+            .unwrap_or_else(|| panic!("{source_name} `{function}` must have a body"));
+        let mut depth = 0usize;
+        for (offset, ch) in body[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return &body[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{source_name} `{function}` body is not balanced");
+    }
+
+    fn assert_contains_token(source: &str, context: &str, token: &str) {
+        assert!(source.contains(token), "{context} must contain `{token}`");
+    }
+
+    fn assert_ordered_tokens(source: &str, context: &str, tokens: &[&str]) {
+        let mut offset = 0usize;
+        for token in tokens {
+            let Some(relative_start) = source[offset..].find(token) else {
+                panic!("{context} must contain `{token}` after byte offset {offset}");
+            };
+            offset += relative_start + token.len();
+        }
+    }
+
     fn assert_array_len(r: &CmdResult, expected: usize) {
         match r {
             CmdResult::Resp(RespFrame::Array(Some(arr))) => {
@@ -1362,6 +1553,26 @@ mod tests {
             }),
             other => panic!("expected Array, got {other:?}"),
         }
+    }
+
+    fn array_contains_bulk_pair(arr: &[RespFrame], key: &[u8], value: &[u8]) -> bool {
+        arr.windows(2).any(|pair| {
+            matches!(
+                (&pair[0], &pair[1]),
+                (RespFrame::BulkString(Some(k)), RespFrame::BulkString(Some(v)))
+                    if k.as_ref() == key && v.as_ref() == value
+            )
+        })
+    }
+
+    fn array_contains_integer_pair(arr: &[RespFrame], key: &[u8], value: i64) -> bool {
+        arr.windows(2).any(|pair| {
+            matches!(
+                (&pair[0], &pair[1]),
+                (RespFrame::BulkString(Some(k)), RespFrame::Integer(n))
+                    if k.as_ref() == key && *n == value
+            )
+        })
     }
 
     // ── DBSIZE ──
@@ -1464,6 +1675,420 @@ mod tests {
         assert_eq!(h.len(), 0);
     }
 
+    #[test]
+    fn engine_command_hot_paths_do_not_publish_runtime_telemetry() {
+        let forbidden = [
+            "record_reactor_",
+            "publish_reactor_",
+            "publish_runtime_backend(",
+            ".runtime_metrics()",
+        ];
+        let files = [
+            ("commands/connection.rs", include_str!("connection.rs")),
+            ("commands/generic.rs", include_str!("generic.rs")),
+            ("commands/mod.rs", include_str!("mod.rs")),
+            ("commands/pattern.rs", include_str!("pattern.rs")),
+            ("commands/string.rs", include_str!("string.rs")),
+            ("commands/transaction.rs", include_str!("transaction.rs")),
+            ("effects.rs", include_str!("../effects.rs")),
+            ("engine/domain.rs", include_str!("../engine/domain.rs")),
+            (
+                "engine/domain/admin_ops.rs",
+                include_str!("../engine/domain/admin_ops.rs"),
+            ),
+            (
+                "engine/domain/key_ops.rs",
+                include_str!("../engine/domain/key_ops.rs"),
+            ),
+            (
+                "engine/domain/mutation.rs",
+                include_str!("../engine/domain/mutation.rs"),
+            ),
+            (
+                "engine/domain/scan_ops.rs",
+                include_str!("../engine/domain/scan_ops.rs"),
+            ),
+            (
+                "engine/domain/string_ops.rs",
+                include_str!("../engine/domain/string_ops.rs"),
+            ),
+            (
+                "engine/domain/string_tables.rs",
+                include_str!("../engine/domain/string_tables.rs"),
+            ),
+            ("engine/mod.rs", include_str!("../engine/mod.rs")),
+            ("entry.rs", include_str!("../entry.rs")),
+            ("eviction.rs", include_str!("../eviction.rs")),
+            ("executor.rs", include_str!("../executor.rs")),
+            ("keyspace.rs", include_str!("../keyspace.rs")),
+            ("keyspace/admin.rs", include_str!("../keyspace/admin.rs")),
+            (
+                "keyspace/eviction_sweep.rs",
+                include_str!("../keyspace/eviction_sweep.rs"),
+            ),
+            ("keyspace/expiry.rs", include_str!("../keyspace/expiry.rs")),
+            (
+                "keyspace/features.rs",
+                include_str!("../keyspace/features.rs"),
+            ),
+            ("keyspace/gate.rs", include_str!("../keyspace/gate.rs")),
+            (
+                "keyspace/lock_profile.rs",
+                include_str!("../keyspace/lock_profile.rs"),
+            ),
+            ("keyspace/memory.rs", include_str!("../keyspace/memory.rs")),
+            (
+                "keyspace/persistence.rs",
+                include_str!("../keyspace/persistence.rs"),
+            ),
+            ("keyspace/shards.rs", include_str!("../keyspace/shards.rs")),
+            ("keyspace/watch.rs", include_str!("../keyspace/watch.rs")),
+            ("morph.rs", include_str!("../morph.rs")),
+            ("prefetch.rs", include_str!("../prefetch.rs")),
+            ("table.rs", include_str!("../table.rs")),
+        ];
+
+        for (name, source) in files {
+            let source = production_region(source);
+            for token in forbidden {
+                assert!(
+                    !source.contains(token),
+                    "{name} must not publish reactor/runtime telemetry from engine command hot paths via `{token}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn engine_eviction_profile_timer_publications_stay_profile_gated() {
+        let profile_start = production_function_body(
+            "keyspace/metrics.rs",
+            include_str!("../keyspace/metrics.rs"),
+            "runtime_profile_metric_start",
+        );
+        assert_ordered_tokens(
+            profile_start,
+            "engine runtime profile timer start gate",
+            &[
+                "#[cfg(feature = \"profile-telemetry\")]",
+                "runtime_profile_timers_enabled()",
+                "Some(Timestamp::now().as_nanos())",
+                "None",
+            ],
+        );
+
+        let profile_elapsed = production_function_body(
+            "keyspace/metrics.rs",
+            include_str!("../keyspace/metrics.rs"),
+            "runtime_profile_metric_elapsed_nanos",
+        );
+        assert_ordered_tokens(
+            profile_elapsed,
+            "engine runtime profile timer elapsed gate",
+            &[
+                "#[cfg(feature = \"profile-telemetry\")]",
+                "Timestamp::now().as_nanos()",
+                "#[cfg(not(feature = \"profile-telemetry\"))]",
+                "0",
+            ],
+        );
+
+        let admission = production_function_body(
+            "keyspace.rs",
+            include_str!("../keyspace.rs"),
+            "ensure_memory_for_snapshot",
+        );
+        assert_ordered_tokens(
+            admission,
+            "admission eviction scan timer metric",
+            &[
+                "let eviction_scan_start = self.runtime_profile_metric_start();",
+                "self.runtime_profile_metric_elapsed_nanos(eviction_scan_start)",
+                "record_with_duration",
+            ],
+        );
+        assert!(
+            !admission.contains("Timestamp::now"),
+            "admission eviction timing must use the keyspace profile-timer helper"
+        );
+
+        let maintenance = production_function_body(
+            "keyspace/eviction_sweep.rs",
+            include_str!("../keyspace/eviction_sweep.rs"),
+            "run_eviction_maintenance_on_shard",
+        );
+        assert_ordered_tokens(
+            maintenance,
+            "maintenance eviction scan timer metric",
+            &[
+                "let scan_start = self.runtime_profile_metric_start();",
+                "let scan_nanos = self.runtime_profile_metric_elapsed_nanos(scan_start);",
+                "record_with_duration",
+            ],
+        );
+        assert!(
+            !maintenance.contains("Timestamp::now"),
+            "maintenance eviction timing must use the keyspace profile-timer helper"
+        );
+    }
+
+    #[test]
+    fn runtime_profile_only_accumulators_stay_feature_gated() {
+        let metrics = production_region(include_str!("../keyspace/metrics.rs"));
+        let profile_fields = [
+            "completion_nanos_total: ShardedCounter,",
+            "close_drain_nanos_total: ShardedCounter,",
+            "active_expiry_nanos_total: ShardedCounter,",
+            "aof_append_nanos_total: ShardedCounter,",
+            "aof_fsync_nanos_total: ShardedCounter,",
+            "aof_backpressure_nanos_total: RuntimeGaugeSlots,",
+            "aof_fsync_latency_nanos_total: RuntimeGaugeSlots,",
+            "aof_fsync_latency_buckets: [RuntimeGaugeSlots; RUNTIME_AOF_FSYNC_LATENCY_BUCKETS],",
+            "maintenance_nanos_total: ShardedCounter,",
+            "metrics_flush_nanos_total: ShardedCounter,",
+            "completion_nanos_max: RuntimeMaxSlots,",
+            "close_drain_nanos_max: RuntimeMaxSlots,",
+            "active_expiry_nanos_max: RuntimeMaxSlots,",
+            "aof_append_nanos_max: RuntimeMaxSlots,",
+            "aof_fsync_nanos_max: RuntimeMaxSlots,",
+            "aof_backpressure_nanos_max: RuntimeMaxSlots,",
+            "aof_fsync_latency_nanos_max: RuntimeMaxSlots,",
+            "maintenance_nanos_max: RuntimeMaxSlots,",
+            "metrics_flush_nanos_max: RuntimeMaxSlots,",
+        ];
+        for field in profile_fields {
+            let token = format!("#[cfg(feature = \"profile-telemetry\")]\n    {field}");
+            assert_contains_token(metrics, "runtime profile accumulator storage", &token);
+        }
+
+        let profile_initializers = [
+            "completion_nanos_total: ShardedCounter::new(slot_count),",
+            "close_drain_nanos_total: ShardedCounter::new(slot_count),",
+            "active_expiry_nanos_total: ShardedCounter::new(slot_count),",
+            "aof_append_nanos_total: ShardedCounter::new(slot_count),",
+            "aof_fsync_nanos_total: ShardedCounter::new(slot_count),",
+            "aof_backpressure_nanos_total: RuntimeGaugeSlots::new(slot_count),",
+            "aof_fsync_latency_nanos_total: RuntimeGaugeSlots::new(slot_count),",
+            "aof_fsync_latency_buckets: std::array::from_fn(|_| RuntimeGaugeSlots::new(slot_count)),",
+            "maintenance_nanos_total: ShardedCounter::new(slot_count),",
+            "metrics_flush_nanos_total: ShardedCounter::new(slot_count),",
+            "completion_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "close_drain_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "active_expiry_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "aof_append_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "aof_fsync_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "aof_backpressure_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "aof_fsync_latency_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "maintenance_nanos_max: RuntimeMaxSlots::new(slot_count),",
+            "metrics_flush_nanos_max: RuntimeMaxSlots::new(slot_count),",
+        ];
+        for initializer in profile_initializers {
+            let token =
+                format!("#[cfg(feature = \"profile-telemetry\")]\n            {initializer}");
+            assert_contains_token(
+                metrics,
+                "runtime profile accumulator initialization",
+                &token,
+            );
+        }
+
+        let profile_recorders = [
+            (
+                "record_completion_nanos",
+                "completion_nanos_total",
+                "completion_nanos_max",
+            ),
+            (
+                "record_close_drain_nanos",
+                "close_drain_nanos_total",
+                "close_drain_nanos_max",
+            ),
+            (
+                "record_active_expiry_nanos",
+                "active_expiry_nanos_total",
+                "active_expiry_nanos_max",
+            ),
+            (
+                "record_aof_append_nanos",
+                "aof_append_nanos_total",
+                "aof_append_nanos_max",
+            ),
+            (
+                "record_aof_fsync_nanos",
+                "aof_fsync_nanos_total",
+                "aof_fsync_nanos_max",
+            ),
+            (
+                "record_maintenance_nanos",
+                "maintenance_nanos_total",
+                "maintenance_nanos_max",
+            ),
+            (
+                "record_metrics_flush_nanos",
+                "metrics_flush_nanos_total",
+                "metrics_flush_nanos_max",
+            ),
+        ];
+        for (function, total_field, max_field) in profile_recorders {
+            let body = production_function_after(
+                "keyspace/metrics.rs",
+                metrics,
+                "impl RuntimeMetrics {",
+                function,
+            );
+            let context = format!("runtime profile accumulator recorder `{function}`");
+            assert_ordered_tokens(
+                body,
+                &context,
+                &[
+                    "#[cfg(feature = \"profile-telemetry\")]",
+                    "if nanos == 0",
+                    total_field,
+                    max_field,
+                    "#[cfg(not(feature = \"profile-telemetry\"))]",
+                    "let _ = (slot, nanos);",
+                ],
+            );
+        }
+
+        let aof_publish = production_function_after(
+            "keyspace/metrics.rs",
+            metrics,
+            "impl RuntimeMetrics {",
+            "publish_aof_telemetry",
+        );
+        assert_ordered_tokens(
+            aof_publish,
+            "runtime AOF profile telemetry publication",
+            &[
+                "self.aof_backpressure_events",
+                "#[cfg(feature = \"profile-telemetry\")]",
+                "self.aof_backpressure_nanos_total",
+                "self.aof_backpressure_nanos_max",
+                "self.aof_last_appended_lsn",
+                "#[cfg(feature = \"profile-telemetry\")]",
+                "self.aof_fsync_latency_nanos_total",
+                "self.aof_fsync_latency_nanos_max",
+                "self.aof_fsync_latency_buckets",
+            ],
+        );
+
+        let snapshot = production_function_after(
+            "keyspace/metrics.rs",
+            metrics,
+            "impl RuntimeMetrics {",
+            "snapshot",
+        );
+        let profile_snapshot_fields = [
+            (
+                "completion_nanos_total",
+                "self.completion_nanos_total.total()",
+                "0",
+            ),
+            (
+                "completion_nanos_max",
+                "self.completion_nanos_max.max()",
+                "0",
+            ),
+            (
+                "close_drain_nanos_total",
+                "self.close_drain_nanos_total.total()",
+                "0",
+            ),
+            (
+                "close_drain_nanos_max",
+                "self.close_drain_nanos_max.max()",
+                "0",
+            ),
+            (
+                "active_expiry_nanos_total",
+                "self.active_expiry_nanos_total.total()",
+                "0",
+            ),
+            (
+                "active_expiry_nanos_max",
+                "self.active_expiry_nanos_max.max()",
+                "0",
+            ),
+            (
+                "aof_append_nanos_total",
+                "self.aof_append_nanos_total.total()",
+                "0",
+            ),
+            (
+                "aof_append_nanos_max",
+                "self.aof_append_nanos_max.max()",
+                "0",
+            ),
+            (
+                "aof_fsync_nanos_total",
+                "self.aof_fsync_nanos_total.total()",
+                "0",
+            ),
+            ("aof_fsync_nanos_max", "self.aof_fsync_nanos_max.max()", "0"),
+            (
+                "aof_backpressure_nanos_total",
+                "self.aof_backpressure_nanos_total.sum()",
+                "0",
+            ),
+            (
+                "aof_backpressure_nanos_max",
+                "self.aof_backpressure_nanos_max.max()",
+                "0",
+            ),
+            (
+                "aof_fsync_latency_nanos_total",
+                "self.aof_fsync_latency_nanos_total.sum()",
+                "0",
+            ),
+            (
+                "aof_fsync_latency_nanos_max",
+                "self.aof_fsync_latency_nanos_max.max()",
+                "0",
+            ),
+            (
+                "aof_fsync_latency_buckets",
+                "std::array::from_fn(|idx| self.aof_fsync_latency_buckets[idx].sum())",
+                "[0; RUNTIME_AOF_FSYNC_LATENCY_BUCKETS]",
+            ),
+            (
+                "maintenance_nanos_total",
+                "self.maintenance_nanos_total.total()",
+                "0",
+            ),
+            (
+                "maintenance_nanos_max",
+                "self.maintenance_nanos_max.max()",
+                "0",
+            ),
+            (
+                "metrics_flush_nanos_total",
+                "self.metrics_flush_nanos_total.total()",
+                "0",
+            ),
+            (
+                "metrics_flush_nanos_max",
+                "self.metrics_flush_nanos_max.max()",
+                "0",
+            ),
+        ];
+        for (field, profile_value, release_value) in profile_snapshot_fields {
+            let field_start = format!("{field}: {{");
+            let context = format!("runtime profile snapshot field `{field}`");
+            assert_ordered_tokens(
+                snapshot,
+                &context,
+                &[
+                    field_start.as_str(),
+                    "#[cfg(feature = \"profile-telemetry\")]",
+                    profile_value,
+                    "#[cfg(not(feature = \"profile-telemetry\"))]",
+                    release_value,
+                ],
+            );
+        }
+    }
+
     // ── INFO ──
 
     #[test]
@@ -1484,7 +2109,9 @@ mod tests {
         assert_bulk_contains(&r, b"# Runtime");
         assert_bulk_contains(&r, b"runtime_telemetry_mode:minimal");
         assert_bulk_contains(&r, b"runtime_profile_timers_available:0");
-        assert_bulk_contains(&r, b"runtime_local_flush_metrics_available:1");
+        assert_bulk_contains(&r, b"runtime_local_flush_metrics_available:0");
+        assert_bulk_contains(&r, b"runtime_local_flush_sample_rate:");
+        assert_bulk_contains(&r, b"runtime_metrics_flush_interval_ms:");
         assert_bulk_contains(&r, b"backend_requested:");
         assert_bulk_contains(&r, b"backend_effective:");
         assert_bulk_contains(&r, b"backend_fixed_buffers_registered:");
@@ -1540,6 +2167,279 @@ mod tests {
         assert_bulk_contains(&r, b"reactor_metrics_flush_nanos_total:");
         assert_bulk_contains(&r, b"eviction_shards_scanned:");
         assert_bulk_contains(&r, b"eviction_nanos_total:");
+    }
+
+    #[test]
+    fn info_runtime_fields_are_documented_in_metric_catalogs() {
+        let docs = concat!(
+            include_str!("../../docs/metrics.md"),
+            "\n",
+            include_str!("../../docs/profiling.md"),
+            "\n",
+            include_str!("../../../vortex-io/docs/metrics.md"),
+            "\n",
+            include_str!("../../../vortex-io/docs/profiling.md"),
+            "\n",
+            include_str!("../../../vortex-persist/docs/metrics.md"),
+            "\n",
+            include_str!("../../../vortex-persist/docs/profiling.md")
+        );
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"INFO", b"runtime"]);
+        let info = bulk_string_text(&r);
+        let mut missing = Vec::new();
+
+        for line in info.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((field, _value)) = line.split_once(':') else {
+                continue;
+            };
+            let marker = format!("`{field}`");
+            if !docs.contains(&marker) {
+                missing.push(field.to_owned());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "INFO runtime fields missing from metric catalogs: {missing:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct MetricCatalogRow<'a> {
+        file: &'a str,
+        line: usize,
+        metric: &'a str,
+        group: &'a str,
+        modes: &'a str,
+        hot_path: &'a str,
+        update_path: &'a str,
+        reason: &'a str,
+    }
+
+    fn release_metric_catalog_rows<'a>(file: &'a str, docs: &'a str) -> Vec<MetricCatalogRow<'a>> {
+        let mut in_catalog = false;
+        let mut rows = Vec::new();
+
+        for (index, line) in docs.lines().enumerate() {
+            let line_number = index + 1;
+            if line == "## Metric Catalog" {
+                in_catalog = true;
+                continue;
+            }
+            if in_catalog && line.starts_with("## ") {
+                break;
+            }
+            if !in_catalog || !line.starts_with('|') {
+                continue;
+            }
+            if line.contains("---") || line.contains("Metric | Group") {
+                continue;
+            }
+
+            let columns: Vec<_> = line.trim_matches('|').split('|').map(str::trim).collect();
+            assert_eq!(
+                columns.len(),
+                6,
+                "{file}:{line_number}: metric catalog rows must keep the six-column schema"
+            );
+
+            rows.push(MetricCatalogRow {
+                file,
+                line: line_number,
+                metric: columns[0],
+                group: columns[1],
+                modes: columns[2],
+                hot_path: columns[3],
+                update_path: columns[4],
+                reason: columns[5],
+            });
+        }
+
+        assert!(
+            !rows.is_empty(),
+            "{file}: release metric catalog must contain rows"
+        );
+        rows
+    }
+
+    fn supported_modes_are_explicit(modes: &str) -> bool {
+        modes.split(';').all(|mode_set| {
+            let Some((binary, modes)) = mode_set.trim().split_once(':') else {
+                return false;
+            };
+            matches!(binary, "release" | "profiling")
+                && modes.split('/').all(|mode| {
+                    matches!(
+                        mode.trim(),
+                        "minimal" | "standard" | "profile" | "minimal/standard"
+                    )
+                })
+        })
+    }
+
+    fn hot_path_cost_is_classified(row: &MetricCatalogRow<'_>) -> bool {
+        let hot_path = row.hot_path.to_ascii_lowercase();
+        if hot_path == "yes" || hot_path == "unknown" || hot_path == "tbd" {
+            return false;
+        }
+
+        let cost = format!(
+            "{} {}",
+            row.hot_path.to_ascii_lowercase(),
+            row.update_path.to_ascii_lowercase()
+        );
+        [
+            "cold",
+            "startup",
+            "static",
+            "derived",
+            "disabled in minimal",
+            "sampled",
+            "exact in profile",
+            "profile",
+            "not compiled",
+            "error path",
+            "only when",
+            "only on",
+            "relaxed counter",
+            "sharded counter",
+            "counter",
+            "timestamp",
+            "instant",
+            "max update",
+            "bucket atomic",
+            "atomic update",
+            "state",
+            "gauge",
+            "snapshot",
+            "flush",
+            "boundary",
+            "budget exhausted",
+            "append path",
+            "fsync",
+            "backpressure",
+            "max publication",
+        ]
+        .iter()
+        .any(|needle| cost.contains(needle))
+    }
+
+    fn profiling_modes_are_explicit(modes: &str) -> bool {
+        modes.contains("profiling:")
+            && modes.contains("release:not compiled")
+            && !modes.contains("release:minimal")
+            && !modes.contains("release:standard")
+    }
+
+    #[test]
+    fn release_metric_catalogs_keep_schema_and_cost_decisions() {
+        let docs = [
+            (
+                "crates/vortex-engine/docs/metrics.md",
+                include_str!("../../docs/metrics.md"),
+            ),
+            (
+                "crates/vortex-io/docs/metrics.md",
+                include_str!("../../../vortex-io/docs/metrics.md"),
+            ),
+            (
+                "crates/vortex-persist/docs/metrics.md",
+                include_str!("../../../vortex-persist/docs/metrics.md"),
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (file, docs) in docs {
+            for row in release_metric_catalog_rows(file, docs) {
+                let metric_is_quoted = row.metric.starts_with('`') && row.metric.ends_with('`');
+                if !metric_is_quoted {
+                    failures.push(format!(
+                        "{}:{} metric must be backtick-quoted",
+                        row.file, row.line
+                    ));
+                }
+                if row.group.is_empty() || row.reason.is_empty() {
+                    failures.push(format!(
+                        "{}:{} metric group and release reason must be non-empty",
+                        row.file, row.line
+                    ));
+                }
+                if !supported_modes_are_explicit(row.modes) {
+                    failures.push(format!(
+                        "{}:{} supported modes must use release:/profiling: minimal/standard/profile vocabulary",
+                        row.file, row.line
+                    ));
+                }
+                if !hot_path_cost_is_classified(&row) {
+                    failures.push(format!(
+                        "{}:{} hot-path cost decision is missing or too vague for {}",
+                        row.file, row.line, row.metric
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "release metric catalog schema/cost failures: {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn profiling_metric_catalogs_stay_profile_only() {
+        let docs = [
+            (
+                "crates/vortex-engine/docs/profiling.md",
+                include_str!("../../docs/profiling.md"),
+            ),
+            (
+                "crates/vortex-io/docs/profiling.md",
+                include_str!("../../../vortex-io/docs/profiling.md"),
+            ),
+            (
+                "crates/vortex-persist/docs/profiling.md",
+                include_str!("../../../vortex-persist/docs/profiling.md"),
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (file, docs) in docs {
+            for row in release_metric_catalog_rows(file, docs) {
+                if !(row.metric.starts_with('`') && row.metric.ends_with('`')) {
+                    failures.push(format!(
+                        "{}:{} profile metric must be backtick-quoted",
+                        row.file, row.line
+                    ));
+                }
+                if !profiling_modes_are_explicit(row.modes) {
+                    failures.push(format!(
+                        "{}:{} profile metric must stay profiling-only and release:not compiled",
+                        row.file, row.line
+                    ));
+                }
+                if !hot_path_cost_is_classified(&row) {
+                    failures.push(format!(
+                        "{}:{} profile metric cost is missing or too vague for {}",
+                        row.file, row.line, row.metric
+                    ));
+                }
+                if row.reason.is_empty() {
+                    failures.push(format!(
+                        "{}:{} profile metric use case must be non-empty",
+                        row.file, row.line
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "profiling metric catalog schema/cost failures: {failures:#?}"
+        );
     }
 
     #[test]
@@ -1604,6 +2504,66 @@ mod tests {
         assert_bulk_contains(&r, b"db0:keys=1,expires=0");
     }
 
+    // ── CLIENT / HELLO setup compatibility ──
+
+    #[test]
+    fn hello_resp2_returns_handshake_metadata() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"HELLO", b"2"]);
+
+        match &r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert!(array_contains_bulk_pair(arr, b"server", b"vortex"));
+                assert!(array_contains_bulk_pair(
+                    arr,
+                    b"version",
+                    env!("CARGO_PKG_VERSION").as_bytes()
+                ));
+                assert!(array_contains_integer_pair(arr, b"proto", 2));
+                assert!(array_contains_bulk_pair(arr, b"mode", b"standalone"));
+                assert!(array_contains_bulk_pair(arr, b"role", b"master"));
+            }
+            other => panic!("expected HELLO array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_resp2_accepts_setname_as_noop() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"HELLO", b"2", b"SETNAME", b"client-a"]);
+
+        match &r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert!(array_contains_integer_pair(arr, b"proto", 2));
+            }
+            other => panic!("expected HELLO array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_resp3_is_rejected_explicitly() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"HELLO", b"3"]);
+        assert_static(&r, ERR_HELLO_RESP3_UNSUPPORTED);
+    }
+
+    #[test]
+    fn client_setinfo_is_alpha_noop() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"CLIENT", b"SETINFO", b"LIB-NAME", b"redis-py"]);
+        assert_static(&r, RESP_OK);
+
+        let r = exec(&h, &[b"CLIENT", b"SETINFO", b"LIB-VER", b"8.0.0"]);
+        assert_static(&r, RESP_OK);
+    }
+
+    #[test]
+    fn unsupported_client_subcommands_remain_closed() {
+        let h = TestHarness::new();
+        let r = exec(&h, &[b"CLIENT", b"ID"]);
+        assert_static(&r, ERR_CLIENT_UNSUPPORTED);
+    }
+
     // ── COMMAND ──
 
     #[test]
@@ -1625,6 +2585,8 @@ mod tests {
 
         assert!(array_contains_command_name(&r, b"GET"));
         assert!(array_contains_command_name(&r, b"CONFIG"));
+        assert!(array_contains_command_name(&r, b"HELLO"));
+        assert!(array_contains_command_name(&r, b"CLIENT"));
         assert!(!array_contains_command_name(&r, b"HSET"));
         assert!(!array_contains_command_name(&r, b"BGREWRITEAOF"));
     }

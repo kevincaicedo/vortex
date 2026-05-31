@@ -2,11 +2,19 @@
 
 > `just profiler` is a profiler-first workflow manager for `vortex-server`. It builds the profiling binary, starts the server, runs the selected profiler, captures host context, and can now drive load either through the built-in `redis-benchmark` path or through `vortex_bench attach` so profiling and benchmark artifacts land in one session root.
 
+The profiler uses the same artifact vocabulary as `just benchmark`: `--artifact-root`, `--target-mode`, `--dry-run`, `--json`, and `--no-color` are the preferred UX flags. `just profiler --help` is the operator man page for every mode and option. Reports and summaries describe measurements and tool availability without embedding product policy.
+
 ## Quick Start
 
 ```bash
 # Show what tools are available on your machine
 just profiler --check
+
+# Show the full option reference, target modes, reports, and examples
+just profiler --help
+
+# Resolve a session, target, and tool preflight without starting a capture
+just profiler --dry-run --cpu --command PING --artifact-root .artifacts/profiling/dry-run
 
 # CPU flamegraph under SET,GET load
 just profiler --command SET,GET
@@ -50,6 +58,54 @@ just profiler --manifest scripts/profiler/manifests/cpu-set-heavy.yaml
 # Compare a new session to an earlier matching workload
 just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml --compare-to .artifacts/profiling/<previous-session>
 ```
+
+Interactive terminals use one live progress line for long-running benchmark
+and profiler phases when the tool is attached to a TTY. CI and captured logs
+stay line-oriented, and `--json` emits machine-readable progress/status events.
+Each completed profiler session writes `summary.md` for quick review and
+`summary.json` for automation.
+
+## Target Modes
+
+| Mode | Use |
+|------|-----|
+| `local` | Build/start a local profiling target and stop it after capture |
+| `host-port` | Attach to an already running local endpoint; the profiler does not stop it |
+| `ssh-managed` | Delegate capture to `scripts/profiler.sh` in a remote checkout after an explicit remote start command |
+| `ssh-attach` | Delegate capture to `scripts/profiler.sh` in a remote checkout for an existing remote endpoint |
+
+Examples:
+
+```bash
+just profiler --cpu --target-mode local --command SET,GET --duration 20
+
+just profiler --perf-stat \
+  --target-mode host-port \
+  --host 127.0.0.1 \
+  --port 16379 \
+  --command PING \
+  --artifact-root .artifacts/profiling/attach
+
+just profiler --cpu \
+  --target-mode ssh-attach \
+  --ssh-target perfbox \
+  --ssh-port 2222 \
+  --ssh-identity-file ~/.ssh/perfbox_ed25519 \
+  --ssh-option StrictHostKeyChecking=accept-new \
+  --ssh-workdir /srv/vortex \
+  --host perfbox \
+  --port 16379 \
+  --command PING \
+  --artifact-root .artifacts/profiling/remote
+```
+
+Remote profiler sessions use SSH to run the same profiler script from the
+remote checkout, then copy the remote artifact root back under
+`<artifact-root>/remote/<timestamp>` when `scp` is available. Use `--ssh-port`,
+`--ssh-identity-file`, `--ssh-config`, `--ssh-option`, and
+`--ssh-connect-timeout` for non-default SSH transport. Root-required tools still require an explicit
+operator-controlled command path; the profiler does not run remote sudo
+implicitly.
 
 ## Build Configuration
 
@@ -115,6 +171,13 @@ rustflags = [
 | `--cachegrind` | `valgrind --tool=cachegrind` | Linux (+ macOS if valgrind available) |
 | `--callgrind` | `valgrind --tool=callgrind` | Linux (+ macOS if valgrind available) |
 | `--massif` | `valgrind --tool=massif` | Linux (+ macOS if valgrind available) |
+
+`just profiler --check` prints the platform evidence boundary and per-probe
+availability before the ordinary tool list. `just profiler --check --dry-run`
+also writes JSON preflight artifacts, including a Darwin-simulated row that
+marks Linux-only PMU/BPF/perf/procfs/socket probes as unsupported on macOS.
+Those artifacts document platform capability boundaries only; they do not
+replace actual macOS polling runtime rows.
 
 ### Criterion
 
@@ -231,7 +294,7 @@ just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/l
 just profiler --scheduler --bench-request .artifacts/benchmarks/requests/<request>.json
 ```
 
-The profiler now uses `vortex_bench attach` under the hood, writes the attached state file into the current profiler session, and keeps the benchmark request/result artifacts under `bench/` so the profiling session and benchmark workload stay aligned.
+The profiler now uses `vortex_bench attach` under the hood, writes the attached state file into the current profiler session, and keeps the benchmark request/result artifacts under `bench/` so the profiling session and benchmark workload stay aligned. Benchmark-manifest load is also driven by memory and cache profiles, and AOF fsync runtime fields are forwarded into attach state so runtime validation sees the same persistence policy as the profiled server.
 
 
 For Linux PMU sessions, `--perf-stat` now writes two raw counter captures plus a derived report:

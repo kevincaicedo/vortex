@@ -144,6 +144,7 @@ mod tests {
         match r {
             CmdResult::Static(s) => assert_eq!(*s, expected, "static mismatch"),
             CmdResult::Inline(_) => panic!("expected Static, got Inline"),
+            CmdResult::Owned(b) => panic!("expected Static, got Owned: {b:?}"),
             CmdResult::Resp(f) => panic!("expected Static, got Resp: {f:?}"),
         }
     }

@@ -5,6 +5,7 @@ fn projected_copy_delta(
     source_value: Option<&VortexValue>,
     dst_table: &SwissTable,
     dst: &VortexKey,
+    dst_hash: TableHash,
     replace: bool,
     now_nanos: u64,
 ) -> PositiveDelta {
@@ -12,7 +13,7 @@ fn projected_copy_delta(
         return PositiveDelta::zero();
     };
 
-    let existing = match dst_table.get_with_ttl(dst) {
+    let existing = match dst_table.get_with_ttl_prehashed(dst.as_bytes(), dst_hash) {
         Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
         _ => None,
     };
@@ -23,11 +24,130 @@ fn projected_copy_delta(
     projected_rewrite_delta(dst, existing, source_value.memory_usage())
 }
 
+struct CopySourceSnapshot {
+    value: VortexValue,
+    ttl_deadline: u64,
+    lsn_version: u64,
+}
+
+#[inline]
+pub(super) fn copy_snapshot_value(value: &VortexValue) -> VortexValue {
+    value.clone()
+}
+
+impl CopySourceSnapshot {
+    #[inline]
+    fn capture(
+        table: &SwissTable,
+        key_bytes: &[u8],
+        hash: TableHash,
+        now_nanos: u64,
+    ) -> Option<Self> {
+        let (value, ttl_deadline, lsn_version) =
+            table.get_value_ttl_lsn_prehashed(key_bytes, hash)?;
+        if ttl_deadline != 0 && ttl_deadline <= now_nanos {
+            return None;
+        }
+        let value = copy_snapshot_value(value);
+
+        Some(Self {
+            value,
+            ttl_deadline,
+            lsn_version,
+        })
+    }
+
+    #[inline]
+    fn value(&self) -> &VortexValue {
+        &self.value
+    }
+
+    #[inline]
+    fn revalidates(
+        &self,
+        table: &SwissTable,
+        key_bytes: &[u8],
+        hash: TableHash,
+        now_nanos: u64,
+    ) -> bool {
+        let Some((current, current_ttl, current_lsn)) =
+            table.get_value_ttl_lsn_prehashed(key_bytes, hash)
+        else {
+            return false;
+        };
+
+        current_ttl == self.ttl_deadline
+            && current_lsn == self.lsn_version
+            && (current_ttl == 0 || current_ttl > now_nanos)
+            && current == &self.value
+    }
+
+    #[inline]
+    fn into_parts(self) -> (VortexValue, u64) {
+        (self.value, self.ttl_deadline)
+    }
+}
+
+#[inline]
+fn current_copy_source(
+    table: &SwissTable,
+    key_bytes: &[u8],
+    hash: TableHash,
+    now_nanos: u64,
+) -> Option<(VortexValue, u64)> {
+    let (value, ttl_deadline, _) = table.get_value_ttl_lsn_prehashed(key_bytes, hash)?;
+    if ttl_deadline != 0 && ttl_deadline <= now_nanos {
+        return None;
+    }
+
+    Some((value.clone(), ttl_deadline))
+}
+
+#[inline]
+fn revalidated_copy_source(
+    prepared: Option<CopySourceSnapshot>,
+    table: &SwissTable,
+    key_bytes: &[u8],
+    hash: TableHash,
+    now_nanos: u64,
+) -> Option<(VortexValue, u64)> {
+    if let Some(prepared) = prepared {
+        if prepared.revalidates(table, key_bytes, hash, now_nanos) {
+            return Some(prepared.into_parts());
+        }
+    }
+
+    current_copy_source(table, key_bytes, hash, now_nanos)
+}
+
+#[inline]
+fn ttl_present_prehashed(table: &SwissTable, key_bytes: &[u8], hash: TableHash) -> bool {
+    matches!(
+        table.get_with_ttl_prehashed(key_bytes, hash),
+        Some((_, ttl_deadline)) if ttl_deadline != 0
+    )
+}
+
+#[inline]
+fn value_move_policy(
+    ttl_deadline: u64,
+    now_nanos: u64,
+    entry_lsn: Option<EntryLsn>,
+) -> MutationPolicy {
+    if ttl_deadline != 0 && ttl_deadline > now_nanos {
+        MutationPolicy::set(ttl_deadline, entry_lsn)
+    } else {
+        MutationPolicy::clear(entry_lsn)
+    }
+}
+
 fn projected_rename_delta(
     src_table: &SwissTable,
     old_key: &VortexKey,
+    old_hash: TableHash,
     dst_table: &SwissTable,
     new_key: &VortexKey,
+    new_hash: TableHash,
     now_nanos: u64,
     nx: bool,
 ) -> Result<PositiveDelta, MutationErrorKind> {
@@ -35,14 +155,16 @@ fn projected_rename_delta(
         return Ok(PositiveDelta::zero());
     }
 
-    let Some((source_value, source_ttl)) = src_table.get_with_ttl(old_key) else {
+    let Some((source_value, source_ttl)) =
+        src_table.get_with_ttl_prehashed(old_key.as_bytes(), old_hash)
+    else {
         return Err(MutationErrorKind::NoSuchKey);
     };
     if source_ttl != 0 && source_ttl <= now_nanos {
         return Err(MutationErrorKind::NoSuchKey);
     }
 
-    let existing_dst = match dst_table.get_with_ttl(new_key) {
+    let existing_dst = match dst_table.get_with_ttl_prehashed(new_key.as_bytes(), new_hash) {
         Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
         _ => None,
     };
@@ -104,73 +226,6 @@ fn delete_live_key_bytes(
         },
         SlotCursor::Vacant(_) => (false, ExpiryTransition::default()),
     }
-}
-
-fn rename_within_table(
-    table: &mut SwissTable,
-    old_key: &VortexKey,
-    new_key: VortexKey,
-    now_nanos: u64,
-    nx: bool,
-) -> Result<bool, MutationErrorKind> {
-    let _ = remove_if_expired(table, old_key, now_nanos);
-    if !table.contains_key(old_key) {
-        return Err(MutationErrorKind::NoSuchKey);
-    }
-
-    if nx && old_key == &new_key {
-        return Ok(false);
-    }
-    if old_key == &new_key {
-        return Ok(true);
-    }
-
-    let _ = remove_if_expired(table, &new_key, now_nanos);
-    if nx && table.contains_key(&new_key) {
-        return Ok(false);
-    }
-
-    let (value, ttl) = table
-        .remove_with_ttl(old_key)
-        .expect("source key must exist after contains_key check");
-    table.remove(&new_key);
-    if ttl != 0 && ttl > now_nanos {
-        table.insert_with(new_key, value, ttl, None);
-    } else {
-        table.insert(new_key, value);
-    }
-    Ok(true)
-}
-
-fn copy_within_table(
-    table: &mut SwissTable,
-    src: &VortexKey,
-    dst: VortexKey,
-    replace: bool,
-    now_nanos: u64,
-) -> bool {
-    let _ = remove_if_expired(table, src, now_nanos);
-    let (value_clone, ttl) = {
-        let Some((value, ttl)) = table.get_with_ttl(src) else {
-            return false;
-        };
-        if ttl != 0 && ttl <= now_nanos {
-            return false;
-        }
-        (value.clone(), ttl)
-    };
-
-    let _ = remove_if_expired(table, &dst, now_nanos);
-    if !replace && table.contains_key(&dst) {
-        return false;
-    }
-
-    if ttl != 0 && ttl > now_nanos {
-        table.insert_with(dst, value_clone, ttl, None);
-    } else {
-        table.insert(dst, value_clone);
-    }
-    true
 }
 
 impl ConcurrentKeyspace {
@@ -556,6 +611,7 @@ impl ConcurrentKeyspace {
     ) -> MutationResult<bool> {
         let source_shard = self.shard_index(old_key.as_bytes());
         let destination_shard = self.shard_index(new_key.as_bytes());
+        let old_hash = self.table_hash_key(old_key.as_bytes());
         let new_hash = self.table_hash_key(new_key.as_bytes());
 
         if source_shard == destination_shard {
@@ -565,8 +621,10 @@ impl ConcurrentKeyspace {
             let projected_delta = projected_rename_delta(
                 &read_guard,
                 old_key,
+                old_hash,
                 &read_guard,
                 &destination,
+                new_hash,
                 now_nanos,
                 nx,
             )?;
@@ -578,7 +636,18 @@ impl ConcurrentKeyspace {
                 state,
                 "rename_key",
                 coordinator.admission_revalidation_active(eviction),
-                |table| projected_rename_delta(table, old_key, table, &destination, now_nanos, nx),
+                |table| {
+                    projected_rename_delta(
+                        table,
+                        old_key,
+                        old_hash,
+                        table,
+                        &destination,
+                        new_hash,
+                        now_nanos,
+                        nx,
+                    )
+                },
             )?;
             let ReservationState {
                 reservation,
@@ -586,22 +655,30 @@ impl ConcurrentKeyspace {
                 ..
             } = state;
             let mut effects: SmallVec<[DeferredEffects<'_>; 6]> = SmallVec::new();
-            if let Some(effect) =
-                self.cleanup_expired_key(source_shard, &mut guard, old_key, now_nanos)
-            {
+            if let Some(effect) = self.cleanup_expired_prehashed(
+                source_shard,
+                &mut guard,
+                old_key.as_bytes(),
+                old_hash,
+                now_nanos,
+            ) {
                 effects.push(effect);
             }
             if old_key != &destination {
-                if let Some(effect) =
-                    self.cleanup_expired_key(source_shard, &mut guard, &destination, now_nanos)
-                {
+                if let Some(effect) = self.cleanup_expired_prehashed(
+                    source_shard,
+                    &mut guard,
+                    destination.as_bytes(),
+                    new_hash,
+                    now_nanos,
+                ) {
                     effects.push(effect);
                 }
             }
-            let old_had_ttl = ttl_present(guard.get_entry_ttl(old_key));
-            let new_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
+            let old_had_ttl = ttl_present_prehashed(&guard, old_key.as_bytes(), old_hash);
+            let new_had_ttl = ttl_present_prehashed(&guard, destination.as_bytes(), new_hash);
             let same_key = old_key == &destination;
-            if !guard.contains_key(old_key) {
+            if !guard.contains_key_prehashed(old_key.as_bytes(), old_hash) {
                 drop(guard);
                 for effect in effects {
                     self.publish_deferred_effects(effect);
@@ -611,7 +688,7 @@ impl ConcurrentKeyspace {
                     evicted,
                 ));
             }
-            if nx && !same_key && guard.contains_key(&destination) {
+            if nx && !same_key && guard.contains_key_prehashed(destination.as_bytes(), new_hash) {
                 drop(guard);
                 for effect in effects {
                     self.publish_deferred_effects(effect);
@@ -619,14 +696,31 @@ impl ConcurrentKeyspace {
                 reservation.settle();
                 return Ok(mutation_outcome_with_evictions(false, None, evicted));
             }
-            let reserved_lsn = if same_key {
-                None
+            let (renamed, aof_lsn) = if same_key {
+                (!nx, None)
             } else {
-                Some(self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?)
+                let (entry_lsn, aof_lsn) =
+                    self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?;
+                let Some((value, ttl)) =
+                    guard.remove_with_ttl_prehashed(old_key.as_bytes(), old_hash)
+                else {
+                    drop(guard);
+                    for effect in effects {
+                        self.publish_deferred_effects(effect);
+                    }
+                    return Err(MutationError::with_evictions(
+                        MutationErrorKind::NoSuchKey,
+                        evicted,
+                    ));
+                };
+                let policy = value_move_policy(ttl, now_nanos, entry_lsn);
+                let _ = guard.mutate_prehashed(new_key, value, new_hash, policy);
+                (true, aof_lsn)
             };
-            let renamed = rename_within_table(&mut guard, old_key, new_key, now_nanos, nx);
-            let old_has_ttl = ttl_present(guard.get_entry_ttl(old_key));
-            let new_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
+            let changed = renamed && !same_key;
+            let moved_has_ttl = changed && old_had_ttl;
+            let old_has_ttl = if same_key { old_had_ttl } else { false };
+            let new_has_ttl = if same_key { new_had_ttl } else { moved_has_ttl };
             effects.push(
                 MutationEffects::none()
                     .with_ttl(
@@ -645,25 +739,6 @@ impl ConcurrentKeyspace {
                         .defer(),
                 );
             }
-            let renamed = match renamed {
-                Ok(renamed) => renamed,
-                Err(kind) => {
-                    drop(guard);
-                    for effect in effects {
-                        self.publish_deferred_effects(effect);
-                    }
-                    return Err(MutationError::with_evictions(kind, evicted));
-                }
-            };
-            let changed = renamed && !same_key;
-            let aof_lsn = if changed {
-                let (entry_lsn, aof_lsn) =
-                    reserved_lsn.expect("changed same-shard RENAME must reserve an LSN");
-                stamp_entry_lsn_if(&mut guard, destination.as_bytes(), new_hash, entry_lsn);
-                aof_lsn
-            } else {
-                None
-            };
             if changed {
                 effects.push(
                     MutationEffects::none()
@@ -690,8 +765,10 @@ impl ConcurrentKeyspace {
         let projected_delta = projected_rename_delta(
             &read_guards[read_src_position].1,
             old_key,
+            old_hash,
             &read_guards[read_dst_position].1,
             &new_key,
+            new_hash,
             now_nanos,
             nx,
         )?;
@@ -710,7 +787,9 @@ impl ConcurrentKeyspace {
                 let (src_table, dst_table) =
                     distinct_guard_tables_mut(guards, src_position, dst_position);
 
-                projected_rename_delta(src_table, old_key, dst_table, &new_key, now_nanos, nx)
+                projected_rename_delta(
+                    src_table, old_key, old_hash, dst_table, &new_key, new_hash, now_nanos, nx,
+                )
             },
         )?;
         let ReservationState {
@@ -726,18 +805,27 @@ impl ConcurrentKeyspace {
 
         let destination_key = new_key.clone();
         let mut effects: SmallVec<[DeferredEffects<'_>; 6]> = SmallVec::new();
-        if let Some(effect) = self.cleanup_expired_key(source_shard, src_table, old_key, now_nanos)
-        {
+        if let Some(effect) = self.cleanup_expired_prehashed(
+            source_shard,
+            src_table,
+            old_key.as_bytes(),
+            old_hash,
+            now_nanos,
+        ) {
             effects.push(effect);
         }
-        if let Some(effect) =
-            self.cleanup_expired_key(destination_shard, dst_table, &destination_key, now_nanos)
-        {
+        if let Some(effect) = self.cleanup_expired_prehashed(
+            destination_shard,
+            dst_table,
+            destination_key.as_bytes(),
+            new_hash,
+            now_nanos,
+        ) {
             effects.push(effect);
         }
-        let old_had_ttl = ttl_present(src_table.get_entry_ttl(old_key));
-        let new_had_ttl = ttl_present(dst_table.get_entry_ttl(&destination_key));
-        if !src_table.contains_key(old_key) {
+        let old_had_ttl = ttl_present_prehashed(src_table, old_key.as_bytes(), old_hash);
+        let new_had_ttl = ttl_present_prehashed(dst_table, destination_key.as_bytes(), new_hash);
+        if !src_table.contains_key_prehashed(old_key.as_bytes(), old_hash) {
             drop(guards);
             for effect in effects {
                 self.publish_deferred_effects(effect);
@@ -747,7 +835,7 @@ impl ConcurrentKeyspace {
                 evicted,
             ));
         }
-        if nx && dst_table.contains_key(&new_key) {
+        if nx && dst_table.contains_key_prehashed(new_key.as_bytes(), new_hash) {
             drop(guards);
             for effect in effects {
                 self.publish_deferred_effects(effect);
@@ -758,16 +846,19 @@ impl ConcurrentKeyspace {
 
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?;
-        let (value, ttl) = src_table
-            .remove_with_ttl(old_key)
-            .expect("source key must exist after contains_key check");
-        dst_table.remove(&new_key);
-        if ttl != 0 && ttl > now_nanos {
-            dst_table.insert_with(new_key, value, ttl, None);
-        } else {
-            dst_table.insert(new_key, value);
-        }
-        stamp_entry_lsn_if(dst_table, destination_key.as_bytes(), new_hash, entry_lsn);
+        let Some((value, ttl)) = src_table.remove_with_ttl_prehashed(old_key.as_bytes(), old_hash)
+        else {
+            drop(guards);
+            for effect in effects {
+                self.publish_deferred_effects(effect);
+            }
+            return Err(MutationError::with_evictions(
+                MutationErrorKind::NoSuchKey,
+                evicted,
+            ));
+        };
+        let policy = value_move_policy(ttl, now_nanos, entry_lsn);
+        let _ = dst_table.mutate_prehashed(new_key, value, new_hash, policy);
         effects.push(
             MutationEffects::none()
                 .with_ttl(source_shard, ExpiryTransition::remove(old_had_ttl))
@@ -777,7 +868,7 @@ impl ConcurrentKeyspace {
             MutationEffects::none()
                 .with_ttl(
                     destination_shard,
-                    ExpiryTransition::new(new_had_ttl, ttl != 0 && ttl > now_nanos),
+                    ExpiryTransition::new(new_had_ttl, old_had_ttl),
                 )
                 .defer(),
         );
@@ -810,18 +901,33 @@ impl ConcurrentKeyspace {
     ) -> MutationResult<bool> {
         let source_shard = self.shard_index(src.as_bytes());
         let destination_shard = self.shard_index(dst.as_bytes());
+        let src_hash = self.table_hash_key(src.as_bytes());
         let dst_hash = self.table_hash_key(dst.as_bytes());
 
         if source_shard == destination_shard {
             let read_guard = self.read_shard_by_index(source_shard);
             let eviction = self.eviction_config();
-            let source_value = match read_guard.get_with_ttl(src) {
-                Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
-                _ => None,
+            let destination_blocks_copy =
+                !replace && key_is_live(&read_guard, dst.as_bytes(), dst_hash, now_nanos);
+            let prepared_source = if destination_blocks_copy {
+                None
+            } else {
+                CopySourceSnapshot::capture(&read_guard, src.as_bytes(), src_hash, now_nanos)
             };
-            let projected_delta =
-                projected_copy_delta(source_value, &read_guard, &dst, replace, now_nanos);
+            let projected_delta = if destination_blocks_copy {
+                PositiveDelta::zero()
+            } else {
+                projected_copy_delta(
+                    prepared_source.as_ref().map(CopySourceSnapshot::value),
+                    &read_guard,
+                    &dst,
+                    dst_hash,
+                    replace,
+                    now_nanos,
+                )
+            };
             drop(read_guard);
+            maybe_pause_after_optimistic_prepare(self, "copy_key");
             let destination = dst.clone();
             let coordinator = ReservationCoordinator::new(self, now_nanos);
             let state = coordinator.reserve(destination_shard, projected_delta, eviction)?;
@@ -831,7 +937,8 @@ impl ConcurrentKeyspace {
                 "copy_key",
                 coordinator.admission_revalidation_active(eviction),
                 |table| {
-                    let source_value = match table.get_with_ttl(src) {
+                    let source_value = match table.get_with_ttl_prehashed(src.as_bytes(), src_hash)
+                    {
                         Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
                         _ => None,
                     };
@@ -839,6 +946,7 @@ impl ConcurrentKeyspace {
                         source_value,
                         table,
                         &dst,
+                        dst_hash,
                         replace,
                         now_nanos,
                     ))
@@ -850,30 +958,46 @@ impl ConcurrentKeyspace {
                 ..
             } = state;
             let mut effects: SmallVec<[DeferredEffects<'_>; 5]> = SmallVec::new();
-            if let Some(effect) = self.cleanup_expired_key(source_shard, &mut guard, src, now_nanos)
-            {
+            if let Some(effect) = self.cleanup_expired_prehashed(
+                source_shard,
+                &mut guard,
+                src.as_bytes(),
+                src_hash,
+                now_nanos,
+            ) {
                 effects.push(effect);
             }
             if src != &destination {
-                if let Some(effect) =
-                    self.cleanup_expired_key(source_shard, &mut guard, &destination, now_nanos)
-                {
+                if let Some(effect) = self.cleanup_expired_prehashed(
+                    source_shard,
+                    &mut guard,
+                    destination.as_bytes(),
+                    dst_hash,
+                    now_nanos,
+                ) {
                     effects.push(effect);
                 }
             }
-            let dst_had_ttl = ttl_present(guard.get_entry_ttl(&destination));
-            let source_live = match guard.get_with_ttl(src) {
-                Some((_, ttl)) => ttl == 0 || ttl > now_nanos,
-                None => false,
+            let dst_had_ttl = ttl_present_prehashed(&guard, destination.as_bytes(), dst_hash);
+            let source = revalidated_copy_source(
+                prepared_source,
+                &guard,
+                src.as_bytes(),
+                src_hash,
+                now_nanos,
+            );
+            let destination_blocks_copy =
+                !replace && guard.contains_key_prehashed(destination.as_bytes(), dst_hash);
+            let (copied, aof_lsn, dst_has_ttl) = match (source, destination_blocks_copy) {
+                (Some((value_clone, ttl)), false) => {
+                    let (entry_lsn, aof_lsn) = self
+                        .allocate_observed_mutation_lsn_with_features(self.mutation_features())?;
+                    let policy = value_move_policy(ttl, now_nanos, entry_lsn);
+                    let _ = guard.mutate_prehashed(dst, value_clone, dst_hash, policy);
+                    (true, aof_lsn, ttl != 0 && ttl > now_nanos)
+                }
+                _ => (false, None, dst_had_ttl),
             };
-            let destination_blocks_copy = !replace && guard.contains_key(&destination);
-            let reserved_lsn = if source_live && !destination_blocks_copy {
-                Some(self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?)
-            } else {
-                None
-            };
-            let copied = copy_within_table(&mut guard, src, dst, replace, now_nanos);
-            let dst_has_ttl = ttl_present(guard.get_entry_ttl(&destination));
             effects.push(
                 MutationEffects::none()
                     .with_ttl(
@@ -882,14 +1006,6 @@ impl ConcurrentKeyspace {
                     )
                     .defer(),
             );
-            let aof_lsn = if copied {
-                let (entry_lsn, aof_lsn) =
-                    reserved_lsn.expect("changed same-shard COPY must reserve an LSN");
-                stamp_entry_lsn_if(&mut guard, destination.as_bytes(), dst_hash, entry_lsn);
-                aof_lsn
-            } else {
-                None
-            };
             if copied {
                 effects.push(
                     MutationEffects::none()
@@ -912,18 +1028,37 @@ impl ConcurrentKeyspace {
         let (read_guards, read_plan) = self.multi_read(&key_refs);
         let read_src_position = read_plan.guard_index_for_key(0).get();
         let read_dst_position = read_plan.guard_index_for_key(1).get();
-        let source_value = match read_guards[read_src_position].1.get_with_ttl(src) {
-            Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
-            _ => None,
+        let destination_blocks_copy = !replace
+            && key_is_live(
+                &read_guards[read_dst_position].1,
+                dst.as_bytes(),
+                dst_hash,
+                now_nanos,
+            );
+        let prepared_source = if destination_blocks_copy {
+            None
+        } else {
+            CopySourceSnapshot::capture(
+                &read_guards[read_src_position].1,
+                src.as_bytes(),
+                src_hash,
+                now_nanos,
+            )
         };
-        let projected_delta = projected_copy_delta(
-            source_value,
-            &read_guards[read_dst_position].1,
-            &dst,
-            replace,
-            now_nanos,
-        );
+        let projected_delta = if destination_blocks_copy {
+            PositiveDelta::zero()
+        } else {
+            projected_copy_delta(
+                prepared_source.as_ref().map(CopySourceSnapshot::value),
+                &read_guards[read_dst_position].1,
+                &dst,
+                dst_hash,
+                replace,
+                now_nanos,
+            )
+        };
         drop(read_guards);
+        maybe_pause_after_optimistic_prepare(self, "copy_key");
         let coordinator = ReservationCoordinator::new(self, now_nanos);
         let state = coordinator.reserve(destination_shard, projected_delta, eviction)?;
         let (mut guards, plan, state) = coordinator.acquire_multi_write(
@@ -938,7 +1073,8 @@ impl ConcurrentKeyspace {
                 let (src_table, dst_table) =
                     distinct_guard_tables_mut(guards, src_position, dst_position);
 
-                let source_value = match src_table.get_with_ttl(src) {
+                let source_value = match src_table.get_with_ttl_prehashed(src.as_bytes(), src_hash)
+                {
                     Some((value, ttl)) if ttl == 0 || ttl > now_nanos => Some(value),
                     _ => None,
                 };
@@ -946,6 +1082,7 @@ impl ConcurrentKeyspace {
                     source_value,
                     dst_table,
                     &dst,
+                    dst_hash,
                     replace,
                     now_nanos,
                 ))
@@ -972,26 +1109,22 @@ impl ConcurrentKeyspace {
         {
             effects.push(effect);
         }
-        let dst_had_ttl = ttl_present(dst_table.get_entry_ttl(&destination));
-        let (value_clone, ttl) = {
-            let Some((value, ttl)) = src_table.get_with_ttl(src) else {
-                drop(guards);
-                for effect in effects {
-                    self.publish_deferred_effects(effect);
-                }
-                return Ok(mutation_outcome_with_evictions(false, None, evicted));
-            };
-            if ttl != 0 && ttl <= now_nanos {
-                drop(guards);
-                for effect in effects {
-                    self.publish_deferred_effects(effect);
-                }
-                return Ok(mutation_outcome_with_evictions(false, None, evicted));
+        let dst_had_ttl = ttl_present_prehashed(dst_table, destination.as_bytes(), dst_hash);
+        let Some((value_clone, ttl)) = revalidated_copy_source(
+            prepared_source,
+            src_table,
+            src.as_bytes(),
+            src_hash,
+            now_nanos,
+        ) else {
+            drop(guards);
+            for effect in effects {
+                self.publish_deferred_effects(effect);
             }
-            (value.clone(), ttl)
+            return Ok(mutation_outcome_with_evictions(false, None, evicted));
         };
 
-        if !replace && dst_table.contains_key(&destination) {
+        if !replace && dst_table.contains_key_prehashed(destination.as_bytes(), dst_hash) {
             drop(guards);
             for effect in effects {
                 self.publish_deferred_effects(effect);
@@ -1001,12 +1134,8 @@ impl ConcurrentKeyspace {
 
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(self.mutation_features())?;
-        if ttl != 0 && ttl > now_nanos {
-            dst_table.insert_with(dst, value_clone, ttl, None);
-        } else {
-            dst_table.insert(dst, value_clone);
-        }
-        stamp_entry_lsn_if(dst_table, destination.as_bytes(), dst_hash, entry_lsn);
+        let policy = value_move_policy(ttl, now_nanos, entry_lsn);
+        let _ = dst_table.mutate_prehashed(dst, value_clone, dst_hash, policy);
         effects.push(
             MutationEffects::none()
                 .with_ttl(

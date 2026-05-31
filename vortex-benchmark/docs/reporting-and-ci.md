@@ -1,58 +1,101 @@
 # Reporting And CI
 
-## Report Artifacts
+Reports are neutral measurement artifacts. They describe the workload, target, telemetry, comparison validity, and likely bottleneck. Release decisions are recorded outside the benchmark package.
 
-Each `report` run now produces two views of the same data:
+## Report Outputs
 
-- timestamped archives under `reports/[timestamp]_report.{json,csv,md}` plus `reports/[timestamp]_assets/`
-- stable publication copies under `reports/latest/`
+Every rendered report writes:
 
-The report history index lives at `reports/index.json`.
+- `reports/<timestamp>_report.json`
+- `reports/<timestamp>_report.csv`
+- `reports/<timestamp>_report.md`
+- `reports/<timestamp>_assets/`
+- `reports/latest/report.json`
+- `reports/latest/report.csv`
+- `reports/latest/report.md`
+- `reports/index.json`
 
-The stable layout is designed for CI, regression dashboards, and Pages publication without workflow-specific copy rules inside the reporting code.
+Only report files are copied to `latest/`. Raw backend outputs remain in timestamped directories.
 
-## How To Read The Outputs
+## Report Contents
 
-The normalized JSON and CSV rows include:
+The report includes:
 
-- database and backend identity
-- series label and thread count
-- throughput and latency percentiles
-- effective runtime configuration: AOF enabled, fsync policy, maxmemory, and eviction policy
-- observability deltas for memory, cache hits and misses, evictions, expirations, and AOF size
+- session and source-run metadata
+- target mode and service ownership
+- workload contract and runtime policy
+- host validity warnings
+- repeat statistics
+- throughput and latency distributions
+- p99.9 when available
+- benchmark-client saturation verdict
+- server/host telemetry summary
+- memory and AOF diagnostics
+- invalid-comparison warnings
+- advisory comparison tables only when inputs differ
 
-The Markdown report adds:
+The JSON, CSV, and Markdown files are rendered from the same normalized payload.
 
-- database target summary table
-- workload summary table
-- latency and throughput table
-- memory, cache, and eviction table
-- AOF overhead section when comparable baseline and AOF rows exist
-- eviction observations when evictions were recorded
-- chart embeds for radar, latency heatmap, and scaling sweep
+## Offline Rendering
 
-## CI Workflow Shape
+```bash
+bash vortex-benchmark/bin/vortex_bench report \
+  --summary-file .artifacts/benchmarks/results/<run>-summary.json \
+  --output-dir .artifacts/benchmarks
+```
 
-`.github/workflows/competitive-bench.yml` now uses `vortex_bench` end to end:
+Multiple summaries may be passed with repeated `--summary-file`.
 
-1. install native benchmark dependencies
-2. run one or more manifest-driven setup/run/teardown scenarios
-3. aggregate summaries with `vortex_bench report`
-4. upload `reports/` as a workflow artifact
-5. publish `reports/latest/` and `reports/index.json` to Pages-friendly paths
+Before/after reports are also offline and match only identical workload
+signatures:
 
-The current CI examples are:
+```bash
+bash vortex-benchmark/bin/vortex_bench report \
+  --baseline-summary-file .artifacts/benchmarks/baseline/results/<run>-summary.json \
+  --candidate-summary-file .artifacts/benchmarks/candidate/results/<run>-summary.json \
+  --output-dir .artifacts/benchmarks/diff
+```
 
-- `ci-regression-native.yaml` — baseline Vortex versus Redis comparison
-- `aof-everysec-native.yaml` — Redis AOF overhead comparison input
-- `eviction-allkeys-lru-native.yaml` — Redis eviction pressure scenario
+## CI Shape
 
-## Historical Comparison
+CI should split work into independent jobs:
 
-`reports/index.json` is intended to be the machine-readable entrypoint for later automation. It records:
+1. smoke
+2. quick benchmark
+3. repeat benchmark
+4. report-only validation
+5. artifact upload
+6. optional publication
 
-- the newest stable report pointers
-- the archived report list
-- metadata such as row count, databases, backends, and generation time
+Local and host-port target modes should be exercised in regular CI. SSH target modes should run as manual or nightly jobs when infrastructure is available.
+The repository CI now has separate smoke, quick-benchmark, report-only, and manual repeat-benchmark jobs.
 
-Consumers should read `reports/latest/report.json` for the newest data and `reports/index.json` when they need history traversal.
+Example quick benchmark:
+
+```bash
+bash vortex-benchmark/bin/vortex_bench run \
+  --workload-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml \
+  --target-mode local \
+  --artifact-root .artifacts/benchmarks/ci-quick \
+  --profile quick \
+  --json \
+  --no-color
+```
+
+Example report validation:
+
+```bash
+bash vortex-benchmark/bin/vortex_bench report \
+  --results-dir .artifacts/benchmarks/ci-quick/results \
+  --output-dir .artifacts/benchmarks/ci-quick
+```
+
+## Publication Contract
+
+Dashboards and Pages jobs should consume:
+
+- `reports/latest/report.json` for the newest report payload
+- `reports/latest/report.md` for human review
+- `reports/index.json` for report history traversal
+
+Do not parse raw backend stdout for CI decisions. Use `report.json` or the normalized summary files.

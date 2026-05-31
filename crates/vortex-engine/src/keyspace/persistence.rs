@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use crate::entry::MAX_STORED_LSN_VERSION;
+use crate::entry::EntryLsn;
 
 use super::{ConcurrentKeyspace, MutationFeatures};
 
@@ -15,30 +15,6 @@ impl Lsn {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntryLsn(u64);
-
-impl EntryLsn {
-    pub const MAX: u64 = MAX_STORED_LSN_VERSION;
-
-    #[inline]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn try_from_raw(lsn: u64) -> Result<Self, LsnOverflow> {
-        if lsn <= Self::MAX {
-            Ok(Self(lsn))
-        } else {
-            Err(LsnOverflow {
-                attempted: lsn,
-                max: Self::MAX,
-            })
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AofLsn(u64);
 
 impl AofLsn {
@@ -49,12 +25,12 @@ impl AofLsn {
 
     #[inline]
     pub fn try_from_raw(lsn: u64) -> Result<Self, LsnOverflow> {
-        EntryLsn::try_from_raw(lsn).map(|entry_lsn| Self(entry_lsn.get()))
+        entry_lsn_from_raw(lsn).map(|entry_lsn| Self(entry_lsn.get()))
     }
 
     #[inline]
-    pub(crate) fn from_allocated_lsn(lsn: u64) -> Result<Self, LsnOverflow> {
-        EntryLsn::try_from_raw(lsn).map(|entry_lsn| Self(entry_lsn.get()))
+    pub(crate) const fn from_entry_lsn(lsn: EntryLsn) -> Self {
+        Self(lsn.get())
     }
 }
 
@@ -67,6 +43,14 @@ pub struct LsnOverflow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LsnRestoreError {
     pub max_replayed_lsn: u64,
+}
+
+#[inline]
+fn entry_lsn_from_raw(lsn: u64) -> Result<EntryLsn, LsnOverflow> {
+    EntryLsn::from_raw(lsn).ok_or(LsnOverflow {
+        attempted: lsn,
+        max: EntryLsn::MAX,
+    })
 }
 
 pub struct ReplayModeGuard<'a> {
@@ -99,13 +83,13 @@ impl ConcurrentKeyspace {
     /// necessary acquire/release synchronization. The atomic itself only needs
     /// monotonicity, which `fetch_add` guarantees on all architectures.
     #[inline(always)]
-    pub(crate) fn next_lsn(&self) -> Result<u64, LsnOverflow> {
+    pub(crate) fn next_lsn(&self) -> Result<EntryLsn, LsnOverflow> {
         match self
             .global_lsn
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current <= EntryLsn::MAX).then_some(current + 1)
             }) {
-            Ok(raw) => EntryLsn::try_from_raw(raw).map(EntryLsn::get),
+            Ok(raw) => entry_lsn_from_raw(raw),
             Err(attempted) => Err(LsnOverflow {
                 attempted,
                 max: EntryLsn::MAX,
@@ -114,10 +98,10 @@ impl ConcurrentKeyspace {
     }
 
     #[inline(always)]
-    fn next_watch_visible_lsn(&self) -> Result<u64, LsnOverflow> {
+    fn next_watch_visible_lsn(&self) -> Result<EntryLsn, LsnOverflow> {
         loop {
             let lsn = self.next_lsn()?;
-            if lsn != 0 {
+            if lsn.get() != 0 {
                 return Ok(lsn);
             }
         }
@@ -154,14 +138,14 @@ impl ConcurrentKeyspace {
         if !self.aof_recording_enabled() {
             return Ok(None);
         }
-        AofLsn::from_allocated_lsn(self.next_lsn()?).map(Some)
+        Ok(Some(AofLsn::from_entry_lsn(self.next_lsn()?)))
     }
 
     #[inline(always)]
     pub(crate) fn allocate_observed_mutation_lsn_with_features(
         &self,
         features: MutationFeatures,
-    ) -> Result<(Option<u64>, Option<AofLsn>), LsnOverflow> {
+    ) -> Result<(Option<EntryLsn>, Option<AofLsn>), LsnOverflow> {
         if !features.entry_lsn_observed() {
             return Ok((None, None));
         }
@@ -174,7 +158,7 @@ impl ConcurrentKeyspace {
         Ok((
             Some(lsn),
             if features.aof() {
-                Some(AofLsn::from_allocated_lsn(lsn)?)
+                Some(AofLsn::from_entry_lsn(lsn))
             } else {
                 None
             },

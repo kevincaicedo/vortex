@@ -6,6 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::EvictionPolicy;
+use vortex_common::value::{VortexHash, VortexList, VortexSet, VortexSortedSet, VortexStream};
 
 const TEST_SHARDS: usize = 64;
 
@@ -882,6 +883,101 @@ fn rename_key_same_shard_respects_memory_admission() {
 }
 
 #[test]
+fn rename_key_same_shard_preserves_ttl_and_replaces_destination() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+    let old_key = key_for_shard_with_len(&keyspace, 0, 32, "rename-same-src");
+    let new_key = key_for_shard_with_len(&keyspace, 0, 32, "rename-same-dst");
+    let value = VortexValue::from_bytes(b"source");
+
+    keyspace
+        .set_value_with_ttl(old_key.clone(), value.clone(), 100, 0)
+        .expect("source SET with TTL should succeed");
+    keyspace
+        .set_value_plain(new_key.clone(), VortexValue::from_bytes(b"destination"), 0)
+        .expect("destination SET should succeed");
+
+    let outcome = keyspace
+        .rename_key(&old_key, new_key.clone(), 10, false)
+        .expect("same-shard RENAME should succeed");
+
+    assert!(outcome.value);
+    assert_eq!(keyspace.get_value(&old_key, 10), None);
+    assert_eq!(keyspace.get_value(&new_key, 10), Some(value));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(new_key.as_bytes(), 10),
+        TtlState::Deadline(100)
+    ));
+}
+
+#[test]
+fn rename_key_prehashed_commit_stamps_destination_lsn() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+
+    for (source_shard, destination_shard, label) in [
+        (0, 0, "rename-lsn-same"),
+        (0, TEST_SHARDS - 1, "rename-lsn-cross"),
+    ] {
+        let old_key = key_for_shard_with_len(&keyspace, source_shard, 32, label);
+        let new_key = key_for_shard_with_len(&keyspace, destination_shard, 36, label);
+        insert_raw(
+            &keyspace,
+            old_key.clone(),
+            VortexValue::from_bytes(label.as_bytes()),
+        );
+        keyspace.enable_aof_recording();
+
+        let outcome = keyspace
+            .rename_key(&old_key, new_key.clone(), 0, false)
+            .expect("RENAME should succeed");
+        let aof_lsn = outcome
+            .aof_lsn
+            .map(|lsn| lsn.get())
+            .expect("AOF-enabled RENAME should allocate an LSN");
+
+        assert!(outcome.value);
+        assert_eq!(entry_lsn(&keyspace, new_key.as_bytes()), Some(aof_lsn));
+        assert_eq!(keyspace.get_value(&old_key, 0), None);
+        keyspace.disable_aof_recording();
+    }
+}
+
+#[test]
+fn rename_key_invalidates_source_and_destination_watches() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+
+    for (source_shard, destination_shard, label) in [
+        (0, 0, "rename-watch-same"),
+        (0, TEST_SHARDS - 1, "rename-watch-cross"),
+    ] {
+        let old_key = key_for_shard_with_len(&keyspace, source_shard, 32, label);
+        let new_key = key_for_shard_with_len(&keyspace, destination_shard, 36, label);
+        let value = VortexValue::from_bytes(label.as_bytes());
+        insert_raw(&keyspace, old_key.clone(), value.clone());
+
+        let epoch = keyspace.current_watch_epoch();
+        let source_watch = keyspace.watch_key(old_key.clone());
+        let destination_watch = keyspace.watch_key(new_key.clone());
+
+        let outcome = keyspace
+            .rename_key(&old_key, new_key.clone(), 0, false)
+            .expect("WATCH-active RENAME should succeed");
+
+        assert!(outcome.value);
+        assert_eq!(keyspace.get_value(&old_key, 0), None);
+        assert_eq!(keyspace.get_value(&new_key, 0), Some(value));
+        assert!(
+            keyspace.watched_keys_changed(epoch, std::slice::from_ref(&source_watch)),
+            "RENAME must invalidate WATCH on the removed source key"
+        );
+        assert!(
+            keyspace.watched_keys_changed(epoch, std::slice::from_ref(&destination_watch)),
+            "RENAME must invalidate WATCH on the created destination key"
+        );
+        keyspace.unwatch_keys([source_watch, destination_watch]);
+    }
+}
+
+#[test]
 fn copy_key_revalidates_after_destination_delete_and_fill() {
     let keyspace = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
     let src = key_for_shard_with_len(&keyspace, 0, 20, "copy-src");
@@ -918,4 +1014,224 @@ fn copy_key_revalidates_after_destination_delete_and_fill() {
     assert!(keyspace.get_value(&src, 0).is_some());
     assert!(keyspace.get_value(&dst, 0).is_none());
     assert!(keyspace.get_value(&filler, 0).is_some());
+}
+
+#[test]
+fn copy_key_cross_shard_revalidates_prepared_source_after_concurrent_replace() {
+    let keyspace = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+    let src = key_for_shard_with_len(&keyspace, 0, 28, "copy-race-src");
+    let dst = key_for_shard_with_len(&keyspace, TEST_SHARDS - 1, 28, "copy-race-dst");
+    let original = VortexValue::from_bytes(b"original");
+    let replacement = VortexValue::from_bytes(b"replacement");
+
+    keyspace
+        .set_value_with_ttl(src.clone(), original, 100, 0)
+        .expect("source SET with TTL should succeed");
+
+    let writer_src = src.clone();
+    let writer_dst = dst.clone();
+    let stale_src = src.clone();
+    let stale_replacement = replacement.clone();
+    let result = run_optimistic_prepare_race(
+        "copy_key",
+        Arc::clone(&keyspace),
+        move |keyspace| keyspace.copy_key(&writer_src, writer_dst, true, 10),
+        move |keyspace| {
+            keyspace
+                .set_value_with_ttl(stale_src, stale_replacement, 200, 10)
+                .expect("interleaved source replacement should succeed");
+        },
+    )
+    .expect("COPY should fall back to current source after stale prepare");
+
+    assert!(result.value);
+    assert_eq!(keyspace.get_value(&src, 10), Some(replacement.clone()));
+    assert_eq!(keyspace.get_value(&dst, 10), Some(replacement));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(dst.as_bytes(), 10),
+        TtlState::Deadline(200)
+    ));
+}
+
+#[test]
+fn copy_key_same_shard_revalidates_prepared_source_after_concurrent_replace() {
+    let keyspace = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+    let src = key_for_shard_with_len(&keyspace, 0, 28, "copy-same-race-src");
+    let dst = key_for_shard_with_len(&keyspace, 0, 28, "copy-same-race-dst");
+    let original = VortexValue::from_bytes(b"original");
+    let replacement = VortexValue::from_bytes(b"replacement");
+
+    keyspace
+        .set_value_with_ttl(src.clone(), original, 100, 0)
+        .expect("source SET with TTL should succeed");
+
+    let writer_src = src.clone();
+    let writer_dst = dst.clone();
+    let stale_src = src.clone();
+    let stale_replacement = replacement.clone();
+    let result = run_optimistic_prepare_race(
+        "copy_key",
+        Arc::clone(&keyspace),
+        move |keyspace| keyspace.copy_key(&writer_src, writer_dst, true, 10),
+        move |keyspace| {
+            keyspace
+                .set_value_with_ttl(stale_src, stale_replacement, 200, 10)
+                .expect("interleaved source replacement should succeed");
+        },
+    )
+    .expect("same-shard COPY should fall back to current source after stale prepare");
+
+    assert!(result.value);
+    assert_eq!(keyspace.get_value(&src, 10), Some(replacement.clone()));
+    assert_eq!(keyspace.get_value(&dst, 10), Some(replacement));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(dst.as_bytes(), 10),
+        TtlState::Deadline(200)
+    ));
+}
+
+#[test]
+fn copy_key_prehashed_commit_stamps_destination_lsn() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+
+    for (source_shard, destination_shard, label) in [
+        (0, 0, "copy-lsn-same"),
+        (0, TEST_SHARDS - 1, "copy-lsn-cross"),
+    ] {
+        let src = key_for_shard_with_len(&keyspace, source_shard, 28, label);
+        let dst = key_for_shard_with_len(&keyspace, destination_shard, 32, label);
+        let value = VortexValue::from_bytes(label.as_bytes());
+        insert_raw(&keyspace, src.clone(), value.clone());
+        keyspace.enable_aof_recording();
+
+        let outcome = keyspace
+            .copy_key(&src, dst.clone(), true, 0)
+            .expect("COPY should succeed");
+        let aof_lsn = outcome
+            .aof_lsn
+            .map(|lsn| lsn.get())
+            .expect("AOF-enabled COPY should allocate an LSN");
+
+        assert!(outcome.value);
+        assert_eq!(keyspace.get_value(&src, 0), Some(value.clone()));
+        assert_eq!(keyspace.get_value(&dst, 0), Some(value));
+        assert_eq!(entry_lsn(&keyspace, dst.as_bytes()), Some(aof_lsn));
+        keyspace.disable_aof_recording();
+    }
+}
+
+#[test]
+fn copy_key_invalidates_destination_watch_without_touching_source_watch() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+
+    for (source_shard, destination_shard, label) in [
+        (0, 0, "copy-watch-same"),
+        (0, TEST_SHARDS - 1, "copy-watch-cross"),
+    ] {
+        let src = key_for_shard_with_len(&keyspace, source_shard, 28, label);
+        let dst = key_for_shard_with_len(&keyspace, destination_shard, 32, label);
+        let value = VortexValue::from_bytes(label.as_bytes());
+        insert_raw(&keyspace, src.clone(), value.clone());
+
+        let epoch = keyspace.current_watch_epoch();
+        let source_watch = keyspace.watch_key(src.clone());
+        let destination_watch = keyspace.watch_key(dst.clone());
+
+        let outcome = keyspace
+            .copy_key(&src, dst.clone(), true, 0)
+            .expect("WATCH-active COPY should succeed");
+
+        assert!(outcome.value);
+        assert_eq!(keyspace.get_value(&src, 0), Some(value.clone()));
+        assert_eq!(keyspace.get_value(&dst, 0), Some(value));
+        assert!(
+            !keyspace.watched_keys_changed(epoch, std::slice::from_ref(&source_watch)),
+            "COPY must not invalidate WATCH on the read-only source key"
+        );
+        assert!(
+            keyspace.watched_keys_changed(epoch, std::slice::from_ref(&destination_watch)),
+            "COPY must invalidate WATCH on the written destination key"
+        );
+        keyspace.unwatch_keys([source_watch, destination_watch]);
+    }
+}
+
+#[test]
+fn copy_snapshot_value_prepares_placeholder_aggregate_variants() {
+    let values = [
+        VortexValue::List(Box::new(VortexList::new())),
+        VortexValue::Hash(Box::new(VortexHash::new())),
+        VortexValue::Set(Box::new(VortexSet::new())),
+        VortexValue::SortedSet(Box::new(VortexSortedSet::new())),
+        VortexValue::Stream(Box::new(VortexStream::new())),
+    ];
+
+    for value in values {
+        assert_eq!(super::key_ops::copy_snapshot_value(&value), value);
+    }
+}
+
+#[test]
+fn copy_key_cross_shard_copies_placeholder_aggregate_with_ttl() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+    let src = key_for_shard_with_len(&keyspace, 0, 28, "copy-list-src");
+    let dst = key_for_shard_with_len(&keyspace, TEST_SHARDS - 1, 28, "copy-list-dst");
+    let source_value = VortexValue::List(Box::new(VortexList::new()));
+
+    keyspace
+        .set_value_with_ttl(src.clone(), source_value.clone(), 100, 0)
+        .expect("aggregate source SET with TTL should succeed");
+
+    let copied = keyspace
+        .copy_key(&src, dst.clone(), true, 10)
+        .expect("cross-shard aggregate COPY should succeed");
+
+    assert!(copied.value);
+    assert_eq!(keyspace.get_value(&src, 10), Some(source_value.clone()));
+    assert_eq!(keyspace.get_value(&dst, 10), Some(source_value));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(dst.as_bytes(), 10),
+        TtlState::Deadline(100)
+    ));
+}
+
+#[test]
+fn copy_key_same_shard_preserves_ttl_and_replace_policy() {
+    let keyspace = ConcurrentKeyspace::new(TEST_SHARDS);
+    let src = key_for_shard_with_len(&keyspace, 0, 28, "copy-same-src");
+    let dst = key_for_shard_with_len(&keyspace, 0, 28, "copy-same-dst");
+    let source_value = VortexValue::from_bytes(b"source");
+    let destination_value = VortexValue::from_bytes(b"destination");
+
+    keyspace
+        .set_value_with_ttl(src.clone(), source_value.clone(), 100, 0)
+        .expect("source SET with TTL should succeed");
+    keyspace
+        .set_value_plain(dst.clone(), destination_value.clone(), 0)
+        .expect("destination SET should succeed");
+
+    let blocked = keyspace
+        .copy_key(&src, dst.clone(), false, 10)
+        .expect("same-shard COPY without REPLACE should not fail");
+    assert!(!blocked.value);
+    assert_eq!(keyspace.get_value(&dst, 10), Some(destination_value));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(dst.as_bytes(), 10),
+        TtlState::Persistent
+    ));
+
+    let copied = keyspace
+        .copy_key(&src, dst.clone(), true, 10)
+        .expect("same-shard COPY with REPLACE should succeed");
+    assert!(copied.value);
+    assert_eq!(keyspace.get_value(&src, 10), Some(source_value.clone()));
+    assert_eq!(keyspace.get_value(&dst, 10), Some(source_value));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(src.as_bytes(), 10),
+        TtlState::Deadline(100)
+    ));
+    assert!(matches!(
+        keyspace.ttl_state_bytes(dst.as_bytes(), 10),
+        TtlState::Deadline(100)
+    ));
 }

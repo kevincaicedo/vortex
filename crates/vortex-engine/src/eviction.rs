@@ -127,6 +127,20 @@ pub struct EvictionConfig {
     pub policy: EvictionPolicy,
 }
 
+impl EvictionConfig {
+    #[inline]
+    pub const fn records_read_access(self) -> bool {
+        self.max_memory != 0
+            && matches!(
+                self.policy,
+                EvictionPolicy::AllKeysLru
+                    | EvictionPolicy::VolatileLru
+                    | EvictionPolicy::AllKeysLfu
+                    | EvictionPolicy::VolatileLfu
+            )
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct EvictionConfigState {
     packed: AtomicU64,

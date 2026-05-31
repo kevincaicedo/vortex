@@ -7,7 +7,7 @@ impl ConcurrentKeyspace {
     }
 
     pub(crate) fn cmd_flush_all(&self) -> Result<Option<AofLsn>, LsnOverflow> {
-        self.flush_all_with_lsn()
+        self.flush_all_with_lsn_command_scoped()
     }
 
     pub(crate) fn info_keyspace(&self, now_nanos: u64) -> (usize, usize) {

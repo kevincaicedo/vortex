@@ -7,6 +7,7 @@ from vortex_benchmark.backends.base import (
     BackendExecutionRecord,
     BackendRunContext,
     DEFAULT_CUSTOM_KEYSPACE,
+    DEFAULT_CUSTOM_MULTI_KEY_WIDTH,
     DEFAULT_CUSTOM_OPS_PER_THREAD,
     DEFAULT_CUSTOM_PIPELINE_DEPTH,
     DEFAULT_CUSTOM_THREAD_SWEEP,
@@ -20,6 +21,7 @@ from vortex_benchmark.backends.base import (
     quote_command,
     read_json,
     run_process,
+    run_process_with_usage,
     write_json,
 )
 from vortex_benchmark.env import resolve_benchmark_root
@@ -70,6 +72,11 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
         get_setting(context.spec.settings, "custom-rust", "pipeline_depth_sweep"),
         label="custom-rust.pipeline_depth_sweep",
         default=(pipeline_depth,),
+    )
+    multi_key_width = coerce_positive_int(
+        get_setting(context.spec.settings, "custom-rust", "multi_key_width"),
+        label="custom-rust.multi_key_width",
+        default=DEFAULT_CUSTOM_MULTI_KEY_WIDTH,
     )
     keyspace_size = coerce_positive_int(
         get_setting(context.spec.settings, "custom-rust", "keyspace_size"),
@@ -151,6 +158,8 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
                     str(value_size),
                     "--pipeline-depth",
                     str(current_pipeline_depth),
+                    "--multi-key-width",
+                    str(multi_key_width),
                     "--output-dir",
                     str(item_dir),
                     "--workload",
@@ -162,16 +171,18 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
 
                 snapshot_before = capture_service_snapshot(context.service)
                 host_telemetry = None
+                load_generator_usage = {}
                 telemetry = start_host_telemetry_capture(
                     item_dir,
                     label="custom-rust",
                     service=context.service,
                 )
                 try:
-                    _, elapsed = run_process(
+                    _, elapsed, load_generator_usage = run_process_with_usage(
                         command,
                         stdout_path=stdout_path,
                         stderr_path=stderr_path,
+                        cpu_list=(context.spec.resource_config or {}).get("load_cpus"),
                     )
                 finally:
                     host_telemetry = telemetry.stop()
@@ -193,6 +204,7 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
                         "workload": payload.get("workload"),
                         "thread_count": payload.get("num_threads"),
                         "pipeline_depth": payload.get("pipeline_depth"),
+                        "multi_key_width": payload.get("multi_key_width"),
                         "latency_sample_unit": payload.get("latency_sample_unit"),
                         "command": quote_command(command),
                         "duration_seconds": round(elapsed, 6),
@@ -216,6 +228,7 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
                             "after": snapshot_after,
                             "delta": diff_service_snapshots(snapshot_before, snapshot_after),
                             "host_telemetry": host_telemetry,
+                            "load_generator": load_generator_usage,
                         },
                     }
                 )
@@ -243,6 +256,7 @@ def run_custom_rust_backend(context: BackendRunContext) -> BackendExecutionRecor
             "profile": profile,
             "thread_sweep": thread_sweep,
             "pipeline_depth_sweep": pipeline_depth_sweep,
+            "multi_key_width": multi_key_width,
             "keyspace_size": keyspace_size,
             "ops_per_thread": ops_per_thread,
             "warmup_ops": warmup_ops,

@@ -142,6 +142,8 @@ class VortexAdapter(DatabaseAdapter):
         for key in (
             "io_backend",
             "telemetry_mode",
+            "telemetry_local_sample_rate",
+            "telemetry_flush_interval_ms",
             "shard_count",
             "ring_size",
             "fixed_buffers",
@@ -175,7 +177,7 @@ class VortexAdapter(DatabaseAdapter):
                 "unsupported Vortex fixed-buffer registration policy: "
                 f"{runtime.get('fixed_buffer_registration')}"
             )
-        if runtime.get("telemetry_mode") not in {None, "minimal", "profile"}:
+        if runtime.get("telemetry_mode") not in {None, "minimal", "standard", "profile"}:
             raise SetupError(
                 f"unsupported Vortex telemetry mode: {runtime.get('telemetry_mode')}"
             )
@@ -197,6 +199,8 @@ class VortexAdapter(DatabaseAdapter):
             "reactor_accept_budget",
             "reactor_writev_budget",
             "reactor_maintenance_budget",
+            "telemetry_local_sample_rate",
+            "telemetry_flush_interval_ms",
             "max_request_bytes",
         ):
             value = runtime.get(key)
@@ -226,6 +230,20 @@ class VortexAdapter(DatabaseAdapter):
             command.extend(["--io-backend", str(runtime["io_backend"])])
         if runtime.get("telemetry_mode"):
             command.extend(["--telemetry-mode", str(runtime["telemetry_mode"])])
+        if runtime.get("telemetry_local_sample_rate") is not None:
+            command.extend(
+                [
+                    "--telemetry-local-sample-rate",
+                    str(runtime["telemetry_local_sample_rate"]),
+                ]
+            )
+        if runtime.get("telemetry_flush_interval_ms") is not None:
+            command.extend(
+                [
+                    "--telemetry-flush-interval-ms",
+                    str(runtime["telemetry_flush_interval_ms"]),
+                ]
+            )
         if runtime.get("ring_size") is not None:
             command.extend(["--ring-size", str(runtime["ring_size"])])
         if runtime.get("fixed_buffers") is not None:
@@ -283,6 +301,20 @@ class VortexAdapter(DatabaseAdapter):
             command.extend(["--io-backend", str(runtime["io_backend"])])
         if runtime.get("telemetry_mode"):
             command.extend(["--telemetry-mode", str(runtime["telemetry_mode"])])
+        if runtime.get("telemetry_local_sample_rate") is not None:
+            command.extend(
+                [
+                    "--telemetry-local-sample-rate",
+                    str(runtime["telemetry_local_sample_rate"]),
+                ]
+            )
+        if runtime.get("telemetry_flush_interval_ms") is not None:
+            command.extend(
+                [
+                    "--telemetry-flush-interval-ms",
+                    str(runtime["telemetry_flush_interval_ms"]),
+                ]
+            )
         if runtime.get("ring_size") is not None:
             command.extend(["--ring-size", str(runtime["ring_size"])])
         if runtime.get("fixed_buffers") is not None:

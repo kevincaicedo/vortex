@@ -1,0 +1,40 @@
+schema_version: 1
+name: workstream-e-custom-multikey-points-polling-svc8
+description: P99.9-capable custom-rust multi-key point rows with eight polling service threads and E-core load isolation.
+databases:
+  - vortex
+  - redis
+backends:
+  - custom-rust
+workloads:
+  - mget_only
+  - mset_only
+  - msetnx_only
+duration: 10s
+repeat: 5
+environment:
+  mode: native
+  port_base: 45379
+resource_config:
+  cpus: 8
+  memory: 2g
+  threads: 8
+  service_cpus: "0,2,4,6,8,10,12,14"
+  load_cpus: "16,17,18,19,20,21,22,23"
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  telemetry_mode: minimal
+  io_backend: polling
+  fixed_buffers: 1024
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 100
+    multi_key_width: 10
+    keyspace_size: 100000
+    ops_per_thread: 5000
+    warmup_ops: 500
+    value_size: 64

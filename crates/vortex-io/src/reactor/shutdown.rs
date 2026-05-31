@@ -119,14 +119,14 @@ impl Reactor {
                 let flush_counts_submit = self.flush_counts_submit_syscall();
                 if let Err(flush_error) = self.backend.flush() {
                     if flush_counts_submit {
-                        self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                        self.local_metrics.record_backend_submit_syscall();
                     }
                     self.keyspace.record_reactor_submit_failure(self.id);
                     tracing::warn!(op = op_name, error = %flush_error, "submit retry flush failed");
                     return Err(flush_error);
                 }
                 if flush_counts_submit {
-                    self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                    self.local_metrics.record_backend_submit_syscall();
                 }
 
                 match submit(&mut self.backend) {
@@ -419,9 +419,10 @@ impl Reactor {
         if conn_id < self.close_started_nanos.len() {
             let started = self.close_started_nanos[conn_id];
             if started != 0 {
-                let elapsed = self.elapsed_profile_metric_nanos(Some(started));
-                self.keyspace
-                    .record_reactor_close_drain_nanos(self.id, elapsed);
+                if let Some(elapsed) = self.elapsed_profile_metric_nanos(Some(started)) {
+                    self.keyspace
+                        .record_reactor_close_drain_nanos(self.id, elapsed);
+                }
                 self.close_started_nanos[conn_id] = 0;
             }
         }
@@ -564,7 +565,7 @@ impl Reactor {
             let flush_counts_submit = self.flush_counts_submit_syscall();
             let flush_result = self.backend.flush();
             if flush_counts_submit {
-                self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                self.local_metrics.record_backend_submit_syscall();
             }
             if let Err(error) = flush_result {
                 self.keyspace.record_reactor_submit_failure(self.id);
@@ -580,19 +581,19 @@ impl Reactor {
             match self.backend.completions(&mut self.cqe_buf) {
                 Ok(0) => {
                     if completions_count_submit {
-                        self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                        self.local_metrics.record_backend_submit_syscall();
                     }
                     std::thread::yield_now();
                     continue;
                 }
                 Ok(_) => {
                     if completions_count_submit {
-                        self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                        self.local_metrics.record_backend_submit_syscall();
                     }
                 }
                 Err(error) => {
                     if completions_count_submit {
-                        self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                        self.local_metrics.record_backend_submit_syscall();
                     }
                     self.keyspace.record_reactor_submit_failure(self.id);
                     tracing::warn!(

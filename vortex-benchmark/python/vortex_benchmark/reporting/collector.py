@@ -7,11 +7,6 @@ from typing import Any, Optional
 from vortex_benchmark.env import build_layout
 from vortex_benchmark.telemetry import capture_host_metadata
 
-ENGINE_BYTES_PER_KEY_ALLOWED = 192.0
-ENGINE_BYTES_PER_KEY_NARROWED = 256.0
-FULL_SERVER_RSS_ALLOWED_RATIO = 1.50
-FULL_SERVER_RSS_NARROWED_RATIO = 2.00
-
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -194,6 +189,7 @@ def _workload_contract_fields(
         "workload_thread_sweep": settings.get("thread_sweep"),
         "workload_ops_per_thread": settings.get("ops_per_thread"),
         "workload_warmup_ops": settings.get("warmup_ops"),
+        "workload_multi_key_width": item.get("multi_key_width") or settings.get("multi_key_width"),
         "workload_duration_seconds": request.get("duration"),
         "workload_latency_sample_unit": item.get("latency_sample_unit"),
         "load_threads": _coerce_int(item.get("thread_count")),
@@ -351,6 +347,7 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
     delta = observability.get("delta") or {}
     host_telemetry = observability.get("host_telemetry") or {}
     telemetry_summary = host_telemetry.get("summary") or {}
+    load_generator = observability.get("load_generator") or {}
     return {
         "used_memory_before_bytes": before.get("used_memory_bytes"),
         "used_memory_after_bytes": after.get("used_memory_bytes"),
@@ -430,6 +427,12 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         ),
         "runtime_local_flush_metrics_available_after": after.get(
             "runtime_local_flush_metrics_available"
+        ),
+        "runtime_local_flush_sample_rate_after": after.get(
+            "runtime_local_flush_sample_rate"
+        ),
+        "runtime_metrics_flush_interval_ms_after": after.get(
+            "runtime_metrics_flush_interval_ms"
         ),
         "service_invalid_delta_fields": delta.get("invalid_delta_fields"),
         "host_invalid_delta_fields": telemetry_summary.get("invalid_delta_fields"),
@@ -626,6 +629,15 @@ def _observability_fields(item: dict[str, Any]) -> dict[str, Any]:
         "system_vm_page_reclaim_delta": telemetry_summary.get("system_vm_page_reclaim_delta"),
         "process_cpu_utilization_avg_pct": telemetry_summary.get("process_cpu_utilization_avg_pct"),
         "process_cpu_utilization_peak_pct": telemetry_summary.get("process_cpu_utilization_peak_pct"),
+        "load_generator_cpu_user_seconds": load_generator.get("cpu_user_seconds"),
+        "load_generator_cpu_system_seconds": load_generator.get("cpu_system_seconds"),
+        "load_generator_cpu_total_seconds": load_generator.get("cpu_total_seconds"),
+        "load_generator_cpu_utilization_avg_pct": load_generator.get("cpu_utilization_avg_pct"),
+        "load_generator_cpu_capacity_cpus": load_generator.get("cpu_capacity_cpus"),
+        "load_generator_cpu_capacity_pct": load_generator.get("cpu_capacity_pct"),
+        "load_generator_cpu_utilization_of_capacity_pct": load_generator.get(
+            "cpu_utilization_of_capacity_pct"
+        ),
         "process_rss_peak_bytes": telemetry_summary.get("process_rss_peak_bytes"),
         "process_minor_faults_delta": telemetry_summary.get("process_minor_faults_delta"),
         "process_major_faults_delta": telemetry_summary.get("process_major_faults_delta"),
@@ -963,7 +975,7 @@ def _memory_comparison_signature(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _rss_bytes_for_memory_claim(row: dict[str, Any]) -> Optional[float]:
+def _rss_bytes_for_memory_ratio(row: dict[str, Any]) -> Optional[float]:
     for key in (
         "process_rss_peak_bytes",
         "full_server_process_rss_after_bytes",
@@ -976,85 +988,30 @@ def _rss_bytes_for_memory_claim(row: dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _engine_memory_claim(value: Optional[float]) -> tuple[str, str]:
-    if value is None or value <= 0:
-        return "Rejected", "missing engine bytes/live-key"
-    if value <= ENGINE_BYTES_PER_KEY_ALLOWED:
-        return (
-            "Allowed",
-            f"engine bytes/live-key {value:.2f} <= {ENGINE_BYTES_PER_KEY_ALLOWED:.2f}",
-        )
-    if value <= ENGINE_BYTES_PER_KEY_NARROWED:
-        return (
-            "Narrowed",
-            "engine bytes/live-key "
-            f"{value:.2f} <= {ENGINE_BYTES_PER_KEY_NARROWED:.2f}; "
-            "claim must name workload and shard count",
-        )
-    return (
-        "Rejected",
-        f"engine bytes/live-key {value:.2f} > {ENGINE_BYTES_PER_KEY_NARROWED:.2f}",
-    )
-
-
-def _full_server_memory_claim(ratio: Optional[float]) -> tuple[str, str]:
-    if ratio is None or ratio <= 0:
-        return "Rejected", "missing comparable Vortex and Redis full-server RSS"
-    if ratio <= FULL_SERVER_RSS_ALLOWED_RATIO:
-        return (
-            "Allowed",
-            f"full-server RSS/Redis ratio {ratio:.2f} <= {FULL_SERVER_RSS_ALLOWED_RATIO:.2f}",
-        )
-    if ratio <= FULL_SERVER_RSS_NARROWED_RATIO:
-        return (
-            "Narrowed",
-            "full-server RSS/Redis ratio "
-            f"{ratio:.2f} <= {FULL_SERVER_RSS_NARROWED_RATIO:.2f}; "
-            "claim must name workload and server config",
-        )
-    return (
-        "Rejected",
-        f"full-server RSS/Redis ratio {ratio:.2f} > {FULL_SERVER_RSS_NARROWED_RATIO:.2f}",
-    )
-
-
-def _annotate_memory_claim_decisions(rows: list[dict[str, Any]]) -> None:
-    redis_rss_by_signature: dict[tuple[Any, ...], float] = {}
+def _annotate_memory_observations(rows: list[dict[str, Any]]) -> None:
+    reference_rss_by_signature: dict[tuple[Any, ...], tuple[str, float]] = {}
     for row in rows:
-        if str(row.get("database") or "").lower() != "redis":
+        database = str(row.get("database") or "").lower()
+        if not database or database == "vortex":
             continue
-        rss = _rss_bytes_for_memory_claim(row)
+        rss = _rss_bytes_for_memory_ratio(row)
         if rss is None:
             continue
         signature = _memory_comparison_signature(row)
-        previous = redis_rss_by_signature.get(signature)
-        redis_rss_by_signature[signature] = rss if previous is None else max(previous, rss)
+        previous = reference_rss_by_signature.get(signature)
+        if previous is None or rss > previous[1]:
+            reference_rss_by_signature[signature] = (database, rss)
 
     for row in rows:
-        database = str(row.get("database") or "").lower()
-        if database != "vortex":
-            row["engine_memory_claim_decision"] = "Rejected"
-            row["engine_memory_claim_reason"] = "not a Vortex engine row"
-            row["full_server_rss_claim_decision"] = "Rejected"
-            row["full_server_rss_claim_reason"] = "Redis/baseline row is not a Vortex claim"
-            row["full_server_rss_vs_redis_ratio"] = None
-            continue
-
-        engine_decision, engine_reason = _engine_memory_claim(
-            _coerce_float(row.get("engine_bytes_per_live_key_after"))
-        )
-        row["engine_memory_claim_decision"] = engine_decision
-        row["engine_memory_claim_reason"] = engine_reason
-
-        vortex_rss = _rss_bytes_for_memory_claim(row)
-        redis_rss = redis_rss_by_signature.get(_memory_comparison_signature(row))
+        current_rss = _rss_bytes_for_memory_ratio(row)
+        reference = reference_rss_by_signature.get(_memory_comparison_signature(row))
         ratio = None
-        if vortex_rss is not None and redis_rss is not None and redis_rss > 0:
-            ratio = vortex_rss / redis_rss
-        full_decision, full_reason = _full_server_memory_claim(ratio)
-        row["full_server_rss_vs_redis_ratio"] = ratio
-        row["full_server_rss_claim_decision"] = full_decision
-        row["full_server_rss_claim_reason"] = full_reason
+        reference_database = None
+        if current_rss is not None and reference is not None and reference[1] > 0:
+            reference_database, reference_rss = reference
+            ratio = current_rss / reference_rss
+        row["full_server_rss_vs_reference_ratio"] = ratio
+        row["full_server_rss_reference_database"] = reference_database
 
 
 def _build_memory_diagnostics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1070,18 +1027,11 @@ def _build_memory_diagnostics(rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "memory_attribution_full_server_scope": row.get(
                     "memory_attribution_full_server_scope"
                 ),
-                "engine_memory_claim_decision": row.get(
-                    "engine_memory_claim_decision"
+                "full_server_rss_vs_reference_ratio": row.get(
+                    "full_server_rss_vs_reference_ratio"
                 ),
-                "engine_memory_claim_reason": row.get("engine_memory_claim_reason"),
-                "full_server_rss_vs_redis_ratio": row.get(
-                    "full_server_rss_vs_redis_ratio"
-                ),
-                "full_server_rss_claim_decision": row.get(
-                    "full_server_rss_claim_decision"
-                ),
-                "full_server_rss_claim_reason": row.get(
-                    "full_server_rss_claim_reason"
+                "full_server_rss_reference_database": row.get(
+                    "full_server_rss_reference_database"
                 ),
                 "engine_live_keys_after": row.get("engine_live_keys_after"),
                 "engine_logical_dataset_after_bytes": row.get(
@@ -1232,38 +1182,8 @@ def _build_diagnostic_summary(
         "max_engine_bytes_per_live_key": _max_numeric(
             memory_rows, "engine_bytes_per_live_key_after"
         ),
-        "max_full_server_rss_vs_redis_ratio": _max_numeric(
-            memory_rows, "full_server_rss_vs_redis_ratio"
-        ),
-        "engine_memory_claims_allowed": sum(
-            1
-            for row in memory_rows
-            if row.get("engine_memory_claim_decision") == "Allowed"
-        ),
-        "engine_memory_claims_narrowed": sum(
-            1
-            for row in memory_rows
-            if row.get("engine_memory_claim_decision") == "Narrowed"
-        ),
-        "engine_memory_claims_rejected": sum(
-            1
-            for row in memory_rows
-            if row.get("engine_memory_claim_decision") == "Rejected"
-        ),
-        "full_server_rss_claims_allowed": sum(
-            1
-            for row in memory_rows
-            if row.get("full_server_rss_claim_decision") == "Allowed"
-        ),
-        "full_server_rss_claims_narrowed": sum(
-            1
-            for row in memory_rows
-            if row.get("full_server_rss_claim_decision") == "Narrowed"
-        ),
-        "full_server_rss_claims_rejected": sum(
-            1
-            for row in memory_rows
-            if row.get("full_server_rss_claim_decision") == "Rejected"
+        "max_full_server_rss_vs_reference_ratio": _max_numeric(
+            memory_rows, "full_server_rss_vs_reference_ratio"
         ),
         "max_allocator_resident_after_bytes": _max_numeric(memory_rows, "allocator_resident_after_bytes"),
         "max_system_mem_dirty_peak_bytes": _max_numeric(memory_rows, "system_mem_dirty_peak_bytes"),
@@ -1333,7 +1253,7 @@ def build_report_payload(summary_paths: list[Path], title: Optional[str] = None)
     normalized_validity = dict(report_validity or {})
     normalized_validity["report_aggregates_multiple_source_runs"] = len(source_runs) > 1
     normalized_validity["report_aggregates_multiple_replicates"] = _detect_report_aggregates_multiple_replicates(rows)
-    _annotate_memory_claim_decisions(rows)
+    _annotate_memory_observations(rows)
     aof_overhead = _build_aof_overhead(rows)
     eviction_rows = [row for row in rows if _has_eviction_activity(row)]
     memory_rows = _build_memory_diagnostics(rows)
@@ -1350,7 +1270,7 @@ def build_report_payload(summary_paths: list[Path], title: Optional[str] = None)
 
     return {
         "schema_version": 1,
-        "title": title or "Vortex Benchmark Report",
+        "title": title or "Benchmark Report",
         "source_runs": source_runs,
         "host_metadata": host_metadata or capture_host_metadata(),
         "validity": normalized_validity,

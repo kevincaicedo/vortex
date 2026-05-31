@@ -364,29 +364,6 @@ pub(super) fn mutation_outcome_with_evictions<T>(
     MutationOutcome::with_aof_records(value, evicted_keys_to_aof_records(evicted), aof_lsn)
 }
 
-#[inline(always)]
-pub(super) fn stamp_entry_lsn(
-    table: &mut SwissTable,
-    key_bytes: &[u8],
-    table_hash: TableHash,
-    lsn: u64,
-) {
-    let stamped = table.set_lsn_version_prehashed(key_bytes, table_hash, lsn);
-    debug_assert!(stamped, "live key must still exist when stamping LSN");
-}
-
-#[inline(always)]
-pub(super) fn stamp_entry_lsn_if(
-    table: &mut SwissTable,
-    key_bytes: &[u8],
-    table_hash: TableHash,
-    lsn: Option<u64>,
-) {
-    if let Some(lsn) = lsn {
-        stamp_entry_lsn(table, key_bytes, table_hash, lsn);
-    }
-}
-
 /// Result of a SET command with options (NX/XX/GET).
 pub(crate) enum SetResult {
     /// SET succeeded (no GET flag).
@@ -1054,15 +1031,6 @@ fn maybe_pause_before_deferred_effect_publish() {
 #[cfg(not(test))]
 #[inline(always)]
 fn maybe_pause_before_deferred_effect_publish() {}
-
-#[inline]
-pub(super) fn remove_if_expired(table: &mut SwissTable, key: &VortexKey, now_nanos: u64) -> bool {
-    let hash = table.table_hash_key_bytes(key.as_bytes());
-    match table.slot_cursor_prehashed(key.as_bytes(), hash, now_nanos) {
-        SlotCursor::Expired(expired) => expired.remove().is_some(),
-        SlotCursor::Live(_) | SlotCursor::Vacant(_) => false,
-    }
-}
 
 impl ConcurrentKeyspace {
     #[inline(always)]

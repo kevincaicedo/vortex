@@ -156,7 +156,11 @@ impl Reactor {
                 let clock = CommandClock::new(self.cached_nanos, self.cached_unix_nanos);
                 let scope = command_keyspace_gate_scope(meta, frame);
                 let execution_scope = if scope.full {
-                    CommandExecutionScope::Full
+                    if scope.exclusive {
+                        CommandExecutionScope::FullExclusive
+                    } else {
+                        CommandExecutionScope::Full
+                    }
                 } else if scope.keys.is_empty() {
                     CommandExecutionScope::None
                 } else {
@@ -209,6 +213,7 @@ impl Reactor {
                                 (CommandResponse::Static(buf), close)
                             }
                             CmdResult::Inline(inline) => (CommandResponse::Inline(inline), false),
+                            CmdResult::Owned(bytes) => (CommandResponse::Owned(bytes), false),
                             CmdResult::Resp(f) => (CommandResponse::Frame(f), false),
                         }
                     }

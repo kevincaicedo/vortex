@@ -7,6 +7,7 @@
 
 SERVER_PID=""
 LOAD_PID=""
+SERVER_EXTERNAL=false
 
 # ── Cleanup trap ─────────────────────────────────────────────────────────────
 _profiler_cleanup() {
@@ -18,7 +19,10 @@ _profiler_cleanup() {
         LOAD_PID=""
     fi
     # Then kill server
-    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    if [[ "$SERVER_EXTERNAL" == "true" ]]; then
+        SERVER_PID=""
+        SERVER_EXTERNAL=false
+    elif [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill -INT "$SERVER_PID" 2>/dev/null || true
         # Give it 3s to shut down gracefully, then force
         local i=0
@@ -121,15 +125,38 @@ build_server_args() {
     printf '%s\n' "${args[@]}"
 }
 
+collect_server_args() {
+    local -n args_ref="$1"
+    shift
+
+    local arg=""
+    args_ref=()
+    while IFS= read -r arg; do
+        args_ref+=("$arg")
+    done < <(build_server_args "$@")
+}
+
 # ── Start server in background ───────────────────────────────────────────────
 start_server() {
     local host="$1" port="$2" threads="$3" aof="$4" maxmemory="$5" eviction="$6" logfile="$7"
     local managed_aof_path=""
 
+    if [[ "${SESSION_TARGET_MODE:-local}" == "host-port" || "${SESSION_TARGET_MODE:-local}" == "ssh-attach" ]]; then
+        info "Attaching profiler session to externally managed ${host}:${port}"
+        wait_for_server "$host" "$port" 30
+        SERVER_PID="$(discover_pid_by_port "$port")"
+        if [[ -n "$SERVER_PID" ]]; then
+            record_session_pid "$SERVER_PID"
+            info "Discovered local target pid ${SERVER_PID}"
+        else
+            warn "No local pid discovered for ${host}:${port}; local process profilers may be unavailable"
+        fi
+        SERVER_EXTERNAL=true
+        return 0
+    fi
+
     local args=()
-    while IFS= read -r arg; do
-        args+=("$arg")
-    done < <(build_server_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction")
+    collect_server_args args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     if [[ "$aof" == "true" && -z "${VORTEX_AOF_PATH:-}" ]]; then
         managed_aof_path="${logfile%.log}.aof"
@@ -225,7 +252,7 @@ start_profiled_shutdown_controller() {
         done
 
         if [[ "$ready" == "true" ]]; then
-            if [[ -n "$command" ]]; then
+            if [[ -n "$command" ]] || { declare -F benchmark_bridge_enabled >/dev/null 2>&1 && benchmark_bridge_enabled; }; then
                 generate_load "$host" "$port" "$command" "$duration" "$clients" "$load_log"
                 wait_for_load "$duration"
             else
@@ -266,17 +293,35 @@ generate_load() {
     fi
 
     if has_cmd redis-benchmark; then
-        # Estimate requests to fill the duration
-        local approx_requests=$(( clients * 5000 * duration / 10 ))
-        info "Generating load: redis-benchmark -t ${command} (${duration}s, ${clients} clients)"
-        redis-benchmark \
-            -h "$host" -p "$port" \
-            -t "$command" \
-            -c "$clients" \
-            -d 256 \
-            --threads 4 \
-            -n "$approx_requests" \
-            >"$logfile" 2>&1 &
+        local batch_requests=$(( clients * 10000 ))
+        if [[ "$batch_requests" -lt 10000 ]]; then
+            batch_requests=10000
+        fi
+
+        info "Generating sustained load: redis-benchmark -t ${command} (${duration}s, ${clients} clients)"
+        (
+            : >"$logfile"
+            local end=$((SECONDS + duration))
+            local batch=1
+            local benchmark_args=(
+                -h "$host" -p "$port"
+                -t "$command"
+                -c "$clients"
+                -d 256
+                --threads 4
+                -n "$batch_requests"
+            )
+            if [[ -n "${WORKLOAD_KEYSPACE:-}" ]]; then
+                benchmark_args+=(-r "$WORKLOAD_KEYSPACE")
+            fi
+            while [[ "$SECONDS" -lt "$end" ]]; do
+                {
+                    printf '\n--- redis-benchmark batch %s ---\n' "$batch"
+                    redis-benchmark "${benchmark_args[@]}"
+                } >>"$logfile" 2>&1 || break
+                batch=$((batch + 1))
+            done
+        ) &
         LOAD_PID=$!
     else
         warn "redis-benchmark not found. Sleeping for ${duration}s instead."

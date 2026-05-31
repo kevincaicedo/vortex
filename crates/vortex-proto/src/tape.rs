@@ -1389,6 +1389,42 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_tape_large_bulk_presizes_by_frame_hint_not_payload_bytes() {
+        let payload_len = 1024 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("${payload_len}\r\n").as_bytes());
+        let data_start = buf.len();
+        buf.resize(data_start + payload_len, b'x');
+        buf.extend_from_slice(b"\r\n");
+
+        let mut scratch = Vec::new();
+        let (frame_count, consumed, entries_len, data_len, data_ptr_matches) = {
+            let tape =
+                BorrowedRespTape::parse_pipeline_limited_into(&buf, &mut scratch, 1).unwrap();
+            let frame = tape.iter().next().unwrap();
+            let data = frame.as_bytes().unwrap();
+            (
+                tape.frame_count(),
+                tape.consumed(),
+                tape.entries().len(),
+                data.len(),
+                std::ptr::eq(data.as_ptr(), buf[data_start..].as_ptr()),
+            )
+        };
+
+        assert_eq!(frame_count, 1);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(entries_len, 1);
+        assert!(
+            scratch.capacity() <= 128,
+            "scratch capacity should stay bounded by frame hint, got {}",
+            scratch.capacity()
+        );
+        assert_eq!(data_len, payload_len);
+        assert!(data_ptr_matches);
+    }
+
+    #[test]
     fn frame_ref_children() {
         let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         let tape = RespTape::parse_pipeline(input).unwrap();

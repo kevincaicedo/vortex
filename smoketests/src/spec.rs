@@ -2,6 +2,13 @@ use crate::context::SmokeContext;
 
 pub type CaseFn = fn(&mut SmokeContext) -> anyhow::Result<()>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaselinePolicy {
+    Inherit,
+    Compare,
+    Skip,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CommandGroup {
     String,
@@ -43,11 +50,27 @@ pub struct CaseDef {
     pub name: &'static str,
     pub summary: &'static str,
     pub run: CaseFn,
+    pub baseline_policy: BaselinePolicy,
 }
 
 impl CaseDef {
     pub const fn new(name: &'static str, summary: &'static str, run: CaseFn) -> Self {
-        Self { name, summary, run }
+        Self {
+            name,
+            summary,
+            run,
+            baseline_policy: BaselinePolicy::Inherit,
+        }
+    }
+
+    pub const fn compare_with_baseline(mut self) -> Self {
+        self.baseline_policy = BaselinePolicy::Compare;
+        self
+    }
+
+    pub const fn skip_baseline(mut self) -> Self {
+        self.baseline_policy = BaselinePolicy::Skip;
+        self
     }
 }
 

@@ -1,144 +1,177 @@
 # Usage
 
-## Tool Flow
-
-`vortex_bench` is split into five steps:
-
-1. `setup` starts the selected database services and writes an environment state file.
-2. `attach` records an already running endpoint as an environment state file.
-3. `run` executes one or more benchmark backends against that saved environment.
-4. `report` aggregates normalized run summaries into JSON, CSV, Markdown, and chart artifacts.
-5. `teardown` stops managed services or detaches external targets recorded in the saved environment state.
-
-The normal entrypoint from the repository root is `bash vortex-benchmark/bin/vortex_bench ...`. The `just benchmark ...` recipe is a thin wrapper around the same tool.
-
-For local developer loops there is also a single-cycle wrapper:
-
-```bash
-just benchmark-local
-just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-memtier.yaml
-just benchmark-local --db vortex,redis --native --backend custom-rust --workload multi_key_only
-```
-
-`just benchmark-local` runs setup, run, report, and teardown as one operation. When no arguments are provided it defaults to `vortex-benchmark/manifests/examples/local-native-full-cycle.yaml` and writes artifacts under `.artifacts/benchmarks/local-dev/`.
+`just benchmark` is the primary benchmark command. It can set up a managed target, attach to an existing target, execute workloads, collect telemetry, render reports, and tear down managed services from one command. Run `just benchmark --help` for the full operator help page with every option and examples.
 
 ## Quick Start
 
-Native baseline comparison:
+```bash
+just benchmark \
+  --workload-manifest vortex-benchmark/manifests/examples/local-native-full-cycle.yaml \
+  --target-mode local \
+  --artifact-root .artifacts/benchmarks/local-dev \
+  --profile engineering
+```
+
+Dry-run the same shape first:
 
 ```bash
-bash vortex-benchmark/bin/vortex_bench setup \
+just benchmark \
+  --workload-manifest vortex-benchmark/manifests/examples/local-native-full-cycle.yaml \
+  --target-mode local \
+  --artifact-root .artifacts/benchmarks/local-dev \
+  --dry-run \
+  --explain
+```
+
+## Target Modes
+
+| Mode | Example |
+|------|---------|
+| Local managed | `--target-mode local --db vortex,redis --native` |
+| Docker managed | `--target-mode local --db vortex,redis,dragonfly,valkey --container` |
+| Existing endpoint | `--target-mode host-port --db vortex --target-url 127.0.0.1:16379` |
+| SSH managed | `--target-mode ssh-managed --ssh-target perfbox --ssh-start-command '...' --target-url perfbox:16379` |
+| SSH attach | `--target-mode ssh-attach --ssh-target perfbox --target-url perfbox:16379` |
+
+Attach modes mark service ownership as external and do not stop or reconfigure the endpoint.
+
+## Common Examples
+
+Native command sweep:
+
+```bash
+just benchmark \
   --db vortex,redis \
   --native \
-  --workload uniform-read_heavy \
-  --duration 30s
-
-bash vortex-benchmark/bin/vortex_bench run \
-  --state-file .artifacts/benchmarks/environments/<state>.json \
   --backend redis-benchmark \
-  --command SET,GET,INCR
-
-bash vortex-benchmark/bin/vortex_bench report \
-  --results-dir .artifacts/benchmarks/results \
-  --output-dir .artifacts/benchmarks
-
-bash vortex-benchmark/bin/vortex_bench teardown \
-  --state-file .artifacts/benchmarks/environments/<state>.json
-```
-
-Attach an already running profiled server:
-
-```bash
-bash vortex-benchmark/bin/vortex_bench attach \
-  --db vortex \
-  --host 127.0.0.1 \
-  --port 16379 \
-  --pid 4242 \
-  --label ttl-profile
-
-bash vortex-benchmark/bin/vortex_bench run \
-  --state-file .artifacts/benchmarks/environments/<attached-state>.json \
-  --backend redis-benchmark \
-  --command SET,GET,INCR
-```
-
-Citation-grade repeatability can live in the manifest itself:
-
-```bash
-just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark-repeat.yaml
-```
-
-CLI `--repeat` still overrides the manifest value when you want to change replicate count without editing the scenario file.
-
-Explicit AOF scenario:
-
-```bash
-bash vortex-benchmark/bin/vortex_bench setup \
-  --db redis \
-  --native \
   --command SET,GET,INCR \
-  --aof-enabled \
-  --aof-fsync everysec \
-  --duration 20s
+  --duration 30s \
+  --artifact-root .artifacts/benchmarks/native
 ```
 
-Explicit eviction scenario:
+Docker comparison:
 
 ```bash
-bash vortex-benchmark/bin/vortex_bench setup \
-  --db redis \
-  --native \
-  --workload uniform-write_heavy \
-  --maxmemory 64mb \
-  --eviction-policy allkeys-lru \
-  --duration 20s
+just benchmark \
+  --db vortex,redis,dragonfly,valkey \
+  --container \
+  --backend memtier_benchmark \
+  --workload uniform-mixed \
+  --duration 30s \
+  --artifact-root .artifacts/benchmarks/docker
 ```
 
-## Quick Flags Versus Manifests
+Host-port attach:
 
-Use CLI flags when:
+```bash
+just benchmark \
+  --db vortex \
+  --target-mode host-port \
+  --target-url 127.0.0.1:16379 \
+  --backend redis-benchmark \
+  --command PING,GET,SET \
+  --artifact-root .artifacts/benchmarks/attach
+```
 
-- the run is exploratory or one-off
-- you only need a small number of options
-- you are iterating locally and do not need a reusable scenario file
+Remote managed:
 
-Use manifests when:
+```bash
+just benchmark \
+  --db vortex \
+  --target-mode ssh-managed \
+  --ssh-target perfbox \
+  --ssh-workdir /srv/vortex \
+  --ssh-start-command 'cd /srv/vortex && ./vortex-server --bind 0.0.0.0:16379 --threads 4' \
+  --ssh-stop-command 'pkill -INT vortex-server' \
+  --ssh-artifact-path /srv/vortex/.artifacts \
+  --target-url perfbox:16379 \
+  --backend redis-benchmark \
+  --command PING \
+  --artifact-root .artifacts/benchmarks/remote
+```
 
-- the run should be reproducible in CI or Pages publication
-- you want to pin databases, workloads, backends, and runtime policies together
-- you want the scenario to live in version control under `vortex-benchmark/manifests/`
+Remote load host:
 
-CLI flags and manifests are merged into one resolved benchmark spec. CLI flags win when both sides define the same field.
+```bash
+just benchmark \
+  --db vortex \
+  --target-mode ssh-managed \
+  --ssh-target servicebox \
+  --ssh-port 2222 \
+  --ssh-identity-file ~/.ssh/perfbox_ed25519 \
+  --ssh-option StrictHostKeyChecking=accept-new \
+  --ssh-load-host loadbox \
+  --ssh-workdir /srv/vortex \
+  --ssh-copy-source \
+  --ssh-build-command 'cargo build --release -p vortex-server --bin vortex-server' \
+  --ssh-start-command 'cd /srv/vortex && target/release/vortex-server --bind 0.0.0.0:16379 --threads 4' \
+  --ssh-stop-command 'pkill -INT vortex-server' \
+  --target-url servicebox:16379 \
+  --backend redis-benchmark \
+  --command PING,GET,SET \
+  --artifact-root .artifacts/benchmarks/remote-load
+```
 
-## Runtime Policy Flags
+Remote benchmark artifacts copied back over SSH are stored under `<artifact-root>/remote/<timestamp>/`, and the resolved `plan.md` records the exact return path.
+Use `--ssh-port`, `--ssh-identity-file`, `--ssh-config`, `--ssh-option`, and
+`--ssh-connect-timeout` for non-default SSH transport. The options are applied
+consistently to remote commands, source copy, remote load delegation, and
+artifact return.
 
-The setup and run commands now expose an explicit runtime policy surface:
+## Profiles
 
-- `--aof-enabled` / `--aof-disabled`
-- `--aof-fsync always|everysec|no`
-- `--maxmemory <size>`
-- `--eviction-policy <policy>`
+| Profile | Behavior |
+|---------|----------|
+| `quick` | Fast exploratory run; repeat defaults to 1 |
+| `engineering` | Default development metadata |
+| `citation` | Repeat defaults to 3 and records citation-grade validity metadata |
+| `diagnostic` | Engineering metadata for a benchmark paired with profiler evidence |
 
-These values are recorded in the saved environment state. Later `run` commands validate that the requested runtime policy still matches the selected state file instead of silently reusing the wrong environment.
+CLI flags still override manifest values.
+
+## Progress And Output
+
+```bash
+--json       # JSON-lines progress stream
+--no-color   # uncolored stable console output
+--explain    # write plan.md
+--dry-run    # write session/preflight/plan only
+--no-report  # run workload but skip report rendering
+```
+
+Interactive terminals use one live progress line with spinner, progress bar,
+step count, and ETA. Log/CI output is stable and row-oriented. Report rendering
+prints a compact result table to the console and writes full Markdown, JSON,
+and CSV artifacts under `reports/latest/`.
 
 ## Artifact Layout
 
-The default artifact root is `.artifacts/benchmarks/` under the repository root and contains:
+The default root is `.artifacts/benchmarks/`.
 
-- `environments/` — saved setup state files
-- `logs/` — per-service startup and teardown logs
-- `requests/` — normalized run-request artifacts
-- `results/` — normalized run summaries and per-backend result JSON
-- `backend-runs/` — raw backend output files
-- `reports/` — timestamped reports plus stable publication outputs
-- `runtime/` — per-service runtime files such as AOF outputs
+| Path | Purpose |
+|------|---------|
+| `sessions/<target-mode>/<timestamp>/session.json` | Common session metadata |
+| `sessions/<target-mode>/<timestamp>/preflight.json` | Tool and platform preflight |
+| `sessions/<target-mode>/<timestamp>/plan.md` | Resolved execution plan |
+| `environments/` | Managed or attached service state |
+| `requests/` | Resolved benchmark request |
+| `results/` | Normalized run summaries |
+| `backend-runs/` | Raw backend output |
+| `reports/` | Timestamped JSON/CSV/Markdown reports |
+| `reports/latest/` | Stable report copies |
+| `runtime/` | Runtime files such as AOF output |
 
-The stable publication paths are:
+## Expert Subcommands
 
-- `reports/latest/report.json`
-- `reports/latest/report.csv`
-- `reports/latest/report.md`
-- `reports/latest/assets/`
-- `reports/index.json`
+The old split flow remains for debugging:
 
-Attached environment states look like normal setup-produced state files and can be consumed by `run` and `report` without any profiling-specific special casing.
+```bash
+just benchmark setup ...
+just benchmark run --state-file .artifacts/benchmarks/environments/<state>.json ...
+just benchmark report --summary-file .artifacts/benchmarks/results/<run>-summary.json
+just benchmark report \
+  --baseline-summary-file .artifacts/benchmarks/baseline/results/<run>-summary.json \
+  --candidate-summary-file .artifacts/benchmarks/candidate/results/<run>-summary.json \
+  --output-dir .artifacts/benchmarks/diff
+just benchmark teardown --state-file .artifacts/benchmarks/environments/<state>.json
+```

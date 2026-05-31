@@ -39,6 +39,10 @@ enum Workload {
     Mset,
     Msetnx,
     Delete,
+    CopySameShard,
+    CopyCrossShard,
+    RenameSameShard,
+    RenameCrossShard,
     Append,
     Setrange,
     Incrbyfloat,
@@ -277,6 +281,10 @@ fn run_probe(args: &Args) -> Result<ProbeSummary, String> {
         Workload::Mset => run_mset(args),
         Workload::Msetnx => run_msetnx(args),
         Workload::Delete => run_delete(args),
+        Workload::CopySameShard => run_copy(args, KeyPairShardMode::SameShard),
+        Workload::CopyCrossShard => run_copy(args, KeyPairShardMode::CrossShard),
+        Workload::RenameSameShard => run_rename(args, KeyPairShardMode::SameShard),
+        Workload::RenameCrossShard => run_rename(args, KeyPairShardMode::CrossShard),
         Workload::Append => run_append(args),
         Workload::Setrange => run_setrange(args),
         Workload::Incrbyfloat => run_incrbyfloat(args),
@@ -712,6 +720,100 @@ fn run_delete(args: &Args) -> Result<ProbeSummary, String> {
         execute_delete_batch(&keyspace, width, batch, args.keys)?;
         latency.record(operations, op_started);
         operations += 1;
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_copy(args: &Args, shard_mode: KeyPairShardMode) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.max(1);
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2))?;
+    let pairs = make_key_pairs_for_mode(&keyspace, args.keys, shard_mode);
+    prefill_key_pairs(&keyspace, &pairs, value_size, true);
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let (src, dst) = pair_for_operation(&pairs, index);
+                let parts = [b"COPY".as_slice(), src, dst, b"REPLACE".as_slice()];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"COPY", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..args.keys {
+                let (src, dst) = pair_for_operation(&pairs, index);
+                let parts = [b"COPY".as_slice(), src, dst, b"REPLACE".as_slice()];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"COPY", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
+    }
+
+    Ok(finalize_summary(
+        args,
+        &keyspace,
+        "command-path",
+        operations,
+        started.elapsed(),
+        latency.summarize(),
+        value_size,
+    ))
+}
+
+fn run_rename(args: &Args, shard_mode: KeyPairShardMode) -> Result<ProbeSummary, String> {
+    let value_size = args.value_size.max(1);
+    let keyspace = new_keyspace(args, args.keys.saturating_mul(2))?;
+    let pairs = make_key_pairs_for_mode(&keyspace, args.keys, shard_mode);
+    prefill_key_pairs(&keyspace, &pairs, value_size, false);
+
+    let mut latency = LatencyRecorder::new(args.latency_sample_rate, args.latency_max_samples);
+    let started = begin_measurement(args, &keyspace);
+    let mut operations = 0u64;
+
+    match args.duration {
+        Some(seconds) => {
+            let deadline = Duration::from_secs(seconds);
+            let mut index = 0usize;
+            while started.elapsed() < deadline {
+                let (src, dst) = pair_for_rename_operation(&pairs, index);
+                let parts = [b"RENAME".as_slice(), src, dst];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"RENAME", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+                index += 1;
+            }
+        }
+        None => {
+            for index in 0..args.keys {
+                let (src, dst) = pair_for_rename_operation(&pairs, index);
+                let parts = [b"RENAME".as_slice(), src, dst];
+                let op_started = Instant::now();
+                execute_parts(&keyspace, b"RENAME", &parts, 0u64.into())?;
+                latency.record(operations, op_started);
+                operations += 1;
+            }
+        }
     }
 
     Ok(finalize_summary(
@@ -1184,6 +1286,92 @@ fn prefill_named_float_strings(keyspace: &ConcurrentKeyspace, prefix: &[u8], key
             VortexKey::from(make_named_key(prefix, index)),
             VortexValue::from_bytes(make_float_value(index).as_slice()),
         );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KeyPairShardMode {
+    SameShard,
+    CrossShard,
+}
+
+fn make_key_pairs_for_mode(
+    keyspace: &ConcurrentKeyspace,
+    count: usize,
+    mode: KeyPairShardMode,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let pair_count = count.max(1);
+    let shard_count = keyspace.num_shards();
+    let mut pairs = Vec::with_capacity(pair_count);
+    for index in 0..pair_count {
+        let src_shard = index % shard_count;
+        let dst_shard = match mode {
+            KeyPairShardMode::SameShard => src_shard,
+            KeyPairShardMode::CrossShard => (src_shard + 1) % shard_count,
+        };
+        let src = make_key_for_shard(keyspace, b"src", index, src_shard);
+        let dst = make_key_for_shard(keyspace, b"dst", index, dst_shard);
+        pairs.push((src, dst));
+    }
+    pairs
+}
+
+fn make_key_for_shard(
+    keyspace: &ConcurrentKeyspace,
+    prefix: &[u8],
+    pair_index: usize,
+    shard_index: usize,
+) -> Vec<u8> {
+    let mut salt = 0usize;
+    loop {
+        let mut key = Vec::with_capacity(prefix.len() + 1 + 16 + 1 + 16);
+        key.extend_from_slice(prefix);
+        key.push(b':');
+        write!(&mut key, "{pair_index:016x}").expect("writing to Vec should not fail");
+        key.push(b':');
+        write!(&mut key, "{salt:016x}").expect("writing to Vec should not fail");
+        if keyspace.shard_index(&key) == shard_index {
+            return key;
+        }
+        salt = salt.wrapping_add(1);
+    }
+}
+
+fn prefill_key_pairs(
+    keyspace: &ConcurrentKeyspace,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    value_size: usize,
+    prefill_destination: bool,
+) {
+    for (index, (src, dst)) in pairs.iter().enumerate() {
+        benchmark_insert(
+            keyspace,
+            VortexKey::from(src.as_slice()),
+            VortexValue::from_bytes(make_value_bytes(index, value_size).as_slice()),
+        );
+        if prefill_destination {
+            benchmark_insert(
+                keyspace,
+                VortexKey::from(dst.as_slice()),
+                VortexValue::from_bytes(
+                    make_value_bytes(index.wrapping_add(pairs.len()), value_size).as_slice(),
+                ),
+            );
+        }
+    }
+}
+
+fn pair_for_operation(pairs: &[(Vec<u8>, Vec<u8>)], index: usize) -> (&[u8], &[u8]) {
+    let pair = &pairs[index % pairs.len()];
+    (pair.0.as_slice(), pair.1.as_slice())
+}
+
+fn pair_for_rename_operation(pairs: &[(Vec<u8>, Vec<u8>)], index: usize) -> (&[u8], &[u8]) {
+    let pair = &pairs[(index / 2) % pairs.len()];
+    if index % 2 == 0 {
+        (pair.0.as_slice(), pair.1.as_slice())
+    } else {
+        (pair.1.as_slice(), pair.0.as_slice())
     }
 }
 
@@ -1671,6 +1859,10 @@ fn workload_name(workload: Workload) -> &'static str {
         Workload::Mset => "mset",
         Workload::Msetnx => "msetnx",
         Workload::Delete => "delete",
+        Workload::CopySameShard => "copy-same-shard",
+        Workload::CopyCrossShard => "copy-cross-shard",
+        Workload::RenameSameShard => "rename-same-shard",
+        Workload::RenameCrossShard => "rename-cross-shard",
         Workload::Append => "append",
         Workload::Setrange => "setrange",
         Workload::Incrbyfloat => "incrbyfloat",

@@ -19,12 +19,13 @@ use super::{
     relative_deadline_nanos,
 };
 use crate::ConcurrentKeyspace;
-use crate::engine::domain::{ExpireOptions, MutationOutcome, TtlState};
+use crate::engine::domain::{ExpireOptions, KEYS_MAX_RESULTS_PER_CALL, MutationOutcome, TtlState};
 
 // ── Error constants ─────────────────────────────────────────────────
 
 static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
 static ERR_DB_INDEX: &[u8] = b"-ERR DB index is out of range\r\n";
+static ERR_KEYS_ALPHA_LIMIT: &[u8] = b"-ERR KEYS result exceeds alpha response limit; use SCAN\r\n";
 
 // ── DEL / UNLINK / EXISTS ───────────────────────────────────────────
 
@@ -663,11 +664,20 @@ pub fn cmd_keys(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
     let Some(args) = CommandArgs::collect(frame) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
+    if args.len() != 2 {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    }
     let Some(pat) = args.get(1) else {
         return CmdResult::Static(ERR_WRONG_ARGS);
     };
+    let (keys, limit_exceeded) =
+        keyspace.keys_matching_limited(pat, KEYS_MAX_RESULTS_PER_CALL, now_nanos);
+    if limit_exceeded {
+        return CmdResult::Static(ERR_KEYS_ALPHA_LIMIT);
+    }
+
     let mut results = Vec::new();
-    for key in keyspace.keys_matching(pat, now_nanos) {
+    for key in keys {
         results.push(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
             key.as_bytes(),
         )));
@@ -795,6 +805,7 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::commands::test_harness::TestHarness;
+    use crate::engine::domain::{KEYS_MAX_RESULTS_PER_CALL, SCAN_MAX_RESULTS_PER_CALL};
     use vortex_common::VortexValue;
     use vortex_proto::RespTape;
 
@@ -832,6 +843,7 @@ mod tests {
         match result {
             CmdResult::Static(s) => assert_eq!(s, expected, "Static mismatch"),
             CmdResult::Inline(_) => panic!("Expected Static, got Inline"),
+            CmdResult::Owned(_) => panic!("Expected Static, got Owned"),
             CmdResult::Resp(_) => panic!("Expected Static, got Resp"),
         }
     }
@@ -839,6 +851,7 @@ mod tests {
     fn assert_integer(result: CmdResult, expected: i64) {
         match result {
             CmdResult::Resp(RespFrame::Integer(n)) => assert_eq!(n, expected),
+            CmdResult::Owned(_) => panic!("expected Integer, got Owned"),
             CmdResult::Static(s) => {
                 // int_resp may return static bytes for common values (0, 1, -1, -2).
                 let expected_bytes = match expected {
@@ -860,6 +873,33 @@ mod tests {
             }
             other => panic!("Expected Integer({}), got {:?}", expected, other),
         }
+    }
+
+    fn scan_result(result: CmdResult) -> (u64, Vec<Vec<u8>>) {
+        let CmdResult::Resp(RespFrame::Array(Some(arr))) = result else {
+            panic!("expected SCAN array response");
+        };
+        assert_eq!(arr.len(), 2);
+
+        let RespFrame::BulkString(Some(cursor)) = &arr[0] else {
+            panic!("expected bulk-string SCAN cursor");
+        };
+        let cursor = std::str::from_utf8(cursor)
+            .expect("SCAN cursor is UTF-8")
+            .parse::<u64>()
+            .expect("SCAN cursor is an integer");
+
+        let RespFrame::Array(Some(keys)) = &arr[1] else {
+            panic!("expected SCAN key array");
+        };
+        let keys = keys
+            .iter()
+            .map(|key| match key {
+                RespFrame::BulkString(Some(bytes)) => bytes.to_vec(),
+                other => panic!("expected bulk-string SCAN key, got {other:?}"),
+            })
+            .collect();
+        (cursor, keys)
     }
 
     fn new_harness() -> TestHarness {
@@ -1435,6 +1475,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scan_large_count_is_capped_for_alpha_response_budget() {
+        let h = new_harness();
+        let keys = SCAN_MAX_RESULTS_PER_CALL + 128;
+        for i in 0..keys {
+            let key = format!("scan-cap:{i:04}");
+            h.set(VortexKey::from(key.as_str()), VortexValue::from("v"));
+        }
+
+        let count = (SCAN_MAX_RESULTS_PER_CALL * 8).to_string();
+        let result = exec(
+            &h.keyspace,
+            cmd_scan,
+            &[b"SCAN", b"0", b"COUNT", count.as_bytes()],
+            NOW,
+        );
+        let (cursor, returned) = scan_result(result);
+
+        assert!(
+            returned.len() <= SCAN_MAX_RESULTS_PER_CALL,
+            "SCAN must cap one-response key material; returned {}",
+            returned.len()
+        );
+        assert_ne!(
+            cursor, 0,
+            "SCAN must return a progress cursor when the capped response leaves keys behind"
+        );
+    }
+
+    #[test]
+    fn scan_sparse_match_advances_by_slot_budget() {
+        use crate::engine::domain::SCAN_MAX_SLOTS_PER_CALL;
+
+        let keyspace = ConcurrentKeyspace::with_capacity(
+            crate::keyspace::MIN_SHARD_COUNT,
+            SCAN_MAX_SLOTS_PER_CALL * crate::keyspace::MIN_SHARD_COUNT * 2,
+        );
+        let mut chosen_key = None;
+        for i in 0..10_000 {
+            let candidate = format!("scan-budget:{i}");
+            if keyspace.shard_index(candidate.as_bytes()) == 0 {
+                chosen_key = Some(candidate);
+                break;
+            }
+        }
+        let key = chosen_key.expect("test should find a key routed to shard zero");
+        keyspace.write(key.as_bytes(), |table| {
+            table.insert(VortexKey::from(key.as_str()), VortexValue::from("v"));
+        });
+
+        let result = exec(
+            &keyspace,
+            cmd_scan,
+            &[b"SCAN", b"0", b"MATCH", b"does-not-match:*", b"COUNT", b"1"],
+            NOW,
+        );
+        let (cursor, returned) = scan_result(result);
+
+        assert!(returned.is_empty());
+        assert_ne!(
+            cursor, 0,
+            "SCAN should return a progress cursor after exhausting its slot budget"
+        );
+    }
+
     // ── KEYS ────────────────────────────────────────────────────────
 
     #[test]
@@ -1494,6 +1599,30 @@ mod tests {
             }
             _ => panic!("Expected array"),
         }
+    }
+
+    #[test]
+    fn keys_rejects_wrong_arity() {
+        let h = new_harness();
+
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS"], NOW);
+        assert_static(r, ERR_WRONG_ARGS);
+
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"*", b"extra"], NOW);
+        assert_static(r, ERR_WRONG_ARGS);
+    }
+
+    #[test]
+    fn keys_large_match_fails_closed_at_alpha_response_cap() {
+        let h = new_harness();
+        for i in 0..=KEYS_MAX_RESULTS_PER_CALL {
+            let key = format!("keys-cap:{i:04}");
+            h.set(VortexKey::from(key), VortexValue::from("1"));
+        }
+
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"keys-cap:*"], NOW);
+
+        assert_static(r, ERR_KEYS_ALPHA_LIMIT);
     }
 
     // ── COPY ────────────────────────────────────────────────────────

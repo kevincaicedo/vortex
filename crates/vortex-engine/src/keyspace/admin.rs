@@ -135,6 +135,7 @@ impl ConcurrentKeyspace {
     /// Outstanding memory reservations are intentionally left untouched. A
     /// [`MemoryReservation`] is an owning token; only that token may release its
     /// bytes from `memory_reserved`.
+    #[cfg(test)]
     pub(crate) fn flush_all_with_lsn(&self) -> Result<Option<AofLsn>, LsnOverflow> {
         let mut guards = Vec::with_capacity(self.shards.len());
         for shard in self.shards.iter() {
@@ -156,6 +157,46 @@ impl ConcurrentKeyspace {
         self.expiry_key_total.store(0, Ordering::Relaxed);
         self.global_memory_used.store(0, Ordering::Relaxed);
         drop(guards);
+        purge_allocator_after_flush();
+        if had_entries {
+            self.bump_all_watches();
+        }
+
+        Ok(aof_lsn)
+    }
+
+    /// Command-scoped FLUSHDB / FLUSHALL path.
+    ///
+    /// The reactor must hold the exclusive all-shard transaction gate before
+    /// calling this path. With normal command readers excluded at the gate, the
+    /// flush can clear shards one at a time instead of retaining every shard
+    /// write guard until the end of the command turn.
+    ///
+    /// Outstanding memory reservations are intentionally left untouched. A
+    /// [`MemoryReservation`] is an owning token; only that token may release its
+    /// bytes from `memory_reserved`.
+    pub(crate) fn flush_all_with_lsn_command_scoped(&self) -> Result<Option<AofLsn>, LsnOverflow> {
+        let mut had_entries = false;
+        let mut lsn_checked = false;
+        let mut aof_lsn = None;
+
+        for shard in self.shards.iter() {
+            let mut guard = shard.write();
+            if !guard.is_empty() {
+                had_entries = true;
+                if !lsn_checked {
+                    aof_lsn = self.next_aof_lsn()?;
+                    lsn_checked = true;
+                }
+            }
+            *guard = SwissTable::with_hasher(self.table_hasher.clone());
+        }
+
+        for count in self.expiry_key_count.iter() {
+            count.store(0, Ordering::Relaxed);
+        }
+        self.expiry_key_total.store(0, Ordering::Relaxed);
+        self.global_memory_used.store(0, Ordering::Relaxed);
         purge_allocator_after_flush();
         if had_entries {
             self.bump_all_watches();

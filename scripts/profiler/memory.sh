@@ -34,18 +34,12 @@ run_heaptrack() {
     fi
 
     local extra_args=()
-    [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
-    [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
-    [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
-    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
-    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
-    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    collect_server_args extra_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     info "Running: heaptrack vortex-server"
     (
         exec heaptrack -o "${session}/heaptrack" \
             "$PROFILING_BINARY" \
-            --bind "${host}:${port}" --threads "$threads" \
             "${extra_args[@]}" \
             >"${session}/server-heaptrack.log" 2>&1
     ) &
@@ -101,19 +95,13 @@ run_massif() {
     fi
 
     local extra_args=()
-    [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
-    [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
-    [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
-    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
-    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
-    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    collect_server_args extra_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     info "Running: valgrind --tool=massif"
     (
         exec valgrind --tool=massif \
             --massif-out-file="${session}/massif.out" \
             "$PROFILING_BINARY" \
-            --bind "${host}:${port}" --threads "$threads" \
             "${extra_args[@]}" \
             >"${session}/server-massif.log" 2>&1
     ) &
@@ -207,7 +195,7 @@ run_instruments_memory() {
 
         if ! kill -0 "$tool_pid" 2>/dev/null; then
             warn "xctrace exited before load generation started for ${template}. See ${trace_log}"
-        elif [[ -n "$command" ]]; then
+        elif [[ -n "$command" ]] || { declare -F benchmark_bridge_enabled >/dev/null 2>&1 && benchmark_bridge_enabled; }; then
             generate_load "$host" "$port" "$command" "$duration" "$clients" "$load_log"
         fi
 

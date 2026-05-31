@@ -31,8 +31,14 @@ pub struct ReactorConfig {
     /// Per-activation reactor work budgets.
     pub budgets: ReactorBudgets,
     /// Runtime telemetry policy. Minimal is the release/default target;
-    /// Profile enables timestamped phase timers for benchmark/profiler runs.
+    /// Standard samples hot-path reactor-local diagnostics; Profile enables
+    /// exact diagnostics plus timestamped phase timers for benchmark/profiler runs.
     pub telemetry_mode: RuntimeTelemetryMode,
+    /// Effective local diagnostic sample rate. Zero disables local telemetry
+    /// for the cheapest minimal path.
+    pub telemetry_local_sample_rate: u32,
+    /// Cold metrics publication interval in monotonic nanoseconds.
+    pub telemetry_flush_interval_nanos: u64,
 }
 
 /// Per-connection retained-memory limits enforced by the reactor.
@@ -186,6 +192,8 @@ impl Default for ReactorConfig {
             sqpoll_idle_ms: 0,
             budgets: ReactorBudgets::default(),
             telemetry_mode: RuntimeTelemetryMode::Minimal,
+            telemetry_local_sample_rate: 0,
+            telemetry_flush_interval_nanos: METRICS_FLUSH_INTERVAL_NANOS,
         }
     }
 }

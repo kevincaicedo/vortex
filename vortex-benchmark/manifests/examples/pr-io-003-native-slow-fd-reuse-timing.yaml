@@ -1,0 +1,38 @@
+schema_version: 1
+name: pr-io-003-native-slow-fd-reuse-timing
+description: "PR-IO-003 native io_uring timing rows for slow-reader, connection churn, and close/fd-reuse pressure."
+databases:
+  - vortex
+backends:
+  - custom-rust
+workloads:
+  - pressure-slow_reader
+  - pressure-connection_storm
+  - pressure-close_storm
+repeat: 3
+duration: 10s
+environment:
+  mode: native
+  port_base: 29179
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  telemetry_mode: minimal
+  io_backend: uring
+  shard_count: 4096
+  ring_size: 4096
+  fixed_buffers: 1024
+  fixed_buffer_registration: auto
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 100
+    keyspace_size: 5000
+    ops_per_thread: 1500
+    warmup_ops: 50
+    value_size: 64

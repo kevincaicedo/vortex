@@ -28,6 +28,7 @@ Skipping is an engineering shortcut, not a release pass. Release candidates use 
 | --- | --- | --- |
 | `cargo-vortex-io` | core | IO lifetime, backend, reactor, shutdown, fixed-buffer, IPv6 bind, timer, and transaction reactor tests. |
 | `cargo-vortex-engine` | core | Engine command semantics, WATCH/MULTI/EXEC, deferred effects, optimistic mutation, table cursor, and unsafe entry invariants. |
+| `cargo-vortex-proto` | core | RESP parser, serializer, scanner, checked-in fuzz corpus, and deterministic parser mutation tests. |
 | `cargo-vortex-persist` | core | AOF record, replay, rewrite, fsync, and failure-injection correctness. |
 | `smoketest-build` | core | Ensures the smoke harness still compiles after command or server changes. |
 | `smoketest-list` | core | Lists command coverage and keeps smoke registration visible. |
@@ -38,11 +39,12 @@ Skipping is an engineering shortcut, not a release pass. Release candidates use 
 
 The report maps every required invariant to a row and representative test names:
 
-- package gates: `cargo test -p vortex-io`, `cargo test -p vortex-engine`, and `cargo test -p vortex-persist`
+- package gates: `cargo test -p vortex-io`, `cargo test -p vortex-engine`, `cargo test -p vortex-proto`, and `cargo test -p vortex-persist`
 - invalid completion tokens and cancellation races
 - shutdown with in-flight read/write/writev/close/cancel
 - fixed-buffer index limits and late accept during drain
 - large bulk frames across reads and `IOV_MAX + 1` pipelines
+- RESP parser fuzz-corpus replay, deterministic parser mutations, and serializer/iovec length bounds
 - high-fd polling registration and IPv6 bind
 - timer deadline bounds
 - multi-reactor AOF enable/disable/replay

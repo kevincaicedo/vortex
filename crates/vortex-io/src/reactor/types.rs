@@ -121,25 +121,192 @@ impl SliceBudget {
 #[derive(Debug, Default)]
 pub(super) struct ReactorLocalMetrics {
     pending: RuntimeLocalFlushMetrics,
+    backend_submit_sampler: LocalMetricSampler,
+    loop_sampler: LocalMetricSampler,
+    accept_eagain_sampler: LocalMetricSampler,
+    accept_sampler: LocalMetricSampler,
+    completion_sampler: LocalMetricSampler,
+    completion_budget_sampler: LocalMetricSampler,
+    command_sampler: LocalMetricSampler,
+    command_budget_sampler: LocalMetricSampler,
+    accept_budget_sampler: LocalMetricSampler,
+    writev_budget_sampler: LocalMetricSampler,
+    maintenance_budget_sampler: LocalMetricSampler,
+    yielded_connection_sampler: LocalMetricSampler,
+    parser_resume_sampler: LocalMetricSampler,
+    writev_sampler: LocalMetricSampler,
+    queued_response_sampler: LocalMetricSampler,
+    active_expiry_sampler: LocalMetricSampler,
+}
+
+#[derive(Debug, Default)]
+struct LocalMetricSampler {
+    sample_rate: u32,
+    sample_countdown: u32,
+}
+
+impl LocalMetricSampler {
+    #[inline]
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            sample_countdown: sample_rate,
+        }
+    }
+
+    #[inline]
+    fn record_weight(&mut self) -> Option<u64> {
+        match self.sample_rate {
+            0 => None,
+            1 => Some(1),
+            rate => {
+                if self.sample_countdown > 1 {
+                    self.sample_countdown -= 1;
+                    return None;
+                }
+                self.sample_countdown = rate;
+                Some(rate as u64)
+            }
+        }
+    }
 }
 
 impl ReactorLocalMetrics {
+    pub(super) fn new(sample_rate: u32) -> Self {
+        Self {
+            pending: RuntimeLocalFlushMetrics::default(),
+            backend_submit_sampler: LocalMetricSampler::new(sample_rate),
+            loop_sampler: LocalMetricSampler::new(sample_rate),
+            accept_eagain_sampler: LocalMetricSampler::new(sample_rate),
+            accept_sampler: LocalMetricSampler::new(sample_rate),
+            completion_sampler: LocalMetricSampler::new(sample_rate),
+            completion_budget_sampler: LocalMetricSampler::new(sample_rate),
+            command_sampler: LocalMetricSampler::new(sample_rate),
+            command_budget_sampler: LocalMetricSampler::new(sample_rate),
+            accept_budget_sampler: LocalMetricSampler::new(sample_rate),
+            writev_budget_sampler: LocalMetricSampler::new(sample_rate),
+            maintenance_budget_sampler: LocalMetricSampler::new(sample_rate),
+            yielded_connection_sampler: LocalMetricSampler::new(sample_rate),
+            parser_resume_sampler: LocalMetricSampler::new(sample_rate),
+            writev_sampler: LocalMetricSampler::new(sample_rate),
+            queued_response_sampler: LocalMetricSampler::new(sample_rate),
+            active_expiry_sampler: LocalMetricSampler::new(sample_rate),
+        }
+    }
+
+    #[inline]
+    pub(super) fn record_backend_submit_syscall(&mut self) {
+        let Some(weight) = self.backend_submit_sampler.record_weight() else {
+            return;
+        };
+        self.pending.backend_submit_syscalls =
+            self.pending.backend_submit_syscalls.saturating_add(weight);
+    }
+
     #[inline]
     pub(super) fn record_loop_iteration(&mut self) {
-        self.pending.loop_iterations = self.pending.loop_iterations.saturating_add(1);
+        let Some(weight) = self.loop_sampler.record_weight() else {
+            return;
+        };
+        self.pending.loop_iterations = self.pending.loop_iterations.saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_accept_eagain_rearm(&mut self) {
+        let Some(weight) = self.accept_eagain_sampler.record_weight() else {
+            return;
+        };
+        self.pending.accept_eagain_rearms =
+            self.pending.accept_eagain_rearms.saturating_add(weight);
     }
 
     #[inline]
     pub(super) fn record_accept_drain(&mut self, accepted: usize) {
-        self.pending.accept_drain_runs = self.pending.accept_drain_runs.saturating_add(1);
+        let Some(weight) = self.accept_sampler.record_weight() else {
+            return;
+        };
+        self.pending.accept_drain_runs = self.pending.accept_drain_runs.saturating_add(weight);
         if accepted == 0 {
             return;
         }
         let accepted = accepted as u64;
-        self.pending.accept_drain_accepted =
-            self.pending.accept_drain_accepted.saturating_add(accepted);
+        self.pending.accept_drain_accepted = self
+            .pending
+            .accept_drain_accepted
+            .saturating_add(accepted.saturating_mul(weight));
         self.pending.accept_drain_accepted_max =
             self.pending.accept_drain_accepted_max.max(accepted);
+    }
+
+    #[inline]
+    pub(super) fn record_completion_budget_exhaustion(&mut self) {
+        let Some(weight) = self.completion_budget_sampler.record_weight() else {
+            return;
+        };
+        self.pending.completion_budget_exhaustions = self
+            .pending
+            .completion_budget_exhaustions
+            .saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_command_budget_exhaustion(&mut self) {
+        let Some(weight) = self.command_budget_sampler.record_weight() else {
+            return;
+        };
+        self.pending.command_budget_exhaustions = self
+            .pending
+            .command_budget_exhaustions
+            .saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_accept_budget_exhaustion(&mut self) {
+        let Some(weight) = self.accept_budget_sampler.record_weight() else {
+            return;
+        };
+        self.pending.accept_budget_exhaustions = self
+            .pending
+            .accept_budget_exhaustions
+            .saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_writev_budget_exhaustion(&mut self) {
+        let Some(weight) = self.writev_budget_sampler.record_weight() else {
+            return;
+        };
+        self.pending.writev_budget_exhaustions = self
+            .pending
+            .writev_budget_exhaustions
+            .saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_maintenance_budget_exhaustion(&mut self) {
+        let Some(weight) = self.maintenance_budget_sampler.record_weight() else {
+            return;
+        };
+        self.pending.maintenance_budget_exhaustions = self
+            .pending
+            .maintenance_budget_exhaustions
+            .saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_yielded_connection(&mut self) {
+        let Some(weight) = self.yielded_connection_sampler.record_weight() else {
+            return;
+        };
+        self.pending.yielded_connections = self.pending.yielded_connections.saturating_add(weight);
+    }
+
+    #[inline]
+    pub(super) fn record_parser_resume(&mut self) {
+        let Some(weight) = self.parser_resume_sampler.record_weight() else {
+            return;
+        };
+        self.pending.parser_resumes = self.pending.parser_resumes.saturating_add(weight);
     }
 
     #[inline]
@@ -147,10 +314,16 @@ impl ReactorLocalMetrics {
         if width == 0 {
             return;
         }
+        let Some(weight) = self.completion_sampler.record_weight() else {
+            return;
+        };
         let width = width as u64;
-        self.pending.completion_batch_count = self.pending.completion_batch_count.saturating_add(1);
-        self.pending.completion_batch_total =
-            self.pending.completion_batch_total.saturating_add(width);
+        self.pending.completion_batch_count =
+            self.pending.completion_batch_count.saturating_add(weight);
+        self.pending.completion_batch_total = self
+            .pending
+            .completion_batch_total
+            .saturating_add(width.saturating_mul(weight));
         self.pending.completion_batch_max = self.pending.completion_batch_max.max(width);
     }
 
@@ -159,20 +332,32 @@ impl ReactorLocalMetrics {
         if width == 0 {
             return;
         }
+        let Some(weight) = self.command_sampler.record_weight() else {
+            return;
+        };
         let width = width as u64;
-        self.pending.command_batch_count = self.pending.command_batch_count.saturating_add(1);
-        self.pending.command_batch_total = self.pending.command_batch_total.saturating_add(width);
+        self.pending.command_batch_count = self.pending.command_batch_count.saturating_add(weight);
+        self.pending.command_batch_total = self
+            .pending
+            .command_batch_total
+            .saturating_add(width.saturating_mul(weight));
         self.pending.command_batch_max = self.pending.command_batch_max.max(width);
     }
 
     #[inline]
     pub(super) fn record_writev_chunk(&mut self, iovecs: usize) {
-        self.pending.writev_chunks = self.pending.writev_chunks.saturating_add(1);
+        let Some(weight) = self.writev_sampler.record_weight() else {
+            return;
+        };
+        self.pending.writev_chunks = self.pending.writev_chunks.saturating_add(weight);
         if iovecs == 0 {
             return;
         }
         let iovecs = iovecs as u64;
-        self.pending.writev_iovecs_total = self.pending.writev_iovecs_total.saturating_add(iovecs);
+        self.pending.writev_iovecs_total = self
+            .pending
+            .writev_iovecs_total
+            .saturating_add(iovecs.saturating_mul(weight));
         self.pending.writev_iovecs_max = self.pending.writev_iovecs_max.max(iovecs);
     }
 
@@ -181,12 +366,35 @@ impl ReactorLocalMetrics {
         if bytes == 0 {
             return;
         }
+        let Some(weight) = self.queued_response_sampler.record_weight() else {
+            return;
+        };
         let bytes = bytes as u64;
         self.pending.queued_response_bytes_total = self
             .pending
             .queued_response_bytes_total
-            .saturating_add(bytes);
+            .saturating_add(bytes.saturating_mul(weight));
         self.pending.queued_response_bytes_max = self.pending.queued_response_bytes_max.max(bytes);
+    }
+
+    #[inline]
+    pub(super) fn record_active_expiry(&mut self, sampled: usize, expired: usize) {
+        let Some(weight) = self.active_expiry_sampler.record_weight() else {
+            return;
+        };
+        self.pending.active_expiry_runs = self.pending.active_expiry_runs.saturating_add(weight);
+        if sampled != 0 {
+            self.pending.active_expiry_sampled = self
+                .pending
+                .active_expiry_sampled
+                .saturating_add((sampled as u64).saturating_mul(weight));
+        }
+        if expired != 0 {
+            self.pending.active_expiry_expired = self
+                .pending
+                .active_expiry_expired
+                .saturating_add((expired as u64).saturating_mul(weight));
+        }
     }
 
     #[inline]
@@ -486,6 +694,7 @@ pub(super) fn append_cmd_result(buf: &mut Vec<u8>, result: CmdResult) {
     match result {
         CmdResult::Static(bytes) => buf.extend_from_slice(bytes),
         CmdResult::Inline(inline) => buf.extend_from_slice(inline.as_bytes()),
+        CmdResult::Owned(bytes) => buf.extend_from_slice(&bytes),
         CmdResult::Resp(frame) => append_resp_frame(buf, &frame),
     }
 }

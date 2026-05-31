@@ -79,6 +79,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  smoke:
+    name: Smoke (local and host-port)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-15
+      - uses: Swatinem/rust-cache@v2
+      - name: Local managed smoke
+        run: cargo run -p vortex-smoketests -- run --spawn-vortex --fail-fast
+      - name: Host-port attach smoke
+        run: |
+          set -euo pipefail
+          cargo build -p vortex-server --bin vortex-server
+          mkdir -p .artifacts/smoke/ci
+          target/debug/vortex-server --bind 127.0.0.1:26379 --threads 1 \
+            > .artifacts/smoke/ci/attach-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for _ in {1..50}; do
+            if (echo > /dev/tcp/127.0.0.1/26379) >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          cargo run -p vortex-smoketests -- run \
+            --target-mode host-port \
+            --server-url redis://127.0.0.1:26379/ \
+            --fail-fast
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts-${{ github.run_id }}
+          path: .artifacts/smoke/
+
   # ── 0.2.6 — Miri job (parallelized via matrix) ─────────────────────
   miri:
     name: Miri (${{ matrix.group }})

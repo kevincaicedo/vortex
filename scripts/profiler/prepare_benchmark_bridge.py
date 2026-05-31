@@ -121,6 +121,8 @@ def main() -> int:
     print(shell_assign("BENCH_EFFECTIVE_DURATION_SECONDS", "" if duration_seconds is None else str(duration_seconds)))
     print(shell_assign("BENCH_RESOURCE_THREADS", str(resource_config.get("threads", ""))))
     print(shell_assign("BENCH_RUNTIME_AOF_ENABLED", "" if "aof_enabled" not in runtime_config else str(runtime_config.get("aof_enabled")).lower()))
+    print(shell_assign("BENCH_RUNTIME_AOF_FSYNC", "" if runtime_config.get("aof_fsync") is None else str(runtime_config.get("aof_fsync"))))
+    print(shell_assign("BENCH_RUNTIME_AOF_MAX_PENDING_FSYNC_BYTES", "" if runtime_config.get("aof_max_pending_fsync_bytes") is None else str(runtime_config.get("aof_max_pending_fsync_bytes"))))
     print(shell_assign("BENCH_RUNTIME_MAXMEMORY", str(runtime_config.get("maxmemory", ""))))
     print(shell_assign("BENCH_SERVER_MAXMEMORY", maxmemory_for_server(runtime_config)))
     print(shell_assign("BENCH_RUNTIME_EVICTION_POLICY", str(runtime_config.get("eviction_policy", ""))))
@@ -129,6 +131,8 @@ def main() -> int:
     print(shell_assign("BENCH_RUNTIME_FIXED_BUFFERS", str(runtime_config.get("fixed_buffers", ""))))
     print(shell_assign("BENCH_RUNTIME_SQPOLL_IDLE_MS", str(runtime_config.get("sqpoll_idle_ms", ""))))
     print(shell_assign("BENCH_RUNTIME_TELEMETRY_MODE", str(runtime_config.get("telemetry_mode", ""))))
+    print(shell_assign("BENCH_RUNTIME_TELEMETRY_LOCAL_SAMPLE_RATE", "" if runtime_config.get("telemetry_local_sample_rate") is None else str(runtime_config.get("telemetry_local_sample_rate"))))
+    print(shell_assign("BENCH_RUNTIME_TELEMETRY_FLUSH_INTERVAL_MS", "" if runtime_config.get("telemetry_flush_interval_ms") is None else str(runtime_config.get("telemetry_flush_interval_ms"))))
     return 0
 
 

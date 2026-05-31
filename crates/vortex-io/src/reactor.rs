@@ -101,7 +101,7 @@ const DEFAULT_MAINTENANCE_BUDGET: MaintenanceBudget = MaintenanceBudget::new_unc
 const COMMAND_TIME_CHECK_GRANULARITY: usize = 64;
 const ACTIVE_EXPIRY_INTERVAL_NANOS: u64 = 1_000_000;
 const ACTIVE_EXPIRY_MAX_EFFORT: usize = 20;
-const METRICS_FLUSH_INTERVAL_NANOS: u64 = 100_000_000;
+pub(crate) const METRICS_FLUSH_INTERVAL_NANOS: u64 = 100_000_000;
 
 /// Pre-computed RESP error for unknown commands.
 static RESP_ERR_UNKNOWN: &[u8] = b"-ERR unknown command\r\n";
@@ -116,6 +116,14 @@ static RESP_ERR_CONFIG_SET_MAXMEMORY: &[u8] = b"-ERR invalid argument for CONFIG
 static RESP_ERR_CONFIG_SET_POLICY: &[u8] =
     b"-ERR invalid argument for CONFIG SET maxmemory-policy\r\n";
 static RESP_ERR_CONFIG_SET_APPENDONLY_MULTI: &[u8] = b"-ERR CONFIG SET appendonly is disabled in multi-reactor alpha mode; configure appendonly at startup\r\n";
+static RESP_ERR_CONFIG_SET_APPENDFSYNC: &[u8] =
+    b"-ERR CONFIG SET appendfsync is disabled in alpha mode; configure appendfsync at startup\r\n";
+static RESP_ERR_CONFIG_SET_TELEMETRY: &[u8] =
+    b"-ERR CONFIG SET telemetry is disabled in alpha mode; configure telemetry at startup\r\n";
+static RESP_ERR_CONFIG_SET_BACKEND: &[u8] =
+    b"-ERR CONFIG SET io-backend is disabled in alpha mode; configure io-backend at startup\r\n";
+static RESP_ERR_CONFIG_SET_FIXED_BUFFERS: &[u8] =
+    b"-ERR CONFIG SET fixed-buffer-registration is disabled in alpha mode; configure fixed buffers at startup\r\n";
 static RESP_ERR_REQUEST_TOO_LARGE: &[u8] = b"-ERR request too large\r\n";
 static RESP_ERR_RESPONSE_TOO_LARGE: &[u8] = b"-ERR response memory limit exceeded\r\n";
 

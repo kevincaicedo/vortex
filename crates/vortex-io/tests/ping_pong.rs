@@ -39,6 +39,7 @@ fn ping_pong_resp() {
             sqpoll_idle_ms: 1000,
             budgets: Default::default(),
             telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -100,6 +101,7 @@ fn ping_pong_inline() {
             sqpoll_idle_ms: 1000,
             budgets: Default::default(),
             telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -149,6 +151,7 @@ fn unknown_command_returns_error() {
             sqpoll_idle_ms: 1000,
             budgets: Default::default(),
             telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

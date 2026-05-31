@@ -19,8 +19,10 @@ pub enum CommandExecutionScope<'a> {
     None,
     /// Gate the shards touched by the borrowed command keys.
     Keys(&'a [&'a [u8]]),
-    /// Gate every shard for whole-keyspace commands.
+    /// Enter every shard as a normal command reader for whole-keyspace reads.
     Full,
+    /// Exclude every normal command reader for whole-keyspace writes.
+    FullExclusive,
 }
 
 impl CommandExecutionScope<'_> {
@@ -96,6 +98,10 @@ impl SharedKeyspaceExecutor {
             }
             CommandExecutionScope::Full => {
                 let _gate = self.enter_all_shard_command_gate(reactor_id);
+                self.execute(name, frame, clock)
+            }
+            CommandExecutionScope::FullExclusive => {
+                let _gate = self.keyspace().enter_all_shard_transaction_gate();
                 self.execute(name, frame, clock)
             }
         }

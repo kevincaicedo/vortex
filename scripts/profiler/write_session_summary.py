@@ -980,11 +980,16 @@ def build_summary_payload(session_dir: Path) -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "session_id": session.get("session_id"),
         "session_dir": str(session_dir),
+        "status": session.get("status"),
+        "exit_code": session.get("exit_code"),
         "mode": session.get("mode"),
         "tool": session.get("tool"),
+        "tool_role": session.get("tool_role"),
         "tools_requested": session.get("tools_requested") or [],
         "tools_executed": session.get("tools_executed") or [],
         "cargo_profile": session.get("cargo_profile"),
+        "target_mode": session.get("target_mode"),
+        "target": session.get("target") or {},
         "workload": session.get("workload") or {},
         "comparison_key": comparison_key(session),
         "top_hotspots": top_hotspots,
@@ -998,6 +1003,7 @@ def build_summary_payload(session_dir: Path) -> dict[str, Any]:
         "lock_offcpu_profiles": collect_lock_offcpu_profiles(session_dir),
         "benchmark_artifacts": benchmark_artifacts(session_dir),
         "notes_path": session.get("notes_path"),
+        "artifact_paths": session.get("artifact_paths") or [],
     }
 
 

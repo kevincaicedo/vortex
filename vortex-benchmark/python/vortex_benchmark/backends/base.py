@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import resource
 import shlex
 import shutil
 import socket
@@ -32,6 +34,7 @@ DEFAULT_MEMTIER_DATA_SIZE = 384
 
 DEFAULT_CUSTOM_THREAD_SWEEP = (1, 2, 4, 8)
 DEFAULT_CUSTOM_PIPELINE_DEPTH = 1
+DEFAULT_CUSTOM_MULTI_KEY_WIDTH = 3
 DEFAULT_CUSTOM_KEYSPACE = 10_000
 DEFAULT_CUSTOM_OPS_PER_THREAD = 50_000
 DEFAULT_CUSTOM_WARMUP_OPS = 5_000
@@ -85,6 +88,37 @@ def apply_load_affinity(context: BackendRunContext, command: list[str]) -> list[
     if shutil.which("taskset") is None:
         return command
     return ["taskset", "-c", str(cpu_list), *command]
+
+
+def cpu_list_count(cpu_list: object) -> Optional[int]:
+    if cpu_list is None:
+        return None
+
+    cpus: set[int] = set()
+    for raw_part in str(cpu_list).split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            try:
+                start = int(start_raw.strip())
+                end = int(end_raw.strip())
+            except ValueError:
+                return None
+            if start < 0 or end < start:
+                return None
+            cpus.update(range(start, end + 1))
+            continue
+        try:
+            cpu = int(part)
+        except ValueError:
+            return None
+        if cpu < 0:
+            return None
+        cpus.add(cpu)
+
+    return len(cpus) if cpus else None
 
 
 def ensure_command_available(name: str) -> None:
@@ -142,6 +176,50 @@ def run_process(
         )
         raise BackendError(f"command failed: {quote_command(command)}\n{detail}")
     return result, elapsed
+
+
+def run_process_with_usage(
+    command: list[str],
+    *,
+    stdout_path: Path,
+    stderr_path: Path,
+    cwd: Optional[Path] = None,
+    check: bool = True,
+    cpu_list: object = None,
+) -> tuple[subprocess.CompletedProcess[str], float, dict[str, Any]]:
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    result, elapsed = run_process(
+        command,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        cwd=cwd,
+        check=check,
+    )
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+
+    user_seconds = max(0.0, after.ru_utime - before.ru_utime)
+    system_seconds = max(0.0, after.ru_stime - before.ru_stime)
+    total_seconds = user_seconds + system_seconds
+    avg_pct = (total_seconds / elapsed) * 100.0 if elapsed > 0 else None
+
+    capacity_cpus = cpu_list_count(cpu_list) or os.cpu_count()
+    capacity_pct = float(capacity_cpus * 100) if capacity_cpus else None
+    capacity_utilization_pct = (
+        (avg_pct / capacity_cpus)
+        if avg_pct is not None and capacity_cpus
+        else None
+    )
+
+    usage: dict[str, Any] = {
+        "cpu_user_seconds": user_seconds,
+        "cpu_system_seconds": system_seconds,
+        "cpu_total_seconds": total_seconds,
+        "cpu_utilization_avg_pct": avg_pct,
+        "cpu_capacity_cpus": capacity_cpus,
+        "cpu_capacity_pct": capacity_pct,
+        "cpu_utilization_of_capacity_pct": capacity_utilization_pct,
+    }
+    return result, elapsed, usage
 
 
 def _setting_aliases(value: str) -> tuple[str, ...]:

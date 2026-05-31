@@ -16,7 +16,11 @@ HAS_SELECTION=0
 
 usage() {
     cat <<'EOF'
-Usage: just benchmark-local [wrapper options] [vortex_bench options]
+Usage: vortex-benchmark/bin/vortex_bench_local [wrapper options] [benchmark options]
+
+Legacy local-cycle wrapper. Prefer the primary tool:
+  just benchmark --help
+  just benchmark --workload-manifest vortex-benchmark/manifests/examples/local-native-full-cycle.yaml
 
 Wrapper options:
   --manifest PATH        Alias for --workload-manifest PATH
@@ -30,11 +34,8 @@ When no selection flags are provided, the wrapper defaults to:
   vortex-benchmark/manifests/examples/local-native-full-cycle.yaml
 
 Examples:
-  just benchmark-local
-  just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
-  just benchmark-local --db vortex,redis --native --backend redis-benchmark --command GET,SET,INCR
-  just benchmark-local --db vortex,redis --native --backend memtier_benchmark --workload uniform-read_heavy
-  just benchmark-local --db vortex,redis --native --backend custom-rust --workload multi_key_only
+  vortex-benchmark/bin/vortex_bench_local
+  vortex-benchmark/bin/vortex_bench_local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
 EOF
 }
 

@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Colors ───────────────────────────────────────────────────────────────────
-if [[ -t 1 ]]; then
+if [[ -t 1 && "${VORTEX_PROFILER_NO_COLOR:-false}" != "true" ]]; then
     C_RESET='\033[0m'
     C_BOLD='\033[1m'
     C_DIM='\033[2m'
@@ -58,6 +58,16 @@ SESSION_SUMMARY_PATH=""
 SESSION_TOOLS_REQUESTED=""
 SESSION_TOOLS_EXECUTED=""
 SESSION_TARGET_PIDS=""
+SESSION_TARGET_MODE="local"
+SESSION_TARGET_HOST=""
+SESSION_TARGET_PORT=""
+SESSION_SSH_TARGET=""
+SESSION_SSH_PORT=""
+SESSION_SSH_IDENTITY_FILE=""
+SESSION_SSH_CONFIG=""
+SESSION_SSH_OPTIONS=""
+SESSION_SSH_CONNECT_TIMEOUT=""
+SESSION_ARTIFACT_ROOT=""
 
 # ── Optional environment loading ─────────────────────────────────────────────
 PROFILER_ENV_FILE=""
@@ -70,7 +80,9 @@ load_profiler_env() {
             PROFILER_ENV_FILE="$candidate"
             # shellcheck disable=SC1090
             source "$candidate"
-            info "Loaded profiler environment from ${candidate}"
+            if [[ "${VORTEX_PROFILER_VERBOSE_ENV:-false}" == "true" ]]; then
+                info "Loaded profiler environment from ${candidate}"
+            fi
             return 0
         fi
     done
@@ -86,6 +98,15 @@ require_cmd() {
     if ! has_cmd "$name"; then
         fatal "Required tool '${name}' is not installed. Run 'just profiler --check' to see available tools."
     fi
+}
+
+shell_join() {
+    local rendered=""
+    local arg
+    for arg in "$@"; do
+        printf -v rendered '%s%q ' "$rendered" "$arg"
+    done
+    printf '%s' "${rendered% }"
 }
 
 _append_unique_line() {
@@ -257,7 +278,8 @@ PROFILING_BINARY="${REPO_ROOT}/target/profiling/vortex-server"
 # ── Session directory factory ────────────────────────────────────────────────
 make_session_dir() {
     local tag="${1:-session}"
-    local dir="${REPO_ROOT}/.artifacts/profiling/$(timestamp)-${tag}"
+    local root="${SESSION_ARTIFACT_ROOT:-${REPO_ROOT}/.artifacts/profiling}"
+    local dir="${root}/$(timestamp)-${tag}"
     mkdir -p "$dir"
     echo "$dir"
 }
@@ -380,6 +402,15 @@ write_session_contract() {
     SESSION_TOOLS_REQUESTED="$SESSION_TOOLS_REQUESTED" \
     SESSION_TOOLS_EXECUTED="$SESSION_TOOLS_EXECUTED" \
     SESSION_TARGET_PIDS="$SESSION_TARGET_PIDS" \
+    SESSION_TARGET_MODE="$SESSION_TARGET_MODE" \
+    SESSION_TARGET_HOST="$SESSION_TARGET_HOST" \
+    SESSION_TARGET_PORT="$SESSION_TARGET_PORT" \
+    SESSION_SSH_TARGET="$SESSION_SSH_TARGET" \
+    SESSION_SSH_PORT="$SESSION_SSH_PORT" \
+    SESSION_SSH_IDENTITY_FILE="$SESSION_SSH_IDENTITY_FILE" \
+    SESSION_SSH_CONFIG="$SESSION_SSH_CONFIG" \
+    SESSION_SSH_OPTIONS="$SESSION_SSH_OPTIONS" \
+    SESSION_SSH_CONNECT_TIMEOUT="$SESSION_SSH_CONNECT_TIMEOUT" \
     SESSION_NOTES_FILE="$SESSION_NOTES_FILE" \
     python3 - <<'PY'
 from __future__ import annotations
@@ -459,11 +490,32 @@ payload = {
         "dirty": bool(run(["git", "status", "--porcelain"], cwd=str(repo_root)) or ""),
     },
     "tool": executed_tools[0] if len(executed_tools) == 1 else None,
+    "tool_role": "profiler",
     "tools_requested": requested_tools,
     "tools_executed": executed_tools,
     "command_line": os.environ.get("SESSION_COMMAND_LINE") or None,
     "pid": target_pids[0] if len(target_pids) == 1 else None,
     "target_pids": target_pids,
+    "target_mode": os.environ.get("SESSION_TARGET_MODE") or "local",
+    "target": {
+        "mode": os.environ.get("SESSION_TARGET_MODE") or "local",
+        "host": os.environ.get("SESSION_TARGET_HOST") or None,
+        "port": int(os.environ["SESSION_TARGET_PORT"])
+        if (os.environ.get("SESSION_TARGET_PORT") or "").isdigit()
+        else None,
+        "ssh_target": os.environ.get("SESSION_SSH_TARGET") or None,
+        "transport": {
+            "port": int(os.environ["SESSION_SSH_PORT"])
+            if (os.environ.get("SESSION_SSH_PORT") or "").isdigit()
+            else None,
+            "identity_file": os.environ.get("SESSION_SSH_IDENTITY_FILE") or None,
+            "config_file": os.environ.get("SESSION_SSH_CONFIG") or None,
+            "options": split_lines("SESSION_SSH_OPTIONS"),
+            "connect_timeout": int(os.environ["SESSION_SSH_CONNECT_TIMEOUT"])
+            if (os.environ.get("SESSION_SSH_CONNECT_TIMEOUT") or "").isdigit()
+            else None,
+        },
+    },
     "workload_description": os.environ.get("SESSION_WORKLOAD_DESCRIPTION") or None,
     "workload": {
         "source": os.environ.get("SESSION_WORKLOAD_SOURCE") or None,

@@ -24,6 +24,7 @@ from vortex_benchmark.backends.base import (
     quote_command,
     read_json,
     run_process,
+    run_process_with_usage,
     send_resp_pipeline,
     write_json,
 )
@@ -249,13 +250,19 @@ def run_memtier_backend(context: BackendRunContext) -> BackendExecutionRecord:
 
             snapshot_before = capture_service_snapshot(context.service)
             host_telemetry = None
+            load_generator_usage = {}
             telemetry = start_host_telemetry_capture(
                 backend_dir,
                 label=stem,
                 service=context.service,
             )
             try:
-                _, elapsed = run_process(command, stdout_path=stdout_path, stderr_path=stderr_path)
+                _, elapsed, load_generator_usage = run_process_with_usage(
+                    command,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    cpu_list=(context.spec.resource_config or {}).get("load_cpus"),
+                )
             finally:
                 host_telemetry = telemetry.stop()
             snapshot_after = capture_service_snapshot(context.service)
@@ -277,6 +284,7 @@ def run_memtier_backend(context: BackendRunContext) -> BackendExecutionRecord:
                         "after": snapshot_after,
                         "delta": diff_service_snapshots(snapshot_before, snapshot_after),
                         "host_telemetry": host_telemetry,
+                        "load_generator": load_generator_usage,
                     },
                 }
             )

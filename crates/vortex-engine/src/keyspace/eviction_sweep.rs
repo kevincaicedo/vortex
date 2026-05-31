@@ -226,7 +226,7 @@ impl SweepPolicy for LfuClockPolicy {
         };
         let frequency = keyspace
             .frequency_sketch
-            .estimate(table.hash_key_bytes(key.as_bytes()));
+            .estimate(table.hash_key_bytes(key));
         if self.best_candidate.is_none() || frequency < self.best_frequency {
             self.best_candidate = Some(slot);
             self.best_frequency = frequency;
@@ -389,11 +389,7 @@ impl ConcurrentKeyspace {
                 .load(std::sync::atomic::Ordering::Acquire),
         );
         let bytes_needed = pressure.saturating_sub(target_used);
-        let scan_start = if self.runtime_profile_timers_enabled() {
-            Some(vortex_common::Timestamp::now().as_nanos())
-        } else {
-            None
-        };
+        let scan_start = self.runtime_profile_metric_start();
         let mut evicted = Vec::new();
         report.bytes_freed = self.evict_from_shard(
             shard_idx,
@@ -404,14 +400,7 @@ impl ConcurrentKeyspace {
             &mut evicted,
         );
         report.oom_after_scan = self.committed_memory_pressure() > snapshot.max_memory;
-        let scan_nanos = scan_start
-            .map(|start| {
-                vortex_common::Timestamp::now()
-                    .as_nanos()
-                    .saturating_sub(start)
-                    .max(1)
-            })
-            .unwrap_or(0);
+        let scan_nanos = self.runtime_profile_metric_elapsed_nanos(scan_start);
         self.eviction_metrics
             .record_with_duration(report, scan_nanos);
 
@@ -632,10 +621,10 @@ impl ConcurrentKeyspace {
         let Some((key, _)) = table.slot_key_value(slot) else {
             return EvictionDeletion::default();
         };
-        let key = (record_aof || track_watch).then(|| key.clone());
+        let key = (record_aof || track_watch).then(|| VortexKey::from_bytes(key));
         let aof_lsn = if record_aof {
-            match self.next_lsn().and_then(AofLsn::from_allocated_lsn) {
-                Ok(lsn) => Some(lsn),
+            match self.next_lsn() {
+                Ok(lsn) => Some(AofLsn::from_entry_lsn(lsn)),
                 Err(_) => return EvictionDeletion::default(),
             }
         } else {

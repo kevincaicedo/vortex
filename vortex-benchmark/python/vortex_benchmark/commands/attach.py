@@ -55,13 +55,13 @@ def execute_attach(args) -> EnvironmentState:
         raise ValueError("attach requires --host")
     if getattr(args, "port", None) is None or args.port <= 0:
         raise ValueError("attach requires a positive --port")
-    if getattr(args, "pid", None) is None or args.pid <= 0:
-        raise ValueError("attach requires a positive --pid")
+    if getattr(args, "pid", None) is not None and args.pid <= 0:
+        raise ValueError("--pid must be positive when provided")
 
     database = databases[0]
     host = str(args.host).strip()
     port = int(args.port)
-    pid = int(args.pid)
+    pid = int(args.pid) if getattr(args, "pid", None) is not None else None
     label = sanitize_identifier(getattr(args, "label", None) or "external")
 
     if not probe_redis_endpoint(host, port):
@@ -87,7 +87,7 @@ def execute_attach(args) -> EnvironmentState:
 
     append_log_header(
         log_path,
-        f"attached external service: database={database} host={host} port={port} pid={pid} label={label}",
+        f"attached external service: database={database} host={host} port={port} pid={pid or 'unknown'} label={label}",
     )
     if binary_path is not None:
         append_log_header(log_path, f"binary path: {binary_path}")
@@ -146,7 +146,7 @@ def execute_attach(args) -> EnvironmentState:
     print(f"environment attached: {state.environment_id}")
     print(f"state file: {state.state_file}")
     print(
-        f"- {database}: external {host}:{port} pid={pid} label={label} log={log_path}"
+        f"- {database}: external {host}:{port} pid={pid or 'unknown'} label={label} log={log_path}"
     )
     if spec.runtime_config:
         formatted_runtime = ", ".join(

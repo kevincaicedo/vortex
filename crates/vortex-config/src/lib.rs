@@ -70,9 +70,12 @@ impl fmt::Display for FixedBufferRegistrationKind {
 #[serde(rename_all = "lowercase")]
 pub enum TelemetryModeKind {
     /// Release/default mode: correctness/status metrics stay available, but
-    /// profiler-only phase timers are disabled.
+    /// diagnostic batch counters and profiler-only phase timers are disabled.
     #[default]
     Minimal,
+    /// Sampled diagnostic mode: low-rate reactor batch counters are enabled,
+    /// but profiler-only phase timers stay disabled.
+    Standard,
     /// Profiling-only mode: enable timestamped phase timers for benchmark
     /// evidence. This variant is not compiled into normal release builds.
     #[cfg(feature = "profile-telemetry")]
@@ -83,6 +86,7 @@ impl fmt::Display for TelemetryModeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Minimal => write!(f, "minimal"),
+            Self::Standard => write!(f, "standard"),
             #[cfg(feature = "profile-telemetry")]
             Self::Profile => write!(f, "profile"),
         }
@@ -109,6 +113,8 @@ pub const DEFAULT_REACTOR_OVERLOAD_PARSER_ACCUMULATOR_BYTES: usize = 256 * 1024 
 pub const DEFAULT_REACTOR_OVERLOAD_AOF_PENDING_BYTES: u64 = DEFAULT_AOF_MAX_PENDING_FSYNC_BYTES;
 pub const DEFAULT_REACTOR_OVERLOAD_WRITEV_BACKLOG_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_REACTOR_OVERLOAD_MAINTENANCE_DEBT: usize = 1024;
+pub const DEFAULT_TELEMETRY_LOCAL_SAMPLE_RATE: u32 = 256;
+pub const DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS: u64 = 100;
 pub const DEFAULT_SHARD_COUNT: usize = 4096;
 pub const MIN_SHARD_COUNT: usize = 64;
 pub const MAX_SHARD_COUNT: usize = 131_072;
@@ -293,8 +299,8 @@ pub struct VortexConfig {
 
     /// Runtime telemetry mode.
     ///
-    /// Normal release builds support only `minimal`; profiling builds compiled
-    /// with `profile-telemetry` also support `profile`.
+    /// Normal release builds support `minimal` and sampled `standard`;
+    /// profiling builds compiled with `profile-telemetry` also support `profile`.
     #[arg(
         long,
         default_value = "minimal",
@@ -302,6 +308,25 @@ pub struct VortexConfig {
         value_enum
     )]
     pub telemetry_mode: TelemetryModeKind,
+
+    /// Sampling rate for `standard` telemetry hot-path reactor-local diagnostics.
+    ///
+    /// `minimal` ignores this value because local diagnostics are disabled.
+    /// `profile` records exact diagnostics and timer data.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TELEMETRY_LOCAL_SAMPLE_RATE,
+        env = "VORTEX_TELEMETRY_LOCAL_SAMPLE_RATE"
+    )]
+    pub telemetry_local_sample_rate: u32,
+
+    /// Cold metrics publication interval in milliseconds.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS,
+        env = "VORTEX_TELEMETRY_FLUSH_INTERVAL_MS"
+    )]
+    pub telemetry_flush_interval_ms: u64,
 
     /// Max backend completions processed by one reactor loop activation.
     #[arg(
@@ -439,6 +464,8 @@ impl Default for VortexConfig {
             connection_timeout_secs: 300,
             sqpoll_idle_ms: 0,
             telemetry_mode: TelemetryModeKind::Minimal,
+            telemetry_local_sample_rate: DEFAULT_TELEMETRY_LOCAL_SAMPLE_RATE,
+            telemetry_flush_interval_ms: DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS,
             reactor_completion_budget: DEFAULT_REACTOR_COMPLETION_BUDGET,
             reactor_command_budget: DEFAULT_REACTOR_COMMAND_BUDGET,
             reactor_accept_budget: DEFAULT_REACTOR_ACCEPT_BUDGET,
@@ -588,6 +615,15 @@ impl VortexConfig {
         if self.reactor_overload_maintenance_debt == 0 {
             return Err("reactor_overload_maintenance_debt must be > 0".to_string());
         }
+        if self.telemetry_local_sample_rate == 0 {
+            return Err("telemetry_local_sample_rate must be > 0".to_string());
+        }
+        if self.telemetry_flush_interval_ms == 0 {
+            return Err("telemetry_flush_interval_ms must be > 0".to_string());
+        }
+        if self.telemetry_flush_interval_ms > u64::MAX / 1_000_000 {
+            return Err("telemetry_flush_interval_ms is too large".to_string());
+        }
         if self.fixed_buffers < 1 {
             return Err(format!(
                 "fixed_buffers must be at least 1 (one fixed read buffer), got {}",
@@ -697,6 +733,8 @@ impl VortexConfig {
         merge_field!("connection_timeout_secs", connection_timeout_secs);
         merge_field!("sqpoll_idle_ms", sqpoll_idle_ms);
         merge_field!("telemetry_mode", telemetry_mode);
+        merge_field!("telemetry_local_sample_rate", telemetry_local_sample_rate);
+        merge_field!("telemetry_flush_interval_ms", telemetry_flush_interval_ms);
         merge_field!("reactor_completion_budget", reactor_completion_budget);
         merge_field!("reactor_command_budget", reactor_command_budget);
         merge_field!("reactor_accept_budget", reactor_accept_budget);
@@ -817,6 +855,14 @@ mod tests {
         assert_eq!(config.connection_timeout_secs, 300);
         assert_eq!(config.telemetry_mode, TelemetryModeKind::Minimal);
         assert_eq!(
+            config.telemetry_local_sample_rate,
+            DEFAULT_TELEMETRY_LOCAL_SAMPLE_RATE
+        );
+        assert_eq!(
+            config.telemetry_flush_interval_ms,
+            DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS
+        );
+        assert_eq!(
             config.aof_max_pending_fsync_bytes,
             DEFAULT_AOF_MAX_PENDING_FSYNC_BYTES
         );
@@ -884,6 +930,26 @@ mod tests {
 
         assert_eq!(config.io_backend, IoBackendKind::Uring);
         assert_eq!(config.ring_size, 2048);
+    }
+
+    #[test]
+    fn from_args_telemetry_standard() {
+        let config = VortexConfig::from_args([
+            "vortex-server".to_string(),
+            "--threads".to_string(),
+            "1".to_string(),
+            "--telemetry-mode".to_string(),
+            "standard".to_string(),
+            "--telemetry-local-sample-rate".to_string(),
+            "32".to_string(),
+            "--telemetry-flush-interval-ms".to_string(),
+            "250".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(config.telemetry_mode, TelemetryModeKind::Standard);
+        assert_eq!(config.telemetry_local_sample_rate, 32);
+        assert_eq!(config.telemetry_flush_interval_ms, 250);
     }
 
     #[test]

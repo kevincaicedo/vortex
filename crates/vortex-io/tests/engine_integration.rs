@@ -55,6 +55,7 @@ fn spawn_reactor() -> (std::thread::JoinHandle<()>, u16, Arc<ShutdownCoordinator
             sqpoll_idle_ms: 1000,
             budgets: Default::default(),
             telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

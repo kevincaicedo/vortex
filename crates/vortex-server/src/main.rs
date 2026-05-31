@@ -130,6 +130,19 @@ fn main() -> ExitCode {
         time: TimeBudget::from_micros(config.reactor_time_budget_us),
     };
 
+    let telemetry_mode = match config.telemetry_mode {
+        vortex_config::TelemetryModeKind::Minimal => RuntimeTelemetryMode::Minimal,
+        vortex_config::TelemetryModeKind::Standard => RuntimeTelemetryMode::Standard,
+        #[cfg(feature = "profile-telemetry")]
+        vortex_config::TelemetryModeKind::Profile => RuntimeTelemetryMode::Profile,
+    };
+    let telemetry_local_sample_rate = match telemetry_mode {
+        RuntimeTelemetryMode::Minimal => 0,
+        RuntimeTelemetryMode::Standard => config.telemetry_local_sample_rate,
+        #[cfg(feature = "profile-telemetry")]
+        RuntimeTelemetryMode::Profile => 1,
+    };
+
     let pool_config = ReactorPoolConfig {
         bind_addr: config.bind,
         threads: config.threads,
@@ -172,11 +185,11 @@ fn main() -> ExitCode {
         ring_size: config.ring_size,
         sqpoll_idle_ms: config.sqpoll_idle_ms,
         budgets,
-        telemetry_mode: match config.telemetry_mode {
-            vortex_config::TelemetryModeKind::Minimal => RuntimeTelemetryMode::Minimal,
-            #[cfg(feature = "profile-telemetry")]
-            vortex_config::TelemetryModeKind::Profile => RuntimeTelemetryMode::Profile,
-        },
+        telemetry_mode,
+        telemetry_local_sample_rate,
+        telemetry_flush_interval_nanos: config
+            .telemetry_flush_interval_ms
+            .saturating_mul(1_000_000),
     };
 
     let mut pool = match ReactorPool::spawn(pool_config) {

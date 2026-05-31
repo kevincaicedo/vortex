@@ -3,8 +3,8 @@
 
 The full alpha matrix is intentionally large. This runner makes the contract
 repeatable without hiding evidence quality: generated-only rows are a plan,
-single-replicate runs are exploratory, and release-candidate rows need 3-5
-clean repeats before they can back a public claim.
+single-replicate runs are exploratory, and publication-grade rows need 3-5
+clean repeats plus explicit report artifacts.
 """
 
 from __future__ import annotations
@@ -224,7 +224,7 @@ def make_core_row(
         tier="tier1",
         surface="core point commands",
         evidence_tier="citation-grade" if repeat >= 3 else "engineering",
-        notes="redis-benchmark row; p99.9 is unavailable, so sub-ms p99.9 claims need memtier/custom rows.",
+        notes="redis-benchmark row; p99.9 is unavailable, so use memtier/custom rows when p99.9 is required.",
         manifest=base_manifest(
             name=name,
             description="VAL-ALPHA-002 Tier 1 core point-command comparison.",
@@ -265,7 +265,7 @@ def make_mixed_row(
         tier="tier1",
         surface="mixed workload with p99.9",
         evidence_tier="citation-grade" if repeat >= 3 else "engineering",
-        notes="p99.9-capable row for latency and throughput claims.",
+        notes="p99.9-capable row for latency and throughput analysis.",
         manifest=base_manifest(
             name=name,
             description="VAL-ALPHA-002 Tier 1 mixed workload comparison.",
@@ -777,8 +777,8 @@ def write_report(
         "Evidence policy:",
         "",
         "- Single-replicate rows are exploratory only.",
-        "- Release-candidate claims require 3-5 repeats, clean host validity, and artifact paths.",
-        "- `redis-benchmark` rows do not expose p99.9; use `memtier_benchmark` or `custom-rust` rows for p99.9 claims.",
+        "- Publication-grade rows require 3-5 repeats, clean host validity, and artifact paths.",
+        "- `redis-benchmark` rows do not expose p99.9; use `memtier_benchmark` or `custom-rust` rows when p99.9 is required.",
         "",
         "## Rows",
         "",
@@ -808,9 +808,9 @@ def write_report(
             "",
             "## Manual/Release Gates Not Automated Here",
             "",
-            "- CPU governor, power profile, thermal state, affinity, socket queues, retransmits, and client saturation must be checked in the generated benchmark reports before accepting a release row.",
-            "- Full-server memory comparison at 50k, 100k, and 1M keys is owned by the memory attribution tooling and must be linked before memory-efficiency claims.",
-            "- Tier 3 DragonflyDB and Valkey comparisons are scheduled after Vortex-vs-Redis evidence stabilizes.",
+            "- CPU governor, power profile, thermal state, affinity, socket queues, retransmits, and client saturation must be checked in the generated benchmark reports before using a row for publication.",
+            "- Full-server memory comparison at 50k, 100k, and 1M keys is owned by the memory attribution tooling and must be linked when memory efficiency is being analyzed.",
+            "- Tier 3 DragonflyDB and Valkey comparisons are scheduled after the core comparison rows stabilize.",
         ]
     )
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")

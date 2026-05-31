@@ -2,10 +2,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use serde_json::json;
 
 use crate::commands;
 use crate::context::SmokeContext;
-use crate::spec::{CommandGroup, CommandSpec, SupportLevel};
+use crate::spec::{BaselinePolicy, CommandGroup, CommandSpec, SupportLevel};
 
 #[derive(Debug, Default, Clone)]
 pub struct Selection {
@@ -137,6 +138,109 @@ impl RunSummary {
         std::fs::write(path, self.to_markdown())?;
         Ok(())
     }
+
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let reports: Vec<_> = self
+            .reports
+            .iter()
+            .map(|report| {
+                json!({
+                    "command": report.command,
+                    "case": report.case,
+                    "summary": report.summary,
+                    "iteration": report.iteration,
+                    "success": report.success,
+                    "target_duration_ms": report.target_duration.as_millis(),
+                    "baseline_duration_ms": report.baseline_duration.map(|duration| duration.as_millis()),
+                    "detail": &report.detail,
+                })
+            })
+            .collect();
+
+        json!({
+            "server_url": &self.server_url,
+            "baseline_url": &self.baseline_url,
+            "repeat": self.repeat,
+            "command_count": self.command_count,
+            "case_count": self.case_count,
+            "failed_cases": self.failed_cases,
+            "reports": reports,
+        })
+    }
+
+    pub fn write_json(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&self.to_json_value())?)?;
+        Ok(())
+    }
+
+    pub fn write_client_log(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = String::new();
+        out.push_str(&format!("target={}\n", self.server_url));
+        if let Some(baseline_url) = &self.baseline_url {
+            out.push_str(&format!("baseline={baseline_url}\n"));
+        }
+        out.push_str(&format!("repeat={}\n", self.repeat));
+        for report in &self.reports {
+            let status = if report.success { "PASS" } else { "FAIL" };
+            out.push_str(&format!(
+                "{} command={} case={} iteration={} target_ms={} baseline_ms={:?}\n",
+                status,
+                report.command,
+                report.case,
+                report.iteration,
+                report.target_duration.as_millis(),
+                report
+                    .baseline_duration
+                    .map(|duration| duration.as_millis())
+            ));
+            if let Some(detail) = &report.detail {
+                out.push_str("  detail=");
+                out.push_str(detail);
+                out.push('\n');
+            }
+        }
+        std::fs::write(path, out)?;
+        Ok(())
+    }
+
+    pub fn write_reproducers(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = String::from("# Smoke Failure Reproducers\n\n");
+        let failures: Vec<_> = self
+            .reports
+            .iter()
+            .filter(|report| !report.success)
+            .collect();
+        if failures.is_empty() {
+            out.push_str("No failing smoke cases were recorded.\n");
+        } else {
+            out.push_str("Rerun a failing command group with:\n\n");
+            out.push_str("```bash\n");
+            out.push_str("cargo run -p vortex-smoketests -- run --server-url ");
+            out.push_str(&self.server_url);
+            out.push_str(" --fail-fast --command <COMMAND>\n");
+            out.push_str("```\n\n");
+            for report in failures {
+                out.push_str(&format!(
+                    "- `{}` / `{}` iteration `{}`: {}\n",
+                    report.command,
+                    report.case,
+                    report.iteration,
+                    report.detail.as_deref().unwrap_or("no detail")
+                ));
+            }
+        }
+        std::fs::write(path, out)?;
+        Ok(())
+    }
 }
 
 pub fn selected_specs(selection: &Selection) -> Vec<CommandSpec> {
@@ -170,7 +274,12 @@ pub fn run(server_url: &str, selection: &Selection, options: &RunOptions) -> Res
             for iteration in 0..options.repeat {
                 case_count += 1;
 
-                let baseline = if spec.support == SupportLevel::Supported {
+                let compare_with_baseline = match case.baseline_policy {
+                    BaselinePolicy::Compare => true,
+                    BaselinePolicy::Skip => false,
+                    BaselinePolicy::Inherit => spec.support == SupportLevel::Supported,
+                };
+                let baseline = if compare_with_baseline {
                     match options.baseline_url.as_deref() {
                         Some(baseline_url) => Some(run_case(baseline_url, case)?),
                         None => None,
@@ -269,11 +378,9 @@ pub fn run(server_url: &str, selection: &Selection, options: &RunOptions) -> Res
                             target_duration,
                             baseline_duration: None,
                             success: true,
-                            detail: if spec.support != SupportLevel::Supported
-                                && options.baseline_url.is_some()
-                            {
+                            detail: if options.baseline_url.is_some() && !compare_with_baseline {
                                 Some(
-                                    "baseline compare skipped for partial/stubbed command"
+                                    "baseline compare skipped for this alpha-divergent case"
                                         .to_string(),
                                 )
                             } else {

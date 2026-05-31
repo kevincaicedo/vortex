@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crossbeam_utils::CachePadded;
+#[cfg(feature = "profile-telemetry")]
+use vortex_common::Timestamp;
 use vortex_sync::ShardedCounter;
 
 use super::{ConcurrentKeyspace, EvictionScanReport};
@@ -71,6 +73,7 @@ impl RuntimeBackendMode {
 pub enum RuntimeTelemetryMode {
     #[default]
     Minimal,
+    Standard,
     #[cfg(feature = "profile-telemetry")]
     Profile,
 }
@@ -80,6 +83,7 @@ impl RuntimeTelemetryMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Minimal => "minimal",
+            Self::Standard => "standard",
             #[cfg(feature = "profile-telemetry")]
             Self::Profile => "profile",
         }
@@ -89,8 +93,9 @@ impl RuntimeTelemetryMode {
     const fn code(self) -> u8 {
         match self {
             Self::Minimal => 0,
+            Self::Standard => 1,
             #[cfg(feature = "profile-telemetry")]
-            Self::Profile => 1,
+            Self::Profile => 2,
         }
     }
 
@@ -98,13 +103,14 @@ impl RuntimeTelemetryMode {
     const fn from_code(code: u8) -> Self {
         #[cfg(feature = "profile-telemetry")]
         match code {
-            1 => Self::Profile,
+            1 => Self::Standard,
+            2 => Self::Profile,
             _ => Self::Minimal,
         }
         #[cfg(not(feature = "profile-telemetry"))]
-        {
-            let _ = code;
-            Self::Minimal
+        match code {
+            1 => Self::Standard,
+            _ => Self::Minimal,
         }
     }
 
@@ -118,6 +124,16 @@ impl RuntimeTelemetryMode {
         {
             let _ = self;
             false
+        }
+    }
+
+    #[inline]
+    pub const fn local_flush_metrics_enabled(self) -> bool {
+        match self {
+            Self::Minimal => false,
+            Self::Standard => true,
+            #[cfg(feature = "profile-telemetry")]
+            Self::Profile => true,
         }
     }
 }
@@ -194,10 +210,19 @@ pub struct RuntimeOverloadTelemetry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeLocalFlushMetrics {
+    pub backend_submit_syscalls: u64,
     pub loop_iterations: u64,
+    pub accept_eagain_rearms: u64,
     pub accept_drain_runs: u64,
     pub accept_drain_accepted: u64,
     pub accept_drain_accepted_max: u64,
+    pub completion_budget_exhaustions: u64,
+    pub command_budget_exhaustions: u64,
+    pub accept_budget_exhaustions: u64,
+    pub writev_budget_exhaustions: u64,
+    pub maintenance_budget_exhaustions: u64,
+    pub yielded_connections: u64,
+    pub parser_resumes: u64,
     pub completion_batch_count: u64,
     pub completion_batch_total: u64,
     pub completion_batch_max: u64,
@@ -209,18 +234,33 @@ pub struct RuntimeLocalFlushMetrics {
     pub writev_iovecs_max: u64,
     pub queued_response_bytes_total: u64,
     pub queued_response_bytes_max: u64,
+    pub active_expiry_runs: u64,
+    pub active_expiry_sampled: u64,
+    pub active_expiry_expired: u64,
 }
 
 impl RuntimeLocalFlushMetrics {
     #[inline]
     pub const fn is_empty(self) -> bool {
-        self.loop_iterations == 0
+        self.backend_submit_syscalls == 0
+            && self.loop_iterations == 0
+            && self.accept_eagain_rearms == 0
             && self.accept_drain_runs == 0
             && self.accept_drain_accepted == 0
+            && self.completion_budget_exhaustions == 0
+            && self.command_budget_exhaustions == 0
+            && self.accept_budget_exhaustions == 0
+            && self.writev_budget_exhaustions == 0
+            && self.maintenance_budget_exhaustions == 0
+            && self.yielded_connections == 0
+            && self.parser_resumes == 0
             && self.completion_batch_count == 0
             && self.command_batch_count == 0
             && self.writev_chunks == 0
             && self.queued_response_bytes_total == 0
+            && self.active_expiry_runs == 0
+            && self.active_expiry_sampled == 0
+            && self.active_expiry_expired == 0
     }
 }
 
@@ -229,6 +269,8 @@ pub struct RuntimeMetricsSnapshot {
     pub telemetry_mode: RuntimeTelemetryMode,
     pub profile_timers_available: bool,
     pub local_flush_metrics_available: bool,
+    pub local_flush_sample_rate: u64,
+    pub metrics_flush_interval_millis: u64,
     pub reactor_slots: usize,
     pub backend: RuntimeBackendSnapshot,
     pub loop_iterations: u64,
@@ -413,6 +455,8 @@ impl EvictionMetrics {
 
 pub(super) struct RuntimeMetrics {
     telemetry_mode: AtomicU8,
+    local_flush_sample_rate: AtomicU64,
+    metrics_flush_interval_millis: AtomicU64,
     backend_requested: AtomicU8,
     backend_effective: AtomicU8,
     backend_plan_mixed: AtomicBool,
@@ -546,6 +590,8 @@ impl RuntimeMetrics {
         let slot_count = num_slots.max(1);
         Self {
             telemetry_mode: AtomicU8::new(RuntimeTelemetryMode::Minimal.code()),
+            local_flush_sample_rate: AtomicU64::new(0),
+            metrics_flush_interval_millis: AtomicU64::new(0),
             backend_requested: AtomicU8::new(RuntimeBackendMode::Unknown.code()),
             backend_effective: AtomicU8::new(RuntimeBackendMode::Unknown.code()),
             backend_plan_mixed: AtomicBool::new(false),
@@ -687,6 +733,14 @@ impl RuntimeMetrics {
     #[inline]
     pub(super) fn telemetry_mode(&self) -> RuntimeTelemetryMode {
         RuntimeTelemetryMode::from_code(self.telemetry_mode.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub(super) fn set_local_flush_policy(&self, sample_rate: u64, flush_interval_millis: u64) {
+        self.local_flush_sample_rate
+            .store(sample_rate, Ordering::Relaxed);
+        self.metrics_flush_interval_millis
+            .store(flush_interval_millis, Ordering::Relaxed);
     }
 
     #[inline]
@@ -907,8 +961,16 @@ impl RuntimeMetrics {
         if metrics.is_empty() {
             return;
         }
+        if metrics.backend_submit_syscalls != 0 {
+            self.backend_submit_syscalls
+                .add(slot, metrics.backend_submit_syscalls);
+        }
         if metrics.loop_iterations != 0 {
             self.loop_iterations.add(slot, metrics.loop_iterations);
+        }
+        if metrics.accept_eagain_rearms != 0 {
+            self.accept_eagain_rearms
+                .add(slot, metrics.accept_eagain_rearms);
         }
         if metrics.accept_drain_runs != 0 {
             self.accept_drain_runs.add(slot, metrics.accept_drain_runs);
@@ -918,6 +980,33 @@ impl RuntimeMetrics {
                 .add(slot, metrics.accept_drain_accepted);
             self.accept_drain_accepted_max
                 .record(slot, metrics.accept_drain_accepted_max);
+        }
+        if metrics.completion_budget_exhaustions != 0 {
+            self.completion_budget_exhaustions
+                .add(slot, metrics.completion_budget_exhaustions);
+        }
+        if metrics.command_budget_exhaustions != 0 {
+            self.command_budget_exhaustions
+                .add(slot, metrics.command_budget_exhaustions);
+        }
+        if metrics.accept_budget_exhaustions != 0 {
+            self.accept_budget_exhaustions
+                .add(slot, metrics.accept_budget_exhaustions);
+        }
+        if metrics.writev_budget_exhaustions != 0 {
+            self.writev_budget_exhaustions
+                .add(slot, metrics.writev_budget_exhaustions);
+        }
+        if metrics.maintenance_budget_exhaustions != 0 {
+            self.maintenance_budget_exhaustions
+                .add(slot, metrics.maintenance_budget_exhaustions);
+        }
+        if metrics.yielded_connections != 0 {
+            self.yielded_connections
+                .add(slot, metrics.yielded_connections);
+        }
+        if metrics.parser_resumes != 0 {
+            self.parser_resumes.add(slot, metrics.parser_resumes);
         }
         if metrics.completion_batch_count != 0 {
             self.completion_batch_count
@@ -947,6 +1036,18 @@ impl RuntimeMetrics {
                 .add(slot, metrics.queued_response_bytes_total);
             self.queued_response_bytes_max
                 .record(slot, metrics.queued_response_bytes_max);
+        }
+        if metrics.active_expiry_runs != 0 {
+            self.active_expiry_runs
+                .add(slot, metrics.active_expiry_runs);
+        }
+        if metrics.active_expiry_sampled != 0 {
+            self.active_expiry_sampled
+                .add(slot, metrics.active_expiry_sampled);
+        }
+        if metrics.active_expiry_expired != 0 {
+            self.active_expiry_expired
+                .add(slot, metrics.active_expiry_expired);
         }
     }
 
@@ -1224,7 +1325,12 @@ impl RuntimeMetrics {
         RuntimeMetricsSnapshot {
             telemetry_mode,
             profile_timers_available: telemetry_mode.profile_timers_enabled(),
-            local_flush_metrics_available: true,
+            local_flush_metrics_available: telemetry_mode.local_flush_metrics_enabled()
+                && self.local_flush_sample_rate.load(Ordering::Relaxed) != 0,
+            local_flush_sample_rate: self.local_flush_sample_rate.load(Ordering::Relaxed),
+            metrics_flush_interval_millis: self
+                .metrics_flush_interval_millis
+                .load(Ordering::Relaxed),
             reactor_slots: self.slot_count(),
             backend: self.backend_snapshot(),
             loop_iterations: self.loop_iterations.total(),
@@ -1620,6 +1726,12 @@ impl ConcurrentKeyspace {
     }
 
     #[inline]
+    pub fn set_runtime_local_flush_policy(&self, sample_rate: u64, flush_interval_millis: u64) {
+        self.runtime_metrics
+            .set_local_flush_policy(sample_rate, flush_interval_millis);
+    }
+
+    #[inline]
     pub fn runtime_telemetry_mode(&self) -> RuntimeTelemetryMode {
         self.runtime_metrics.telemetry_mode()
     }
@@ -1627,6 +1739,32 @@ impl ConcurrentKeyspace {
     #[inline]
     pub fn runtime_profile_timers_enabled(&self) -> bool {
         self.runtime_telemetry_mode().profile_timers_enabled()
+    }
+
+    #[inline]
+    pub(crate) fn runtime_profile_metric_start(&self) -> Option<u64> {
+        #[cfg(feature = "profile-telemetry")]
+        if self.runtime_profile_timers_enabled() {
+            return Some(Timestamp::now().as_nanos());
+        }
+        None
+    }
+
+    #[inline]
+    pub(crate) fn runtime_profile_metric_elapsed_nanos(&self, start: Option<u64>) -> u64 {
+        #[cfg(feature = "profile-telemetry")]
+        {
+            let _ = self;
+            return start
+                .map(|started| Timestamp::now().as_nanos().saturating_sub(started).max(1))
+                .unwrap_or(0);
+        }
+        #[cfg(not(feature = "profile-telemetry"))]
+        {
+            let _ = self;
+            let _ = start;
+            0
+        }
     }
 
     #[inline]

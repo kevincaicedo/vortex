@@ -19,8 +19,7 @@ impl Reactor {
             budget.consume_one();
             total_nanos = total_nanos.saturating_add(run.elapsed_nanos);
             if run.pending_more && last_unit {
-                self.keyspace
-                    .record_reactor_maintenance_budget_exhaustion(self.id);
+                self.local_metrics.record_maintenance_budget_exhaustion();
             }
         }
 
@@ -56,13 +55,13 @@ impl Reactor {
             if self.connection_ready_to_finalize(conn_id) {
                 self.finalize_close_now(conn_id);
                 return MaintenanceRun::ran(
-                    self.elapsed_profile_metric_nanos(start),
+                    self.elapsed_profile_metric_nanos(start).unwrap_or(0),
                     !self.pending_close_finalization.is_empty(),
                 );
             }
         }
 
-        MaintenanceRun::ran(self.elapsed_profile_metric_nanos(start), false)
+        MaintenanceRun::ran(self.elapsed_profile_metric_nanos(start).unwrap_or(0), false)
     }
 
     pub(super) fn run_timer_slice(&mut self) -> MaintenanceRun {
@@ -79,7 +78,10 @@ impl Reactor {
             self.handle_expired_timer(expired.conn_id, expired.generation);
             let pending_more = !self.pending_expired_timers.is_empty()
                 || self.timer_wheel.current_tick() <= self.now_secs;
-            return MaintenanceRun::ran(self.elapsed_profile_metric_nanos(start), pending_more);
+            return MaintenanceRun::ran(
+                self.elapsed_profile_metric_nanos(start).unwrap_or(0),
+                pending_more,
+            );
         }
 
         self.expired_buf.clear();
@@ -89,7 +91,10 @@ impl Reactor {
         }
         self.expired_buf.clear();
         let pending_more = more_in_tick || self.timer_wheel.current_tick() <= self.now_secs;
-        MaintenanceRun::ran(self.elapsed_profile_metric_nanos(start), pending_more)
+        MaintenanceRun::ran(
+            self.elapsed_profile_metric_nanos(start).unwrap_or(0),
+            pending_more,
+        )
     }
 
     pub(super) fn run_active_expiry_slice(&mut self) -> MaintenanceRun {
@@ -111,8 +116,7 @@ impl Reactor {
             ACTIVE_EXPIRY_MAX_EFFORT,
             now,
         );
-        self.keyspace
-            .record_reactor_active_expiry(self.id, sampled, expired);
+        self.local_metrics.record_active_expiry(sampled, expired);
         self.expiry_slot_cursor = self
             .expiry_slot_cursor
             .wrapping_add(ACTIVE_EXPIRY_MAX_EFFORT);
@@ -122,9 +126,11 @@ impl Reactor {
         if pending_more {
             self.next_active_expiry_nanos = now;
         }
-        let elapsed = self.elapsed_profile_metric_nanos(start);
-        self.keyspace
-            .record_reactor_active_expiry_nanos(self.id, elapsed);
+        let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);
+        if elapsed != 0 {
+            self.keyspace
+                .record_reactor_active_expiry_nanos(self.id, elapsed);
+        }
         MaintenanceRun::ran(elapsed, pending_more)
     }
 
@@ -154,7 +160,7 @@ impl Reactor {
             }
         }
 
-        let elapsed = self.elapsed_profile_metric_nanos(start);
+        let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);
         let pending_more = outcome.oom_after_scan && self.keyspace.eviction_pressure_active();
         MaintenanceRun::ran(elapsed, pending_more)
     }
@@ -186,9 +192,11 @@ impl Reactor {
                     .mark_failed(self.id, "maybe_fsync", &error);
             }
         }
-        let elapsed = self.elapsed_profile_metric_nanos(start);
-        self.keyspace
-            .record_reactor_aof_fsync_nanos(self.id, elapsed);
+        let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);
+        if elapsed != 0 {
+            self.keyspace
+                .record_reactor_aof_fsync_nanos(self.id, elapsed);
+        }
         MaintenanceRun::ran(elapsed, false)
     }
 
@@ -199,7 +207,8 @@ impl Reactor {
         }
 
         let start = self.profile_metric_start();
-        self.next_metrics_flush_nanos = now.saturating_add(METRICS_FLUSH_INTERVAL_NANOS);
+        self.next_metrics_flush_nanos =
+            now.saturating_add(self.config.telemetry_flush_interval_nanos);
         self.flush_local_runtime_metrics();
         self.publish_backend_queue_pressure();
         self.publish_aof_telemetry();
@@ -211,9 +220,11 @@ impl Reactor {
                 backend_plan_for(&self.config, &self.backend),
                 self.fixed_buffers_enabled,
             ));
-        let elapsed = self.elapsed_profile_metric_nanos(start);
-        self.keyspace
-            .record_reactor_metrics_flush_nanos(self.id, elapsed);
+        let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);
+        if elapsed != 0 {
+            self.keyspace
+                .record_reactor_metrics_flush_nanos(self.id, elapsed);
+        }
         MaintenanceRun::ran(elapsed, false)
     }
 

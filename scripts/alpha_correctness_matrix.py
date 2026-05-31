@@ -87,6 +87,25 @@ ROWS: tuple[MatrixRow, ...] = (
         ),
     ),
     MatrixRow(
+        id="cargo-vortex-proto",
+        title="Protocol parser, serializer, scanner, and fuzz-corpus correctness",
+        tier="core",
+        command=("cargo", "test", "-p", "vortex-proto"),
+        covers=(
+            "proto-package",
+            "large-bulk-across-reads",
+            "resp-parser-fuzz-corpus",
+            "serializer-length-bounds",
+        ),
+        tests=(
+            "parse_large_bulk_string_above_transport_buffer",
+            "generated_bulk_array_prefixes_need_more_data_until_complete",
+            "resp_parser_fuzz_corpus_replays_without_panic",
+            "resp_parser_fuzz_corpus",
+            "serializer::tests",
+        ),
+    ),
+    MatrixRow(
         id="cargo-vortex-persist",
         title="Persistence record, replay, rewrite, fsync, and failure-injection correctness",
         tier="core",
@@ -165,6 +184,7 @@ ROWS: tuple[MatrixRow, ...] = (
 COVERAGE: tuple[tuple[str, str], ...] = (
     ("io-package", "`cargo test -p vortex-io`"),
     ("engine-package", "`cargo test -p vortex-engine`"),
+    ("proto-package", "`cargo test -p vortex-proto`"),
     ("persist-package", "`cargo test -p vortex-persist`"),
     ("invalid-completion-tokens", "Invalid completion tokens do not decode as accept or dispatch."),
     ("cancellation-races", "Cancel completions cannot release buffers before target terminal state."),
@@ -183,6 +203,8 @@ COVERAGE: tuple[tuple[str, str], ...] = (
     ("optimistic-prepare-revalidate-swap", "Optimistic mutation prepare/revalidate/swap retries or falls back correctly."),
     ("borrowed-multikey-duplicates", "Borrowed multi-key duplicate semantics match Redis-visible behavior."),
     ("fused-table-cursor-property", "Fused table cursor and property tests cover TTL, LSN, raw bytes, resize, tombstones, and delete-heavy rows."),
+    ("resp-parser-fuzz-corpus", "Checked-in RESP parser fuzz seeds and deterministic mutations replay under ordinary cargo test."),
+    ("serializer-length-bounds", "Serializer and iovec paths reject short outputs and preserve RESP length boundaries."),
     ("persistence-replay-rewrite-fsync", "AOF replay, rewrite, fsync policy, and failure injection remain green."),
     ("smoketest-harness", "Smoke-test harness compiles and command coverage is visible."),
     ("smoketest-e2e", "Real server smoke tests exercise command and AOF behavior through the Redis client."),
@@ -191,6 +213,7 @@ COVERAGE: tuple[tuple[str, str], ...] = (
 COVERAGE_PROOFS: dict[str, tuple[str, ...]] = {
     "io-package": ("cargo test -p vortex-io",),
     "engine-package": ("cargo test -p vortex-engine",),
+    "proto-package": ("cargo test -p vortex-proto",),
     "persist-package": ("cargo test -p vortex-persist",),
     "invalid-completion-tokens": (
         "backend::tests::malformed_reserved_accept_bits_do_not_decode_as_accept",
@@ -212,6 +235,7 @@ COVERAGE_PROOFS: dict[str, tuple[str, ...]] = {
     ),
     "late-accept-drain": ("reactor::tests::late_accept_during_drain_closes_fd_without_allocating_connection",),
     "large-bulk-across-reads": (
+        "parse_large_bulk_string_above_transport_buffer",
         "reactor::tests::large_bulk_value_streams_across_read_buffer",
         "tests/engine_integration.rs::large_bulk_value_exceeds_io_buffer",
     ),
@@ -261,6 +285,14 @@ COVERAGE_PROOFS: dict[str, tuple[str, ...]] = {
         "table::tests::resize_after_pointer_move_rewrites_heap_entry_pointers",
         "table::tests::memory_and_tombstone_ratios_remain_consistent_after_delete_heavy_workload",
         "table::proptests::storage_metadata_invariants_match_model",
+    ),
+    "resp-parser-fuzz-corpus": (
+        "resp_parser_fuzz_corpus_replays_without_panic",
+        "resp_parser_fuzz_corpus",
+    ),
+    "serializer-length-bounds": (
+        "serializer::tests",
+        "iovec::tests",
     ),
     "persistence-replay-rewrite-fsync": (
         "aof::reader::tests::kway_merge_fails_on_duplicate_lsn",
@@ -322,14 +354,44 @@ def sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def capture_tool_versions(cwd: pathlib.Path) -> dict[str, str]:
+    commands = {
+        "cargo": ("cargo", "--version"),
+        "rustc": ("rustc", "--version"),
+        "git_revision": ("git", "rev-parse", "HEAD"),
+    }
+    versions: dict[str, str] = {}
+    for name, command in commands.items():
+        try:
+            process = subprocess.run(
+                command,
+                cwd=cwd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        except OSError as exc:
+            versions[name] = f"unavailable: {exc}"
+            continue
+        value = process.stdout.strip()
+        if process.returncode != 0:
+            value = f"exit {process.returncode}: {value}"
+        versions[name] = value
+    return versions
+
+
 def run_row(row: MatrixRow, cwd: pathlib.Path, log_dir: pathlib.Path) -> RowResult:
     started = dt.datetime.now(dt.UTC)
     completed = None
     log_path = log_dir / f"{row.id}.log"
+    tool_versions = capture_tool_versions(cwd)
     header = [
         f"$ {shell_quote(row.command)}",
         f"cwd: {cwd}",
         f"started_at_utc: {started.isoformat(timespec='seconds')}",
+        "tool_versions:",
+        *(f"  {name}: {value}" for name, value in tool_versions.items()),
         "",
     ]
     process = subprocess.run(
@@ -376,6 +438,7 @@ def write_report(
     cwd: pathlib.Path,
     results: list[RowResult],
     artifact_dir: pathlib.Path,
+    tool_versions: dict[str, str],
 ) -> None:
     passed = sum(1 for result in results if result.status == "PASS")
     failed = sum(1 for result in results if result.status == "FAIL")
@@ -389,6 +452,9 @@ def write_report(
         f"- Workspace: `{cwd}`",
         f"- Artifact dir: `{artifact_dir}`",
         f"- Summary: `{passed}` passed, `{failed}` failed, `{skipped}` skipped/not-selected",
+        f"- Cargo: `{tool_versions.get('cargo', 'unavailable')}`",
+        f"- Rustc: `{tool_versions.get('rustc', 'unavailable')}`",
+        f"- Git revision: `{tool_versions.get('git_revision', 'unavailable')}`",
         "",
         "## Rows",
         "",
@@ -467,6 +533,7 @@ def main() -> int:
     report_path = args.report if args.report is not None else artifact_dir / "report.md"
     skipped = parse_skip(args.skip)
     included_tiers = PROFILE_TIERS[args.profile]
+    tool_versions = capture_tool_versions(cwd)
 
     results: list[RowResult] = []
     for row in ROWS:
@@ -490,7 +557,7 @@ def main() -> int:
         )
         results.append(result)
 
-    write_report(report_path, args.profile, cwd, results, artifact_dir)
+    write_report(report_path, args.profile, cwd, results, artifact_dir, tool_versions)
     print(f"[alpha-correctness] report: {report_path}")
 
     if any(result.status == "FAIL" for result in results):

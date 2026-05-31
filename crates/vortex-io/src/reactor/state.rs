@@ -44,17 +44,17 @@ impl Reactor {
     }
 
     #[inline]
-    pub(super) fn elapsed_profile_metric_nanos(&self, start: Option<u64>) -> u64 {
+    pub(super) fn elapsed_profile_metric_nanos(&self, start: Option<u64>) -> Option<u64> {
         #[cfg(feature = "profile-telemetry")]
         {
             return start
                 .map(|started| Timestamp::now().as_nanos().saturating_sub(started).max(1))
-                .unwrap_or(0);
+                .filter(|elapsed| *elapsed != 0);
         }
         #[cfg(not(feature = "profile-telemetry"))]
         {
             let _ = start;
-            0
+            None
         }
     }
 
@@ -657,7 +657,13 @@ impl Reactor {
             backend_completions_count_submit_syscall(backend_plan);
         let backend_drain_cq_counts_submit_syscall =
             backend_drain_cq_counts_submit_syscall(backend_plan);
+        let telemetry_local_sample_rate = config.telemetry_local_sample_rate;
+        let telemetry_flush_interval_nanos = config.telemetry_flush_interval_nanos;
         keyspace.set_runtime_telemetry_mode(config.telemetry_mode);
+        keyspace.set_runtime_local_flush_policy(
+            telemetry_local_sample_rate as u64,
+            telemetry_flush_interval_nanos / 1_000_000,
+        );
         keyspace.publish_runtime_backend(Self::runtime_backend_snapshot(
             &config,
             backend_plan,
@@ -690,7 +696,7 @@ impl Reactor {
             pending_completions: VecDeque::new(),
             accept_inflight: false,
             accept_cancel_inflight: false,
-            local_metrics: ReactorLocalMetrics::default(),
+            local_metrics: ReactorLocalMetrics::new(telemetry_local_sample_rate),
             invalid_completion_tokens: 0,
             unexpected_completion_tokens: 0,
             timer_wheel: TimerWheel::new(max_conn),
@@ -723,7 +729,7 @@ impl Reactor {
             cached_nanos,
             cached_unix_nanos,
             next_active_expiry_nanos: cached_nanos,
-            next_metrics_flush_nanos: cached_nanos.saturating_add(METRICS_FLUSH_INTERVAL_NANOS),
+            next_metrics_flush_nanos: cached_nanos.saturating_add(telemetry_flush_interval_nanos),
             aof_writer,
             aof_scratch: vec![0u8; 4096],
             aof_coordinator: aof_runtime.coordinator,

@@ -13,6 +13,14 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 
 const SEED: u64 = 0xDEADBEEF_CAFE_BABE;
+const KEY_PREFIX: &str = "bench:key:";
+const MSETNX_KEY_PREFIX: &str = "bench:msetnx:";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiKeyWriteCommand {
+    Mset,
+    Msetnx,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "custom-loadgen")]
@@ -40,6 +48,8 @@ struct Cli {
     value_size: usize,
     #[arg(long, default_value_t = 1)]
     pipeline_depth: usize,
+    #[arg(long, default_value_t = 3)]
+    multi_key_width: usize,
     #[arg(long)]
     duration_ms: Option<u64>,
     #[arg(long)]
@@ -52,6 +62,7 @@ struct WorkloadSpec {
     read_weight: u32,
     write_weight: u32,
     multi_key: bool,
+    multi_key_write: MultiKeyWriteCommand,
     transactional: bool,
     hot_key: bool,
     counter: Option<CounterKind>,
@@ -72,6 +83,7 @@ impl WorkloadSpec {
             read_weight,
             write_weight,
             multi_key,
+            multi_key_write: MultiKeyWriteCommand::Mset,
             transactional,
             hot_key,
             counter: None,
@@ -92,6 +104,7 @@ impl WorkloadSpec {
             read_weight,
             write_weight,
             multi_key,
+            multi_key_write: MultiKeyWriteCommand::Mset,
             transactional,
             hot_key: true,
             counter: Some(counter),
@@ -105,6 +118,7 @@ impl WorkloadSpec {
             read_weight: 100,
             write_weight: 0,
             multi_key: false,
+            multi_key_write: MultiKeyWriteCommand::Mset,
             transactional: false,
             hot_key: false,
             counter: None,
@@ -192,6 +206,7 @@ struct BenchmarkResult {
     warmup_ops: u64,
     value_size: usize,
     pipeline_depth: usize,
+    multi_key_width: usize,
     latency_sample_unit: &'static str,
     total_ops: u64,
     total_duration_ns: u64,
@@ -275,6 +290,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if cli.pipeline_depth == 0 {
         return Err("pipeline depth must be positive".into());
     }
+    if cli.multi_key_width == 0 {
+        return Err("multi-key width must be positive".into());
+    }
 
     std::fs::create_dir_all(&cli.output_dir)?;
 
@@ -309,6 +327,7 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
         let warmup_ops = cli.warmup_ops;
         let num_keys = cli.num_keys;
         let pipeline_depth = cli.pipeline_depth;
+        let multi_key_width = cli.multi_key_width;
         handles.push(thread::spawn(move || {
             run_thread(
                 &host,
@@ -319,6 +338,7 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
                 ops_per_thread,
                 warmup_ops,
                 pipeline_depth,
+                multi_key_width,
                 thread_id,
                 barrier,
             )
@@ -377,6 +397,7 @@ fn run_workload(cli: &Cli, spec: WorkloadSpec, num_threads: usize) -> Result<(),
         warmup_ops: cli.warmup_ops,
         value_size: cli.value_size,
         pipeline_depth: cli.pipeline_depth,
+        multi_key_width: cli.multi_key_width,
         latency_sample_unit: if cli.pipeline_depth > 1 {
             "pipeline_batch_assigned_to_each_operation"
         } else {
@@ -507,6 +528,7 @@ fn run_pressure_workload(
         warmup_ops: cli.warmup_ops,
         value_size: cli.value_size,
         pipeline_depth: 1,
+        multi_key_width: cli.multi_key_width,
         latency_sample_unit: "operation",
         total_ops,
         total_duration_ns,
@@ -776,6 +798,7 @@ fn run_thread(
     ops_per_thread: u64,
     warmup_ops: u64,
     pipeline_depth: usize,
+    multi_key_width: usize,
     thread_id: usize,
     barrier: Arc<Barrier>,
 ) -> io::Result<ThreadOutcome> {
@@ -784,6 +807,11 @@ fn run_thread(
     let mut reader = BufReader::new(writer.try_clone()?);
     let value = "x".repeat(value_size);
     let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(thread_id as u64 * 104_729));
+    let mut command_buffer = Vec::with_capacity(estimate_multi_key_command_bytes(
+        multi_key_width,
+        value_size,
+    ));
+    let mut key_buffer = Vec::with_capacity(multi_key_width.max(1));
     let mut counter_warmup = CounterOperationStats::default();
     let mut counter_measured = CounterOperationStats::default();
 
@@ -806,6 +834,9 @@ fn run_thread(
             spec,
             &value,
             num_keys,
+            multi_key_width,
+            &mut key_buffer,
+            &mut command_buffer,
             &mut rng,
             Some(&mut counter_warmup),
         )?;
@@ -822,6 +853,9 @@ fn run_thread(
             spec,
             &value,
             num_keys,
+            multi_key_width,
+            &mut key_buffer,
+            &mut command_buffer,
             &mut rng,
             Some(&mut counter_measured),
         )?;
@@ -886,6 +920,9 @@ fn execute_operation(
     spec: WorkloadSpec,
     value: &str,
     num_keys: u64,
+    multi_key_width: usize,
+    key_buffer: &mut Vec<u64>,
+    command_buffer: &mut Vec<u8>,
     rng: &mut StdRng,
     counter_stats: Option<&mut CounterOperationStats>,
 ) -> io::Result<()> {
@@ -901,36 +938,30 @@ fn execute_operation(
     }
 
     if spec.transactional {
-        return execute_transaction(writer, reader, spec, value, num_keys, rng);
+        return execute_transaction(writer, reader, spec, value, num_keys, multi_key_width, rng);
     }
     if spec.multi_key {
+        let width = multi_key_width.max(1);
+        fill_next_keys(spec, num_keys, rng, width, key_buffer);
         if is_read(spec, rng) {
-            let keys = next_keys(spec, num_keys, rng, 3);
-            return execute_command(
+            return execute_mget_keys(writer, reader, key_buffer.as_slice(), command_buffer);
+        }
+        return match spec.multi_key_write {
+            MultiKeyWriteCommand::Mset => execute_mset_keys(
                 writer,
                 reader,
-                &[
-                    "MGET".to_string(),
-                    key_name(keys[0]),
-                    key_name(keys[1]),
-                    key_name(keys[2]),
-                ],
-            );
-        }
-        let keys = next_keys(spec, num_keys, rng, 3);
-        return execute_command(
-            writer,
-            reader,
-            &[
-                "MSET".to_string(),
-                key_name(keys[0]),
-                value.to_string(),
-                key_name(keys[1]),
-                value.to_string(),
-                key_name(keys[2]),
-                value.to_string(),
-            ],
-        );
+                key_buffer.as_slice(),
+                value.as_bytes(),
+                command_buffer,
+            ),
+            MultiKeyWriteCommand::Msetnx => execute_msetnx_keys(
+                writer,
+                reader,
+                key_buffer.as_slice(),
+                value.as_bytes(),
+                command_buffer,
+            ),
+        };
     }
     let key = next_key(spec, num_keys, rng);
     if is_read(spec, rng) {
@@ -1112,44 +1143,33 @@ fn execute_transaction(
     spec: WorkloadSpec,
     value: &str,
     num_keys: u64,
+    multi_key_width: usize,
     rng: &mut StdRng,
 ) -> io::Result<()> {
     if spec.multi_key {
-        let keys = next_keys(spec, num_keys, rng, 3);
-        execute_command(
-            writer,
-            reader,
-            &[
-                "WATCH".to_string(),
-                key_name(keys[0]),
-                key_name(keys[1]),
-                key_name(keys[2]),
-            ],
-        )?;
+        let width = multi_key_width.max(1);
+        let keys = next_keys(spec, num_keys, rng, width);
+        let mut watch_parts = Vec::with_capacity(width + 1);
+        watch_parts.push("WATCH".to_string());
+        for key in &keys {
+            watch_parts.push(key_name(*key));
+        }
+        execute_command(writer, reader, &watch_parts)?;
         execute_command(writer, reader, &["MULTI".to_string()])?;
-        execute_command(
-            writer,
-            reader,
-            &[
-                "MGET".to_string(),
-                key_name(keys[0]),
-                key_name(keys[1]),
-                key_name(keys[2]),
-            ],
-        )?;
-        execute_command(
-            writer,
-            reader,
-            &[
-                "MSET".to_string(),
-                key_name(keys[0]),
-                value.to_string(),
-                key_name(keys[1]),
-                value.to_string(),
-                key_name(keys[2]),
-                value.to_string(),
-            ],
-        )?;
+        let mut mget_parts = Vec::with_capacity(width + 1);
+        mget_parts.push("MGET".to_string());
+        for key in &keys {
+            mget_parts.push(key_name(*key));
+        }
+        execute_command(writer, reader, &mget_parts)?;
+
+        let mut mset_parts = Vec::with_capacity(width * 2 + 1);
+        mset_parts.push("MSET".to_string());
+        for key in keys {
+            mset_parts.push(key_name(key));
+            mset_parts.push(value.to_string());
+        }
+        execute_command(writer, reader, &mset_parts)?;
         return execute_command(writer, reader, &["EXEC".to_string()]);
     }
 
@@ -1414,6 +1434,110 @@ fn write_command_unflushed<S: AsRef<str>>(writer: &mut TcpStream, parts: &[S]) -
     Ok(())
 }
 
+fn execute_mget_keys(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    keys: &[u64],
+    buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    encode_mget_command(keys, buffer);
+    writer.write_all(buffer)?;
+    writer.flush()?;
+    read_response(reader)
+}
+
+fn execute_mset_keys(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    keys: &[u64],
+    value: &[u8],
+    buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    encode_mset_command(keys, value, buffer);
+    writer.write_all(buffer)?;
+    writer.flush()?;
+    read_response(reader)
+}
+
+fn execute_msetnx_keys(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    keys: &[u64],
+    value: &[u8],
+    buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    encode_msetnx_command(keys, value, buffer);
+    writer.write_all(buffer)?;
+    writer.flush()?;
+    read_response(reader)
+}
+
+fn encode_mget_command(keys: &[u64], buffer: &mut Vec<u8>) {
+    buffer.clear();
+    append_array_header(buffer, keys.len() + 1);
+    append_bulk_bytes(buffer, b"MGET");
+    for key in keys {
+        append_prefixed_key_bulk(buffer, KEY_PREFIX, *key);
+    }
+}
+
+fn encode_mset_command(keys: &[u64], value: &[u8], buffer: &mut Vec<u8>) {
+    encode_multiset_command(b"MSET", KEY_PREFIX, keys, value, buffer);
+}
+
+fn encode_msetnx_command(keys: &[u64], value: &[u8], buffer: &mut Vec<u8>) {
+    encode_multiset_command(b"MSETNX", MSETNX_KEY_PREFIX, keys, value, buffer);
+}
+
+fn encode_multiset_command(
+    command: &[u8],
+    key_prefix: &str,
+    keys: &[u64],
+    value: &[u8],
+    buffer: &mut Vec<u8>,
+) {
+    buffer.clear();
+    append_array_header(buffer, keys.len() * 2 + 1);
+    append_bulk_bytes(buffer, command);
+    for key in keys {
+        append_prefixed_key_bulk(buffer, key_prefix, *key);
+        append_bulk_bytes(buffer, value);
+    }
+}
+
+fn append_array_header(buffer: &mut Vec<u8>, item_count: usize) {
+    write!(buffer, "*{item_count}\r\n").expect("writing to Vec cannot fail");
+}
+
+fn append_bulk_bytes(buffer: &mut Vec<u8>, value: &[u8]) {
+    write!(buffer, "${}\r\n", value.len()).expect("writing to Vec cannot fail");
+    buffer.extend_from_slice(value);
+    buffer.extend_from_slice(b"\r\n");
+}
+
+fn append_prefixed_key_bulk(buffer: &mut Vec<u8>, prefix: &str, key_id: u64) {
+    write!(
+        buffer,
+        "${}\r\n{prefix}{key_id}\r\n",
+        prefix.len() + decimal_len(key_id)
+    )
+    .expect("writing to Vec cannot fail");
+}
+
+fn decimal_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
+}
+
+fn estimate_multi_key_command_bytes(width: usize, value_size: usize) -> usize {
+    let width = width.max(1);
+    32 + width * (KEY_PREFIX.len() + value_size + 48)
+}
+
 #[derive(Debug)]
 enum RespValue {
     Simple,
@@ -1602,12 +1726,26 @@ fn next_keys(spec: WorkloadSpec, num_keys: u64, rng: &mut StdRng, count: usize) 
         .collect::<Vec<u64>>()
 }
 
+fn fill_next_keys(
+    spec: WorkloadSpec,
+    num_keys: u64,
+    rng: &mut StdRng,
+    count: usize,
+    output: &mut Vec<u64>,
+) {
+    output.clear();
+    output.reserve(count);
+    for _ in 0..count {
+        output.push(next_key(spec, num_keys, rng));
+    }
+}
+
 fn next_key_for_latency(num_keys: u64, rng: &mut StdRng) -> u64 {
     rng.gen_range(1..=num_keys.max(1))
 }
 
 fn key_name(id: u64) -> String {
-    format!("bench:key:{id}")
+    format!("{KEY_PREFIX}{id}")
 }
 
 fn counter_key(id: u64) -> String {
@@ -1739,6 +1877,12 @@ fn resolve_workload(name: &str) -> Result<WorkloadSpec, Box<dyn Error>> {
             WorkloadSpec::standard("multi-key operations", 50, 50, true, false, false)
         }
         "multi-key-only" => WorkloadSpec::standard("multi_key_only", 50, 50, true, false, false),
+        "mget-only" => WorkloadSpec::standard("mget_only", 100, 0, true, false, false),
+        "mset-only" => WorkloadSpec::standard("mset_only", 0, 100, true, false, false),
+        "msetnx-only" => WorkloadSpec {
+            multi_key_write: MultiKeyWriteCommand::Msetnx,
+            ..WorkloadSpec::standard("msetnx_only", 0, 100, true, false, false)
+        },
         "transaction" => WorkloadSpec::standard("transaction", 50, 50, false, true, false),
         "transaction-only" => {
             WorkloadSpec::standard("transaction_only", 50, 50, false, true, false)
@@ -1836,6 +1980,62 @@ mod tests {
             assert!(spec.pressure.is_none());
             assert!(spec.hot_key);
         }
+    }
+
+    #[test]
+    fn resolves_width_configurable_multikey_point_workloads() {
+        let cases = [
+            (
+                "mget_only",
+                "mget_only",
+                100,
+                0,
+                MultiKeyWriteCommand::Mset,
+            ),
+            ("mset_only", "mset_only", 0, 100, MultiKeyWriteCommand::Mset),
+            (
+                "msetnx_only",
+                "msetnx_only",
+                0,
+                100,
+                MultiKeyWriteCommand::Msetnx,
+            ),
+        ];
+
+        for (input, canonical, read_weight, write_weight, write_command) in cases {
+            let spec = resolve_workload(input).expect("multi-key point workload should resolve");
+            assert_eq!(spec.canonical_name, canonical);
+            assert_eq!(spec.read_weight, read_weight);
+            assert_eq!(spec.write_weight, write_weight);
+            assert_eq!(spec.multi_key_write, write_command);
+            assert!(spec.multi_key);
+            assert!(!spec.transactional);
+            assert!(spec.counter.is_none());
+            assert!(spec.pressure.is_none());
+        }
+    }
+
+    #[test]
+    fn encodes_multikey_commands_into_single_resp_buffer() {
+        let mut buffer = Vec::new();
+
+        encode_mset_command(&[1, 23], b"xx", &mut buffer);
+        assert_eq!(
+            std::str::from_utf8(&buffer).expect("RESP should be utf8 for this test"),
+            "*5\r\n$4\r\nMSET\r\n$11\r\nbench:key:1\r\n$2\r\nxx\r\n$12\r\nbench:key:23\r\n$2\r\nxx\r\n"
+        );
+
+        encode_mget_command(&[1, 23], &mut buffer);
+        assert_eq!(
+            std::str::from_utf8(&buffer).expect("RESP should be utf8 for this test"),
+            "*3\r\n$4\r\nMGET\r\n$11\r\nbench:key:1\r\n$12\r\nbench:key:23\r\n"
+        );
+
+        encode_msetnx_command(&[1], b"v", &mut buffer);
+        assert_eq!(
+            std::str::from_utf8(&buffer).expect("RESP should be utf8 for this test"),
+            "*3\r\n$6\r\nMSETNX\r\n$14\r\nbench:msetnx:1\r\n$1\r\nv\r\n"
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ fn graceful_shutdown_single_reactor() {
             sqpoll_idle_ms: 1000,
             budgets: Default::default(),
             telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -116,6 +117,7 @@ fn graceful_shutdown_pool() {
         telemetry_mode: Default::default(),
         max_memory: 0,
         eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
+        ..Default::default()
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -183,6 +185,7 @@ fn new_connections_refused_during_drain() {
             sqpoll_idle_ms: 1000,
             budgets: Default::default(),
             telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

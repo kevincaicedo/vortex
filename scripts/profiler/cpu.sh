@@ -45,13 +45,8 @@ run_flamegraph() {
         return 0
     fi
 
-    local extra_args=("--bind" "${host}:${port}" "--threads" "$threads")
-    [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
-    [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
-    [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
-    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
-    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
-    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    local extra_args=()
+    collect_server_args extra_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     # cargo flamegraph uses elevated profiling on both Linux (--root perf)
     # and macOS (DTrace). Request sudo synchronously before backgrounding so
@@ -488,13 +483,8 @@ run_samply() {
         return 0
     fi
 
-    local extra_args=("--bind" "${host}:${port}" "--threads" "$threads")
-    [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
-    [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
-    [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
-    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
-    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
-    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    local extra_args=()
+    collect_server_args extra_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     info "Running: samply record"
     (cd "$REPO_ROOT" && exec samply record --save-only \

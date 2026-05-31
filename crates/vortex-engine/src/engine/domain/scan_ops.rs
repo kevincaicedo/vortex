@@ -2,54 +2,97 @@ use super::*;
 
 const SCAN_CURSOR_SHARD_SHIFT: u32 = 32;
 const DEFAULT_RANDOM_SEED: u64 = 0xDEAD_BEEF_CAFE_BABE;
+pub(crate) const SCAN_MAX_RESULTS_PER_CALL: usize = 1024;
+pub(crate) const SCAN_MAX_SLOTS_PER_CALL: usize = 2048;
+pub(crate) const KEYS_MAX_RESULTS_PER_CALL: usize = SCAN_MAX_RESULTS_PER_CALL;
+
+struct ScanTableProgress {
+    next_slot: usize,
+    slots_scanned: usize,
+    budget_exhausted: bool,
+}
 
 fn scan_table_slots(
     table: &SwissTable,
     start_slot: usize,
     pattern: Option<&[u8]>,
     count: usize,
+    slot_budget: usize,
     type_filter: Option<&[u8]>,
     now_nanos: u64,
     results: &mut Vec<VortexKey>,
-) -> usize {
+) -> ScanTableProgress {
     let total_slots = table.total_slots();
+    if table.is_empty() || start_slot >= total_slots {
+        return ScanTableProgress {
+            next_slot: total_slots,
+            slots_scanned: 0,
+            budget_exhausted: false,
+        };
+    }
+
     let pattern_filter = match pattern {
         Some(b"*") | None => None,
         Some(pattern) => Some(pattern),
     };
 
-    for slot in start_slot..total_slots {
+    let mut slot = start_slot;
+    let mut slots_scanned = 0usize;
+    while slot < total_slots && slots_scanned < slot_budget {
         let Some((key, value)) = table.slot_key_value(slot) else {
+            slot += 1;
+            slots_scanned += 1;
             continue;
         };
         let ttl = table.slot_entry_ttl(slot);
         if ttl != 0 && ttl <= now_nanos {
+            slot += 1;
+            slots_scanned += 1;
             continue;
         }
 
         if let Some(pattern) = pattern_filter {
-            if !glob_match(pattern, key.as_bytes()) {
+            if !glob_match(pattern, key) {
+                slot += 1;
+                slots_scanned += 1;
                 continue;
             }
         }
         if let Some(filter) = type_filter {
             if !filter.eq_ignore_ascii_case(value.type_name().as_bytes()) {
+                slot += 1;
+                slots_scanned += 1;
                 continue;
             }
         }
 
-        results.push(key.clone());
+        results.push(VortexKey::from_bytes(key));
+        slot += 1;
+        slots_scanned += 1;
         if results.len() >= count {
-            return slot + 1;
+            return ScanTableProgress {
+                next_slot: slot,
+                slots_scanned,
+                budget_exhausted: false,
+            };
         }
     }
 
-    total_slots
+    ScanTableProgress {
+        next_slot: slot,
+        slots_scanned,
+        budget_exhausted: slot < total_slots,
+    }
 }
 
-fn collect_matching_keys(table: &SwissTable, pattern: &[u8], now_nanos: u64) -> Vec<VortexKey> {
+fn collect_matching_keys_limited(
+    table: &SwissTable,
+    pattern: &[u8],
+    now_nanos: u64,
+    limit: usize,
+    results: &mut Vec<VortexKey>,
+) -> bool {
     let match_all = pattern == b"*";
-    let mut results = Vec::new();
     for slot in 0..table.total_slots() {
         let Some((key, _value)) = table.slot_key_value(slot) else {
             continue;
@@ -58,11 +101,14 @@ fn collect_matching_keys(table: &SwissTable, pattern: &[u8], now_nanos: u64) -> 
         if ttl != 0 && ttl <= now_nanos {
             continue;
         }
-        if match_all || glob_match(pattern, key.as_bytes()) {
-            results.push(key.clone());
+        if match_all || glob_match(pattern, key) {
+            if results.len() >= limit {
+                return true;
+            }
+            results.push(VortexKey::from_bytes(key));
         }
     }
-    results
+    false
 }
 
 fn random_live_key_from_table(table: &SwissTable, seed: u64, now_nanos: u64) -> Option<VortexKey> {
@@ -82,7 +128,7 @@ fn random_live_key_from_table(table: &SwissTable, seed: u64, now_nanos: u64) -> 
         if let Some((key, _value)) = table.slot_key_value(slot) {
             let ttl = table.slot_entry_ttl(slot);
             if ttl == 0 || ttl > now_nanos {
-                return Some(key.clone());
+                return Some(VortexKey::from_bytes(key));
             }
         }
         slot = (slot + 1) & mask;
@@ -111,6 +157,7 @@ impl ConcurrentKeyspace {
         type_filter: Option<&[u8]>,
         now_nanos: u64,
     ) -> (u64, Vec<VortexKey>) {
+        let count = count.clamp(1, SCAN_MAX_RESULTS_PER_CALL);
         let (mut shard_index, mut slot_index) = decode_scan_cursor(cursor);
         let shard_count = self.num_shards();
         if shard_index >= shard_count {
@@ -118,7 +165,8 @@ impl ConcurrentKeyspace {
             slot_index = 0;
         }
 
-        let mut results = Vec::with_capacity(count.max(1));
+        let mut results = Vec::with_capacity(count);
+        let mut remaining_slot_budget = SCAN_MAX_SLOTS_PER_CALL;
         for current_shard in shard_index..shard_count {
             let guard = self.read_shard_by_index(current_shard);
             let start_slot = if current_shard == shard_index {
@@ -126,19 +174,24 @@ impl ConcurrentKeyspace {
             } else {
                 0
             };
-            let next_slot = scan_table_slots(
+            let progress = scan_table_slots(
                 &guard,
                 start_slot,
                 pattern,
-                count.max(1),
+                count,
+                remaining_slot_budget,
                 type_filter,
                 now_nanos,
                 &mut results,
             );
+            remaining_slot_budget = remaining_slot_budget.saturating_sub(progress.slots_scanned);
 
-            if results.len() >= count.max(1) {
-                if next_slot < guard.total_slots() {
-                    return (encode_scan_cursor(current_shard, next_slot), results);
+            if results.len() >= count || progress.budget_exhausted || remaining_slot_budget == 0 {
+                if progress.next_slot < guard.total_slots() {
+                    return (
+                        encode_scan_cursor(current_shard, progress.next_slot),
+                        results,
+                    );
                 }
                 if current_shard + 1 < shard_count {
                     return (encode_scan_cursor(current_shard + 1, 0), results);
@@ -150,16 +203,22 @@ impl ConcurrentKeyspace {
         (0, results)
     }
 
-    pub(crate) fn keys_matching(&self, pattern: &[u8], now_nanos: u64) -> Vec<VortexKey> {
-        let per_shard = self.scan_all_shards(|_shard_index, table| {
-            collect_matching_keys(table, pattern, now_nanos)
-        });
-        let total = per_shard.iter().map(Vec::len).sum();
-        let mut results = Vec::with_capacity(total);
-        for mut shard_keys in per_shard {
-            results.append(&mut shard_keys);
+    pub(crate) fn keys_matching_limited(
+        &self,
+        pattern: &[u8],
+        limit: usize,
+        now_nanos: u64,
+    ) -> (Vec<VortexKey>, bool) {
+        let mut results = Vec::with_capacity(limit.min(128));
+        for shard_index in 0..self.num_shards() {
+            let guard = self.read_shard_by_index(shard_index);
+            let limit_exceeded =
+                collect_matching_keys_limited(&guard, pattern, now_nanos, limit, &mut results);
+            if limit_exceeded {
+                return (results, true);
+            }
         }
-        results
+        (results, false)
     }
 
     pub(crate) fn random_key(&self, seed: u64, now_nanos: u64) -> Option<VortexKey> {

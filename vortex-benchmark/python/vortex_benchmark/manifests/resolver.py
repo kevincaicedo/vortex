@@ -201,6 +201,18 @@ def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
     sqpoll_idle_ms = runtime_config.get("sqpoll_idle_ms")
     if sqpoll_idle_ms is not None and (not isinstance(sqpoll_idle_ms, int) or sqpoll_idle_ms < 0):
         raise ValueError("sqpoll_idle_ms must be a non-negative integer when provided")
+    telemetry_local_sample_rate = runtime_config.get("telemetry_local_sample_rate")
+    if telemetry_local_sample_rate is not None and (
+        not isinstance(telemetry_local_sample_rate, int)
+        or telemetry_local_sample_rate <= 0
+    ):
+        raise ValueError("telemetry_local_sample_rate must be a positive integer when provided")
+    telemetry_flush_interval_ms = runtime_config.get("telemetry_flush_interval_ms")
+    if telemetry_flush_interval_ms is not None and (
+        not isinstance(telemetry_flush_interval_ms, int)
+        or telemetry_flush_interval_ms <= 0
+    ):
+        raise ValueError("telemetry_flush_interval_ms must be a positive integer when provided")
 
     return runtime_config
 
@@ -305,6 +317,16 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
         manifest_runtime_config.get("telemetry_mode"),
         None,
     )
+    telemetry_local_sample_rate = _coalesce_scalar(
+        getattr(args, "telemetry_local_sample_rate", None),
+        manifest_runtime_config.get("telemetry_local_sample_rate"),
+        None,
+    )
+    telemetry_flush_interval_ms = _coalesce_scalar(
+        getattr(args, "telemetry_flush_interval_ms", None),
+        manifest_runtime_config.get("telemetry_flush_interval_ms"),
+        None,
+    )
     ring_size = _coalesce_scalar(
         getattr(args, "ring_size", None), manifest_runtime_config.get("ring_size"), None
     )
@@ -362,6 +384,8 @@ def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
                 "eviction_policy": eviction_policy,
                 "io_backend": io_backend,
                 "telemetry_mode": telemetry_mode,
+                "telemetry_local_sample_rate": telemetry_local_sample_rate,
+                "telemetry_flush_interval_ms": telemetry_flush_interval_ms,
                 "ring_size": ring_size,
                 "fixed_buffers": fixed_buffers,
                 "fixed_buffer_registration": fixed_buffer_registration,

@@ -62,13 +62,13 @@ impl Reactor {
             self.maybe_inject_aof_fsync_failure()?;
         }
         let outcome = Self::require_aof_outcome(outcome, requirement)?;
-        self.publish_aof_telemetry();
         if self.aof_scratch.len() < 4096 {
             self.aof_scratch.resize(4096, 0);
         }
-        let append_elapsed = self.elapsed_profile_metric_nanos(append_start);
-        self.keyspace
-            .record_reactor_aof_append_nanos(self.id, append_elapsed);
+        if let Some(append_elapsed) = self.elapsed_profile_metric_nanos(append_start) {
+            self.keyspace
+                .record_reactor_aof_append_nanos(self.id, append_elapsed);
+        }
         Ok(outcome)
     }
 
@@ -93,10 +93,10 @@ impl Reactor {
             self.maybe_inject_aof_fsync_failure()?;
         }
         let outcome = Self::require_aof_outcome(outcome, requirement)?;
-        self.publish_aof_telemetry();
-        let append_elapsed = self.elapsed_profile_metric_nanos(append_start);
-        self.keyspace
-            .record_reactor_aof_append_nanos(self.id, append_elapsed);
+        if let Some(append_elapsed) = self.elapsed_profile_metric_nanos(append_start) {
+            self.keyspace
+                .record_reactor_aof_append_nanos(self.id, append_elapsed);
+        }
         Ok(outcome)
     }
 
@@ -177,10 +177,10 @@ impl Reactor {
             self.maybe_inject_aof_fsync_failure()?;
         }
         let outcome = Self::require_aof_outcome(outcome, requirement)?;
-        self.publish_aof_telemetry();
-        let append_elapsed = self.elapsed_profile_metric_nanos(append_start);
-        self.keyspace
-            .record_reactor_aof_append_nanos(self.id, append_elapsed);
+        if let Some(append_elapsed) = self.elapsed_profile_metric_nanos(append_start) {
+            self.keyspace
+                .record_reactor_aof_append_nanos(self.id, append_elapsed);
+        }
 
         Ok(outcome)
     }
@@ -392,6 +392,38 @@ impl Reactor {
                         b"maxmemory-policy",
                         self.keyspace.eviction_policy().as_str().as_bytes().to_vec(),
                     )),
+                    b"telemetry-mode" => Some(config_pair_response(
+                        b"telemetry-mode",
+                        self.keyspace
+                            .runtime_telemetry_mode()
+                            .as_str()
+                            .as_bytes()
+                            .to_vec(),
+                    )),
+                    b"telemetry-local-sample-rate" => Some(config_pair_response(
+                        b"telemetry-local-sample-rate",
+                        self.keyspace
+                            .runtime_metrics()
+                            .local_flush_sample_rate
+                            .to_string()
+                            .into_bytes(),
+                    )),
+                    b"telemetry-flush-interval-ms" => Some(config_pair_response(
+                        b"telemetry-flush-interval-ms",
+                        self.keyspace
+                            .runtime_metrics()
+                            .metrics_flush_interval_millis
+                            .to_string()
+                            .into_bytes(),
+                    )),
+                    b"io-backend" => Some(config_pair_response(
+                        b"io-backend",
+                        io_backend_mode_value(self.config.io_backend),
+                    )),
+                    b"fixed-buffer-registration" => Some(config_pair_response(
+                        b"fixed-buffer-registration",
+                        fixed_buffer_registration_value(self.config.fixed_buffer_registration),
+                    )),
                     _ => None, // Fall through to engine.
                 }
             }
@@ -447,6 +479,23 @@ impl Reactor {
                         self.keyspace.set_eviction_policy(policy);
                         Some((CommandResponse::Static(b"+OK\r\n"), false))
                     }
+                    b"appendfsync" => Some((
+                        CommandResponse::Static(RESP_ERR_CONFIG_SET_APPENDFSYNC),
+                        false,
+                    )),
+                    b"telemetry-mode"
+                    | b"telemetry-local-sample-rate"
+                    | b"telemetry-flush-interval-ms" => Some((
+                        CommandResponse::Static(RESP_ERR_CONFIG_SET_TELEMETRY),
+                        false,
+                    )),
+                    b"io-backend" => {
+                        Some((CommandResponse::Static(RESP_ERR_CONFIG_SET_BACKEND), false))
+                    }
+                    b"fixed-buffer-registration" => Some((
+                        CommandResponse::Static(RESP_ERR_CONFIG_SET_FIXED_BUFFERS),
+                        false,
+                    )),
                     _ => None, // Fall through to engine.
                 }
             }
@@ -455,4 +504,20 @@ impl Reactor {
     }
 
     // ── Write handler ──────────────────────────────────────────────
+}
+
+fn io_backend_mode_value(mode: IoBackendMode) -> Vec<u8> {
+    match mode {
+        IoBackendMode::Auto => b"auto".to_vec(),
+        IoBackendMode::Uring => b"uring".to_vec(),
+        IoBackendMode::Polling => b"polling".to_vec(),
+    }
+}
+
+fn fixed_buffer_registration_value(mode: FixedBufferRegistrationMode) -> Vec<u8> {
+    match mode {
+        FixedBufferRegistrationMode::Auto => b"auto".to_vec(),
+        FixedBufferRegistrationMode::On => b"on".to_vec(),
+        FixedBufferRegistrationMode::Off => b"off".to_vec(),
+    }
 }

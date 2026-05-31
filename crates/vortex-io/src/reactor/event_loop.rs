@@ -25,14 +25,14 @@ impl Reactor {
             let flush_counts_submit = self.flush_counts_submit_syscall();
             if let Err(e) = self.backend.flush() {
                 if flush_counts_submit {
-                    self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                    self.local_metrics.record_backend_submit_syscall();
                 }
                 self.keyspace.record_reactor_submit_failure(self.id);
                 tracing::error!(error = %e, "backend flush failed");
                 break;
             }
             if flush_counts_submit {
-                self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                self.local_metrics.record_backend_submit_syscall();
             }
 
             // 2. Drain completions.
@@ -53,12 +53,12 @@ impl Reactor {
                 match self.backend.completions(&mut self.cqe_buf) {
                     Ok(_) => {
                         if completions_count_submit {
-                            self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                            self.local_metrics.record_backend_submit_syscall();
                         }
                     }
                     Err(e) => {
                         if completions_count_submit {
-                            self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                            self.local_metrics.record_backend_submit_syscall();
                         }
                         self.keyspace.record_reactor_submit_failure(self.id);
                         tracing::error!(error = %e, "backend completions failed");
@@ -86,7 +86,7 @@ impl Reactor {
                 let drain_ok = match self.backend.drain_cq(&mut self.cqe_buf) {
                     Ok(count) => {
                         if self.drain_cq_counts_submit_syscall(count) {
-                            self.keyspace.record_reactor_backend_submit_syscall(self.id);
+                            self.local_metrics.record_backend_submit_syscall();
                         }
                         true
                     }
@@ -108,11 +108,11 @@ impl Reactor {
                 }
             }
             if completion_budget_exhausted {
-                self.keyspace
-                    .record_reactor_completion_budget_exhaustion(self.id);
+                self.local_metrics.record_completion_budget_exhaustion();
             }
-            if saw_completion_work {
-                let elapsed = self.elapsed_profile_metric_nanos(completion_phase_start);
+            if saw_completion_work
+                && let Some(elapsed) = self.elapsed_profile_metric_nanos(completion_phase_start)
+            {
                 self.keyspace
                     .record_reactor_completion_nanos(self.id, elapsed);
             }

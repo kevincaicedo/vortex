@@ -15,8 +15,27 @@ use vortex_proto::RespTape;
 
 static RESP_PONG: &[u8] = b"+PONG\r\n";
 
-fn production_region(source: &'static str) -> &'static str {
+fn production_region(source: &str) -> &str {
     source.split("\n#[cfg(test").next().unwrap_or(source)
+}
+
+fn production_function_body<'a>(source_name: &str, source: &'a str, function: &str) -> &'a str {
+    let source = production_region(source);
+    let start = source
+        .find(&format!("fn {function}"))
+        .unwrap_or_else(|| panic!("{source_name} must define `{function}`"));
+    let body = &source[start..];
+    body.split("\n    pub").next().unwrap_or(body)
+}
+
+fn assert_ordered_tokens(source: &str, context: &str, tokens: &[&str]) {
+    let mut offset = 0usize;
+    for token in tokens {
+        let Some(relative_start) = source[offset..].find(token) else {
+            panic!("{context} must contain `{token}` after byte offset {offset}");
+        };
+        offset += relative_start + token.len();
+    }
 }
 
 #[test]
@@ -110,6 +129,467 @@ fn reactor_dispatch_uses_shared_keyspace_executor_boundary() {
     );
 }
 
+#[test]
+fn reactor_hot_batch_diagnostics_stay_reactor_local() {
+    let forbidden = [
+        "record_reactor_loop_iteration(",
+        "record_reactor_backend_submit_syscall(",
+        "record_reactor_accept_eagain_rearm(",
+        "record_reactor_accept_drain(",
+        "record_reactor_completion_batch(",
+        "record_reactor_completion_budget_exhaustion(",
+        "record_reactor_command_batch(",
+        "record_reactor_command_budget_exhaustion(",
+        "record_reactor_accept_budget_exhaustion(",
+        "record_reactor_writev_budget_exhaustion(",
+        "record_reactor_maintenance_budget_exhaustion(",
+        "record_reactor_yielded_connection(",
+        "record_reactor_parser_resume(",
+        "record_reactor_writev_chunk(",
+        "record_reactor_queued_response_bytes(",
+        "record_reactor_active_expiry(",
+    ];
+    let files = [
+        ("reactor.rs", include_str!("../reactor.rs")),
+        ("reactor/accept.rs", include_str!("accept.rs")),
+        ("reactor/admission.rs", include_str!("admission.rs")),
+        ("reactor/aof.rs", include_str!("aof.rs")),
+        ("reactor/event_loop.rs", include_str!("event_loop.rs")),
+        ("reactor/maintenance.rs", include_str!("maintenance.rs")),
+        ("reactor/read_path.rs", include_str!("read_path.rs")),
+        ("reactor/shutdown.rs", include_str!("shutdown.rs")),
+        ("reactor/state.rs", include_str!("state.rs")),
+        ("reactor/transaction.rs", include_str!("transaction.rs")),
+        ("reactor/write_path.rs", include_str!("write_path.rs")),
+    ];
+
+    for (name, source) in files {
+        let source = production_region(source);
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "{name} must publish high-frequency diagnostics through ReactorLocalMetrics, not `{token}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn backend_queue_pressure_hot_path_stays_profile_gated() {
+    let source = production_region(include_str!("event_loop.rs"));
+    let hot_start = source
+        .find("fn publish_backend_queue_pressure_hot")
+        .expect("event_loop must define hot backend queue pressure helper");
+    let hot_body = &source[hot_start..];
+    let hot_body = hot_body
+        .split("\n    #[inline]\n    pub(super) fn publish_backend_queue_pressure")
+        .next()
+        .expect("hot backend queue pressure helper must precede cold helper");
+
+    assert!(
+        hot_body.contains("profile_timers_enabled()"),
+        "hot backend queue pressure publication must stay profile-gated"
+    );
+    assert!(
+        hot_body.contains("self.publish_backend_queue_pressure();"),
+        "hot backend queue pressure should delegate to the cold snapshot helper only after the profile gate"
+    );
+}
+
+#[test]
+fn reactor_profile_timer_publications_stay_profile_gated() {
+    let profile_metric_start = production_function_body(
+        "reactor/state.rs",
+        include_str!("state.rs"),
+        "profile_metric_start",
+    );
+    assert_ordered_tokens(
+        profile_metric_start,
+        "reactor profile timer start gate",
+        &[
+            "#[cfg(feature = \"profile-telemetry\")]",
+            "profile_timers_enabled()",
+            "Some(Timestamp::now().as_nanos())",
+            "None",
+        ],
+    );
+
+    let elapsed_profile_metric_nanos = production_function_body(
+        "reactor/state.rs",
+        include_str!("state.rs"),
+        "elapsed_profile_metric_nanos",
+    );
+    assert_ordered_tokens(
+        elapsed_profile_metric_nanos,
+        "reactor profile timer elapsed gate",
+        &[
+            "#[cfg(feature = \"profile-telemetry\")]",
+            "start",
+            "Timestamp::now().as_nanos()",
+            "#[cfg(not(feature = \"profile-telemetry\"))]",
+            "None",
+        ],
+    );
+
+    let run = production_function_body(
+        "reactor/event_loop.rs",
+        include_str!("event_loop.rs"),
+        "run",
+    );
+    assert_ordered_tokens(
+        run,
+        "reactor completion timer metric",
+        &[
+            "let completion_phase_start = self.profile_metric_start();",
+            "self.elapsed_profile_metric_nanos(completion_phase_start)",
+            "record_reactor_completion_nanos",
+        ],
+    );
+
+    let aof_timer_functions = [
+        "append_eviction_aof_record",
+        "append_aof_payload",
+        "append_to_aof",
+    ];
+    for function in aof_timer_functions {
+        let body = production_function_body("reactor/aof.rs", include_str!("aof.rs"), function);
+        assert_ordered_tokens(
+            body,
+            &format!("{function} AOF append timer metric"),
+            &[
+                "let append_start = self.profile_metric_start();",
+                "self.elapsed_profile_metric_nanos(append_start)",
+                "record_reactor_aof_append_nanos",
+            ],
+        );
+    }
+    let transaction_batch = production_function_body(
+        "reactor/aof.rs",
+        include_str!("aof.rs"),
+        "append_transaction_aof_batch",
+    );
+    assert!(
+        transaction_batch.contains("self.append_aof_payload("),
+        "transaction AOF batches should reuse the profile-gated payload append path"
+    );
+    assert!(
+        !transaction_batch.contains("record_reactor_aof_append_nanos"),
+        "transaction AOF batch assembly must not add a second append timer publication"
+    );
+
+    let maintenance_timer_functions = [
+        "run_close_drain_slice",
+        "run_timer_slice",
+        "run_active_expiry_slice",
+        "run_eviction_pressure_slice",
+        "run_aof_fsync_slice",
+        "run_metrics_flush_slice",
+    ];
+    for function in maintenance_timer_functions {
+        let body = production_function_body(
+            "reactor/maintenance.rs",
+            include_str!("maintenance.rs"),
+            function,
+        );
+        assert!(
+            body.contains("self.profile_metric_start()"),
+            "{function} must source elapsed maintenance time from the profile timer gate"
+        );
+        assert!(
+            body.contains("self.elapsed_profile_metric_nanos(start)"),
+            "{function} must collapse elapsed maintenance time to zero outside Profile"
+        );
+    }
+
+    let active_expiry = production_function_body(
+        "reactor/maintenance.rs",
+        include_str!("maintenance.rs"),
+        "run_active_expiry_slice",
+    );
+    assert_ordered_tokens(
+        active_expiry,
+        "active-expiry timer metric",
+        &[
+            "let start = self.profile_metric_start();",
+            "let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);",
+            "record_reactor_active_expiry_nanos",
+        ],
+    );
+
+    let aof_fsync = production_function_body(
+        "reactor/maintenance.rs",
+        include_str!("maintenance.rs"),
+        "run_aof_fsync_slice",
+    );
+    assert_ordered_tokens(
+        aof_fsync,
+        "AOF fsync timer metric",
+        &[
+            "let start = self.profile_metric_start();",
+            "let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);",
+            "record_reactor_aof_fsync_nanos",
+        ],
+    );
+
+    let metrics_flush = production_function_body(
+        "reactor/maintenance.rs",
+        include_str!("maintenance.rs"),
+        "run_metrics_flush_slice",
+    );
+    assert_ordered_tokens(
+        metrics_flush,
+        "metrics-flush timer metric",
+        &[
+            "let start = self.profile_metric_start();",
+            "let elapsed = self.elapsed_profile_metric_nanos(start).unwrap_or(0);",
+            "record_reactor_metrics_flush_nanos",
+        ],
+    );
+
+    let scheduler = production_function_body(
+        "reactor/maintenance.rs",
+        include_str!("maintenance.rs"),
+        "run_maintenance_scheduler",
+    );
+    assert_ordered_tokens(
+        scheduler,
+        "aggregate maintenance timer metric",
+        &[
+            "let mut total_nanos = 0u64;",
+            "total_nanos = total_nanos.saturating_add(run.elapsed_nanos);",
+            "if total_nanos != 0",
+            "record_reactor_maintenance_nanos",
+        ],
+    );
+    assert!(
+        !scheduler.contains("Timestamp::now"),
+        "maintenance aggregate timing must sum profile-gated slice elapsed time, not read the clock directly"
+    );
+
+    let close_connection = production_function_body(
+        "reactor/shutdown.rs",
+        include_str!("shutdown.rs"),
+        "close_connection",
+    );
+    assert_ordered_tokens(
+        close_connection,
+        "close-drain timer start",
+        &[
+            "if conn_id < self.close_started_nanos.len() && self.close_started_nanos[conn_id] == 0",
+            "self.close_started_nanos[conn_id] = self.profile_metric_start().unwrap_or(0);",
+        ],
+    );
+
+    let finalize_close_now = production_function_body(
+        "reactor/shutdown.rs",
+        include_str!("shutdown.rs"),
+        "finalize_close_now",
+    );
+    assert_ordered_tokens(
+        finalize_close_now,
+        "close-drain timer metric",
+        &[
+            "let started = self.close_started_nanos[conn_id];",
+            "if started != 0",
+            "self.elapsed_profile_metric_nanos(Some(started))",
+            "record_reactor_close_drain_nanos",
+            "self.close_started_nanos[conn_id] = 0;",
+        ],
+    );
+}
+
+#[test]
+fn aof_append_hot_path_does_not_publish_runtime_telemetry() {
+    let source = production_region(include_str!("aof.rs"));
+    for function in [
+        "append_eviction_aof_record",
+        "append_aof_payload",
+        "append_to_aof",
+    ] {
+        let start = source
+            .find(&format!("fn {function}"))
+            .expect("AOF append helper must exist");
+        let body = &source[start..];
+        let body = body
+            .split("\n    pub(super) fn ")
+            .next()
+            .expect("function body slice must be available");
+
+        assert!(
+            !body.contains("publish_aof_telemetry"),
+            "{function} must not publish shared AOF telemetry from the append hot path"
+        );
+    }
+
+    let maintenance = production_region(include_str!("maintenance.rs"));
+    assert!(
+        maintenance.contains("self.publish_aof_telemetry();"),
+        "AOF telemetry should still publish from cold maintenance/metrics flush paths"
+    );
+}
+
+#[test]
+fn reactor_direct_runtime_metric_publications_stay_classified() {
+    let allowed = [
+        (
+            "record_reactor_submit_failure",
+            "backend error path, not steady-state diagnostics",
+        ),
+        (
+            "record_reactor_submit_sq_full_retry",
+            "SQ-full retry path, not steady-state diagnostics",
+        ),
+        (
+            "record_reactor_backend_queue_status",
+            "profile-gated hot helper or cold metrics flush snapshot",
+        ),
+        (
+            "record_reactor_completion_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_close_drain_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_active_expiry_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_aof_append_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_aof_fsync_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_maintenance_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_metrics_flush_nanos",
+            "profile-timer metric; Option-gated outside Profile",
+        ),
+        (
+            "record_reactor_request_cap_exceeded",
+            "cap enforcement error path",
+        ),
+        (
+            "record_reactor_response_cap_exceeded",
+            "cap enforcement error path",
+        ),
+        (
+            "record_reactor_writev_chunk_cap_exceeded",
+            "cap enforcement fallback path",
+        ),
+        (
+            "record_reactor_multi_queue_command_cap_exceeded",
+            "transaction cap enforcement path",
+        ),
+        (
+            "record_reactor_multi_queue_bytes_cap_exceeded",
+            "transaction cap enforcement path",
+        ),
+        (
+            "record_reactor_watch_cap_exceeded",
+            "WATCH cap enforcement path",
+        ),
+        (
+            "record_reactor_overload_accept_throttled",
+            "overload state transition",
+        ),
+        (
+            "record_reactor_overload_accept_resumed",
+            "overload state transition",
+        ),
+        (
+            "record_reactor_overload_read_disabled",
+            "overload state transition",
+        ),
+        (
+            "record_reactor_overload_read_resumed",
+            "overload state transition",
+        ),
+        (
+            "record_reactor_overload_command_deferred",
+            "overload state transition",
+        ),
+        (
+            "record_reactor_overload_command_resumed",
+            "overload state transition",
+        ),
+        (
+            "record_reactor_overload_connection_dropped",
+            "overload drop path",
+        ),
+        (
+            "publish_reactor_overload_telemetry",
+            "cold metrics flush snapshot",
+        ),
+        (
+            "publish_reactor_aof_telemetry",
+            "fsync completion or cold metrics flush snapshot",
+        ),
+        (
+            "publish_reactor_client_retained_bytes",
+            "cold metrics flush snapshot",
+        ),
+        (
+            "publish_runtime_backend",
+            "startup or cold metrics flush snapshot",
+        ),
+    ];
+    let files = [
+        ("reactor.rs", include_str!("../reactor.rs")),
+        ("reactor/accept.rs", include_str!("accept.rs")),
+        ("reactor/admission.rs", include_str!("admission.rs")),
+        ("reactor/aof.rs", include_str!("aof.rs")),
+        ("reactor/event_loop.rs", include_str!("event_loop.rs")),
+        ("reactor/maintenance.rs", include_str!("maintenance.rs")),
+        ("reactor/read_path.rs", include_str!("read_path.rs")),
+        ("reactor/shutdown.rs", include_str!("shutdown.rs")),
+        ("reactor/state.rs", include_str!("state.rs")),
+        ("reactor/transaction.rs", include_str!("transaction.rs")),
+        ("reactor/write_path.rs", include_str!("write_path.rs")),
+    ];
+    let prefixes = [
+        "record_reactor_",
+        "publish_reactor_",
+        "publish_runtime_backend",
+    ];
+    let mut failures = Vec::new();
+
+    for (name, source) in files {
+        let compact: String = production_region(source)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        for prefix in prefixes {
+            let mut search_from = 0usize;
+            while let Some(relative_start) = compact[search_from..].find(prefix) {
+                let start = search_from + relative_start;
+                let Some(relative_end) = compact[start..].find('(') else {
+                    failures.push(format!("{name}: unterminated metric call after `{prefix}`"));
+                    break;
+                };
+                let metric = &compact[start..start + relative_end];
+                if !allowed.iter().any(|(allowed, _)| *allowed == metric) {
+                    failures.push(format!(
+                        "{name}: `{metric}` must be classified before direct reactor-to-keyspace publication"
+                    ));
+                }
+                search_from = start + relative_end + 1;
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "unclassified direct runtime metric publications: {failures:#?}"
+    );
+}
+
 fn test_reactor() -> Reactor {
     let config = ReactorConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -126,8 +606,13 @@ struct MockBackendState {
     closes: Vec<CompletionToken>,
     completions: VecDeque<Completion>,
     flushes: usize,
+    queue_status: BackendQueueStatus,
+    fail_next_flush: bool,
+    fail_next_completions: bool,
+    fail_next_drain_cq: bool,
     fail_next_submit_sq_full: bool,
     fail_retry_submit_sq_full: bool,
+    complete_accept_cancel_on_submit: bool,
 }
 
 struct MockBackend {
@@ -146,6 +631,22 @@ impl MockBackend {
             return Err(SubmitError::QueueFull);
         }
         Ok(())
+    }
+
+    fn maybe_fail_io(flag: &mut bool, reason: &'static str) -> std::io::Result<()> {
+        if *flag {
+            *flag = false;
+            return Err(std::io::Error::other(reason));
+        }
+        Ok(())
+    }
+
+    fn drain_completions(state: &mut MockBackendState, out: &mut Vec<Completion>) -> usize {
+        let start = out.len();
+        while let Some(cqe) = state.completions.pop_front() {
+            out.push(cqe);
+        }
+        out.len() - start
     }
 }
 
@@ -197,31 +698,62 @@ impl crate::backend::BackendDriver for MockBackend {
         target: CompletionToken,
         cancel: CompletionToken,
     ) -> Result<(), SubmitError> {
-        self.state.lock().unwrap().cancels.push((target, cancel));
+        self.maybe_fail_submit()?;
+        let mut state = self.state.lock().unwrap();
+        state.cancels.push((target, cancel));
+        if state.complete_accept_cancel_on_submit && target == CompletionToken::accept() {
+            state.completions.push_back(Completion {
+                token: cancel,
+                result: 0,
+                flags: 0,
+            });
+            state.completions.push_back(Completion {
+                token: CompletionToken::accept(),
+                result: -libc::ECANCELED,
+                flags: 0,
+            });
+        }
         Ok(())
     }
 
     fn submit_close(&mut self, _fd: ConnFd, token: CompletionToken) -> Result<(), SubmitError> {
+        self.maybe_fail_submit()?;
         self.state.lock().unwrap().closes.push(token);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<usize, SubmitError> {
-        self.state.lock().unwrap().flushes += 1;
+        let mut state = self.state.lock().unwrap();
+        state.flushes += 1;
+        if state.fail_next_flush {
+            state.fail_next_flush = false;
+            return Err(SubmitError::Backend(std::io::Error::other(
+                "mock backend flush failure",
+            )));
+        }
         Ok(0)
     }
 
     fn completions(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize> {
         let mut state = self.state.lock().unwrap();
-        let start = out.len();
-        while let Some(cqe) = state.completions.pop_front() {
-            out.push(cqe);
-        }
-        Ok(out.len() - start)
+        Self::maybe_fail_io(
+            &mut state.fail_next_completions,
+            "mock backend completions failure",
+        )?;
+        Ok(Self::drain_completions(&mut state, out))
     }
 
     fn drain_cq(&mut self, out: &mut Vec<Completion>) -> std::io::Result<usize> {
-        self.completions(out)
+        let mut state = self.state.lock().unwrap();
+        Self::maybe_fail_io(
+            &mut state.fail_next_drain_cq,
+            "mock backend CQ drain failure",
+        )?;
+        Ok(Self::drain_completions(&mut state, out))
+    }
+
+    fn queue_status(&mut self) -> BackendQueueStatus {
+        self.state.lock().unwrap().queue_status
     }
 }
 
@@ -247,6 +779,96 @@ fn test_reactor_with_backend_config(
         1,
     )
     .unwrap()
+}
+
+fn enable_exact_standard_local_metrics(reactor: &mut Reactor) {
+    reactor.config.telemetry_mode = RuntimeTelemetryMode::Standard;
+    reactor.config.telemetry_local_sample_rate = 1;
+    reactor.local_metrics = ReactorLocalMetrics::new(1);
+    reactor
+        .keyspace
+        .set_runtime_telemetry_mode(RuntimeTelemetryMode::Standard);
+    reactor.keyspace.set_runtime_local_flush_policy(
+        1,
+        reactor.config.telemetry_flush_interval_nanos / 1_000_000,
+    );
+}
+
+#[test]
+fn local_metrics_disabled_sample_rate_suppresses_hot_batch_diagnostics() {
+    let mut metrics = ReactorLocalMetrics::new(0);
+
+    metrics.record_backend_submit_syscall();
+    metrics.record_loop_iteration();
+    metrics.record_accept_eagain_rearm();
+    metrics.record_accept_drain(4);
+    metrics.record_completion_budget_exhaustion();
+    metrics.record_command_budget_exhaustion();
+    metrics.record_accept_budget_exhaustion();
+    metrics.record_writev_budget_exhaustion();
+    metrics.record_maintenance_budget_exhaustion();
+    metrics.record_yielded_connection();
+    metrics.record_parser_resume();
+    metrics.record_completion_batch(8);
+    metrics.record_command_batch(3);
+    metrics.record_writev_chunk(2);
+    metrics.record_queued_response_bytes(128);
+    metrics.record_active_expiry(16, 2);
+
+    assert!(metrics.take().is_empty());
+}
+
+#[test]
+fn local_metrics_sampling_is_independent_per_metric_family() {
+    let mut metrics = ReactorLocalMetrics::new(2);
+
+    metrics.record_backend_submit_syscall();
+    metrics.record_backend_submit_syscall();
+    metrics.record_loop_iteration();
+    metrics.record_loop_iteration();
+    metrics.record_accept_eagain_rearm();
+    metrics.record_accept_eagain_rearm();
+    metrics.record_completion_budget_exhaustion();
+    metrics.record_completion_budget_exhaustion();
+    metrics.record_command_budget_exhaustion();
+    metrics.record_command_budget_exhaustion();
+    metrics.record_accept_budget_exhaustion();
+    metrics.record_accept_budget_exhaustion();
+    metrics.record_writev_budget_exhaustion();
+    metrics.record_writev_budget_exhaustion();
+    metrics.record_maintenance_budget_exhaustion();
+    metrics.record_maintenance_budget_exhaustion();
+    metrics.record_yielded_connection();
+    metrics.record_yielded_connection();
+    metrics.record_parser_resume();
+    metrics.record_parser_resume();
+    metrics.record_command_batch(3);
+    metrics.record_command_batch(3);
+    metrics.record_writev_chunk(4);
+    metrics.record_writev_chunk(4);
+    metrics.record_active_expiry(8, 1);
+    metrics.record_active_expiry(8, 1);
+
+    let snapshot = metrics.take();
+    assert_eq!(snapshot.backend_submit_syscalls, 2);
+    assert_eq!(snapshot.loop_iterations, 2);
+    assert_eq!(snapshot.accept_eagain_rearms, 2);
+    assert_eq!(snapshot.completion_budget_exhaustions, 2);
+    assert_eq!(snapshot.command_budget_exhaustions, 2);
+    assert_eq!(snapshot.accept_budget_exhaustions, 2);
+    assert_eq!(snapshot.writev_budget_exhaustions, 2);
+    assert_eq!(snapshot.maintenance_budget_exhaustions, 2);
+    assert_eq!(snapshot.yielded_connections, 2);
+    assert_eq!(snapshot.parser_resumes, 2);
+    assert_eq!(snapshot.command_batch_count, 2);
+    assert_eq!(snapshot.command_batch_total, 6);
+    assert_eq!(snapshot.command_batch_max, 3);
+    assert_eq!(snapshot.writev_chunks, 2);
+    assert_eq!(snapshot.writev_iovecs_total, 8);
+    assert_eq!(snapshot.writev_iovecs_max, 4);
+    assert_eq!(snapshot.active_expiry_runs, 2);
+    assert_eq!(snapshot.active_expiry_sampled, 16);
+    assert_eq!(snapshot.active_expiry_expired, 2);
 }
 
 fn insert_test_connection(reactor: &mut Reactor, fd: RawFd, bytes: &[u8]) -> usize {
@@ -471,7 +1093,7 @@ fn backend_runtime_snapshot_formats_capability_contract() {
 fn telemetry_mode_gates_profile_timer_starts() {
     let mut reactor = test_reactor();
     assert_eq!(reactor.profile_metric_start(), None);
-    assert_eq!(reactor.elapsed_profile_metric_nanos(None), 0);
+    assert_eq!(reactor.elapsed_profile_metric_nanos(None), None);
     assert!(!reactor.keyspace.runtime_profile_timers_enabled());
 
     reactor.config.telemetry_mode = RuntimeTelemetryMode::Profile;
@@ -559,12 +1181,20 @@ fn keyspace_get_response(keyspace: &ConcurrentKeyspace, key: &[u8]) -> Vec<u8> {
     match result.response {
         CmdResult::Static(bytes) => bytes.to_vec(),
         CmdResult::Inline(inline) => inline.as_bytes().to_vec(),
+        CmdResult::Owned(bytes) => bytes.into_vec(),
         CmdResult::Resp(frame) => {
             let mut out = Vec::new();
             append_resp_frame(&mut out, &frame);
             out
         }
     }
+}
+
+fn seed_reactor_value(reactor: &mut Reactor, key: &[u8], value: &[u8]) {
+    let set_wire = resp_command(&[b"SET", key, value]);
+    let (resp, close) = dispatch_reactor_wire_on(reactor, 0, &set_wire);
+    assert_eq!(response_bytes(resp), b"+OK\r\n");
+    assert!(!close);
 }
 
 fn replayed_get_response(path: &Path, key: &[u8]) -> Vec<u8> {
@@ -609,6 +1239,7 @@ fn dispatch_wire(wire: &[u8]) -> (CommandResponse, bool) {
                         (CommandResponse::Static(buf), close)
                     }
                     CmdResult::Inline(inline) => (CommandResponse::Inline(inline), false),
+                    CmdResult::Owned(bytes) => (CommandResponse::Owned(bytes), false),
                     CmdResult::Resp(f) => (CommandResponse::Frame(f), false),
                 },
                 None => (
@@ -1648,6 +2279,131 @@ fn config_get_reads_runtime_eviction_state() {
 }
 
 #[test]
+fn config_get_reads_runtime_persistence_state() {
+    let path = temp_aof_path("config-get-persistence");
+    let mut reactor = test_reactor();
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"appendonly", b"no");
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$11\r\nappendfsync\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"appendfsync", b"everysec");
+
+    enable_test_aof_with_policy(&mut reactor, &path, AofFsyncPolicy::No);
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"appendonly", b"yes");
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$11\r\nappendfsync\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"appendfsync", b"no");
+
+    cleanup(&path);
+}
+
+#[test]
+fn config_get_reads_runtime_telemetry_and_backend_state() {
+    let mut reactor = test_reactor();
+    reactor.config.telemetry_mode = RuntimeTelemetryMode::Standard;
+    reactor.config.telemetry_local_sample_rate = 8;
+    reactor.config.telemetry_flush_interval_nanos = 250_000_000;
+    reactor.config.io_backend = IoBackendMode::Polling;
+    reactor.config.fixed_buffer_registration = FixedBufferRegistrationMode::Off;
+    reactor
+        .keyspace
+        .set_runtime_telemetry_mode(RuntimeTelemetryMode::Standard);
+    reactor.keyspace.set_runtime_local_flush_policy(8, 250);
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$14\r\ntelemetry-mode\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"telemetry-mode", b"standard");
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$27\r\ntelemetry-local-sample-rate\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"telemetry-local-sample-rate", b"8");
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$27\r\ntelemetry-flush-interval-ms\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"telemetry-flush-interval-ms", b"250");
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nio-backend\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"io-backend", b"polling");
+
+    let (resp, close) = handle_config_wire(
+        &mut reactor,
+        b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$25\r\nfixed-buffer-registration\r\n",
+    );
+    assert!(!close);
+    expect_config_pair(resp, b"fixed-buffer-registration", b"off");
+}
+
+#[test]
+fn config_set_rejects_alpha_disabled_runtime_toggles() {
+    let mut reactor = test_reactor();
+
+    let cases: &[(&[u8], &[u8])] = &[
+        (
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$11\r\nappendfsync\r\n$2\r\nno\r\n",
+            RESP_ERR_CONFIG_SET_APPENDFSYNC,
+        ),
+        (
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$14\r\ntelemetry-mode\r\n$8\r\nstandard\r\n",
+            RESP_ERR_CONFIG_SET_TELEMETRY,
+        ),
+        (
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$27\r\ntelemetry-local-sample-rate\r\n$1\r\n8\r\n",
+            RESP_ERR_CONFIG_SET_TELEMETRY,
+        ),
+        (
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$27\r\ntelemetry-flush-interval-ms\r\n$3\r\n250\r\n",
+            RESP_ERR_CONFIG_SET_TELEMETRY,
+        ),
+        (
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$10\r\nio-backend\r\n$7\r\npolling\r\n",
+            RESP_ERR_CONFIG_SET_BACKEND,
+        ),
+        (
+            b"*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$25\r\nfixed-buffer-registration\r\n$3\r\noff\r\n",
+            RESP_ERR_CONFIG_SET_FIXED_BUFFERS,
+        ),
+    ];
+
+    for &(request, expected) in cases {
+        let (resp, close) = handle_config_wire(&mut reactor, request);
+        assert_eq!(response_bytes(resp), expected);
+        assert!(!close);
+    }
+}
+
+#[test]
 fn config_set_updates_runtime_eviction_state() {
     let mut reactor = test_reactor();
 
@@ -1917,9 +2673,11 @@ fn fixed_buffer_policy_on_requires_capable_backend() {
 fn parser_resume_counter_moves_on_incomplete_frame() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(state);
+    enable_exact_standard_local_metrics(&mut reactor);
     let conn_id = insert_test_connection(&mut reactor, 123, b"*2\r\n$3\r\nGET\r\n");
 
     reactor.process_commands(conn_id, 123);
+    reactor.flush_local_runtime_metrics();
 
     let runtime = reactor.keyspace.runtime_metrics();
     assert_eq!(runtime.parser_resumes, 1);
@@ -1931,6 +2689,7 @@ fn parser_resume_counter_moves_on_incomplete_frame() {
 fn command_budget_yields_pipeline_and_resumes_after_write() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    enable_exact_standard_local_metrics(&mut reactor);
     reactor.config.budgets.command = CommandBudget::new(2).unwrap();
     let mut pipeline = Vec::new();
     for _ in 0..3 {
@@ -2087,6 +2846,85 @@ fn pending_response_cap_bounds_deep_pipeline_slow_reader() {
     let conn = reactor.connections.get(conn_id).unwrap();
     assert_ne!(conn.flags & ConnectionFlags::CLOSE_AFTER_WRITE, 0);
     assert_eq!(reactor.keyspace.runtime_metrics().response_cap_exceeded, 1);
+}
+
+#[test]
+fn pending_response_cap_uses_exact_large_dynamic_frame_length() {
+    let key = b"large-dynamic-response";
+    let value = vec![b'v'; 512];
+    let mut expected = Vec::new();
+    push_resp_bulk_string(&mut expected, value.as_slice());
+
+    let allowed_state = Arc::new(Mutex::new(MockBackendState::default()));
+    let allowed_config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: 8,
+        buffer_count: 16,
+        connection_caps: ConnectionMemoryCaps {
+            max_pending_response_bytes: expected.len(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut allowed_reactor =
+        test_reactor_with_backend_config(Arc::clone(&allowed_state), allowed_config);
+    seed_reactor_value(&mut allowed_reactor, key, value.as_slice());
+    let allowed_conn =
+        insert_test_connection(&mut allowed_reactor, 73, &resp_command(&[b"GET", key]));
+
+    allowed_reactor.process_commands(allowed_conn, 73);
+
+    assert_eq!(
+        pending_writev_bytes(&allowed_reactor, allowed_conn),
+        expected
+    );
+    assert_eq!(
+        allowed_reactor
+            .keyspace
+            .runtime_metrics()
+            .response_cap_exceeded,
+        0
+    );
+
+    let rejected_state = Arc::new(Mutex::new(MockBackendState::default()));
+    let rejected_config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: 8,
+        buffer_count: 16,
+        connection_caps: ConnectionMemoryCaps {
+            max_pending_response_bytes: expected.len() - 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut rejected_reactor =
+        test_reactor_with_backend_config(Arc::clone(&rejected_state), rejected_config);
+    seed_reactor_value(&mut rejected_reactor, key, value.as_slice());
+    let rejected_conn =
+        insert_test_connection(&mut rejected_reactor, 74, &resp_command(&[b"GET", key]));
+
+    rejected_reactor.process_commands(rejected_conn, 74);
+
+    assert_eq!(
+        pending_writev_bytes(&rejected_reactor, rejected_conn),
+        RESP_ERR_RESPONSE_TOO_LARGE
+    );
+    assert_ne!(
+        rejected_reactor
+            .connections
+            .get(rejected_conn)
+            .unwrap()
+            .flags
+            & ConnectionFlags::CLOSE_AFTER_WRITE,
+        0
+    );
+    assert_eq!(
+        rejected_reactor
+            .keyspace
+            .runtime_metrics()
+            .response_cap_exceeded,
+        1
+    );
 }
 
 #[test]
@@ -2322,6 +3160,72 @@ fn capped_pending_write_can_close_after_terminal_write() {
 
     assert!(reactor.connections.is_closing(conn_id));
     assert!(reactor.writev_states[conn_id].remaining_iovecs().is_empty());
+}
+
+#[test]
+fn capped_pending_write_partial_resubmits_then_closes_after_drain() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let config = ReactorConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        max_connections: 8,
+        buffer_size: 4096,
+        buffer_count: 16,
+        connection_caps: ConnectionMemoryCaps {
+            max_pending_response_bytes: 96,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut reactor = test_reactor_with_backend_config(Arc::clone(&state), config);
+    let mut wire = Vec::new();
+    for _ in 0..128 {
+        wire.extend_from_slice(&resp_command(&[b"PING"]));
+    }
+
+    let conn_id = insert_test_connection(&mut reactor, 77, &wire);
+    reactor.process_commands(conn_id, 77);
+    let first_token = state.lock().unwrap().writevs[0].0;
+    let total = reactor.connections.get(conn_id).unwrap().write_buf_len as usize;
+    let partial = RESP_PONG.len() + 3;
+    assert!(partial < total);
+    assert_ne!(
+        reactor.connections.get(conn_id).unwrap().flags & ConnectionFlags::CLOSE_AFTER_WRITE,
+        0
+    );
+
+    reactor.handle_completion(&Completion {
+        token: first_token,
+        result: partial as i32,
+        flags: 0,
+    });
+
+    let remaining = total - partial;
+    assert!(!reactor.connections.is_closing(conn_id));
+    assert!(reactor.inflight_ops[conn_id].writev);
+    assert_eq!(
+        reactor.connections.get(conn_id).unwrap().write_buf_len as usize,
+        remaining
+    );
+    assert_eq!(pending_writev_bytes(&reactor, conn_id).len(), remaining);
+    let second_token = {
+        let state = state.lock().unwrap();
+        assert_eq!(state.writevs.len(), 2);
+        assert!(state.closes.is_empty());
+        assert!(state.reads.is_empty());
+        state.writevs[1].0
+    };
+
+    reactor.handle_completion(&Completion {
+        token: second_token,
+        result: remaining as i32,
+        flags: 0,
+    });
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert!(reactor.writev_states[conn_id].remaining_iovecs().is_empty());
+    let state = state.lock().unwrap();
+    assert_eq!(state.closes.len(), 1);
+    assert!(state.reads.is_empty());
 }
 
 #[test]
@@ -2680,6 +3584,7 @@ fn overload_eviction_pressure_debt_disables_reads_until_eviction_progress() {
 fn transaction_and_watch_state_survive_command_budget_requeue() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    enable_exact_standard_local_metrics(&mut reactor);
     reactor.config.budgets.command = CommandBudget::new(2).unwrap();
     let mut wire = resp_command(&[b"WATCH", b"watched"]);
     wire.extend_from_slice(&resp_command(&[b"MULTI"]));
@@ -2688,6 +3593,7 @@ fn transaction_and_watch_state_survive_command_budget_requeue() {
     let conn_id = insert_test_connection(&mut reactor, 123, &wire);
 
     reactor.process_commands(conn_id, 123);
+    reactor.flush_local_runtime_metrics();
 
     assert_eq!(pending_writev_bytes(&reactor, conn_id), b"+OK\r\n+OK\r\n");
     assert!(reactor.transaction_states[conn_id].queueing);
@@ -2811,6 +3717,7 @@ fn completion_budget_requeues_overflow_in_reactor_order() {
 fn writev_and_response_byte_counters_move_on_response_submit() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(state);
+    enable_exact_standard_local_metrics(&mut reactor);
     let conn_id = insert_test_connection(&mut reactor, 123, b"*1\r\n$4\r\nPING\r\n");
 
     reactor.process_commands(conn_id, 123);
@@ -2862,6 +3769,7 @@ fn iov_max_plus_one_pipeline_is_chunked_before_backend_submit() {
 fn writev_budget_chunks_before_backend_iov_limit() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    enable_exact_standard_local_metrics(&mut reactor);
     reactor.config.budgets.writev = WritevBudget::new(2).unwrap();
     let mut pipeline = Vec::new();
     for _ in 0..3 {
@@ -2877,6 +3785,11 @@ fn writev_budget_chunks_before_backend_iov_limit() {
         assert_eq!(state.writevs[0].1, 2);
         state.writevs[0].0
     };
+    assert_eq!(
+        reactor.keyspace.runtime_metrics().writev_budget_exhaustions,
+        0
+    );
+    reactor.flush_local_runtime_metrics();
     assert_eq!(
         reactor.keyspace.runtime_metrics().writev_budget_exhaustions,
         1
@@ -3133,6 +4046,7 @@ fn close_drain_scheduler_respects_one_connection_slice() {
 #[test]
 fn maintenance_budget_exhaustion_reports_pending_close_drain() {
     let mut reactor = test_reactor();
+    enable_exact_standard_local_metrics(&mut reactor);
     reactor.config.budgets.maintenance = MaintenanceBudget::new(1).unwrap();
     let (first_fd, first_peer) = socket_pair();
     let (second_fd, second_peer) = socket_pair();
@@ -3158,6 +4072,14 @@ fn maintenance_budget_exhaustion_reports_pending_close_drain() {
             .keyspace
             .runtime_metrics()
             .maintenance_budget_exhaustions,
+        0
+    );
+    reactor.flush_local_runtime_metrics();
+    assert_eq!(
+        reactor
+            .keyspace
+            .runtime_metrics()
+            .maintenance_budget_exhaustions,
         1
     );
 }
@@ -3165,6 +4087,7 @@ fn maintenance_budget_exhaustion_reports_pending_close_drain() {
 #[test]
 fn active_expiry_scheduler_records_bounded_slice() {
     let mut reactor = test_reactor();
+    enable_exact_standard_local_metrics(&mut reactor);
     #[cfg(feature = "profile-telemetry")]
     {
         reactor.config.telemetry_mode = RuntimeTelemetryMode::Profile;
@@ -3190,6 +4113,7 @@ fn active_expiry_scheduler_records_bounded_slice() {
         }
     }
 
+    reactor.flush_local_runtime_metrics();
     let runtime = reactor.keyspace.runtime_metrics();
     assert!(runtime.active_expiry_runs > 0);
     #[cfg(feature = "profile-telemetry")]
@@ -3591,6 +4515,98 @@ fn stale_slot_reuse_cqes_are_dropped_by_generation() {
 }
 
 #[test]
+fn stale_cqes_after_close_finalization_do_not_touch_reused_fd_slot() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let reused_fd = 123;
+
+    let conn_id = insert_test_connection(&mut reactor, reused_fd, b"");
+    let old_generation = reactor.generations[conn_id];
+    let old_tokens = [
+        encode_token(conn_id, old_generation, OpType::Read).unwrap(),
+        encode_token(conn_id, old_generation, OpType::Write).unwrap(),
+        encode_token(conn_id, old_generation, OpType::Writev).unwrap(),
+        encode_token(conn_id, old_generation, OpType::Close).unwrap(),
+    ];
+
+    reactor.close_connection(conn_id);
+    assert!(reactor.connections.is_closing(conn_id));
+    assert_eq!(state.lock().unwrap().closes, vec![old_tokens[3]]);
+
+    reactor.handle_completion(&Completion {
+        token: old_tokens[3],
+        result: 0,
+        flags: 0,
+    });
+    let close_slice = reactor.run_close_drain_slice();
+    assert!(close_slice.did_work);
+    assert!(reactor.connections.get(conn_id).is_none());
+    assert_eq!(reactor.buffer_pool.outstanding(), 0);
+
+    let reused_id = insert_test_connection(&mut reactor, reused_fd, &resp_command(&[b"PING"]));
+    assert_eq!(reused_id, conn_id);
+    reactor.generations[reused_id] = old_generation.wrapping_add(1);
+    reactor.process_commands(reused_id, reused_fd);
+
+    let before = pending_writev_bytes(&reactor, reused_id);
+    assert_eq!(before, RESP_PONG);
+    assert!(reactor.inflight_ops[reused_id].writev);
+
+    for token in old_tokens {
+        reactor.handle_completion(&Completion {
+            token,
+            result: RESP_PONG.len() as i32,
+            flags: 0,
+        });
+    }
+
+    let conn = reactor.connections.get(reused_id).unwrap();
+    assert_eq!(conn.fd, reused_fd);
+    assert!(!reactor.connections.is_closing(reused_id));
+    assert_eq!(pending_writev_bytes(&reactor, reused_id), before);
+    assert!(reactor.inflight_ops[reused_id].writev);
+    assert_eq!(state.lock().unwrap().closes.len(), 1);
+    assert_eq!(reactor.unexpected_completion_tokens, 0);
+}
+
+#[test]
+fn stale_cancel_cqe_does_not_touch_reused_slot_generation() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(state);
+
+    let old_read_idx = reactor.buffer_pool.lease_index().unwrap();
+    let old_meta = ConnectionMeta::new(123, old_read_idx as u32);
+    let conn_id = reactor.connections.insert(old_meta);
+    reactor.generations[conn_id] = 7;
+    let old_read_token = encode_token(conn_id, 7, OpType::Read).unwrap();
+    let old_cancel_token = CompletionToken::cancel(old_read_token).unwrap();
+
+    reactor.buffer_pool.release_index(old_read_idx);
+    let _ = reactor.connections.remove(conn_id);
+
+    let new_read_idx = reactor.buffer_pool.lease_index().unwrap();
+    let new_meta = ConnectionMeta::new(124, new_read_idx as u32);
+    let reused_id = reactor.connections.insert(new_meta);
+    assert_eq!(reused_id, conn_id);
+    reactor.generations[reused_id] = 8;
+    reactor.inflight_ops[reused_id].read = true;
+    reactor.inflight_ops[reused_id].cancel_read = true;
+
+    reactor.handle_completion(&Completion {
+        token: old_cancel_token,
+        result: 0,
+        flags: 0,
+    });
+
+    let conn = reactor.connections.get(reused_id).unwrap();
+    assert_eq!(conn.fd, 124);
+    assert!(reactor.inflight_ops[reused_id].read);
+    assert!(reactor.inflight_ops[reused_id].cancel_read);
+    assert_eq!(reactor.invalid_completion_tokens, 0);
+    assert_eq!(reactor.unexpected_completion_tokens, 0);
+}
+
+#[test]
 fn same_generation_completion_without_inflight_state_is_dropped() {
     let state = Arc::new(Mutex::new(MockBackendState::default()));
     let mut reactor = test_reactor_with_backend(state);
@@ -3705,6 +4721,187 @@ fn cancel_enoent_tracks_not_found_vs_already_terminal() {
 }
 
 #[test]
+fn backend_flush_error_records_submit_failure_and_stops() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_flush: true,
+        complete_accept_cancel_on_submit: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state);
+
+    reactor.run();
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_failures, 1);
+    assert!(!reactor.is_running());
+}
+
+#[test]
+fn backend_completions_error_records_submit_failure_and_stops() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_completions: true,
+        complete_accept_cancel_on_submit: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state);
+
+    reactor.run();
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_failures, 1);
+    assert!(!reactor.is_running());
+}
+
+#[test]
+fn backend_drain_cq_error_records_submit_failure_without_blocking_shutdown() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_drain_cq: true,
+        complete_accept_cancel_on_submit: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state);
+    reactor.stop();
+
+    reactor.run();
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_failures, 1);
+    assert!(!reactor.is_running());
+}
+
+#[test]
+fn backend_cq_overflow_status_publishes_from_cold_snapshot() {
+    let state = Arc::new(Mutex::new(MockBackendState::default()));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    state.lock().unwrap().queue_status = BackendQueueStatus {
+        sq_occupancy: 2,
+        sq_capacity: 64,
+        cq_occupancy: 3,
+        cq_capacity: 128,
+        cq_overflow_delta: 7,
+    };
+
+    reactor.publish_backend_queue_pressure();
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.backend_sq_occupancy_max, 2);
+    assert_eq!(runtime.backend_sq_capacity, 64);
+    assert_eq!(runtime.backend_cq_occupancy_max, 3);
+    assert_eq!(runtime.backend_cq_capacity, 128);
+    assert_eq!(runtime.backend_cq_overflows, 7);
+}
+
+#[test]
+fn backend_queue_capacity_publishes_once_during_reactor_construction() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        queue_status: BackendQueueStatus {
+            sq_occupancy: 2,
+            sq_capacity: 64,
+            cq_occupancy: 3,
+            cq_capacity: 128,
+            cq_overflow_delta: 7,
+        },
+        ..Default::default()
+    }));
+    let reactor = test_reactor_with_backend(state);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.backend_sq_occupancy_max, 2);
+    assert_eq!(runtime.backend_sq_capacity, 64);
+    assert_eq!(runtime.backend_cq_occupancy_max, 3);
+    assert_eq!(runtime.backend_cq_capacity, 128);
+    assert_eq!(runtime.backend_cq_overflows, 7);
+}
+
+#[test]
+fn submit_accept_sq_full_flushes_and_retries_once() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state.clone());
+
+    reactor.submit_accept_rearm().unwrap();
+
+    assert!(reactor.accept_inflight);
+    assert_eq!(state.lock().unwrap().flushes, 1);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 0);
+}
+
+#[test]
+fn submit_accept_sq_full_retry_failure_keeps_accept_idle() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        fail_retry_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state.clone());
+
+    assert!(reactor.submit_accept_rearm().is_err());
+
+    assert!(!reactor.accept_inflight);
+    assert_eq!(state.lock().unwrap().flushes, 1);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 1);
+}
+
+#[test]
+fn submit_writev_sq_full_flushes_and_retries_once() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let conn_id = insert_test_connection(&mut reactor, 123, &resp_command(&[b"PING"]));
+
+    reactor.process_commands(conn_id, 123);
+
+    assert!(reactor.inflight_ops[conn_id].writev);
+    assert_eq!(pending_writev_bytes(&reactor, conn_id), RESP_PONG);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 1);
+    assert_eq!(state.writevs.len(), 1);
+    drop(state);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 0);
+}
+
+#[test]
+fn submit_writev_sq_full_retry_failure_closes_without_queued_response() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        fail_retry_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(Arc::clone(&state));
+    let conn_id = insert_test_connection(&mut reactor, 123, &resp_command(&[b"PING"]));
+
+    reactor.process_commands(conn_id, 123);
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert!(!reactor.inflight_ops[conn_id].writev);
+    assert!(reactor.writev_states[conn_id].remaining_iovecs().is_empty());
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 1);
+    assert!(state.writevs.is_empty());
+    assert_eq!(state.closes.len(), 1);
+    drop(state);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 1);
+}
+
+#[test]
 fn submit_read_sq_full_flushes_and_retries_once() {
     let state = Arc::new(Mutex::new(MockBackendState {
         fail_next_submit_sq_full: true,
@@ -3750,6 +4947,128 @@ fn submit_read_sq_full_retry_failure_closes_connection() {
 
     assert!(reactor.connections.is_closing(conn_id));
     assert_eq!(state.lock().unwrap().flushes, 1);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 1);
+}
+
+#[test]
+fn submit_cancel_sq_full_flushes_and_retries_once() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state.clone());
+    let conn_id = insert_test_connection(&mut reactor, 123, b"");
+    reactor.inflight_ops[conn_id].read = true;
+
+    let read_token = encode_token(conn_id, reactor.generations[conn_id], OpType::Read).unwrap();
+    let submitted = reactor.submit_cancel_for(read_token);
+
+    assert!(submitted);
+    assert!(reactor.inflight_ops[conn_id].read);
+    assert!(reactor.inflight_ops[conn_id].cancel_read);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 1);
+    assert_eq!(state.cancels.len(), 1);
+    assert_eq!(state.cancels[0].0, read_token);
+    assert_eq!(
+        state.cancels[0].1,
+        CompletionToken::cancel(read_token).unwrap()
+    );
+    drop(state);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 0);
+}
+
+#[test]
+fn submit_cancel_sq_full_retry_failure_keeps_target_inflight() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        fail_retry_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state.clone());
+    let conn_id = insert_test_connection(&mut reactor, 123, b"");
+    reactor.inflight_ops[conn_id].read = true;
+
+    let read_token = encode_token(conn_id, reactor.generations[conn_id], OpType::Read).unwrap();
+    let submitted = reactor.submit_cancel_for(read_token);
+
+    assert!(!submitted);
+    assert!(reactor.inflight_ops[conn_id].read);
+    assert!(!reactor.inflight_ops[conn_id].cancel_read);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 1);
+    assert!(state.cancels.is_empty());
+    drop(state);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 1);
+}
+
+#[test]
+fn submit_close_sq_full_flushes_and_retries_once() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state.clone());
+    let conn_id = insert_test_connection(&mut reactor, 123, b"");
+    let close_token = encode_token(conn_id, reactor.generations[conn_id], OpType::Close).unwrap();
+
+    reactor.close_connection(conn_id);
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert!(reactor.inflight_ops[conn_id].close);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 1);
+    assert_eq!(state.closes, vec![close_token]);
+    drop(state);
+
+    let runtime = reactor.keyspace.runtime_metrics();
+    assert_eq!(runtime.submit_sq_full_retries, 1);
+    assert_eq!(runtime.submit_failures, 0);
+}
+
+#[test]
+fn submit_close_sq_full_retry_failure_finalizes_with_direct_close() {
+    let state = Arc::new(Mutex::new(MockBackendState {
+        fail_next_submit_sq_full: true,
+        fail_retry_submit_sq_full: true,
+        ..Default::default()
+    }));
+    let mut reactor = test_reactor_with_backend(state.clone());
+    let (fd, peer_fd) = socket_pair();
+    let conn_id = insert_test_connection(&mut reactor, fd, b"");
+
+    reactor.close_connection(conn_id);
+
+    assert!(reactor.connections.is_closing(conn_id));
+    assert!(!reactor.inflight_ops[conn_id].close);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 1);
+    assert!(state.closes.is_empty());
+    drop(state);
+
+    reactor.drain_close_finalization_until_idle();
+
+    assert!(reactor.connections.get(conn_id).is_none());
+    assert!(peer_observes_eof(peer_fd));
+
+    // SAFETY: `peer_fd` is the still-open peer half after the reactor directly
+    // closed `fd` during close finalization.
+    unsafe {
+        libc::close(peer_fd);
+    }
 
     let runtime = reactor.keyspace.runtime_metrics();
     assert_eq!(runtime.submit_sq_full_retries, 1);

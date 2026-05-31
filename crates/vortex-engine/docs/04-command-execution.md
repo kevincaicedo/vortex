@@ -284,7 +284,7 @@ The domain uses:
 
 `EXPIRE` with a deadline at or before `now_nanos` deletes the key. Future deadlines update the entry TTL and stamp an LSN if WATCH or AOF is active. `PERSIST` clears a TTL only if a live TTL existed.
 
-## Delete And Rename
+## Delete, Rename, And Copy
 
 `DEL` and `UNLINK` share delete mechanics. Single-key delete uses the direct byte path. Multi-key delete uses a prehashed plan, sorted write locks, and deferred effects.
 
@@ -293,7 +293,17 @@ The domain uses:
 - same shard: one write guard
 - cross shard: sorted multi-write guards plus helper splitting to obtain distinct mutable table references
 
-Memory admission is based on the final state: source removed, destination inserted or replaced, and TTL carried forward if it is still live.
+Memory admission is based on the final state: source removed, destination inserted or replaced, and TTL carried forward if it is still live. Projection and revalidation use the same prehashed table lookups as the eventual commit, so the locked admission pass does not repeat table hashing.
+
+`COPY` follows the same admission shape without removing the source:
+
+- prepare a source value, TTL, and LSN snapshot before the write guard when the destination does not already block the command
+- reserve projected destination growth before acquiring write guards
+- revalidate source value, TTL, and LSN under the write guard before using the prepared copy
+- fall back to a locked source clone when the optimistic source snapshot is stale
+- update only the destination WATCH state and destination entry LSN
+
+`RENAME` updates both source and destination WATCH state. `COPY` is intentionally read-only for the source key, so source WATCH registrations stay valid while destination watches are invalidated.
 
 ## SCAN, KEYS, RANDOMKEY
 
@@ -304,9 +314,13 @@ upper 32 bits: shard index
 lower 32 bits: slot index
 ```
 
-The scan path walks shard tables by slot index, filters expired entries, applies optional glob and type filters, and returns a new cursor. It is incremental and not a global snapshot.
+The scan path walks shard tables by slot index, filters expired entries, applies optional glob and type filters, and returns a new cursor. It is incremental and not a global snapshot. In alpha, `COUNT` is a capped work hint: the command bounds per-response key material and sparse slot traversal, then returns a progress cursor when more work remains.
 
-`KEYS` scans all shards and collects matching keys. `RANDOMKEY` starts at a pseudo-random shard and pseudo-random slot, then searches for a live key.
+`KEYS` scans all shards and collects matching keys until the alpha response cap is reached. If another matching key is found after that cap, the command fails closed and asks callers to use `SCAN`; this bounds response material but does not make large `KEYS` a latency-proof surface. `RANDOMKEY` starts at a pseudo-random shard and pseudo-random slot, then searches for a live key.
+
+## FLUSHDB And FLUSHALL
+
+`FLUSHDB` and `FLUSHALL` are synchronous alpha admin commands. The reactor routes them through `CommandExecutionScope::FullExclusive`, so normal command readers wait at the transaction gate before the flush begins. The command-facing keyspace path then clears shards sequentially instead of retaining every shard write guard at once. This reduces shard-lock footprint, but it is still one synchronous command turn; command-level yielding or an async flush scheduler remains future work before large flushes can be included in latency/fairness claims.
 
 ## AOF Payloads And Side Records
 

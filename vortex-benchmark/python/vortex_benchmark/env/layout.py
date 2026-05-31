@@ -15,6 +15,8 @@ class ArtifactLayout:
     backend_runs_dir: Path
     reports_dir: Path
     runtime_dir: Path
+    sessions_dir: Path
+    preflight_dir: Path
 
 
 def resolve_repo_root() -> Path:
@@ -44,6 +46,8 @@ def build_layout(output_dir: Optional[str]) -> ArtifactLayout:
         backend_runs_dir=root / "backend-runs",
         reports_dir=root / "reports",
         runtime_dir=root / "runtime",
+        sessions_dir=root / "sessions",
+        preflight_dir=root / "preflight",
     )
     for path in (
         layout.root,
@@ -54,6 +58,8 @@ def build_layout(output_dir: Optional[str]) -> ArtifactLayout:
         layout.backend_runs_dir,
         layout.reports_dir,
         layout.runtime_dir,
+        layout.sessions_dir,
+        layout.preflight_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
     return layout

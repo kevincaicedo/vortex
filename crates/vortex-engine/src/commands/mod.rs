@@ -126,6 +126,7 @@ pub(crate) fn seconds_to_millis(seconds: u64) -> Option<u64> {
 /// The result of executing a command.
 ///
 /// `Static` avoids allocation entirely for pre-computed wire bytes.
+/// `Owned` carries already-serialized dynamic wire bytes.
 /// `Resp` wraps a `RespFrame` for dynamic responses.
 #[derive(Debug)]
 pub enum CmdResult {
@@ -133,6 +134,9 @@ pub enum CmdResult {
     Static(&'static [u8]),
     /// Pre-serialized inline RESP bytes for tiny dynamic replies.
     Inline(InlineResp),
+    /// Owned serialized RESP bytes for dynamic replies that can bypass frame
+    /// construction and serializer traversal.
+    Owned(Box<[u8]>),
     /// Dynamic RESP frame requiring serialization.
     Resp(RespFrame),
 }
@@ -143,6 +147,7 @@ impl CmdResult {
         match self {
             Self::Static(buf) => buf.first() == Some(&b'-'),
             Self::Inline(inline) => inline.as_bytes().first() == Some(&b'-'),
+            Self::Owned(buf) => buf.first() == Some(&b'-'),
             Self::Resp(frame) => matches!(frame, RespFrame::Error(_)),
         }
     }
@@ -517,6 +522,8 @@ pub fn execute_command(
         b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos).into()),
         b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos).into()),
         b"SELECT" => Some(connection::cmd_select(keyspace, frame, now_nanos).into()),
+        b"HELLO" => Some(server::cmd_hello(keyspace, frame, now_nanos).into()),
+        b"CLIENT" => Some(server::cmd_client(keyspace, frame, now_nanos).into()),
         b"TIME" => {
             Some(server::cmd_time_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
         }

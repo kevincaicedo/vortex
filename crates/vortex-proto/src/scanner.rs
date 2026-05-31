@@ -7,10 +7,7 @@ use core::arch::x86_64::{
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", test)))]
 use std::simd::{Simd, cmp::SimdPartialEq};
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
-use std::sync::{
-    Once,
-    atomic::{AtomicU8, Ordering},
-};
+use std::sync::OnceLock;
 
 const INLINE_CAPACITY: usize = 64;
 const SMALL_BUFFER_MAX: usize = u16::MAX as usize;
@@ -18,11 +15,11 @@ const SMALL_BUFFER_MAX: usize = u16::MAX as usize;
 const NO_PENDING_CR: usize = usize::MAX;
 
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
-const SIMD_LEVEL_UNKNOWN: u8 = 0;
-#[cfg(all(feature = "simd", target_arch = "x86_64"))]
-const SIMD_LEVEL_AVX2: u8 = 1;
-#[cfg(all(feature = "simd", target_arch = "x86_64"))]
-const SIMD_LEVEL_SSE2: u8 = 2;
+#[derive(Clone, Copy)]
+enum X86SimdLevel {
+    Avx2,
+    Sse2,
+}
 
 /// CRLF positions discovered in a buffer.
 ///
@@ -249,25 +246,22 @@ pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions {
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline]
 fn x86_scan_crlf(buf: &[u8]) -> CrlfPositions {
-    static SIMD_LEVEL: AtomicU8 = AtomicU8::new(SIMD_LEVEL_UNKNOWN);
-    static INIT: Once = Once::new();
+    static SIMD_LEVEL: OnceLock<X86SimdLevel> = OnceLock::new();
 
-    INIT.call_once(|| {
-        let level = if std::arch::is_x86_feature_detected!("avx2") {
-            SIMD_LEVEL_AVX2
+    let level = *SIMD_LEVEL.get_or_init(|| {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            X86SimdLevel::Avx2
         } else {
-            SIMD_LEVEL_SSE2
-        };
-        SIMD_LEVEL.store(level, Ordering::Relaxed);
+            X86SimdLevel::Sse2
+        }
     });
 
-    match SIMD_LEVEL.load(Ordering::Relaxed) {
-        SIMD_LEVEL_AVX2 => {
+    match level {
+        X86SimdLevel::Avx2 => {
             // SAFETY: Runtime dispatch guarantees AVX2 support before calling.
             unsafe { avx2_scan_crlf(buf) }
         }
-        SIMD_LEVEL_SSE2 | SIMD_LEVEL_UNKNOWN => sse2_scan_crlf(buf),
-        _ => sse2_scan_crlf(buf),
+        X86SimdLevel::Sse2 => sse2_scan_crlf(buf),
     }
 }
 
@@ -418,8 +412,21 @@ mod tests {
 
     use super::*;
 
+    fn production_region(source: &'static str) -> &'static str {
+        source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    }
+
     fn collect(positions: &CrlfPositions) -> Vec<usize> {
         positions.iter().collect()
+    }
+
+    #[test]
+    fn x86_simd_dispatch_avoids_raw_atomic_level_flag() {
+        let source = production_region(include_str!("scanner.rs"));
+        assert!(
+            !source.contains("AtomicU8") && !source.contains("SIMD_LEVEL_UNKNOWN"),
+            "x86 CRLF scanner dispatch should use typed one-time state, not a raw hot-path atomic level flag"
+        );
     }
 
     fn assert_all_paths(input: &[u8], expected: &[usize]) {

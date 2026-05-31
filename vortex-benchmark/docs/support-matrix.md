@@ -1,5 +1,12 @@
 # Support Matrix
 
+Primary operator entrypoints:
+
+| Tool | Help | Purpose |
+|------|------|---------|
+| `just benchmark` | `just benchmark --help` | Benchmark local, Docker, host-port, and SSH targets, then render neutral reports. |
+| `just profiler` | `just profiler --help` | Capture profiler sessions and summaries for local, host-port, and SSH targets. |
+
 ## Database Modes
 
 | Database | Native | Container | Runtime Config Notes |
@@ -8,6 +15,38 @@
 | Redis | Yes | Yes | Supports `appendonly`, `appendfsync`, `maxmemory`, and `maxmemory-policy` at startup. |
 | Valkey | No | Yes | Container adapter mirrors the Redis runtime policy surface. |
 | Dragonfly | No | Yes | Supports `maxmemory`; AOF automation and non-default eviction policies are rejected explicitly. |
+
+## Target Modes
+
+| Target Mode | Benchmark | Profiler | Notes |
+|-------------|-----------|----------|-------|
+| `local` | Yes | Yes | Managed local native or Docker service lifecycle. |
+| `host-port` | Yes | Yes for local processes with discoverable PID | External service is not stopped or reconfigured. |
+| `ssh-managed` | Yes, including optional `--ssh-load-host` remote load execution | Yes, delegated to `scripts/profiler.sh` in a remote checkout | Requires `--ssh-target`; source copy/build and remote load execution require `--ssh-workdir`. |
+| `ssh-attach` | Yes, including optional `--ssh-load-host` remote load execution | Yes, delegated to `scripts/profiler.sh` in a remote checkout | External remote service is not stopped or reconfigured. |
+
+Benchmark and profiler SSH paths accept non-default transport with `--ssh-port`,
+`--ssh-identity-file`, `--ssh-config`, repeated `--ssh-option`, and
+`--ssh-connect-timeout`. Benchmark SSH copy-back writes remote artifacts under
+`<artifact-root>/remote/<timestamp>/`.
+
+## Profiler Tool Modes
+
+| Mode / Tool | Platform | Target Question | Permission / Overhead | Output Contract | Fallback |
+|-------------|----------|-----------------|-----------------------|-----------------|----------|
+| `--perf-stat` | Linux | PMU counters, IPC, cycles/op, cache/TLB rates | May require lower `perf_event_paranoid`; low overhead | `perf-stat.txt`, parsed counter summary where available | Host/process telemetry only |
+| `--flamegraph` / `--cpu` | Linux/macOS where tools exist | On-CPU hot functions and stack distribution | Sampling overhead; frequency-controlled | flamegraph SVG, `perf.data` or platform trace | Samply or profiler notes |
+| `--scheduler` | Linux | Runnable latency, context switches, scheduler delay | May require BPF/perf permissions; medium overhead | run-queue artifacts and scheduler notes | procfs host telemetry |
+| `--lock-offcpu` | Linux | Blocked/off-CPU, futex, fsync, and lock wait attribution | BPF/ftrace tools may require root; medium-high overhead | off-CPU/futex/fsync artifacts and notes | scheduler focus plus manual notes |
+| `--c2c` | Linux | HITM and false-sharing escalation | PMU support and permissions required; high overhead | `perf c2c` data/report | cachegrind or layout review |
+| `perf trace` / `perf lock` | Linux | Syscall flow and kernel lock contention | tracepoint access may require privileges; medium-high overhead | trace/lock reports | process syscall counters and off-CPU notes |
+| `trace-cmd` | Linux | ftrace escalation for named hypotheses | tracefs access may require root; hypothesis-dependent overhead | `trace.dat`, trace reports | perf trace or BPF probes |
+| sysstat pack | Linux | Low-overhead CPU/process/disk/network context | ordinary command access; low overhead | `vmstat`, `mpstat`, `pidstat`, `iostat`, `sar` outputs | procfs telemetry |
+| `--memory` | Linux/macOS where tools exist | Allocation volume, RSS, resident/retained memory | heaptrack/Instruments may be high overhead | heaptrack/massif/Instruments plus host memory summaries | process RSS and allocator INFO |
+| `--cache` | Linux/macOS with Valgrind | Cache simulation and instruction locality | Very high overhead; diagnostic-only | cachegrind/callgrind outputs | PMU cache counters if available |
+| `--aof-disk` | Linux | Disk/fsync pressure and writeback attribution | sysstat/perf/BPF availability dependent | disk, writeback, fsync, and AOF artifacts | low-overhead host telemetry |
+| `--network` | Linux | TCP retransmits, socket queues, network throughput/errors | low to medium overhead | `ss`, `nstat`, network telemetry | host telemetry only |
+| macOS host/process pack | macOS | VM, disk, network, process RSS, and process sampling | ordinary command access; task sampling may need permission | `vm_stat`, `iostat`, `netstat`, `sysctl`, `sample`, `ps` outputs | Instruments/Samply or explicit unavailable fields |
 
 ## Backend Coverage
 

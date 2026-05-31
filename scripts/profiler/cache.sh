@@ -33,19 +33,13 @@ run_cachegrind() {
     fi
 
     local extra_args=()
-    [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
-    [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
-    [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
-    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
-    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
-    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    collect_server_args extra_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     info "Running: valgrind --tool=cachegrind"
     (
         exec valgrind --tool=cachegrind \
             --cachegrind-out-file="${session}/cachegrind.out" \
             "$PROFILING_BINARY" \
-            --bind "${host}:${port}" --threads "$threads" \
             "${extra_args[@]}" \
             >"${session}/server-cachegrind.log" 2>&1
     ) &
@@ -103,12 +97,7 @@ run_callgrind() {
     fi
 
     local extra_args=()
-    [[ "$aof" == "true" ]] && extra_args+=("--aof-enabled")
-    [[ -n "$maxmemory" ]] && extra_args+=("--max-memory" "$maxmemory")
-    [[ -n "$eviction" ]] && extra_args+=("--eviction-policy" "$eviction")
-    [[ -n "${IO_BACKEND:-}" ]] && extra_args+=("--io-backend" "$IO_BACKEND")
-    [[ -n "${RING_SIZE:-}" ]] && extra_args+=("--ring-size" "$RING_SIZE")
-    [[ -n "${SQPOLL_IDLE_MS:-}" ]] && extra_args+=("--sqpoll-idle-ms" "$SQPOLL_IDLE_MS")
+    collect_server_args extra_args "$host" "$port" "$threads" "$aof" "$maxmemory" "$eviction"
 
     info "Running: valgrind --tool=callgrind --simulate-cache=yes --collect-jumps=yes"
     (
@@ -117,7 +106,6 @@ run_callgrind() {
             --simulate-cache=yes \
             --collect-jumps=yes \
             "$PROFILING_BINARY" \
-            --bind "${host}:${port}" --threads "$threads" \
             "${extra_args[@]}" \
             >"${session}/server-callgrind.log" 2>&1
     ) &

@@ -31,10 +31,38 @@ _check_any_tool() {
     printf "  ${C_DIM}✗ %-24s not found${C_RESET}\n" "$label"
 }
 
+_print_platform_preflight() {
+    printf "${C_BOLD}Platform evidence boundary:${C_RESET}\n"
+    if has_cmd python3; then
+        PYTHONPATH="${REPO_ROOT}/vortex-benchmark/python" \
+            python3 "${PROFILER_SCRIPT_DIR}/platform_preflight.py" --format text \
+            | sed 's/^/  /'
+    else
+        printf "  platform=%s\n" "$OS"
+        printf "  python3 not found; machine-readable platform preflight unavailable\n"
+    fi
+    echo ""
+}
+
+_write_platform_preflight_artifacts() {
+    has_cmd python3 || return 0
+
+    local check_dir
+    check_dir="$(make_session_dir check)"
+    PYTHONPATH="${REPO_ROOT}/vortex-benchmark/python" \
+        python3 "${PROFILER_SCRIPT_DIR}/platform_preflight.py" --format json \
+        >"${check_dir}/profiler-platform-preflight.json"
+    PYTHONPATH="${REPO_ROOT}/vortex-benchmark/python" \
+        python3 "${PROFILER_SCRIPT_DIR}/platform_preflight.py" --system Darwin --format json \
+        >"${check_dir}/profiler-platform-preflight-darwin-simulated.json"
+    ok "Platform preflight artifacts: ${check_dir}"
+}
+
 run_check_mode() {
     header "Vortex Profiler — Environment Check"
 
     printf "${C_BOLD}OS:${C_RESET} %s (%s)\n\n" "$OS" "$(uname -m)"
+    _print_platform_preflight
 
     printf "${C_BOLD}CPU Profiling:${C_RESET}\n"
     _check_tool cargo-flamegraph
@@ -131,5 +159,10 @@ run_check_mode() {
         fi
     else
         printf "  ${C_YELLOW}⚠${C_RESET} .cargo/config.toml not found\n"
+    fi
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        echo ""
+        _write_platform_preflight_artifacts
     fi
 }

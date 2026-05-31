@@ -9,9 +9,10 @@ cargo build --profile profiling --features profile-telemetry --bin vortex-server
 target/profiling/vortex-server --telemetry-mode profile
 ```
 
-Normal `target/release/vortex-server` supports `minimal` only and rejects
-`profile`. Release reports may include zero/unavailable schema fields for these
-metrics, but their timing storage and clock reads are not compiled.
+Normal `target/release/vortex-server` supports `minimal` and sampled `standard`
+telemetry, but rejects `profile`. Release reports may include zero/unavailable
+schema fields for these metrics, but their timing storage and clock reads are
+not compiled.
 
 ## Metric Catalog
 
@@ -29,7 +30,7 @@ metrics, but their timing storage and clock reads are not compiled.
 | `reactor_aof_fsync_latency_le_50ms` | Fsync latency bucket | profiling:profile only; release:not compiled | Fsync completion path | One bucket increment. | Histogram bucket for severe disk pressure. |
 | `reactor_aof_fsync_latency_le_100ms` | Fsync latency bucket | profiling:profile only; release:not compiled | Fsync completion path | One bucket increment. | Histogram bucket for release-gate failure analysis. |
 | `reactor_aof_fsync_latency_gt_100ms` | Fsync latency bucket | profiling:profile only; release:not compiled | Fsync completion path | One bucket increment. | Captures pathological fsync stalls. |
-| `reactor_aof_append_nanos_total` | IO AOF phase timing | profiling:profile only; release:not compiled | AOF-enabled mutation path | IO phase timer around append handoff. | Attribute command latency to append handoff. |
+| `reactor_aof_append_nanos_total` | IO AOF phase timing | profiling:profile only; release:not compiled | AOF-enabled mutation path | Timestamp delta from IO phase timer around append handoff. | Attribute command latency to append handoff. |
 | `reactor_aof_append_nanos_max` | IO AOF phase timing | profiling:profile only; release:not compiled | AOF-enabled mutation path | IO phase timer plus max update. | Detect append outliers. |
 | `reactor_aof_fsync_nanos_total` | IO AOF phase timing | profiling:profile only; release:not compiled | AOF maintenance path | IO phase timer around fsync maintenance. | Attribute reactor time spent scheduling/polling fsync. |
 | `reactor_aof_fsync_nanos_max` | IO AOF phase timing | profiling:profile only; release:not compiled | AOF maintenance path | IO phase timer plus max update. | Detect fsync maintenance outliers. |

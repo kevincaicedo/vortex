@@ -799,11 +799,11 @@ impl AofRewriter {
                         VortexValue::Integer(n) => {
                             let mut buf = itoa::Buffer::new();
                             let s = buf.format(*n);
-                            Self::write_set_cmd(&mut writer, key_bytes.as_bytes(), s.as_bytes())?;
+                            Self::write_set_cmd(&mut writer, key_bytes, s.as_bytes())?;
                         }
                         VortexValue::InlineString(_) | VortexValue::String(_) => {
                             let bytes = value.as_string_bytes().unwrap_or(b"");
-                            Self::write_set_cmd(&mut writer, key_bytes.as_bytes(), bytes)?;
+                            Self::write_set_cmd(&mut writer, key_bytes, bytes)?;
                         }
                         _ => {
                             // Skip non-string types for now (Phase 4 will extend).
@@ -818,7 +818,7 @@ impl AofRewriter {
                             now_nanos,
                             unix_now_nanos,
                         ) / 1_000_000;
-                        Self::write_pexpireat_cmd(&mut writer, key_bytes.as_bytes(), deadline_ms)?;
+                        Self::write_pexpireat_cmd(&mut writer, key_bytes, deadline_ms)?;
                     }
 
                     keys_written += 1;

@@ -94,14 +94,14 @@ Transaction commands and some server commands are reactor-owned because they dep
 
 | Name | Description | Status | Time complexity | Syntax | Notes |
 | --- | --- | --- | --- | --- | --- |
-| COPY | Copy a key to a destination key. | Partial | O(N) for copied value bytes. | `COPY source destination [DB destination-db] [REPLACE]` | Supports `REPLACE`. `DB` is parsed and ignored because Vortex alpha has one logical database. |
+| COPY | Copy a key to a destination key. | Partial | O(N) for copied value bytes. | `COPY source destination [DB destination-db] [REPLACE]` | Supports `REPLACE` and `DB 0`. Cross-database `DB` targets are rejected because Vortex alpha has one logical database. |
 | DEL | Delete one or more keys. | Supported | O(N) keys | `DEL key [key ...]` | Single-key fast path avoids argument collection; batch path locks sorted shards. |
 | DUMP | Return serialized key payload. | Pending | O(N) serialized bytes | `DUMP key` | No Redis RDB-style serialization command yet. |
 | EXISTS | Count existing keys. | Supported | O(N) keys | `EXISTS key [key ...]` | Expired keys are treated as missing and may be lazily cleaned. Duplicate keys count like Redis. |
 | EXPIRE | Set TTL in seconds. | Supported | O(1) | `EXPIRE key seconds [NX or XX or GT or LT]` | Supports `NX`, `XX`, `GT`, and `LT`; updates entry deadline and TTL counters. |
 | EXPIREAT | Set TTL by Unix seconds timestamp. | Supported | O(1) | `EXPIREAT key unix-time-seconds [NX or XX or GT or LT]` | Converts wall-clock timestamp to monotonic deadline. |
 | EXPIRETIME | Return expiration Unix time in seconds. | Supported | O(1) | `EXPIRETIME key` | Returns Redis `-1` and `-2` sentinel values for no TTL and missing keys. |
-| KEYS | Return keys matching a glob pattern. | Supported | O(total slots) | `KEYS pattern` | Scans the whole keyspace and filters expired entries; intended for admin/debug use. |
+| KEYS | Return keys matching a glob pattern. | Supported with alpha cap | O(total slots) | `KEYS pattern` | Scans the whole keyspace and filters expired entries; fails closed when matching keys exceed the alpha response cap. Use `SCAN` for large keyspaces. |
 | MIGRATE | Transfer keys to another Redis instance. | Pending | Varies | `MIGRATE host port key db timeout [COPY] [REPLACE] [AUTH password] [KEYS key ...]` | No networking/key migration command yet. |
 | MOVE | Move a key to another logical database. | Pending | O(1) | `MOVE key db` | Vortex alpha has one logical database. |
 | OBJECT ENCODING | Return Redis object encoding. | Pending | O(1) | `OBJECT ENCODING key` | No Redis `OBJECT` command family yet. |
@@ -117,7 +117,7 @@ Transaction commands and some server commands are reactor-owned because they dep
 | RENAME | Rename a key and overwrite destination. | Supported | O(1) average plus value move/copy cost | `RENAME key newkey` | Handles same-key case, destination overwrite, TTL movement, memory admission, WATCH, and AOF. |
 | RENAMENX | Rename a key only if destination is absent. | Supported | O(1) average plus value move/copy cost | `RENAMENX key newkey` | Returns `0` if destination exists. |
 | RESTORE | Create key from serialized payload. | Pending | O(N) serialized bytes | `RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]` | No Redis dump/restore serialization support yet. |
-| SCAN | Incrementally iterate keys. | Supported | O(count plus scanned slots) | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Cursor encodes shard and slot. Supports `MATCH`, `COUNT`, and `TYPE` over current value type names. |
+| SCAN | Incrementally iterate keys. | Supported | O(capped count plus capped scanned slots) | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Cursor encodes shard and slot. Supports `MATCH`, `COUNT`, and `TYPE`; alpha caps `COUNT` as a work hint and returns a progress cursor when the slot budget is exhausted. |
 | SORT | Sort list/set/zset elements. | Pending | O(N log N) | `SORT key [BY pattern] [LIMIT offset count] [GET pattern] [ASC or DESC] [ALPHA] [STORE destination]` | Depends on data types not implemented yet. |
 | SORT_RO | Read-only sort. | Pending | O(N log N) | `SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern] [ASC or DESC] [ALPHA]` | Depends on list/set/zset data types not implemented yet. |
 | TOUCH | Touch keys and return count. | Partial | O(N) keys | `TOUCH key [key ...]` | Currently behaves like `EXISTS`; normal access recording may update LRU/LFU metadata when maxmemory is active. |
@@ -143,14 +143,14 @@ Transaction commands and some server commands are reactor-owned because they dep
 | CLIENT NO-TOUCH | Toggle LRU/LFU touch behavior. | Pending | O(1) | `CLIENT NO-TOUCH ON or OFF` | No per-client access-recording override. |
 | CLIENT PAUSE | Pause command processing. | Pending | O(1) | `CLIENT PAUSE timeout [WRITE or ALL]` | No pause gate exposed as Redis command. |
 | CLIENT REPLY | Control replies for this connection. | Pending | O(1) | `CLIENT REPLY ON or OFF or SKIP` | Reactor always writes normal replies today. |
-| CLIENT SETINFO | Set client library metadata. | Pending | O(1) | `CLIENT SETINFO LIB-NAME name or LIB-VER ver` | No client metadata command yet. |
+| CLIENT SETINFO | Set client library metadata. | Partial | O(1) | `CLIENT SETINFO LIB-NAME name or LIB-VER ver` | Accepted as an alpha no-op for modern RESP2 client setup; metadata is not stored. |
 | CLIENT SETNAME | Set connection name. | Pending | O(1) | `CLIENT SETNAME connection-name` | No connection-name storage. |
 | CLIENT TRACKING | Configure client-side caching. | Pending | O(1) | `CLIENT TRACKING ON or OFF [options]` | No tracking invalidation protocol. |
 | CLIENT TRACKINGINFO | Return tracking settings. | Pending | O(1) | `CLIENT TRACKINGINFO` | No tracking support. |
 | CLIENT UNBLOCK | Unblock a blocked client. | Pending | O(log N) in Redis | `CLIENT UNBLOCK client-id [TIMEOUT or ERROR]` | Blocking commands and client ids are not exposed. |
 | CLIENT UNPAUSE | Resume paused clients. | Pending | O(1) | `CLIENT UNPAUSE` | No pause state. |
 | ECHO | Return a message. | Supported | O(M) message bytes | `ECHO message` | Engine returns a bulk string copy and does not touch the keyspace. |
-| HELLO | RESP handshake and protocol negotiation. | Pending | O(1) | `HELLO [protover [AUTH username password] [SETNAME name]]` | No RESP3 handshake command yet. |
+| HELLO | RESP handshake and protocol negotiation. | Partial | O(1) | `HELLO [protover [SETNAME name]]` | `HELLO` and `HELLO 2` return RESP2 handshake metadata; `SETNAME` is parsed as a no-op; RESP3 and AUTH remain unsupported. |
 | PING | Return server liveness response or echo message. | Supported | O(1) without message, O(M) with message. | `PING [message]` | No-message path returns static `PONG`. |
 | QUIT | Close the connection after replying. | Supported | O(1) | `QUIT` | Engine returns `OK`; reactor owns socket close. |
 | RESET | Reset connection state. | Pending | O(1) | `RESET` | No Redis `RESET` command yet. |
@@ -197,8 +197,8 @@ Transaction commands and some server commands are reactor-owned because they dep
 | CONFIG SET | Set runtime config values. | Partial | O(1) for supported params plus AOF I/O when toggling appendonly. | `CONFIG SET parameter value` | Reactor supports `appendonly`, `maxmemory`, and `maxmemory-policy`; appendonly runtime changes are restricted in multi-reactor alpha. |
 | DBSIZE | Return number of keys. | Supported | Redis O(1); Vortex exact count scans shards/slots. | `DBSIZE` | Counts only live, non-expired keys via exact keyspace count. |
 | FAILOVER | Coordinate failover to replica. | Pending | O(1) request | `FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT milliseconds]` | No replication/failover support. |
-| FLUSHALL | Remove all keys from all databases. | Partial | O(N) keys | `FLUSHALL [ASYNC or SYNC]` | Vortex has one database. Handler clears shared keyspace synchronously and emits AOF LSN when active. |
-| FLUSHDB | Remove all keys from current database. | Partial | O(N) keys | `FLUSHDB [ASYNC or SYNC]` | Same effect as `FLUSHALL` in one-DB alpha. |
+| FLUSHALL | Remove all keys from all databases. | Partial | O(N) keys | `FLUSHALL [ASYNC or SYNC]` | Vortex has one database. Handler is synchronous, enters an exclusive all-shard gate, clears shards sequentially, and emits an AOF LSN when active. |
+| FLUSHDB | Remove all keys from current database. | Partial | O(N) keys | `FLUSHDB [ASYNC or SYNC]` | Same effect as `FLUSHALL` in one-DB alpha; async/yielding flush remains unsupported. |
 | HOTKEYS | Container for hotkey tracking commands. | Pending | Varies | `HOTKEYS subcommand [arg ...]` | Redis 8.6 feature; Vortex has LFU metadata but no HOTKEYS command surface. |
 | HOTKEYS GET | Return tracked hotkeys. | Pending | Varies | `HOTKEYS GET [options]` | No hotkey reporting command. |
 | HOTKEYS RESET | Reset hotkey tracking. | Pending | Varies | `HOTKEYS RESET` | No hotkey reporting command. |
@@ -237,4 +237,3 @@ Transaction commands and some server commands are reactor-owned because they dep
 | SWAPDB | Swap two logical databases. | Pending | O(1) | `SWAPDB index1 index2` | Vortex alpha has one logical database. |
 | SYNC | Internal full replication sync. | Pending | Varies | `SYNC` | No replication protocol. |
 | TIME | Return server wall-clock time. | Supported | O(1) | `TIME` | Uses reactor-provided Unix clock when available. |
-

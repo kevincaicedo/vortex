@@ -1,0 +1,37 @@
+schema_version: 1
+name: workstream-e-memtier-read-heavy-polling-svc8-t1-t4
+description: Focused Workstream E memtier read-heavy t1/t4 slice with eight polling service threads and E-core load isolation.
+databases:
+  - vortex
+  - redis
+backends:
+  - memtier_benchmark
+workloads:
+  - uniform-read_heavy
+duration: 10s
+repeat: 5
+environment:
+  mode: native
+  port_base: 45379
+resource_config:
+  cpus: 8
+  memory: 2g
+  threads: 8
+  service_cpus: "0,2,4,6,8,10,12,14"
+  load_cpus: "16,17,18,19,20,21,22,23"
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  telemetry_mode: minimal
+  io_backend: polling
+  fixed_buffers: 1024
+settings:
+  memtier_benchmark:
+    clients: 100
+    pipeline: 1
+    keyspace_size: 100000
+    data_size: 256
+    thread_sweep:
+      - 1
+      - 4

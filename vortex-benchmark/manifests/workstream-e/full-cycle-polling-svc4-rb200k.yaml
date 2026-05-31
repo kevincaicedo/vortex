@@ -1,0 +1,61 @@
+schema_version: 1
+name: workstream-e-full-cycle-polling-svc4-rb200k
+description: Workstream E full-cycle Linux polling matrix with four service threads pinned away from four P-core load CPUs.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+  - memtier_benchmark
+  - custom-rust
+commands:
+  - GET
+  - SET
+  - INCR
+workloads:
+  - uniform-read_heavy
+  - multi_key_only
+duration: 10s
+repeat: 3
+environment:
+  mode: native
+  port_base: 37379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+  service_cpus: "0,2,4,6"
+  load_cpus: "8,10,12,14"
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  telemetry_mode: minimal
+  io_backend: polling
+  fixed_buffers: 1024
+  sqpoll_idle_ms: 0
+settings:
+  redis-benchmark:
+    requests: 200000
+    clients: 100
+    pipeline: 1
+    keyspace_size: 100000
+  memtier_benchmark:
+    clients: 100
+    pipeline: 1
+    keyspace_size: 100000
+    data_size: 256
+    thread_sweep:
+      - 1
+      - 4
+      - 8
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 1
+      - 4
+      - 8
+    keyspace_size: 50000
+    ops_per_thread: 6000
+    warmup_ops: 500
+    value_size: 64

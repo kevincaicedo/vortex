@@ -919,6 +919,7 @@ fn decimal_len_i64(n: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -929,10 +930,28 @@ mod tests {
     }
 
     fn serialize_slice(frame: &RespFrame) -> Vec<u8> {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; RespSerializer::serialized_len(frame)];
         let n = RespSerializer::serialize_to_slice(frame, &mut buf).unwrap();
         buf.truncate(n);
         buf
+    }
+
+    fn resp2_frame_strategy() -> impl Strategy<Value = RespFrame> {
+        let bytes = proptest::collection::vec(any::<u8>(), 0..64).prop_map(Bytes::from);
+        let leaf = prop_oneof![
+            bytes.clone().prop_map(RespFrame::SimpleString),
+            bytes.clone().prop_map(RespFrame::Error),
+            any::<i64>().prop_map(RespFrame::Integer),
+            Just(RespFrame::BulkString(None)),
+            bytes
+                .clone()
+                .prop_map(|value| RespFrame::BulkString(Some(value))),
+            Just(RespFrame::Array(None)),
+        ];
+
+        leaf.prop_recursive(3, 64, 6, |inner| {
+            proptest::collection::vec(inner, 0..8).prop_map(|frames| RespFrame::Array(Some(frames)))
+        })
     }
 
     #[test]
@@ -1050,6 +1069,27 @@ mod tests {
                 RespSerializer::serialized_len(frame),
                 serialize_iovec(frame).len()
             );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn serialized_len_matches_all_resp2_serializers(frame in resp2_frame_strategy()) {
+            let expected = serialize(&frame);
+            let len = RespSerializer::serialized_len(&frame);
+
+            prop_assert_eq!(len, expected.len());
+            let slice = serialize_slice(&frame);
+            let iovec = serialize_iovec(&frame);
+            prop_assert_eq!(&slice, &expected);
+            prop_assert_eq!(&iovec, &expected);
+
+            if len > 0 {
+                let mut short = vec![0u8; len - 1];
+                prop_assert!(RespSerializer::serialize_to_slice(&frame, &mut short).is_none());
+            }
         }
     }
 

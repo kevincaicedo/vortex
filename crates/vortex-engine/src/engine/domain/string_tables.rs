@@ -34,6 +34,17 @@ pub(super) fn string_value_memory_usage(len: usize) -> usize {
 }
 
 #[inline]
+pub(super) fn raw_string_entry_memory_usage(key_bytes: &[u8], value_len: usize) -> usize {
+    let key_bytes = size_of::<VortexKey>()
+        + if key_bytes.len() <= vortex_common::MAX_INLINE_KEY_LEN {
+            0
+        } else {
+            key_bytes.len()
+        };
+    size_of::<Entry>() + key_bytes + string_value_memory_usage(value_len)
+}
+
+#[inline]
 pub(super) fn integer_value_memory_usage() -> usize {
     size_of::<i64>()
 }
@@ -53,6 +64,21 @@ enum ValueMutationSnapshotState {
 #[derive(Clone)]
 pub(super) struct ValueMutationSnapshot {
     state: ValueMutationSnapshotState,
+}
+
+pub(super) enum RevalidatedValueSlot<'a> {
+    Missing(crate::table::VacantSlot<'a>),
+    Live(crate::table::LiveSlotCursor<'a>),
+}
+
+impl RevalidatedValueSlot<'_> {
+    #[inline]
+    pub(super) fn had_live_ttl(&self) -> bool {
+        match self {
+            Self::Missing(_) => false,
+            Self::Live(live) => live.had_ttl(),
+        }
+    }
 }
 
 impl ValueMutationSnapshot {
@@ -79,32 +105,35 @@ impl ValueMutationSnapshot {
     }
 
     #[inline]
-    pub(super) fn revalidates(
+    pub(super) fn revalidated_slot<'a>(
         &self,
-        table: &SwissTable,
+        table: &'a mut SwissTable,
         key_bytes: &[u8],
         hash: TableHash,
         now_nanos: u64,
-    ) -> bool {
+    ) -> Option<RevalidatedValueSlot<'a>> {
         match (
             &self.state,
-            table.get_value_ttl_lsn_prehashed(key_bytes, hash),
+            table.slot_cursor_prehashed(key_bytes, hash, now_nanos),
         ) {
-            (ValueMutationSnapshotState::Missing, None) => true,
+            (ValueMutationSnapshotState::Missing, SlotCursor::Vacant(vacant)) => {
+                Some(RevalidatedValueSlot::Missing(vacant))
+            }
             (
                 ValueMutationSnapshotState::Live {
                     ttl_deadline,
                     lsn_version,
                     value,
                 },
-                Some((current, current_ttl, current_lsn)),
-            ) => {
-                current_ttl == *ttl_deadline
-                    && current_lsn == *lsn_version
-                    && (current_ttl == 0 || current_ttl > now_nanos)
-                    && current == value
+                SlotCursor::Live(live),
+            ) if live.ttl_deadline() == *ttl_deadline
+                && live.lsn_version() == *lsn_version
+                && (*ttl_deadline == 0 || *ttl_deadline > now_nanos)
+                && live.value() == value =>
+            {
+                Some(RevalidatedValueSlot::Live(live))
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -117,24 +146,11 @@ impl ValueMutationSnapshot {
     }
 
     #[inline]
-    pub(super) fn had_live_ttl(&self) -> bool {
-        match &self.state {
-            ValueMutationSnapshotState::Live { ttl_deadline, .. } => *ttl_deadline != 0,
-            ValueMutationSnapshotState::Missing => false,
-        }
-    }
-
-    #[inline]
     pub(super) fn ttl_deadline(&self) -> Option<u64> {
         match &self.state {
             ValueMutationSnapshotState::Live { ttl_deadline, .. } => Some(*ttl_deadline),
             ValueMutationSnapshotState::Missing => None,
         }
-    }
-
-    #[inline]
-    pub(super) fn is_missing(&self) -> bool {
-        matches!(&self.state, ValueMutationSnapshotState::Missing)
     }
 }
 
@@ -582,7 +598,7 @@ pub(super) fn set_with_options_on_table<F>(
     mut allocate_lsn: F,
 ) -> Result<(SetResult, ExpiryTransition, Option<AofLsn>), LsnOverflow>
 where
-    F: FnMut() -> Result<(Option<u64>, Option<AofLsn>), LsnOverflow>,
+    F: FnMut() -> Result<(Option<EntryLsn>, Option<AofLsn>), LsnOverflow>,
 {
     let table_hash = table.table_hash_key_bytes(key.as_bytes());
     match table.slot_cursor_prehashed(key.as_bytes(), table_hash, now_nanos) {
@@ -640,7 +656,7 @@ fn set_live_with_options(
     live: crate::table::LiveSlotCursor<'_>,
     value: VortexValue,
     options: SetOptions,
-    entry_lsn: Option<u64>,
+    entry_lsn: Option<EntryLsn>,
     aof_lsn: Option<AofLsn>,
 ) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
     let existing_ttl = live.ttl_deadline();
@@ -671,7 +687,7 @@ fn set_vacant_with_options(
     value: VortexValue,
     options: SetOptions,
     had_ttl: bool,
-    entry_lsn: Option<u64>,
+    entry_lsn: Option<EntryLsn>,
     aof_lsn: Option<AofLsn>,
 ) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
     let effective_ttl = if options.keepttl {
@@ -717,7 +733,7 @@ fn set_absent_after_cursor_probe(
     table_hash: TableHash,
     options: SetOptions,
     had_ttl: bool,
-    entry_lsn: Option<u64>,
+    entry_lsn: Option<EntryLsn>,
     aof_lsn: Option<AofLsn>,
 ) -> (SetResult, ExpiryTransition, Option<AofLsn>) {
     let effective_ttl = if options.keepttl {
@@ -754,7 +770,7 @@ pub(super) fn increment_table_by(
     table: &mut SwissTable,
     key: VortexKey,
     delta: i64,
-    lsn: Option<u64>,
+    lsn: Option<EntryLsn>,
     now_nanos: u64,
 ) -> Result<(i64, ExpiryTransition), MutationErrorKind> {
     let hash = table.table_hash_key_bytes(key.as_bytes());
@@ -805,7 +821,7 @@ pub(super) fn increment_table_by_float(
     table: &mut SwissTable,
     key: VortexKey,
     increment: f64,
-    lsn: Option<u64>,
+    lsn: Option<EntryLsn>,
     now_nanos: u64,
 ) -> Result<Bytes, MutationErrorKind> {
     let current = match table.get_with_ttl(&key) {
@@ -839,7 +855,7 @@ pub(super) fn increment_table_by_float(
     let mut buffer = ryu::Buffer::new();
     let text = buffer.format(result);
     let bytes = Bytes::copy_from_slice(text.as_bytes());
-    let _ = table.insert_with_lsn(key, VortexValue::from_bytes(bytes.as_ref()), lsn);
+    let _ = table.insert_with_entry_lsn(key, VortexValue::from_bytes(bytes.as_ref()), lsn);
     Ok(bytes)
 }
 
@@ -847,7 +863,7 @@ pub(super) fn append_to_table(
     table: &mut SwissTable,
     key: VortexKey,
     append_bytes: &[u8],
-    lsn: Option<u64>,
+    lsn: Option<EntryLsn>,
     now_nanos: u64,
 ) -> Result<(usize, ExpiryTransition), MutationErrorKind> {
     let hash = table.table_hash_key_bytes(key.as_bytes());
@@ -987,7 +1003,7 @@ pub(super) fn setrange_in_table(
     key: VortexKey,
     offset: usize,
     new_bytes: &[u8],
-    lsn: Option<u64>,
+    lsn: Option<EntryLsn>,
     now_nanos: u64,
 ) -> Result<(usize, ExpiryTransition), MutationErrorKind> {
     let hash = table.table_hash_key_bytes(key.as_bytes());

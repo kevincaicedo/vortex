@@ -41,6 +41,7 @@ fn multi_reactor_ping_pong() {
         telemetry_mode: Default::default(),
         max_memory: 0,
         eviction_policy: EvictionPolicy::NoEviction,
+        ..Default::default()
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");

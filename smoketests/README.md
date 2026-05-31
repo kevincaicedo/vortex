@@ -92,7 +92,7 @@ Examples:
 ```bash
 cargo run -p vortex-smoketests -- run --spawn-vortex
 cargo run -p vortex-smoketests -- run --spawn-vortex --command GET --command SET
-cargo run -p vortex-smoketests -- run --server-url redis://127.0.0.1:6379/ --group string
+cargo run -p vortex-smoketests -- run --target-mode host-port --server-url redis://127.0.0.1:6379/ --group string
 cargo run -p vortex-smoketests -- run --spawn-vortex --spawn-redis-baseline --repeat 3 --group string
 cargo run -p vortex-smoketests -- list --verbose
 ```
@@ -104,7 +104,9 @@ Useful flags:
 - `--include-stubbed true|false`: include or skip stubbed commands
 - `--fail-fast`: stop on first failure
 - `--repeat N`: rerun every selected case `N` times
-- `--report PATH`: write a markdown report (default: `smoketests/.artifacts/last-run.md`)
+- `--artifact-root PATH`: choose the smoke artifact root (default: `.artifacts/smoke`)
+- `--report PATH`: also write a compatibility markdown copy at `PATH`
+- `--target-mode local|host-port|ssh-managed|ssh-attach`: record the target ownership and artifact mode; omitted mode is inferred from `--spawn-vortex`
 - `--spawn-vortex`: build/start `vortex-server` automatically
 - `--baseline-url redis://127.0.0.1:6379/`: compare supported commands against an already running Redis baseline
 - `--spawn-redis-baseline`: start `redis-server` automatically and use it as the baseline target for supported commands
@@ -113,10 +115,16 @@ Useful flags:
 - `--bind 127.0.0.1:16379`: bind address for spawned Vortex
 - `--vortex-bin PATH`: use an explicit server binary instead of `target/debug/vortex-server`
 - `--vortex-arg ARG`: pass extra CLI args through to the spawned Vortex server
+- `--ssh-target USER@HOST`: SSH target for remote smoke metadata and remote command execution
+- `--ssh-start-command CMD`: remote start command for `ssh-managed` mode
+- `--ssh-stop-command CMD`: optional remote teardown command for `ssh-managed` mode
+- `--ssh-log-path PATH`: optional remote server log path copied into local artifacts
 
 When `--spawn-vortex` is used without an explicit `--threads` override, the runner injects `--threads 1` automatically.
 When `--spawn-vortex` uses the default workspace binary, the runner rebuilds `vortex-server` before launch so the smoke suite compares Redis against the current workspace code rather than a stale executable.
 When a Redis baseline is configured, only commands marked `supported` are differential-checked against Redis. `partial` and `stubbed` commands still run against Vortex only so expected divergence does not drown the signal.
+
+SSH modes keep the same command matrix and artifact schema as local modes. `ssh-attach` records remote metadata and runs the local client against `--server-url` without mutating the service. `ssh-managed` runs the provided remote start command, captures remote metadata/logs, and runs the optional stop command during teardown.
 
 ## Support Matrix
 
@@ -128,7 +136,10 @@ Supported:
 ### Key Commands
 
 Supported:
-`COPY`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `EXPIRETIME`, `KEYS`, `PERSIST`, `PEXPIRE`, `PEXPIREAT`, `PEXPIRETIME`, `PTTL`, `RANDOMKEY`, `RENAME`, `RENAMENX`, `SCAN`, `TOUCH`, `TTL`, `TYPE`, `UNLINK`
+`DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `EXPIRETIME`, `KEYS`, `PERSIST`, `PEXPIRE`, `PEXPIREAT`, `PEXPIRETIME`, `PTTL`, `RANDOMKEY`, `RENAME`, `RENAMENX`, `SCAN`, `TOUCH`, `TTL`, `TYPE`, `UNLINK`
+
+Partial:
+`COPY`
 
 ### Server / Connection Commands
 
@@ -143,11 +154,17 @@ Stubbed:
 
 ## Artifacts
 
-Smoke test artifacts are written under `smoketests/.artifacts/`.
+Smoke test artifacts are written under `.artifacts/smoke/<target-mode>/<timestamp>/`.
 
-- `last-run.md`: markdown report for the most recent run
-- `vortex-server.log`: server log when the suite spawns Vortex itself
-- `redis-server.log`: baseline log when the suite spawns Redis itself
+- `session.json`: tool, target, command line, git revision, exit code, workload, and artifact paths
+- `report.md` and `report.json`: human and machine-readable command results
+- `logs/client.log`: client-side case results
+- `logs/vortex-server-*.log`: local managed server log when the suite spawns Vortex
+- `logs/redis-server-*.log`: baseline log when the suite spawns Redis
+- `environment.json`: OS/arch and redacted Vortex/Rust environment
+- `runtime-config.txt`: `INFO runtime` and `CONFIG GET *` capture when available
+- `reproducers.md`: rerun hints for failing cases
+- `reports/latest/`: stable copies of `report.md`, `report.json`, and `session.json`
 
 ## Extending Coverage
 

@@ -15,6 +15,7 @@ workload:
   command: SET
   duration: 30
   clients: 100
+  keyspace: 1000000
 
 profiler:
   frequency: 99

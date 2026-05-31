@@ -692,6 +692,49 @@ fn parse_inline_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn bulk_array_wire(values: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("*{}\r\n", values.len()).as_bytes());
+        for value in values {
+            buf.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+            buf.extend_from_slice(value);
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf
+    }
+
+    fn bulk_array_frame(values: &[Vec<u8>]) -> RespFrame {
+        RespFrame::Array(Some(
+            values
+                .iter()
+                .map(|value| RespFrame::BulkString(Some(Bytes::copy_from_slice(value))))
+                .collect(),
+        ))
+    }
+
+    fn inline_wire(values: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                buf.push(b' ');
+            }
+            buf.extend_from_slice(value);
+        }
+        buf.extend_from_slice(b"\r\n");
+        buf
+    }
+
+    fn assert_bulk_array_values(frame: &RespFrame, values: &[&[u8]]) {
+        let RespFrame::Array(Some(frames)) = frame else {
+            panic!("expected array frame, got {frame:?}");
+        };
+        assert_eq!(frames.len(), values.len());
+        for (frame, expected) in frames.iter().zip(values) {
+            assert_eq!(frame.as_bytes().map(Bytes::as_ref), Some(*expected));
+        }
+    }
 
     fn parse_pipeline_loop(buf: &[u8]) -> Result<(Vec<RespFrame>, usize), ParseError> {
         let mut frames = Vec::new();
@@ -804,9 +847,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_large_bulk_string_above_transport_buffer() {
+        let payload = vec![b'x'; 64 * 1024 + 17];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(b"\r\n");
+
+        let backing = Bytes::from(buf);
+        let (frame, consumed) = RespParser::parse_bytes(backing.clone()).unwrap();
+
+        assert_eq!(consumed, backing.len());
+        assert_eq!(
+            frame,
+            RespFrame::BulkString(Some(Bytes::copy_from_slice(&payload)))
+        );
+    }
+
+    #[test]
     fn parse_rejects_invalid_bulk_length() {
         assert_eq!(
             RespParser::parse(b"$2a\r\nhi\r\n"),
+            Err(ParseError::InvalidFrame)
+        );
+        assert_eq!(RespParser::parse(b"$-2\r\n"), Err(ParseError::InvalidFrame));
+        assert_eq!(
+            RespParser::parse(b"$5\r\nhelloXX"),
             Err(ParseError::InvalidFrame)
         );
     }
@@ -833,6 +899,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_invalid_array_length() {
+        assert_eq!(RespParser::parse(b"*-2\r\n"), Err(ParseError::InvalidFrame));
+        assert_eq!(
+            RespParser::parse(b"*1x\r\n$0\r\n\r\n"),
+            Err(ParseError::InvalidFrame)
+        );
+    }
+
+    #[test]
     fn parse_nested_array() {
         let buf = b"*1\r\n*2\r\n:1\r\n:2\r\n";
         let (frame, _) = RespParser::parse(buf).unwrap();
@@ -852,13 +927,16 @@ mod tests {
     fn parse_inline_command() {
         let buf = b"PING\r\n";
         let (frame, consumed) = RespParser::parse(buf).unwrap();
-        match frame {
-            RespFrame::Array(Some(ref frames)) => {
-                assert_eq!(frames.len(), 1);
-            }
-            _ => panic!("Expected array from inline"),
-        }
+        assert_bulk_array_values(&frame, &[b"PING"]);
         assert_eq!(consumed, 6);
+    }
+
+    #[test]
+    fn parse_inline_collapses_spaces_without_empty_arguments() {
+        let buf = b"  SET   key   value  \r\n";
+        let (frame, consumed) = RespParser::parse(buf).unwrap();
+        assert_bulk_array_values(&frame, &[b"SET", b"key", b"value"]);
+        assert_eq!(consumed, buf.len());
     }
 
     #[test]
@@ -1106,6 +1184,82 @@ mod tests {
                 RespParser::parse(input),
                 Err(ParseError::FrameTooLarge | ParseError::InvalidFrame)
             ));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn binary_bulk_arrays_match_incremental_parser(
+            values in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..64),
+                0..16,
+            )
+        ) {
+            let wire = bulk_array_wire(&values);
+            let expected = vec![bulk_array_frame(&values)];
+
+            let (frames, consumed) = RespParser::parse_pipeline(&wire)
+                .expect("generated bulk-array wire parses with the slice parser");
+            let (loop_frames, loop_consumed) = parse_pipeline_loop(&wire)
+                .expect("generated bulk-array wire parses with the incremental parser");
+
+            prop_assert_eq!(consumed, wire.len());
+            prop_assert_eq!(&frames, &expected);
+            prop_assert_eq!(&loop_frames, &expected);
+            prop_assert_eq!(loop_consumed, consumed);
+        }
+
+        #[test]
+        fn generated_bulk_array_prefixes_need_more_data_until_complete(
+            values in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..64),
+                0..16,
+            ),
+            split_seed in any::<usize>(),
+        ) {
+            let wire = bulk_array_wire(&values);
+            let split = split_seed % wire.len();
+
+            prop_assert_eq!(
+                RespParser::parse_pipeline(&wire[..split]),
+                Err(ParseError::NeedMoreData)
+            );
+        }
+
+        #[test]
+        fn generated_inline_commands_match_bulk_array_shape(
+            values in proptest::collection::vec(
+                proptest::collection::vec(b'A'..=b'Z', 1..32),
+                1..16,
+            )
+        ) {
+            let wire = inline_wire(&values);
+            let expected = bulk_array_frame(&values);
+
+            let (frame, consumed) = RespParser::parse(&wire)
+                .expect("generated inline command parses");
+
+            prop_assert_eq!(consumed, wire.len());
+            prop_assert_eq!(frame, expected);
+        }
+
+        #[test]
+        fn generated_inline_prefixes_need_more_data_until_complete(
+            values in proptest::collection::vec(
+                proptest::collection::vec(b'A'..=b'Z', 1..32),
+                1..16,
+            ),
+            split_seed in any::<usize>(),
+        ) {
+            let wire = inline_wire(&values);
+            let split = split_seed % wire.len();
+
+            prop_assert_eq!(
+                RespParser::parse(&wire[..split]),
+                Err(ParseError::NeedMoreData)
+            );
         }
     }
 }

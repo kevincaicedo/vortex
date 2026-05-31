@@ -12,11 +12,11 @@ use vortex_common::{VortexKey, VortexValue};
 
 use super::{
     CmdResult, CommandArgs, ERR_NOT_FLOAT, ERR_NOT_INTEGER, ERR_SYNTAX, ExecutedCommand,
-    MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO, absolute_deadline_nanos,
-    arg_bytes, deadline_nanos_to_absolute_unix_nanos, encode_aof_persist, encode_aof_pexpireat,
-    encode_aof_set, encode_aof_set_pxat, int_resp, key_from_bytes, mutation_error_response,
-    owned_value_to_resp, relative_deadline_nanos, seconds_to_millis, value_from_bytes,
-    value_to_resp,
+    InlineResp, MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NIL, RESP_OK, RESP_ZERO,
+    absolute_deadline_nanos, arg_bytes, deadline_nanos_to_absolute_unix_nanos, encode_aof_persist,
+    encode_aof_pexpireat, encode_aof_set, encode_aof_set_pxat, int_resp, key_from_bytes,
+    mutation_error_response, owned_value_to_resp, push_resp_array_len, push_resp_bulk_string,
+    relative_deadline_nanos, seconds_to_millis, value_from_bytes, value_to_resp,
 };
 use crate::ConcurrentKeyspace;
 use crate::engine::domain::{GetExOption, MutationOutcome, SetOptions, SetResult, TtlState};
@@ -409,20 +409,54 @@ pub(crate) fn cmd_psetex_with_clock(
 
 // ── MGET ────────────────────────────────────────────────────────────────────
 
+enum MgetEncodedValue {
+    Inline(InlineResp),
+    Shared(Bytes),
+    Nil,
+}
+
 #[inline]
-fn mget_value_to_frame(value: &VortexValue) -> RespFrame {
+fn mget_value_to_wire(value: &VortexValue) -> MgetEncodedValue {
     match value {
         VortexValue::InlineString(inline) => {
-            RespFrame::bulk_string(Bytes::copy_from_slice(inline.as_bytes()))
+            MgetEncodedValue::Inline(InlineResp::bulk_from_payload(inline.as_bytes()))
         }
-        VortexValue::String(bytes) => RespFrame::bulk_string(bytes.clone()),
+        VortexValue::String(bytes) => MgetEncodedValue::Shared(bytes.clone()),
         VortexValue::Integer(number) => {
-            let mut buffer = itoa::Buffer::new();
-            let text = buffer.format(*number);
-            RespFrame::bulk_string(Bytes::copy_from_slice(text.as_bytes()))
+            MgetEncodedValue::Inline(InlineResp::bulk_from_i64(*number))
         }
-        _ => RespFrame::null_bulk_string(),
+        _ => MgetEncodedValue::Nil,
     }
+}
+
+#[inline]
+fn mget_nil_wire() -> MgetEncodedValue {
+    MgetEncodedValue::Nil
+}
+
+#[inline]
+fn mget_response_capacity(values: &[MgetEncodedValue]) -> usize {
+    values.iter().fold(16, |sum, value| {
+        sum + match value {
+            MgetEncodedValue::Inline(inline) => inline.as_bytes().len(),
+            MgetEncodedValue::Shared(bytes) => bytes.len() + 16,
+            MgetEncodedValue::Nil => RESP_NIL.len(),
+        }
+    })
+}
+
+#[inline]
+fn mget_values_to_owned_response(values: &[MgetEncodedValue]) -> Box<[u8]> {
+    let mut buf = Vec::with_capacity(mget_response_capacity(values));
+    push_resp_array_len(&mut buf, values.len());
+    for value in values {
+        match value {
+            MgetEncodedValue::Inline(inline) => buf.extend_from_slice(inline.as_bytes()),
+            MgetEncodedValue::Shared(bytes) => push_resp_bulk_string(&mut buf, bytes.as_ref()),
+            MgetEncodedValue::Nil => buf.extend_from_slice(RESP_NIL),
+        }
+    }
+    buf.into_boxed_slice()
 }
 
 /// MGET key [key ...] — Returns values of all specified keys.
@@ -446,12 +480,8 @@ pub fn cmd_mget(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: 
         keys.push(key_bytes);
     }
 
-    CmdResult::Resp(RespFrame::Array(Some(keyspace.mget_values_with(
-        &keys,
-        now_nanos,
-        mget_value_to_frame,
-        RespFrame::null_bulk_string,
-    ))))
+    let values = keyspace.mget_values_with(&keys, now_nanos, mget_value_to_wire, mget_nil_wire);
+    CmdResult::Owned(mget_values_to_owned_response(&values))
 }
 
 // ── MSET ────────────────────────────────────────────────────────────────────
@@ -469,13 +499,11 @@ pub fn cmd_mset(
     if argc < 3 || (argc - 1) % 2 != 0 {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     }
-
     let Some(mut children) = frame.children() else {
         return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
     };
     let _ = children.next();
-    let mut pairs: SmallVec<[(VortexKey, VortexValue); 16]> =
-        SmallVec::with_capacity((argc - 1) / 2);
+    let mut pairs: SmallVec<[(&[u8], &[u8]); 16]> = SmallVec::with_capacity((argc - 1) / 2);
     while let (Some(key_arg), Some(value_arg)) = (children.next(), children.next()) {
         let Some(key_bytes) = key_arg.as_bytes() else {
             return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
@@ -483,10 +511,27 @@ pub fn cmd_mset(
         let Some(value_bytes) = value_arg.as_bytes() else {
             return ExecutedCommand::from(CmdResult::Static(ERR_SYNTAX));
         };
-        pairs.push((key_from_bytes(key_bytes), value_from_bytes(value_bytes)));
+        pairs.push((key_bytes, value_bytes));
     }
 
-    let outcome = match keyspace.mset_values(pairs, _now_nanos) {
+    if let Some(result) = keyspace.try_mset_values_bytes_fast_path(&pairs) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(err) => return err.into_executed(),
+        };
+        return ExecutedCommand::with_aof_records(
+            CmdResult::Static(RESP_OK),
+            outcome.aof_records,
+            outcome.aof_lsn,
+        );
+    }
+
+    let outcome = match keyspace.mset_values(
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key_from_bytes(key), value_from_bytes(value))),
+        _now_nanos,
+    ) {
         Ok(outcome) => outcome,
         Err(err) => return err.into_executed(),
     };
@@ -1173,6 +1218,7 @@ mod tests {
         match result.as_cmd_result() {
             CmdResult::Static(b) => assert_eq!(*b, expected, "static mismatch"),
             CmdResult::Inline(_) => panic!("expected Static, got Inline"),
+            CmdResult::Owned(_) => panic!("expected Static, got Owned"),
             CmdResult::Resp(_) => panic!("expected Static, got Resp"),
         }
     }
@@ -1183,6 +1229,7 @@ mod tests {
             CmdResult::Inline(inline) => inline.payload(),
             CmdResult::Resp(RespFrame::BulkString(Some(b))) => b.as_ref(),
             CmdResult::Resp(other) => panic!("expected BulkString, got {:?}", other),
+            CmdResult::Owned(_) => panic!("expected BulkString, got Owned"),
             CmdResult::Static(b) => {
                 panic!("expected Resp, got Static({:?})", std::str::from_utf8(b))
             }
@@ -1195,6 +1242,7 @@ mod tests {
             CmdResult::Resp(RespFrame::Integer(n)) => *n,
             CmdResult::Resp(other) => panic!("expected Integer, got {:?}", other),
             CmdResult::Inline(_) => panic!("expected Integer, got Inline bulk string"),
+            CmdResult::Owned(_) => panic!("expected Integer, got Owned"),
             CmdResult::Static(b) => {
                 // Handle static integer responses from int_resp optimization.
                 if *b == b":0\r\n" {
@@ -1844,22 +1892,10 @@ mod tests {
         let frame = tape.iter().next().unwrap();
         let result = cmd_mget(&h.keyspace, &frame, 0);
         match result {
-            CmdResult::Resp(RespFrame::Array(Some(frames))) => {
-                assert_eq!(frames.len(), 3);
-                // a = "1" (stored as Integer(1))
-                match &frames[0] {
-                    RespFrame::BulkString(Some(b)) => assert_eq!(b.as_ref(), b"1"),
-                    other => panic!("expected bulk string, got {:?}", other),
-                }
-                // b = nil
-                assert!(matches!(&frames[1], RespFrame::BulkString(None)));
-                // c = "3"
-                match &frames[2] {
-                    RespFrame::BulkString(Some(b)) => assert_eq!(b.as_ref(), b"3"),
-                    other => panic!("expected bulk string, got {:?}", other),
-                }
+            CmdResult::Owned(bytes) => {
+                assert_eq!(bytes.as_ref(), b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n");
             }
-            _ => panic!("expected Array, got something else"),
+            other => panic!("expected owned array response, got {other:?}"),
         }
     }
 
@@ -1876,16 +1912,10 @@ mod tests {
         let result = cmd_mget(&h.keyspace, &frame, 0);
 
         match result {
-            CmdResult::Resp(RespFrame::Array(Some(frames))) => {
-                assert_eq!(frames.len(), 2);
-                for frame in frames {
-                    match frame {
-                        RespFrame::BulkString(Some(bytes)) => assert_eq!(bytes.as_ref(), b"7"),
-                        other => panic!("expected duplicate bulk value, got {other:?}"),
-                    }
-                }
+            CmdResult::Owned(bytes) => {
+                assert_eq!(bytes.as_ref(), b"*2\r\n$1\r\n7\r\n$1\r\n7\r\n");
             }
-            other => panic!("expected array response, got {other:?}"),
+            other => panic!("expected owned array response, got {other:?}"),
         }
     }
 
@@ -1931,6 +1961,37 @@ mod tests {
 
         assert_static(&result, RESP_OK);
         assert_eq!(h.get(&key, 0), Some(final_value));
+    }
+
+    #[test]
+    fn mset_clears_existing_ttl_on_borrowed_fast_path() {
+        let h = TestHarness::new();
+        let now = 1_000_000_000u64;
+        h.keyspace
+            .configure_eviction(1024 * 1024, EvictionPolicy::NoEviction);
+        let setex_tape = make_tape(b"*4\r\n$5\r\nSETEX\r\n$3\r\nttl\r\n$2\r\n10\r\n$3\r\nold\r\n");
+        let setex_frame = setex_tape.iter().next().unwrap();
+        let setex_result = cmd_setex(&h.keyspace, &setex_frame, now);
+        assert_static(&setex_result, RESP_OK);
+        assert_eq!(h.keyspace.total_expiry_keys(), 1);
+
+        let mset_tape =
+            make_tape(b"*5\r\n$4\r\nMSET\r\n$3\r\nttl\r\n$3\r\nnew\r\n$5\r\nother\r\n$1\r\n1\r\n");
+        let mset_frame = mset_tape.iter().next().unwrap();
+        let mset_result = cmd_mset(&h.keyspace, &mset_frame, now + NS_PER_SEC);
+        assert_static(&mset_result, RESP_OK);
+
+        let key = VortexKey::from(b"ttl" as &[u8]);
+        assert_eq!(h.keyspace.total_expiry_keys(), 0);
+        assert_eq!(
+            h.get(&key, now + 11 * NS_PER_SEC),
+            Some(VortexValue::from_bytes(b"new"))
+        );
+
+        let incr_tape = make_tape(b"*2\r\n$4\r\nINCR\r\n$5\r\nother\r\n");
+        let incr_frame = incr_tape.iter().next().unwrap();
+        let incr_result = cmd_incr(&h.keyspace, &incr_frame, now + NS_PER_SEC);
+        assert_eq!(resp_int(&incr_result), 2);
     }
 
     #[test]

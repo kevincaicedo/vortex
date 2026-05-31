@@ -103,6 +103,8 @@ unsafe impl Send for ArmedWrite {}
 struct RegisteredInterest {
     fd: RawFd,
     flags: u8,
+    read_token: Option<CompletionToken>,
+    write_token: Option<CompletionToken>,
 }
 
 #[derive(Default)]
@@ -188,19 +190,6 @@ impl PollingBackend {
     }
 
     #[inline]
-    fn set_registered_flags(&mut self, fd: RawFd, flags: u8) {
-        if let Some(&slot) = self.registered_lookup.get(&fd) {
-            if let Some(entry) = self.registered.get_mut(slot) {
-                entry.flags = flags;
-            }
-            return;
-        }
-        let slot = self.registered.len();
-        self.registered.push(RegisteredInterest { fd, flags });
-        self.registered_lookup.insert(fd, slot);
-    }
-
-    #[inline]
     fn clear_registered(&mut self, fd: RawFd) -> bool {
         let Some(slot) = self.registered_lookup.remove(&fd) else {
             return false;
@@ -212,12 +201,46 @@ impl PollingBackend {
         true
     }
 
+    #[inline]
+    fn readiness_event(fd: RawFd, flags: u8) -> Event {
+        debug_assert!(fd >= 0);
+        Event::new(
+            fd as usize,
+            (flags & INTEREST_READABLE) != 0,
+            (flags & INTEREST_WRITABLE) != 0,
+        )
+    }
+
     /// Register (or re-arm) interest for `fd` with the poller using
     /// edge-triggered mode (`EV_CLEAR` on kqueue, `EPOLLET` on epoll).
-    fn register_interest(&mut self, fd: RawFd, event: Event) {
+    ///
+    /// The poll event is keyed by fd while the registry stores the active read
+    /// and write tokens separately. This lets one fd keep both readiness
+    /// interests armed without replacing a read token with a write token.
+    fn register_interest(&mut self, fd: RawFd, flags: u8, token: CompletionToken) {
+        let previous = self.registered_lookup.get(&fd).copied();
+        let mut next_flags = flags;
+        let mut read_token = None;
+        let mut write_token = None;
+
+        if let Some(slot) = previous {
+            if let Some(entry) = self.registered.get(slot) {
+                next_flags |= entry.flags;
+                read_token = entry.read_token;
+                write_token = entry.write_token;
+            }
+        }
+        if (flags & INTEREST_READABLE) != 0 {
+            read_token = Some(token);
+        }
+        if (flags & INTEREST_WRITABLE) != 0 {
+            write_token = Some(token);
+        }
+
+        let event = Self::readiness_event(fd, next_flags);
         // SAFETY: fd is a valid, open file descriptor owned by the reactor.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        if self.registered_flags(fd) != 0 {
+        if previous.is_some() {
             let _ = self
                 .poller
                 .modify_with_mode(borrowed, event, PollMode::Edge);
@@ -232,15 +255,33 @@ impl PollingBackend {
                     });
             }
         }
-        // Update tracked interest flags.
-        let mut flags = 0u8;
-        if event.readable {
-            flags |= INTEREST_READABLE;
+        self.set_registered_interest(fd, next_flags, read_token, write_token);
+    }
+
+    #[inline]
+    fn set_registered_interest(
+        &mut self,
+        fd: RawFd,
+        flags: u8,
+        read_token: Option<CompletionToken>,
+        write_token: Option<CompletionToken>,
+    ) {
+        if let Some(&slot) = self.registered_lookup.get(&fd) {
+            if let Some(entry) = self.registered.get_mut(slot) {
+                entry.flags = flags;
+                entry.read_token = read_token;
+                entry.write_token = write_token;
+            }
+            return;
         }
-        if event.writable {
-            flags |= INTEREST_WRITABLE;
-        }
-        self.set_registered_flags(fd, flags);
+        let slot = self.registered.len();
+        self.registered.push(RegisteredInterest {
+            fd,
+            flags,
+            read_token,
+            write_token,
+        });
+        self.registered_lookup.insert(fd, slot);
     }
 
     #[inline]
@@ -351,25 +392,50 @@ impl PollingBackend {
         self.ready_read_tokens.clear();
         self.ready_write_tokens.clear();
         for event in self.events.iter() {
-            let token = CompletionToken::from_raw(event.key as u64);
-            match token.decode() {
-                Ok(DecodedCompletionToken::Accept) if event.readable => {
-                    self.ready_accept_tokens.push(token);
-                }
-                Ok(DecodedCompletionToken::Conn { id, op, .. }) => {
-                    if event.readable && matches!(op, OpType::Read) && id < self.armed_reads.len() {
-                        self.ready_read_tokens.push(token);
+            let fd = event.key as RawFd;
+            let Some(entry) = self
+                .registered_lookup
+                .get(&fd)
+                .and_then(|&slot| self.registered.get(slot))
+            else {
+                continue;
+            };
+
+            if event.readable {
+                if let Some(token) = entry.read_token {
+                    match token.decode() {
+                        Ok(DecodedCompletionToken::Accept) => {
+                            self.ready_accept_tokens.push(token);
+                        }
+                        Ok(DecodedCompletionToken::Conn {
+                            id,
+                            op: OpType::Read,
+                            ..
+                        }) if id < self.armed_reads.len() => {
+                            self.ready_read_tokens.push(token);
+                        }
+                        Ok(DecodedCompletionToken::Cancel { .. })
+                        | Ok(DecodedCompletionToken::Conn { .. })
+                        | Err(_) => {}
                     }
-                    if event.writable
-                        && matches!(op, OpType::Write | OpType::Writev)
-                        && id < self.armed_writes.len()
-                    {
-                        self.ready_write_tokens.push(token);
+                }
+            }
+
+            if event.writable {
+                if let Some(token) = entry.write_token {
+                    match token.decode() {
+                        Ok(DecodedCompletionToken::Conn { id, op, .. })
+                            if matches!(op, OpType::Write | OpType::Writev)
+                                && id < self.armed_writes.len() =>
+                        {
+                            self.ready_write_tokens.push(token);
+                        }
+                        Ok(DecodedCompletionToken::Accept)
+                        | Ok(DecodedCompletionToken::Cancel { .. })
+                        | Ok(DecodedCompletionToken::Conn { .. })
+                        | Err(_) => {}
                     }
                 }
-                Ok(DecodedCompletionToken::Cancel { .. })
-                | Err(_)
-                | Ok(DecodedCompletionToken::Accept) => {}
             }
         }
 
@@ -729,7 +795,7 @@ impl PollingBackend {
                 // Not ready — register listener for read-readiness and re-queue.
                 // Edge-triggered: skip if already registered.
                 if (self.registered_flags(listener_fd) & INTEREST_READABLE) == 0 {
-                    self.register_interest(listener_fd, Event::readable(token.raw() as usize));
+                    self.register_interest(listener_fd, INTEREST_READABLE, token);
                 }
                 self.armed_accept = Some((listener, token));
             }
@@ -748,9 +814,10 @@ impl PollingBackend {
         let fd = lease.fd().raw();
         let buf_ptr = lease.ptr();
         let buf_len = lease.len();
-        // Read-loop: drain all available data from the kernel socket buffer
-        // in a single pass to reduce syscall overhead. With edge-triggered
-        // polling we must drain until EAGAIN anyway, so this is correct.
+        // Read-loop: drain available data without forcing a final EAGAIN on
+        // short reads. A short nonblocking read means the socket receive
+        // buffer was drained for this pass; the reactor will submit the next
+        // read immediately if more command data is needed.
         let mut total: usize = 0;
         let mut ptr = buf_ptr;
         let mut remaining = buf_len;
@@ -762,12 +829,13 @@ impl PollingBackend {
 
             if n > 0 {
                 let bytes = n as usize;
+                let short_read = bytes < remaining;
                 total += bytes;
                 // SAFETY: advancing within the same buffer allocation.
                 ptr = unsafe { ptr.add(bytes) };
                 remaining -= bytes;
-                if remaining == 0 {
-                    break; // Buffer full — stop reading.
+                if short_read || remaining == 0 {
+                    break;
                 }
                 continue; // More buffer space — try to read more.
             } else if n == 0 {
@@ -814,7 +882,7 @@ impl PollingBackend {
             // persists across events, so re-registration is unnecessary
             // and would waste a kevent/epoll_ctl syscall.
             if (self.registered_flags(fd) & INTEREST_READABLE) == 0 {
-                self.register_interest(fd, Event::readable(token.raw() as usize));
+                self.register_interest(fd, INTEREST_READABLE, token);
             }
             if let Some((conn_id, op)) = decode_conn_token(token) {
                 debug_assert!(matches!(op, OpType::Read));
@@ -842,11 +910,9 @@ impl PollingBackend {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                // Register for write-readiness instead of busy-polling.
-                // Note: this replaces readable interest via the polling crate's
-                // modify semantics; the readable flag is cleared so the next
-                // read EAGAIN will re-register it.
-                self.register_interest(fd, Event::writable(token.raw() as usize));
+                // Register for write-readiness instead of busy-polling while
+                // preserving any already-armed read readiness on this fd.
+                self.register_interest(fd, INTEREST_WRITABLE, token);
                 if let Some((conn_id, _)) = decode_conn_token(token) {
                     self.ensure_write_capacity(conn_id);
                     self.armed_writes[conn_id] = Some(ArmedWrite::Write { lease, token });
@@ -880,8 +946,9 @@ impl PollingBackend {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                // Register for write-readiness instead of busy-polling.
-                self.register_interest(fd, Event::writable(token.raw() as usize));
+                // Register for write-readiness instead of busy-polling while
+                // preserving any already-armed read readiness on this fd.
+                self.register_interest(fd, INTEREST_WRITABLE, token);
                 if let Some((conn_id, _)) = decode_conn_token(token) {
                     self.ensure_write_capacity(conn_id);
                     self.armed_writes[conn_id] = Some(ArmedWrite::Writev { batch, token });
@@ -1042,6 +1109,22 @@ mod tests {
         let mut fds = [0; 2];
         // SAFETY: `pipe` initializes both fds on success.
         let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        for fd in fds {
+            // SAFETY: fd is open and owned by this test.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            // SAFETY: fd is open and owned by this test.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(rc, 0);
+        }
+        (fds[0], fds[1])
+    }
+
+    fn nonblocking_socket_pair() -> (RawFd, RawFd) {
+        let mut fds = [0; 2];
+        // SAFETY: `socketpair` initializes both fds on success.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0);
         for fd in fds {
             // SAFETY: fd is open and owned by this test.
@@ -1299,6 +1382,37 @@ mod tests {
     }
 
     #[test]
+    fn write_interest_preserves_existing_read_interest() {
+        let mut backend = PollingBackend::new().unwrap();
+        let (fd, peer_fd) = nonblocking_socket_pair();
+        let read_token = encode_token(4, 9, OpType::Read).unwrap();
+        let write_token = encode_token(4, 9, OpType::Writev).unwrap();
+
+        backend.register_interest(fd, INTEREST_READABLE, read_token);
+        backend.register_interest(fd, INTEREST_WRITABLE, write_token);
+
+        let entry = backend
+            .registered_lookup
+            .get(&fd)
+            .and_then(|&slot| backend.registered.get(slot))
+            .expect("registered interest");
+        assert_eq!(
+            entry.flags & (INTEREST_READABLE | INTEREST_WRITABLE),
+            INTEREST_READABLE | INTEREST_WRITABLE
+        );
+        assert_eq!(entry.read_token, Some(read_token));
+        assert_eq!(entry.write_token, Some(write_token));
+
+        if backend.clear_registered(fd) {
+            // SAFETY: fd was registered by this backend above.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let _ = backend.poller.delete(borrowed);
+        }
+        close_fd(fd);
+        close_fd(peer_fd);
+    }
+
+    #[test]
     fn writev_partial_pipe_write_reports_short_completion() {
         let mut backend = PollingBackend::new().unwrap();
         let (read_fd, write_fd) = nonblocking_pipe();
@@ -1415,7 +1529,7 @@ mod tests {
 
         let token = encode_token(9, 1, OpType::Read).unwrap();
         let initial_capacity = backend.registered.capacity();
-        backend.register_interest(high_fd, Event::readable(token.raw() as usize));
+        backend.register_interest(high_fd, INTEREST_READABLE, token);
 
         assert_eq!(backend.registered.len(), 1);
         assert_eq!(backend.registered_lookup.len(), 1);

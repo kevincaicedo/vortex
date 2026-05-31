@@ -99,7 +99,13 @@ All databases are configured with optimal threading for fair comparison. Redis a
 Both VortexDB and Redis run natively on the host — no Docker overhead. Most accurate comparison for macOS.
 
 ```sh
-just compare-native
+just benchmark \
+  --db vortex,redis \
+  --native \
+  --backend redis-benchmark \
+  --command SET,GET,INCR \
+  --duration 30s \
+  --artifact-root .artifacts/benchmarks/native
 ```
 
 #### Docker Mode (Fair Comparison)
@@ -107,7 +113,13 @@ just compare-native
 All databases run in identical Docker containers with the same resource limits.
 
 ```sh
-just compare-docker
+just benchmark \
+  --db vortex,redis,dragonfly,valkey \
+  --container \
+  --backend redis-benchmark \
+  --command SET,GET,INCR \
+  --duration 30s \
+  --artifact-root .artifacts/benchmarks/docker
 ```
 
 #### Full Statistical Mode
@@ -115,7 +127,13 @@ just compare-docker
 Multiple runs with confidence intervals:
 
 ```sh
-just compare-full  # 3 runs, JSON + Markdown, latency, custom commands, memtier mixed workloads
+just benchmark \
+  --db vortex,redis,dragonfly,valkey \
+  --container \
+  --backend memtier_benchmark \
+  --workload uniform-mixed \
+  --repeat 3 \
+  --artifact-root .artifacts/benchmarks/docker-repeat
 ```
 
 ---
@@ -225,22 +243,22 @@ cargo install just
 cd vortex/
 
 # Native VortexDB vs native Redis (most accurate on macOS)
-just compare-native
+just benchmark --db vortex,redis --native --backend redis-benchmark --command SET,GET,INCR
 
 # Quick comparison with throughput only
-just compare
+just benchmark --db vortex,redis --native --backend redis-benchmark --command PING
 
 # Mixed workload + point-command suite
-just compare-memtier
+just benchmark --db vortex,redis --native --backend memtier_benchmark --workload uniform-mixed
 
 # Full comparison with latency percentiles, custom commands, and reports
-just compare --latency --markdown --custom --json --memtier
+just benchmark --db vortex,redis --native --backend redis-benchmark --command SET,GET,INCR --profile engineering
 
 # Fair Docker-based comparison (all databases containerized)
-just compare-docker
+just benchmark --db vortex,redis,dragonfly,valkey --container --backend redis-benchmark --command SET,GET,INCR
 
 # Full statistical run (3 iterations with CI95 + memtier mixed workloads)
-just compare-full
+just benchmark --db vortex,redis,dragonfly,valkey --container --backend memtier_benchmark --workload uniform-mixed --repeat 3
 
 # Custom parameters
 bash scripts/compare.sh -n 200000 -c 100 -P 32 --native --latency --markdown --memtier

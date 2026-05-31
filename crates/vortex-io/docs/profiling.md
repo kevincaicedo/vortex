@@ -8,9 +8,15 @@ cargo build --profile profiling --features profile-telemetry --bin vortex-server
 target/profiling/vortex-server --telemetry-mode profile
 ```
 
-Normal `target/release/vortex-server` supports `minimal` only and rejects
-`profile`. The release binary keeps zero/unavailable report fields for schema
-stability, but the timestamp reads and timer storage below are not compiled.
+Normal `target/release/vortex-server` supports `minimal` and sampled `standard`
+telemetry, but rejects `profile`. The release binary keeps zero/unavailable
+report fields for schema stability, but the timestamp reads and timer storage
+below are not compiled.
+
+In profiling binaries, reactor timer helpers return `None` outside Profile
+mode. Timer publication callsites only update shared runtime metrics when a real
+elapsed duration exists, so Minimal and Standard do not publish zero-duration
+profile timer rows.
 
 ## Metric Catalog
 

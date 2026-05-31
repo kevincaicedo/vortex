@@ -87,7 +87,7 @@ services:
 | `requirepass secret` | `--requirepass secret` | Simple password auth |
 | `loglevel notice` | `--log-level info` | Levels: trace, debug, info, warn, error |
 | `databases 16` | N/A | VortexDB uses a single database (DB 0) |
-| `appendonly yes` | `--aof-enabled` | AOF support planned |
+| `appendonly yes` | `--aof-enabled` | Alpha AOF append/replay support; Redis RDB/AOF import is not supported |
 | `appendfsync everysec` | `--aof-fsync everysec` | Options: always, everysec, no |
 
 ### Environment Variables
@@ -122,41 +122,61 @@ Load with: `vortex-server -c vortex.toml`
 
 ## Step 3: Client Library Compatibility
 
-VortexDB speaks RESP2. Any Redis client library works without modification.
+VortexDB v0.1-alpha speaks RESP2. `HELLO 2` and `CLIENT SETINFO` are accepted
+for modern RESP2 client setup, but RESP3 negotiation remains outside alpha
+scope. Configure clients that default to RESP3 to stay on RESP2.
 
 ### Tested Libraries
 
 | Language | Library | Status |
 |----------|---------|--------|
-| Python | `redis-py` | ✅ Works |
-| Node.js | `ioredis` | ✅ Works |
-| Node.js | `redis` (node-redis) | ✅ Works |
-| Go | `go-redis` | ✅ Works |
-| Rust | `redis-rs` | ✅ Works |
-| Java | `Jedis` | ✅ Works |
-| Java | `Lettuce` | ✅ Works |
-| C | `hiredis` | ✅ Works |
+| Python | `redis-py` | ✅ Works with `protocol=2` |
+| Node.js | `ioredis` | ✅ Works with default setup |
+| Node.js | `redis` (node-redis) | ✅ Works with default setup and explicit `RESP: 2` |
+| Go | `go-redis` | Not revalidated in this alpha pass |
+| Rust | `redis-rs` | ✅ Tested |
+| Java | `Jedis` | Not revalidated in this alpha pass |
+| Java | `Lettuce` | Not revalidated in this alpha pass |
+| C | `hiredis` | Not revalidated in this alpha pass |
 
 ### Connection Example
 
 ```python
-# Python — no code changes needed
+# Python redis-py 8.x — keep RESP2
 import redis
-r = redis.Redis(host='localhost', port=6379)
+r = redis.Redis(
+    host='localhost',
+    port=6379,
+    protocol=2,
+)
 r.set('hello', 'world')
 print(r.get('hello'))  # b'world'
 ```
 
 ```javascript
-// Node.js with ioredis — no code changes
+// Node.js with ioredis
 const Redis = require('ioredis');
-const redis = new Redis(6379, '127.0.0.1');
+const redis = new Redis({
+  port: 6379,
+  host: '127.0.0.1',
+});
+await redis.set('hello', 'world');
+console.log(await redis.get('hello')); // 'world'
+```
+
+```javascript
+// Node.js with node-redis 5.x
+const { createClient } = require('redis');
+const redis = createClient({
+  socket: { host: '127.0.0.1', port: 6379 },
+});
+await redis.connect();
 await redis.set('hello', 'world');
 console.log(await redis.get('hello')); // 'world'
 ```
 
 ```go
-// Go with go-redis — no code changes
+// Go with go-redis — typical RESP2 setup
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 rdb.Set(ctx, "hello", "world", 0)
 val, _ := rdb.Get(ctx, "hello").Result()
@@ -283,13 +303,18 @@ Since VortexDB speaks the same protocol, rollback is straightforward:
 2. Start Redis on the same port
 3. Reload data from your application or Redis persistence files
 
-**Note:** VortexDB v0.1 does not support RDB import or AOF replay. Data exists only in memory. Plan your migration for workloads where data loss on restart is acceptable (caches, session stores, rate limiters).
+**Note:** VortexDB v0.1-alpha does not support Redis RDB import or Redis AOF import.
+Vortex AOF append/replay is available only for logs written by Vortex when AOF
+is enabled. The default remains in-memory only, so plan migrations for workloads
+where the configured persistence mode and loss window are acceptable.
 
 ---
 
 ## Data Import (Future)
 
-RDB import and AOF replay are planned for Phase 5. Once available:
+Redis RDB import and Redis AOF import are planned future migration features.
+Vortex-owned AOF replay is already part of the alpha persistence surface when
+AOF is enabled. Once import is available:
 
 ```sh
 # Import from Redis RDB file (planned)
@@ -307,7 +332,9 @@ vortex-server --import-rdb dump.rdb
 A: Yes. All the commands needed for a caching layer are implemented: GET, SET with EX/PX for TTL, DEL, EXISTS, EXPIRE, MGET, MSET.
 
 **Q: Does VortexDB persist data?**
-A: Not in v0.1-alpha. All data is in-memory only. AOF persistence is planned for Phase 5.
+A: By default, no. v0.1-alpha can append and replay Vortex-owned AOF logs when
+started with `--aof-enabled`, but Redis RDB/AOF import is not supported and the
+loss window depends on the configured `appendfsync` policy.
 
 **Q: Can I use Redis Sentinel or Cluster with VortexDB?**
 A: Not yet. Replication (Phase 6) and Cluster (Phase 7) are planned.

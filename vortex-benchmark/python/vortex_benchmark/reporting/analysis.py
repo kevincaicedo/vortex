@@ -511,6 +511,9 @@ def _build_latency_breakdown(
 def _build_winners(
     rows: list[dict[str, Any]], databases: list[str]
 ) -> dict[str, dict[str, Any]]:
+    if len(set(databases)) < 2:
+        return {}
+
     winners: dict[str, dict[str, Any]] = {}
 
     def _ctx(row: dict[str, Any]) -> str:

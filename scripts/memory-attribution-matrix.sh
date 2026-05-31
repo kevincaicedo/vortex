@@ -224,10 +224,10 @@ fields = [
     "throughput_ops_per_second",
     "p99_ns",
     "shards",
-    "engine_memory_claim_decision",
-    "engine_memory_claim_reason",
-    "full_server_rss_claim_decision",
-    "full_server_rss_claim_reason",
+    "engine_memory_observation",
+    "engine_memory_reason",
+    "full_server_rss_observation",
+    "full_server_rss_reason",
     "command",
     "notes",
 ]
@@ -261,26 +261,26 @@ if run_shard_sweep:
     for sweep_shards in (1024, 4096, 16384, 65536):
         row_notes[f"engine-shard-sweep-{sweep_shards}"] = (
             "Shard-count sweep row for per-shard metadata and table slack cost; "
-            "engine-only attribution, not a full-server Redis parity claim."
+            "engine-only attribution; full-server RSS/reference data must come from server rows."
         )
 
 
-def engine_decision(bytes_per_live_key):
+def engine_observation(bytes_per_live_key):
     if bytes_per_live_key is None:
-        return "Rejected", "missing engine bytes/live-key"
+        return "missing", "missing engine bytes/live-key"
     value = float(bytes_per_live_key)
     if value <= engine_bpk_allowed:
-        return "Allowed", f"engine bytes/live-key {value:.2f} <= {engine_bpk_allowed:.2f}"
+        return "within-target", f"engine bytes/live-key {value:.2f} <= {engine_bpk_allowed:.2f}"
     if value <= engine_bpk_narrowed:
-        return "Narrowed", (
+        return "watch", (
             f"engine bytes/live-key {value:.2f} <= {engine_bpk_narrowed:.2f}; "
-            "claim must name workload and shard count"
+            "interpret with workload and shard count"
         )
-    return "Rejected", f"engine bytes/live-key {value:.2f} > {engine_bpk_narrowed:.2f}"
+    return "over-target", f"engine bytes/live-key {value:.2f} > {engine_bpk_narrowed:.2f}"
 
 
-def full_server_decision_for_engine_row():
-    return "Rejected", "engine-only row cannot support full-server RSS or Redis parity claim"
+def full_server_observation_for_engine_row():
+    return "not-applicable", "engine-only row does not contain full-server RSS/reference data"
 
 rows = []
 for json_path in sorted(engine_dir.glob("*.json")):
@@ -290,8 +290,8 @@ for json_path in sorted(engine_dir.glob("*.json")):
     with json_path.open() as handle:
         data = json.load(handle)
     latency = data.get("latency_ns") or {}
-    engine_claim, engine_reason = engine_decision(data.get("bytes_per_live_key"))
-    full_claim, full_reason = full_server_decision_for_engine_row()
+    engine_observed, engine_reason = engine_observation(data.get("bytes_per_live_key"))
+    full_observed, full_reason = full_server_observation_for_engine_row()
     rows.append({
         "row_id": row_id,
         "layer": "engine",
@@ -323,10 +323,10 @@ for json_path in sorted(engine_dir.glob("*.json")):
         "throughput_ops_per_second": data.get("throughput_ops_per_second"),
         "p99_ns": latency.get("p99"),
         "shards": data.get("shards"),
-        "engine_memory_claim_decision": engine_claim,
-        "engine_memory_claim_reason": engine_reason,
-        "full_server_rss_claim_decision": full_claim,
-        "full_server_rss_claim_reason": full_reason,
+        "engine_memory_observation": engine_observed,
+        "engine_memory_reason": engine_reason,
+        "full_server_rss_observation": full_observed,
+        "full_server_rss_reason": full_reason,
         "command": engine_commands.get(row_id, ""),
         "notes": row_notes.get(row_id, ""),
     })
@@ -336,10 +336,10 @@ external_rows = [
         "row_id": "vortex-server-one-thread-polling",
         "layer": "server",
         "status": "external-manual",
-        "engine_memory_claim_decision": "Rejected",
-        "engine_memory_claim_reason": "server row not populated yet",
-        "full_server_rss_claim_decision": "Rejected",
-        "full_server_rss_claim_reason": "server RSS/Redis evidence not populated yet",
+        "engine_memory_observation": "pending",
+        "engine_memory_reason": "server row not populated yet",
+        "full_server_rss_observation": "pending",
+        "full_server_rss_reason": "server RSS/reference evidence not populated yet",
         "command": "just profiler --memory --io-backend polling --threads 1 --command SET,GET,MGET,MSET --duration 30",
         "notes": "Measures vortex-server, parser, IO backend, runtime, allocator, and engine together; fill metrics from profiler summary.",
     },
@@ -347,10 +347,10 @@ external_rows = [
         "row_id": "vortex-server-multi-thread-polling",
         "layer": "server",
         "status": "external-manual",
-        "engine_memory_claim_decision": "Rejected",
-        "engine_memory_claim_reason": "server row not populated yet",
-        "full_server_rss_claim_decision": "Rejected",
-        "full_server_rss_claim_reason": "server RSS/Redis evidence not populated yet",
+        "engine_memory_observation": "pending",
+        "engine_memory_reason": "server row not populated yet",
+        "full_server_rss_observation": "pending",
+        "full_server_rss_reason": "server RSS/reference evidence not populated yet",
         "command": "just profiler --memory --io-backend polling --threads 4 --command SET,GET,MGET,MSET --duration 30",
         "notes": "Same as one-thread row with reactor/thread scaling overhead included.",
     },
@@ -358,22 +358,22 @@ external_rows = [
         "row_id": "vortex-server-redis-comparison",
         "layer": "server",
         "status": "external-manual",
-        "engine_memory_claim_decision": "Rejected",
-        "engine_memory_claim_reason": "server row not populated yet",
-        "full_server_rss_claim_decision": "Rejected",
-        "full_server_rss_claim_reason": "server RSS/Redis evidence not populated yet",
-        "command": "just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-full-cycle.yaml",
+        "engine_memory_observation": "pending",
+        "engine_memory_reason": "server row not populated yet",
+        "full_server_rss_observation": "pending",
+        "full_server_rss_reason": "server RSS/reference evidence not populated yet",
+        "command": "just benchmark --workload-manifest vortex-benchmark/manifests/examples/local-native-full-cycle.yaml",
         "notes": "Use the full local comparison manifest for server-level throughput/RSS evidence.",
     },
     {
         "row_id": "redis-baseline-equivalent",
         "layer": "redis",
         "status": "external-manual",
-        "engine_memory_claim_decision": "Rejected",
-        "engine_memory_claim_reason": "Redis row has no Vortex engine attribution",
-        "full_server_rss_claim_decision": "Rejected",
-        "full_server_rss_claim_reason": "Redis baseline row must be paired with a Vortex server row",
-        "command": "just benchmark-local --manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark-polling.yaml",
+        "engine_memory_observation": "not-applicable",
+        "engine_memory_reason": "reference row has no Vortex engine attribution",
+        "full_server_rss_observation": "reference",
+        "full_server_rss_reason": "reference row for matched server RSS comparison",
+        "command": "just benchmark --workload-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark-polling.yaml",
         "notes": "Redis baseline must use equivalent key count, value size, command mix, and persistence setting.",
     },
 ]
@@ -397,8 +397,8 @@ with json_path.open("w") as handle:
             "thresholds": {
                 "engine_bytes_per_live_key_allowed": engine_bpk_allowed,
                 "engine_bytes_per_live_key_narrowed": engine_bpk_narrowed,
-                "full_server_rss_vs_redis_allowed_ratio": full_rss_allowed_ratio,
-                "full_server_rss_vs_redis_narrowed_ratio": full_rss_narrowed_ratio,
+                "full_server_rss_vs_reference_watch_ratio": full_rss_allowed_ratio,
+                "full_server_rss_vs_reference_high_ratio": full_rss_narrowed_ratio,
             },
             "rows": rows,
         },
@@ -416,22 +416,22 @@ with plan_path.open("w") as handle:
     handle.write(f"- Shards: {shards}\n")
     handle.write(f"- Resident TTL row: {ttl_ms} ms\n")
     handle.write(f"- Multi-key width hint: {multi_key_width}\n\n")
-    handle.write("## Claim Thresholds\n\n")
-    handle.write(f"- Engine bytes/live-key Allowed: <= {engine_bpk_allowed:.2f}\n")
-    handle.write(f"- Engine bytes/live-key Narrowed: <= {engine_bpk_narrowed:.2f}\n")
-    handle.write(f"- Full-server RSS/Redis Allowed ratio: <= {full_rss_allowed_ratio:.2f}\n")
-    handle.write(f"- Full-server RSS/Redis Narrowed ratio: <= {full_rss_narrowed_ratio:.2f}\n\n")
+    handle.write("## Measurement Reference Thresholds\n\n")
+    handle.write(f"- Engine bytes/live-key target: <= {engine_bpk_allowed:.2f}\n")
+    handle.write(f"- Engine bytes/live-key watch band: <= {engine_bpk_narrowed:.2f}\n")
+    handle.write(f"- Full-server RSS/reference watch ratio: <= {full_rss_allowed_ratio:.2f}\n")
+    handle.write(f"- Full-server RSS/reference high ratio: <= {full_rss_narrowed_ratio:.2f}\n\n")
     handle.write("## Measured Engine Rows\n\n")
     for row in rows:
         if row.get("status") == "measured":
             handle.write(f"- `{row['row_id']}`: `{row['command']}`\n")
             handle.write(
-                f"  Engine claim: {row['engine_memory_claim_decision']} - "
-                f"{row['engine_memory_claim_reason']}\n"
+                f"  Engine memory: {row['engine_memory_observation']} - "
+                f"{row['engine_memory_reason']}\n"
             )
             handle.write(
-                f"  Full-server RSS claim: {row['full_server_rss_claim_decision']} - "
-                f"{row['full_server_rss_claim_reason']}\n"
+                f"  Full-server RSS: {row['full_server_rss_observation']} - "
+                f"{row['full_server_rss_reason']}\n"
             )
     handle.write("\n## External Rows To Fill From Server/Redis Runs\n\n")
     for row in rows:
@@ -439,8 +439,8 @@ with plan_path.open("w") as handle:
             handle.write(f"- `{row['row_id']}`: `{row['command']}`\n")
             handle.write(f"  Notes: {row['notes']}\n")
     handle.write("\n## Metric Contract\n\n")
-    handle.write("Every completed row should populate logical dataset bytes, table allocated bytes, table total slots, capacity slack slots, tombstones, load factor, bytes per live key, allocator allocated/active/resident/mapped/retained bytes when available, process RSS, throughput, p99, shard count, and explicit Allowed/Narrowed/Rejected claim decisions.\n")
-    handle.write("Engine-only rows must reject full-server RSS and Redis parity claims. Server rows must separate engine attribution, IO fixed-buffer reservation/commitment, per-connection state, allocator state, and process RSS before any Redis comparison is allowed.\n")
+    handle.write("Every completed row should populate logical dataset bytes, table allocated bytes, table total slots, capacity slack slots, tombstones, load factor, bytes per live key, allocator allocated/active/resident/mapped/retained bytes when available, process RSS, throughput, p99, shard count, and neutral observation fields.\n")
+    handle.write("Engine-only rows do not contain full-server RSS/reference data. Server rows must separate engine attribution, IO fixed-buffer reservation/commitment, per-connection state, allocator state, and process RSS before any cross-database comparison is rendered.\n")
 
 print(f"wrote {csv_path.relative_to(root)}")
 print(f"wrote {json_path.relative_to(root)}")

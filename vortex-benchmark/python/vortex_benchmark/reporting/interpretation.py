@@ -1,4 +1,9 @@
-"""Benchmark interpretation gates for alpha optimization reports."""
+"""Neutral benchmark interpretation helpers.
+
+The benchmark tool classifies measurement quality, comparison compatibility,
+client saturation, and likely limiting resources. Policy decisions belong in
+the documents that consume the generated artifacts, not in this package.
+"""
 
 from __future__ import annotations
 
@@ -20,17 +25,13 @@ LIMITING_RESOURCE_CHOICES = (
 )
 
 CLIENT_CPU_FIELDS = (
+    "load_generator_cpu_utilization_of_capacity_pct",
     "load_generator_cpu_utilization_peak_pct",
+    "load_generator_cpu_utilization_avg_pct",
     "client_cpu_utilization_peak_pct",
     "benchmark_client_cpu_peak_pct",
 )
 
-CORE_P99_TARGET_MS = 1.0
-CORE_P999_TARGET_MS = 1.0
-PRESSURE_P99_TARGET_MS = 1.0
-PRESSURE_P999_TARGET_MS = 5.0
-REDIS_THROUGHPUT_ALLOWED_RATIO = 1.50
-REDIS_THROUGHPUT_NARROWED_RATIO = 1.00
 CLIENT_CPU_SATURATION_PCT = 85.0
 
 
@@ -50,10 +51,6 @@ def _coerce_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _yes(value: Any) -> bool:
-    return value is True or str(value).lower() in {"true", "yes", "1", "on"}
 
 
 def _database(row: dict[str, Any]) -> str:
@@ -83,6 +80,9 @@ def _comparison_signature(row: dict[str, Any]) -> tuple[Any, ...]:
         _maxmemory_normalized(row.get("configured_maxmemory")),
         row.get("configured_eviction_policy"),
         row.get("database_mode"),
+        row.get("workload_key_count"),
+        row.get("workload_value_size"),
+        row.get("workload_pipeline"),
     )
 
 
@@ -208,125 +208,78 @@ def _limiting_resource(row: dict[str, Any]) -> tuple[str, str]:
     return "unknown", "no single limiting resource is identified by benchmark telemetry"
 
 
-def _is_pressure_row(row: dict[str, Any]) -> bool:
-    backend = row.get("backend")
-    pipeline = _coerce_int(row.get("workload_pipeline")) or 1
-    eviction = str(row.get("configured_eviction_policy") or "").lower()
-    series = str(row.get("series_label") or "").lower()
-    return (
-        backend == "memtier_benchmark"
-        or pipeline > 1
-        or _yes(row.get("configured_aof_enabled"))
-        or (eviction not in {"", "none", "noeviction"})
-        or any(token in series for token in ("ttl", "expire", "eviction", "aof", "watch", "exec"))
-    )
-
-
-def _latency_gate(row: dict[str, Any]) -> tuple[str, str, str]:
+def _latency_coverage(row: dict[str, Any]) -> tuple[str, str]:
     p99 = _coerce_float(row.get("p99_latency_ms"))
     p999 = _coerce_float(row.get("p99_9_latency_ms"))
-    pressure = _is_pressure_row(row)
-    scope = "alpha-pressure" if pressure else "core-sub-ms-p99.9"
-    p99_target = PRESSURE_P99_TARGET_MS if pressure else CORE_P99_TARGET_MS
-    p999_target = PRESSURE_P999_TARGET_MS if pressure else CORE_P999_TARGET_MS
-
     if p99 is None:
-        return "Unknown", scope, "missing p99 latency"
-    if p99 >= p99_target:
-        return "Rejected", scope, f"p99 {p99:.3f} ms >= target {p99_target:.3f} ms"
+        return "missing", "p99 latency is unavailable"
     if p999 is None:
-        return (
-            "Narrowed",
-            scope,
-            f"p99 {p99:.3f} ms passes but p99.9 is unavailable; no p99.9 claim is allowed",
-        )
-    if p999 >= p999_target:
-        return "Rejected", scope, f"p99.9 {p999:.3f} ms >= target {p999_target:.3f} ms"
-    return (
-        "Allowed",
-        scope,
-        f"p99 {p99:.3f} ms and p99.9 {p999:.3f} ms meet {scope} targets",
-    )
+        return "partial", "p99 is available but p99.9 is unavailable"
+    return "complete", "p99 and p99.9 latency are available"
 
 
-def _memory_gate(row: dict[str, Any]) -> tuple[str, str]:
-    if _database(row) != "vortex":
-        return "n/a", "Redis/baseline row is not a Vortex memory claim"
-
-    full_decision = row.get("full_server_rss_claim_decision")
-    full_reason = row.get("full_server_rss_claim_reason")
-    engine_decision = row.get("engine_memory_claim_decision")
-    engine_reason = row.get("engine_memory_claim_reason")
-
-    if full_decision in {"Allowed", "Narrowed"}:
-        return str(full_decision), str(full_reason or "full-server RSS claim classified")
-    if engine_decision in {"Allowed", "Narrowed"}:
-        return (
-            "Narrowed",
-            str(engine_reason or "engine memory passes, but full-server Redis RSS comparison is missing"),
-        )
-    if full_decision:
-        return str(full_decision), str(full_reason or "full-server memory claim rejected")
-    return "Unknown", "memory attribution is unavailable"
-
-
-def _redis_reference(rows: list[dict[str, Any]]) -> dict[tuple[Any, ...], dict[str, Any]]:
+def _comparison_references(rows: list[dict[str, Any]]) -> dict[tuple[Any, ...], dict[str, Any]]:
     references: dict[tuple[Any, ...], dict[str, Any]] = {}
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if _database(row) != "redis":
-            continue
-        key = _scenario_key(row)
-        current = references.get(key)
-        if current is None or (
-            (_coerce_float(row.get("throughput_ops_sec")) or 0.0)
-            > (_coerce_float(current.get("throughput_ops_sec")) or 0.0)
-        ):
-            references[key] = row
+        grouped[_scenario_key(row)].append(row)
+
+    for scenario, group in grouped.items():
+        for row in group:
+            row_database = _database(row)
+            peers = [
+                peer
+                for peer in group
+                if _database(peer) != row_database
+                and _comparison_signature(peer) == _comparison_signature(row)
+            ]
+            if not peers:
+                continue
+            references[(scenario, row_database)] = max(
+                peers,
+                key=lambda peer: _coerce_float(peer.get("throughput_ops_sec")) or 0.0,
+            )
     return references
 
 
-def _redis_comparison(
-    row: dict[str, Any], references: dict[tuple[Any, ...], dict[str, Any]]
-) -> tuple[str, Optional[float], str]:
-    if _database(row) != "vortex":
-        return "n/a", None, "Redis/baseline row is not a Vortex-vs-Redis claim"
+def _peer_comparison(
+    row: dict[str, Any],
+    references: dict[tuple[Any, ...], dict[str, Any]],
+) -> tuple[str, Optional[str], Optional[float], str]:
     if row.get("comparison_invalid") is True:
-        return "Exploratory", None, "runtime settings differ across compared rows"
+        return "invalid", None, None, "comparison inputs differ for this scenario"
 
-    reference = references.get(_scenario_key(row))
+    reference = references.get((_scenario_key(row), _database(row)))
     if reference is None:
-        return "Unknown", None, "no comparable Redis row is present"
+        return "missing-reference", None, None, "no peer row with matching workload signature is present"
 
-    vortex_ops = _coerce_float(row.get("throughput_ops_sec"))
-    redis_ops = _coerce_float(reference.get("throughput_ops_sec"))
-    ratio = vortex_ops / redis_ops if vortex_ops is not None and redis_ops else None
+    row_ops = _coerce_float(row.get("throughput_ops_sec"))
+    reference_ops = _coerce_float(reference.get("throughput_ops_sec"))
+    ratio = row_ops / reference_ops if row_ops is not None and reference_ops else None
     if ratio is None:
-        return "Unknown", None, "missing Vortex or Redis throughput"
+        return "missing-throughput", _database(reference), None, "missing row or reference throughput"
 
-    latency_checks = []
+    compared_latencies = []
     for key in ("p50_latency_ms", "p95_latency_ms", "p99_latency_ms", "p99_9_latency_ms"):
-        vortex_latency = _coerce_float(row.get(key))
-        redis_latency = _coerce_float(reference.get(key))
-        if vortex_latency is None or redis_latency is None:
+        row_latency = _coerce_float(row.get(key))
+        reference_latency = _coerce_float(reference.get(key))
+        if row_latency is None or reference_latency is None:
             continue
-        latency_checks.append(vortex_latency <= redis_latency)
-    latency_ok = bool(latency_checks) and all(latency_checks)
+        compared_latencies.append(row_latency <= reference_latency)
 
-    if ratio >= REDIS_THROUGHPUT_ALLOWED_RATIO and latency_ok:
-        return (
-            "Allowed",
-            ratio,
-            f"throughput is {ratio:.2f}x Redis and compared latency percentiles are lower/equal",
+    latency_text = "latency percentiles were unavailable for peer comparison"
+    if compared_latencies:
+        latency_text = (
+            "all comparable latency percentiles are lower/equal"
+            if all(compared_latencies)
+            else "one or more comparable latency percentiles are higher"
         )
-    if ratio >= REDIS_THROUGHPUT_NARROWED_RATIO and latency_ok:
-        return (
-            "Narrowed",
-            ratio,
-            f"Vortex beats Redis latency but throughput is {ratio:.2f}x, below 1.5x target",
-        )
-    if not latency_ok:
-        return "Rejected", ratio, "Vortex did not beat Redis on compared latency percentiles"
-    return "Rejected", ratio, f"throughput is {ratio:.2f}x Redis, below parity"
+    return (
+        "comparable",
+        _database(reference),
+        ratio,
+        f"throughput ratio {ratio:.2f}x vs {_database(reference)}; {latency_text}",
+    )
 
 
 def _workload_contract(row: dict[str, Any], validity: dict[str, Any], host: dict[str, Any]) -> dict[str, Any]:
@@ -366,7 +319,7 @@ def _workload_contract(row: dict[str, Any], validity: dict[str, Any], host: dict
     }
 
 
-def _evidence_tier(row: dict[str, Any], validity: dict[str, Any], host: dict[str, Any]) -> tuple[str, str]:
+def _measurement_tier(row: dict[str, Any], validity: dict[str, Any], host: dict[str, Any]) -> tuple[str, str]:
     reasons: list[str] = []
     repeat_count = _coerce_int(row.get("replicate_count") or validity.get("requested_repeat_count"))
     host_os = str(row.get("host_os") or host.get("os") or "")
@@ -376,9 +329,6 @@ def _evidence_tier(row: dict[str, Any], validity: dict[str, Any], host: dict[str
         reasons.append("single replicate or fewer than 3 repeats")
     if host_os.lower() not in {"linux"}:
         reasons.append("not a Linux run")
-    io_effective = row.get("runtime_backend_effective_after") or row.get("io_backend_effective")
-    if _database(row) == "vortex" and str(io_effective or "").lower() in {"", "unknown"}:
-        reasons.append("missing Vortex backend effective mode")
     if _rss_bytes(row) is None:
         reasons.append("missing RSS attribution")
     if row.get("benchmark_client_saturation_verdict") == "saturated":
@@ -387,16 +337,16 @@ def _evidence_tier(row: dict[str, Any], validity: dict[str, Any], host: dict[str
         reasons.append("invalid cross-database comparison")
 
     if reasons:
-        return "Exploratory", "; ".join(reasons)
+        return "exploratory", "; ".join(reasons)
 
     if (
         repeat_count >= 3
         and str(host_validity.get("effective_cpu_power_mode") or "").lower() == "performance"
         and host_validity.get("thermal_degraded") is False
     ):
-        return "Citation-grade candidate", "Linux repeat run with clean host validity checks"
+        return "publication-candidate", "Linux repeat run with clean host validity checks"
 
-    return "Engineering", "usable for engineering triage, not a release claim"
+    return "engineering", "usable for engineering triage"
 
 
 def annotate_interpretation_rows(
@@ -416,7 +366,6 @@ def annotate_interpretation_rows(
         )
         for entry in (comparison_validity or [])
     }
-    references = _redis_reference(rows)
 
     for row in rows:
         if _scenario_key(row) in invalid_keys:
@@ -434,23 +383,21 @@ def annotate_interpretation_rows(
         row["limiting_resource_hypothesis"] = limiting
         row["limiting_resource_reason"] = limiting_reason
 
-        latency_decision, latency_scope, latency_reason = _latency_gate(row)
-        row["alpha_latency_gate_decision"] = latency_decision
-        row["alpha_latency_claim_scope"] = latency_scope
-        row["alpha_latency_gate_reason"] = latency_reason
+        latency_status, latency_reason = _latency_coverage(row)
+        row["latency_coverage_status"] = latency_status
+        row["latency_coverage_reason"] = latency_reason
 
-        memory_decision, memory_reason = _memory_gate(row)
-        row["alpha_memory_gate_decision"] = memory_decision
-        row["alpha_memory_gate_reason"] = memory_reason
+    references = _comparison_references(rows)
+    for row in rows:
+        status, reference_database, ratio, reason = _peer_comparison(row, references)
+        row["peer_comparison_status"] = status
+        row["peer_comparison_reference_database"] = reference_database
+        row["throughput_vs_reference_ratio"] = ratio
+        row["peer_comparison_reason"] = reason
 
-        redis_decision, redis_ratio, redis_reason = _redis_comparison(row, references)
-        row["alpha_redis_comparison_decision"] = redis_decision
-        row["alpha_throughput_vs_redis_ratio"] = redis_ratio
-        row["alpha_redis_comparison_reason"] = redis_reason
-
-        tier, tier_reason = _evidence_tier(row, validity, host_metadata)
-        row["evidence_tier_row"] = tier
-        row["evidence_tier_reason"] = tier_reason
+        tier, tier_reason = _measurement_tier(row, validity, host_metadata)
+        row["measurement_tier_row"] = tier
+        row["measurement_tier_reason"] = tier_reason
 
 
 def build_interpretation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -461,15 +408,16 @@ def build_interpretation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
             "series_label": row.get("series_label"),
             "thread_count": row.get("thread_count"),
             "service_threads": row.get("configured_service_threads"),
-            "evidence_tier": row.get("evidence_tier_row"),
+            "measurement_tier": row.get("measurement_tier_row"),
             "client_saturation": row.get("benchmark_client_saturation_verdict"),
             "limiting_resource_hypothesis": row.get("limiting_resource_hypothesis"),
-            "alpha_latency_gate": row.get("alpha_latency_gate_decision"),
-            "alpha_memory_gate": row.get("alpha_memory_gate_decision"),
-            "redis_comparison_gate": row.get("alpha_redis_comparison_decision"),
-            "throughput_vs_redis_ratio": row.get("alpha_throughput_vs_redis_ratio"),
-            "reason": row.get("evidence_tier_reason")
-            or row.get("alpha_latency_gate_reason")
+            "latency_coverage": row.get("latency_coverage_status"),
+            "peer_comparison": row.get("peer_comparison_status"),
+            "reference_database": row.get("peer_comparison_reference_database"),
+            "throughput_vs_reference_ratio": row.get("throughput_vs_reference_ratio"),
+            "reason": row.get("measurement_tier_reason")
+            or row.get("peer_comparison_reason")
+            or row.get("latency_coverage_reason")
             or row.get("limiting_resource_reason"),
         }
         for row in rows
@@ -506,26 +454,30 @@ def build_workload_contract_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
     ]
 
 
-def _decision_counts(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
-    counts = Counter(str(row.get(key) or "Unknown") for row in rows)
+def _counts(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts = Counter(str(row.get(key) or "unknown") for row in rows)
     return dict(sorted(counts.items()))
 
 
-def _gate_from_counts(counts: dict[str, int]) -> str:
+def _status_from_counts(
+    counts: dict[str, int],
+    *,
+    fail_values: set[str],
+    warn_values: set[str],
+    pass_values: set[str],
+) -> str:
     if not counts:
-        return "Unknown"
-    if counts.get("Rejected", 0) > 0:
-        return "Rejected"
-    if counts.get("Exploratory", 0) > 0:
-        return "Narrowed"
-    if counts.get("Unknown", 0) > 0 or counts.get("Narrowed", 0) > 0:
-        return "Narrowed"
-    if counts.get("Allowed", 0) > 0:
-        return "Allowed"
-    return "Unknown"
+        return "unknown"
+    if any(counts.get(value, 0) > 0 for value in fail_values):
+        return "fail"
+    if any(counts.get(value, 0) > 0 for value in warn_values):
+        return "warn"
+    if sum(counts.get(value, 0) for value in pass_values) == sum(counts.values()):
+        return "pass"
+    return "unknown"
 
 
-def _scalability_gate(rows: list[dict[str, Any]]) -> tuple[str, str]:
+def _scalability_status(rows: list[dict[str, Any]]) -> tuple[str, str]:
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         service_threads = _coerce_int(row.get("configured_service_threads"))
@@ -553,112 +505,93 @@ def _scalability_gate(rows: list[dict[str, Any]]) -> tuple[str, str]:
             service_sweeps.append(group)
 
     if not service_sweeps:
-        return "Unknown", "no service-thread sweep is present in this report"
+        return "unknown", "no service-thread sweep is present in this report"
 
-    failures = 0
+    regressions = 0
     for group in service_sweeps:
         ordered = sorted(group, key=lambda row: _coerce_int(row.get("configured_service_threads")) or 0)
         first, last = ordered[0], ordered[-1]
-        first_threads = _coerce_float(first.get("configured_service_threads"))
-        last_threads = _coerce_float(last.get("configured_service_threads"))
         first_ops = _coerce_float(first.get("throughput_ops_sec"))
         last_ops = _coerce_float(last.get("throughput_ops_sec"))
-        if not first_threads or not last_threads or not first_ops or last_ops is None:
-            failures += 1
+        if not first_ops or last_ops is None:
             continue
-        ideal = last_threads / first_threads
-        observed = last_ops / first_ops
-        efficiency = observed / ideal if ideal > 0 else 0.0
-        if efficiency < 0.70:
-            failures += 1
-    if failures:
-        return "Rejected", f"{failures} service-thread sweep(s) missed 70% scaling efficiency"
-    return "Allowed", "service-thread sweeps meet the alpha efficiency floor"
+        if last_ops < first_ops:
+            regressions += 1
+    if regressions:
+        return "warn", f"{regressions} service-thread sweep(s) regressed at the high-thread endpoint"
+    return "pass", "service-thread sweeps did not regress at the high-thread endpoint"
 
 
-def build_alpha_gate_summary(
+def build_measurement_summary(
     rows: list[dict[str, Any]],
     validity: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     validity = validity or {}
-    vortex_rows = [row for row in rows if _database(row) == "vortex"]
-    latency_scope_rows = vortex_rows or rows
-    latency_counts = _decision_counts(latency_scope_rows, "alpha_latency_gate_decision")
-    memory_counts = _decision_counts(vortex_rows, "alpha_memory_gate_decision")
-    redis_counts = _decision_counts(vortex_rows, "alpha_redis_comparison_decision")
-    evidence_counts = _decision_counts(rows, "evidence_tier_row")
-    client_counts = _decision_counts(rows, "benchmark_client_saturation_verdict")
-    scalability_decision, scalability_reason = _scalability_gate(rows)
-    evidence_decision = "Unknown"
-    if rows:
-        evidence_decision = (
-            "Allowed"
-            if evidence_counts.get("Citation-grade candidate") == len(rows)
-            else "Narrowed"
-        )
-    client_decision = "Unknown"
-    if rows:
-        if client_counts.get("saturated", 0):
-            client_decision = "Rejected"
-        elif client_counts.get("clear", 0) == len(rows):
-            client_decision = "Allowed"
-        else:
-            client_decision = "Narrowed"
+    latency_counts = _counts(rows, "latency_coverage_status")
+    evidence_counts = _counts(rows, "measurement_tier_row")
+    client_counts = _counts(rows, "benchmark_client_saturation_verdict")
+    comparison_counts = _counts(rows, "peer_comparison_status")
+    limiting_counts = _counts(rows, "limiting_resource_hypothesis")
+    scalability_status, scalability_reason = _scalability_status(rows)
 
-    gates = [
+    checks = [
         {
-            "gate": "correctness",
-            "decision": "Unknown",
-            "target": "required correctness matrix green",
-            "reason": "benchmark report has no correctness-matrix artifact attached",
+            "check": "latency_coverage",
+            "status": _status_from_counts(
+                latency_counts,
+                fail_values={"missing"},
+                warn_values={"partial"},
+                pass_values={"complete"},
+            ),
+            "requirement": "p99 and p99.9 should be present when the backend can report them",
+            "reason": f"row coverage: {latency_counts or {'unknown': 0}}",
         },
         {
-            "gate": "latency",
-            "decision": _gate_from_counts(latency_counts),
-            "target": "p99 < 1 ms and p99.9 < 5 ms for accepted Linux alpha workloads; core no-pressure rows target p99.9 < 1 ms",
-            "reason": f"row decisions: {latency_counts or {'Unknown': 0}}",
+            "check": "comparison_compatibility",
+            "status": _status_from_counts(
+                comparison_counts,
+                fail_values={"invalid"},
+                warn_values={"missing-reference", "missing-throughput"},
+                pass_values={"comparable"},
+            ),
+            "requirement": "winner or ratio tables require matched workload signatures",
+            "reason": f"peer comparison rows: {comparison_counts or {'unknown': 0}}",
         },
         {
-            "gate": "memory",
-            "decision": _gate_from_counts(memory_counts),
-            "target": "scoped tiny/mixed KV moves toward <= 1.5x Redis full-server RSS",
-            "reason": f"Vortex row decisions: {memory_counts or {'Unknown': 0}}",
+            "check": "benchmark_client",
+            "status": _status_from_counts(
+                client_counts,
+                fail_values={"saturated"},
+                warn_values={"unknown"},
+                pass_values={"clear"},
+            ),
+            "requirement": "load-generator CPU and socket telemetry should not be the bottleneck",
+            "reason": f"client saturation verdicts: {client_counts or {'unknown': 0}}",
         },
         {
-            "gate": "redis_comparison",
-            "decision": _gate_from_counts(redis_counts),
-            "target": "Vortex lower latency than Redis and 1.5x-2x Redis throughput on comparable accepted rows",
-            "reason": f"Vortex-vs-Redis row decisions: {redis_counts or {'Unknown': 0}}",
+            "check": "repeatability",
+            "status": "pass"
+            if (validity.get("requested_repeat_count") or 0) >= 3
+            else "warn",
+            "requirement": "engineering and publication workflows should use repeated runs",
+            "reason": f"requested repeat count: {validity.get('requested_repeat_count') or 'n/a'}",
         },
         {
-            "gate": "scalability",
-            "decision": scalability_decision,
-            "target": "service-thread scaling improves without p99.9 cliffs through planned thread counts",
+            "check": "scalability_shape",
+            "status": scalability_status,
+            "requirement": "thread sweeps should be reviewed for high-thread regressions",
             "reason": scalability_reason,
-        },
-        {
-            "gate": "evidence",
-            "decision": evidence_decision,
-            "target": "3-5 clean Linux repeats, comparable settings, artifacts attached before release claims",
-            "reason": f"row evidence tiers: {evidence_counts or {'Unknown': 0}}",
-        },
-        {
-            "gate": "benchmark_client",
-            "decision": client_decision,
-            "target": "load-generator CPU, socket queue/retransmit telemetry, and affinity disclosure rule out client limits",
-            "reason": f"client saturation verdicts: {client_counts or {'Unknown': 0}}",
         },
     ]
     return {
-        "target_summary": "Alpha optimization targets lower latency than Redis on accepted rows, 1.5x-2x Redis throughput where comparable, p99 < 1 ms, p99.9 < 5 ms for pressure rows, and <= 1.5x Redis full-server RSS for scoped tiny/mixed KV.",
         "requested_repeat_count": validity.get("requested_repeat_count"),
-        "gates": gates,
+        "checks": checks,
         "limiting_resource_choices": list(LIMITING_RESOURCE_CHOICES),
-        "decision_counts": {
-            "latency": latency_counts,
-            "memory": memory_counts,
-            "redis_comparison": redis_counts,
-            "evidence": evidence_counts,
+        "counts": {
+            "latency_coverage": latency_counts,
+            "measurement_tier": evidence_counts,
             "benchmark_client": client_counts,
+            "peer_comparison": comparison_counts,
+            "limiting_resource": limiting_counts,
         },
     }

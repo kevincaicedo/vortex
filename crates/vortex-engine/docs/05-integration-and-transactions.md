@@ -56,9 +56,10 @@ The reactor decides which transaction gate scope a command needs:
 | --- | --- |
 | `None` | No gate. |
 | `Keys(&[&[u8]])` | Gate the shards touched by these keys. |
-| `Full` | Gate all shards. Used for whole-keyspace commands. |
+| `Full` | Enter all shard command gates as readers. Used for whole-keyspace reads. |
+| `FullExclusive` | Enter all shard transaction gates as writers. Used for whole-keyspace writes such as `FLUSHDB` and `FLUSHALL`. |
 
-For `Keys`, the executor asks the keyspace to enter per-shard command gates as readers. For `Full`, it enters all shard gates.
+For `Keys`, the executor asks the keyspace to enter per-shard command gates as readers. `Full` uses all shard command gates as readers. `FullExclusive` excludes normal command readers before executing the command, which lets command-scoped full-keyspace mutations avoid retaining every shard write lock at once.
 
 ## Transaction Ownership
 
@@ -240,11 +241,11 @@ Admission-time eviction and maintenance-time eviction use the same sweep mechani
 Reactors publish local counters through methods such as:
 
 - `flush_reactor_local_metrics`
-- `record_reactor_completion_batch`
-- `record_reactor_command_budget_exhaustion`
 - `publish_reactor_aof_telemetry`
 - `publish_reactor_overload_telemetry`
 
+Hot loop, batch, and budget-exhaustion diagnostics are carried inside
+`RuntimeLocalFlushMetrics` and published on the cold metrics-maintenance path.
 The keyspace aggregates these into `RuntimeMetricsSnapshot`.
 
 ## Memory Attribution Integration

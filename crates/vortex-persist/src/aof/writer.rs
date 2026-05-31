@@ -203,6 +203,21 @@ struct AsyncFsyncRequest {
     measure_latency: bool,
 }
 
+impl AsyncFsyncRequest {
+    #[inline]
+    fn latency_measurement_start(self) -> Option<Instant> {
+        #[cfg(feature = "profile-telemetry")]
+        {
+            return self.measure_latency.then(Instant::now);
+        }
+        #[cfg(not(feature = "profile-telemetry"))]
+        {
+            let _ = self;
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AsyncFsyncCompletion {
     request: AsyncFsyncRequest,
@@ -229,10 +244,7 @@ impl AsyncFsyncWorker {
         let (done_tx, done_rx) = sync_channel::<io::Result<AsyncFsyncCompletion>>(1);
         let handle = thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
-                #[cfg(feature = "profile-telemetry")]
-                let started = request.measure_latency.then(Instant::now);
-                #[cfg(not(feature = "profile-telemetry"))]
-                let started: Option<Instant> = None;
+                let started = request.latency_measurement_start();
                 let result = sync_file
                     .sync_data()
                     .map(|()| AsyncFsyncCompletion {
@@ -969,6 +981,35 @@ mod tests {
     use std::io::Read;
     use vortex_engine::keyspace::{AofLsn, ConcurrentKeyspace};
 
+    fn production_region(source: &str) -> &str {
+        source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    }
+
+    fn production_function_body<'a>(source_name: &str, source: &'a str, function: &str) -> &'a str {
+        let source = production_region(source);
+        let start = source
+            .find(&format!("fn {function}"))
+            .unwrap_or_else(|| panic!("{source_name} must define `{function}`"));
+        let body = &source[start..];
+        let mut end = body.len();
+        for delimiter in ["\n    fn ", "\n    pub ", "\n}\n\n"] {
+            if let Some(relative_end) = body[1..].find(delimiter) {
+                end = end.min(1 + relative_end);
+            }
+        }
+        &body[..end]
+    }
+
+    fn assert_ordered_tokens(source: &str, context: &str, tokens: &[&str]) {
+        let mut offset = 0usize;
+        for token in tokens {
+            let Some(relative_start) = source[offset..].find(token) else {
+                panic!("{context} must contain `{token}` after byte offset {offset}");
+            };
+            offset += relative_start + token.len();
+        }
+    }
+
     fn temp_aof_path() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -991,6 +1032,95 @@ mod tests {
 
     fn record(bytes: &[u8]) -> AofRecordBytes<'_> {
         AofRecordBytes::from_resp(bytes)
+    }
+
+    #[test]
+    fn aof_latency_timers_stay_profile_gated() {
+        let source = production_region(include_str!("writer.rs"));
+        assert!(
+            source.contains("let started = request.latency_measurement_start();"),
+            "async fsync worker must use the typed latency helper"
+        );
+
+        let request_start = production_function_body(
+            "aof/writer.rs",
+            include_str!("writer.rs"),
+            "latency_measurement_start",
+        );
+        assert_ordered_tokens(
+            request_start,
+            "async fsync latency helper",
+            &[
+                "#[cfg(feature = \"profile-telemetry\")]",
+                "self.measure_latency.then(Instant::now)",
+                "#[cfg(not(feature = \"profile-telemetry\"))]",
+                "None",
+            ],
+        );
+
+        let profile_start =
+            production_function_body("aof/writer.rs", include_str!("writer.rs"), "profile_start");
+        assert_ordered_tokens(
+            profile_start,
+            "foreground AOF latency helper",
+            &[
+                "#[cfg(feature = \"profile-telemetry\")]",
+                "self.profile_telemetry.then(Instant::now)",
+                "#[cfg(not(feature = \"profile-telemetry\"))]",
+                "None",
+            ],
+        );
+
+        let append = production_function_body(
+            "aof/writer.rs",
+            include_str!("writer.rs"),
+            "append_with_lsn",
+        );
+        assert!(
+            !append.contains("Instant::now"),
+            "AOF append hot path must not read the clock directly"
+        );
+        assert!(
+            !append.contains("telemetry()"),
+            "AOF append hot path must not publish full telemetry snapshots"
+        );
+
+        let backpressure = production_function_body(
+            "aof/writer.rs",
+            include_str!("writer.rs"),
+            "enforce_everysec_backpressure",
+        );
+        assert_ordered_tokens(
+            backpressure,
+            "everysec backpressure latency metric",
+            &[
+                "let started = self.profile_start();",
+                "self.record_backpressure_wait(started);",
+            ],
+        );
+        assert!(
+            !backpressure.contains("Instant::now"),
+            "backpressure timing must use the foreground profile helper"
+        );
+
+        let flush =
+            production_function_body("aof/writer.rs", include_str!("writer.rs"), "flush_and_sync");
+        assert_ordered_tokens(
+            flush,
+            "foreground fsync latency metric",
+            &[
+                "let started = self.profile_start();",
+                "self.record_fsync_success(started.map(|start| start.elapsed()));",
+            ],
+        );
+        assert!(
+            !flush.contains("let started = Instant::now"),
+            "foreground fsync latency timing must use the foreground profile helper"
+        );
+        assert!(
+            flush.contains("self.last_fsync = Instant::now();"),
+            "foreground fsync still updates release-required scheduling state"
+        );
     }
 
     #[test]

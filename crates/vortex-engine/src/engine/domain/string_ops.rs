@@ -188,7 +188,7 @@ impl ConcurrentKeyspace {
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features)?;
-        let previous = guard.insert_with(key, value, ttl_deadline_nanos, entry_lsn);
+        let previous = guard.insert_with_ttl_entry_lsn(key, value, ttl_deadline_nanos, entry_lsn);
         let effects = MutationEffects::none()
             .with_ttl(shard_index, ExpiryTransition::new(had_ttl, true))
             .with_frequency(table_hash)
@@ -423,6 +423,8 @@ impl ConcurrentKeyspace {
         }
         lookups.sort_unstable_by_key(|lookup| lookup.shard_idx);
 
+        let access_config = self.eviction_config();
+        let record_access = access_config.records_read_access();
         let mut values = Vec::with_capacity(keys.len());
         values.resize_with(keys.len(), || None);
         let mut expired: SmallVec<[KeyLookup; 8]> = SmallVec::new();
@@ -446,7 +448,14 @@ impl ConcurrentKeyspace {
                 let key_bytes = keys[lookup.output_idx];
                 match guard.get_with_ttl_prehashed(key_bytes, lookup.hash) {
                     Some((value, ttl)) if ttl == 0 || ttl > now_nanos => {
-                        self.record_access_prehashed(&guard, key_bytes, lookup.hash);
+                        if record_access {
+                            self.record_access_prehashed_snapshot(
+                                &guard,
+                                key_bytes,
+                                lookup.hash,
+                                access_config,
+                            );
+                        }
                         values[lookup.output_idx] = Some(encode(value));
                     }
                     Some(_) => {
@@ -559,7 +568,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features)?;
-        let record_frequency = publish_features.maxmemory();
+        let record_frequency = eviction.max_memory != 0 && eviction.policy.is_lfu();
         let mut effects: SmallVec<[DeferredEffects<'static>; 16]> =
             SmallVec::with_capacity(lookup_count);
         let mut owned_watch_effects: SmallVec<[OwnedDeferredEffects; 16]> = SmallVec::new();
@@ -602,6 +611,80 @@ impl ConcurrentKeyspace {
         }
         reservation.settle();
         Ok(mutation_outcome_with_evictions((), aof_lsn, evicted))
+    }
+
+    #[inline]
+    pub(crate) fn try_mset_values_bytes_fast_path<'a>(
+        &self,
+        pairs: &[(&'a [u8], &'a [u8])],
+    ) -> Option<MutationResult<()>> {
+        if pairs.is_empty() {
+            return Some(Ok(MutationOutcome::new((), None)));
+        }
+
+        let features = self.mutation_features();
+        let eviction = self.eviction_config();
+        if features.watch()
+            || features.aof()
+            || self.replay_mode_active()
+            || (eviction.max_memory != 0 && !eviction.policy.is_noeviction())
+        {
+            return None;
+        }
+        let reservation = if eviction.max_memory == 0 {
+            MemoryReservation::new(self, 0)
+        } else {
+            let reserve_bytes = pairs.iter().try_fold(0usize, |acc, (key, value)| {
+                acc.checked_add(raw_string_entry_memory_usage(key, value.len()))
+            })?;
+            self.try_reserve_memory_headroom(reserve_bytes, eviction)?
+        };
+
+        let plan = self.prehashed_plan(
+            pairs
+                .iter()
+                .enumerate()
+                .map(|(pair_index, (key, _))| (pair_index, *key)),
+        );
+        let mut guards = self.multi_write_prehashed(&plan);
+        let features = self.mutation_features();
+        let eviction_after_lock = self.eviction_config();
+        if features.watch()
+            || features.aof()
+            || self.replay_mode_active()
+            || eviction_after_lock != eviction
+        {
+            drop(guards);
+            return None;
+        }
+
+        let mut ttl_effects: SmallVec<[DeferredEffects<'static>; 16]> = SmallVec::new();
+        for lookup in plan.entries() {
+            let table = &mut *guards[lookup.guard_index().get()].1;
+            let (_, value_bytes) = pairs[lookup.key_index()];
+            let old_had_ttl = table
+                .mutate_prehashed(
+                    BorrowedKey(lookup.key_bytes()),
+                    RawValueBytes(value_bytes),
+                    lookup.table_hash(),
+                    MutationPolicy::clear(None),
+                )
+                .had_ttl();
+            let transition = ExpiryTransition::remove(old_had_ttl);
+            if !transition.is_noop() {
+                ttl_effects.push(
+                    MutationEffects::none()
+                        .with_ttl(lookup.shard_index(), transition)
+                        .defer(),
+                );
+            }
+        }
+        drop(guards);
+        for effect in ttl_effects {
+            self.publish_deferred_effects(effect);
+        }
+        reservation.settle();
+        Some(Ok(MutationOutcome::new((), None)))
     }
 
     pub(crate) fn msetnx_values<I>(&self, pairs: I, now_nanos: u64) -> MutationResult<bool>
@@ -691,7 +774,7 @@ impl ConcurrentKeyspace {
         let publish_features = self.mutation_features();
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features)?;
-        let record_frequency = publish_features.maxmemory();
+        let record_frequency = eviction.max_memory != 0 && eviction.policy.is_lfu();
         let mut effects: SmallVec<[DeferredEffects<'static>; 16]> =
             SmallVec::with_capacity(lookup_count);
         let mut owned_watch_effects: SmallVec<[OwnedDeferredEffects; 16]> = SmallVec::new();
@@ -861,38 +944,28 @@ impl ConcurrentKeyspace {
             return Ok(None);
         }
 
-        if !prepared
+        let Some(slot) = prepared
             .snapshot()
-            .revalidates(&guard, key_bytes, table_hash, now_nanos)
-        {
+            .revalidated_slot(&mut guard, key_bytes, table_hash, now_nanos)
+        else {
             self.record_optimistic_value_mutation_retry();
             return Ok(None);
-        }
+        };
 
-        let had_ttl = prepared.snapshot().had_live_ttl();
-        let was_missing = prepared.snapshot().is_missing();
+        let had_ttl = slot.had_live_ttl();
         let _projected_delta = prepared.projected_delta();
         let watched_key = publish_features.watch().then(|| key.clone());
         let (entry_lsn, aof_lsn) =
             self.allocate_observed_mutation_lsn_with_features(publish_features)?;
         let value = prepared.into_value();
 
-        if was_missing {
-            let _ = guard.mutate_prehashed(
-                BorrowedKey(key_bytes),
-                value,
-                table_hash,
-                MutationPolicy::clear(entry_lsn),
-            );
-        } else {
-            guard
-                .replace_prehashed(
-                    key_bytes,
-                    value,
-                    table_hash,
-                    MutationPolicy::preserve_ttl(entry_lsn),
-                )
-                .expect("revalidated live key must exist while swapping prepared value");
+        match slot {
+            RevalidatedValueSlot::Missing(vacant) => {
+                let _report = vacant.insert(key.clone(), value, MutationPolicy::clear(entry_lsn));
+            }
+            RevalidatedValueSlot::Live(live) => {
+                let _report = live.replace_value(value, MutationPolicy::preserve_ttl(entry_lsn));
+            }
         }
 
         let effects = MutationEffects::none()

@@ -2,6 +2,8 @@
 
 > Status: P1.10.1 through P1.10.4 are live. `just profiler` is a **profiling tool manager** for vortex-server — it detects the OS, checks available tools, builds the binary, starts the server, runs the selected profiler, and collects artifacts. It is **not** a benchmark wrapper. `vortex_bench` is the separate benchmark tool for any Redis-compatible server.
 
+Current UX conventions match `vortex_bench`: use `--artifact-root` for session placement, `--target-mode local|host-port|ssh-managed|ssh-attach` for target ownership, `--dry-run` for preflight-only checks, `--json` for stable progress output, and `--no-color` for CI logs. Profiler summaries describe observed bottlenecks and tool availability without embedding product policy.
+
 ## Goal
 
 Profiling in Vortex should be a repeatable engineering loop, not an ad hoc debugging trick.

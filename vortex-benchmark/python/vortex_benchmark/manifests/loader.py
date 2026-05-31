@@ -41,6 +41,8 @@ RUNTIME_CONFIG_KEYS = {
     "eviction_policy",
     "io_backend",
     "telemetry_mode",
+    "telemetry_local_sample_rate",
+    "telemetry_flush_interval_ms",
     "ring_size",
     "fixed_buffers",
     "fixed_buffer_registration",
@@ -56,7 +58,7 @@ RUNTIME_CONFIG_KEYS = {
 SIZE_LITERAL_RE = re.compile(r"^\d+(?:[kmgt]i?b?|[kmgt]b?)?$", re.IGNORECASE)
 SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
 SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION = ("auto", "on", "off")
-SUPPORTED_VORTEX_TELEMETRY_MODES = ("minimal", "profile")
+SUPPORTED_VORTEX_TELEMETRY_MODES = ("minimal", "standard", "profile")
 
 
 @dataclass
@@ -242,6 +244,14 @@ def _validate_runtime_config(payload: dict[str, Any]) -> dict[str, Any]:
     ):
         supported = ", ".join(SUPPORTED_VORTEX_TELEMETRY_MODES)
         raise ValueError(f"runtime_config.telemetry_mode must be one of: {supported}")
+    telemetry_local_sample_rate = _optional_positive_int(
+        payload.get("telemetry_local_sample_rate"),
+        "runtime_config.telemetry_local_sample_rate",
+    )
+    telemetry_flush_interval_ms = _optional_positive_int(
+        payload.get("telemetry_flush_interval_ms"),
+        "runtime_config.telemetry_flush_interval_ms",
+    )
 
     ring_size = _optional_positive_int(payload.get("ring_size"), "runtime_config.ring_size")
     if ring_size is not None and ring_size & (ring_size - 1) != 0:
@@ -304,6 +314,10 @@ def _validate_runtime_config(payload: dict[str, Any]) -> dict[str, Any]:
         normalized["io_backend"] = io_backend
     if telemetry_mode is not None:
         normalized["telemetry_mode"] = telemetry_mode
+    if telemetry_local_sample_rate is not None:
+        normalized["telemetry_local_sample_rate"] = telemetry_local_sample_rate
+    if telemetry_flush_interval_ms is not None:
+        normalized["telemetry_flush_interval_ms"] = telemetry_flush_interval_ms
     if ring_size is not None:
         normalized["ring_size"] = ring_size
     if fixed_buffers is not None:

@@ -6,7 +6,7 @@ impl Reactor {
             let errno = -cqe.result;
             // EAGAIN/EWOULDBLOCK is normal for non-blocking accept — retry.
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                self.keyspace.record_reactor_accept_eagain_rearm(self.id);
+                self.local_metrics.record_accept_eagain_rearm();
                 if !self.draining && !self.accept_backpressure_active() {
                     let _ = self.submit_accept_rearm();
                 } else if !self.draining {
@@ -54,8 +54,7 @@ impl Reactor {
         let (drained, accept_budget_exhausted) = self.drain_ready_accepts();
         self.local_metrics.record_accept_drain(drained);
         if accept_budget_exhausted {
-            self.keyspace
-                .record_reactor_accept_budget_exhaustion(self.id);
+            self.local_metrics.record_accept_budget_exhaustion();
         }
 
         // Re-arm accept (unless draining).

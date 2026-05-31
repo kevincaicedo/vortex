@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use vortex_common::{Timestamp, VortexKey, VortexValue};
+use vortex_common::{VortexKey, VortexValue};
 
 use crate::effects::MutationErrorKind;
 use crate::eviction::{
@@ -55,6 +55,7 @@ mod persistence;
 mod shards;
 mod watch;
 
+pub use crate::entry::EntryLsn;
 pub use eviction_sweep::EvictionMaintenanceSlice;
 pub(super) use eviction_sweep::EvictionScanReport;
 pub(crate) use eviction_sweep::{EvictedKey, EvictedKeys};
@@ -78,7 +79,7 @@ pub use metrics::{
     RuntimeLocalFlushMetrics, RuntimeMetricsSnapshot, RuntimeOverloadTelemetry,
     RuntimeTelemetryMode,
 };
-pub use persistence::{AofLsn, EntryLsn, Lsn, LsnOverflow, LsnRestoreError, ReplayModeGuard};
+pub use persistence::{AofLsn, Lsn, LsnOverflow, LsnRestoreError, ReplayModeGuard};
 use shards::{MultiReadGuards, MultiWriteGuards, Shard, ShardId, ShardReadGuards};
 pub(crate) use shards::{PrehashedKeyPlan, PrehashedShardPlan, ShardPlan, ShardWriteGuards};
 pub use shards::{ShardCount, ShardCountError};
@@ -276,7 +277,7 @@ pub struct ConcurrentKeyspace {
     /// the same key, then LSN₁ < LSN₂. Used for:
     /// - AOF per-reactor file ordering (K-Way merge recovery)
     /// - Phase 5 shadow-page epoch tracking
-    /// - P2.4 hot-key cache version stamps
+    /// - future version-stamp research, if a measured hot-key cache earns it
     global_lsn: AtomicU64,
     /// Number of active AOF writers using this keyspace. When zero, mutating
     /// commands skip LSN allocation and synthetic eviction record capture.
@@ -566,6 +567,17 @@ impl ConcurrentKeyspace {
         hash: TableHash,
     ) {
         let snapshot = self.eviction_config();
+        self.record_access_prehashed_snapshot(table, key_bytes, hash, snapshot);
+    }
+
+    #[inline]
+    pub(crate) fn record_access_prehashed_snapshot(
+        &self,
+        table: &SwissTable,
+        key_bytes: &[u8],
+        hash: TableHash,
+        snapshot: EvictionConfig,
+    ) {
         if snapshot.max_memory == 0 {
             return;
         }
@@ -670,11 +682,7 @@ impl ConcurrentKeyspace {
         let target_used = snapshot
             .max_memory
             .saturating_sub(self.memory_reserved.load(Ordering::Acquire));
-        let eviction_scan_start = if self.runtime_profile_timers_enabled() {
-            Some(Timestamp::now().as_nanos())
-        } else {
-            None
-        };
+        let eviction_scan_start = self.runtime_profile_metric_start();
         report.bytes_freed = self.evict_until_target(
             preferred_shard,
             target_used,
@@ -683,9 +691,7 @@ impl ConcurrentKeyspace {
             &mut report,
             &mut evicted,
         );
-        let eviction_scan_nanos = eviction_scan_start
-            .map(|start| Timestamp::now().as_nanos().saturating_sub(start).max(1))
-            .unwrap_or(0);
+        let eviction_scan_nanos = self.runtime_profile_metric_elapsed_nanos(eviction_scan_start);
 
         // Step 4: Re-check after eviction.
         report.oom_after_scan = self.committed_memory_pressure() > snapshot.max_memory;
@@ -736,6 +742,26 @@ impl ConcurrentKeyspace {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn try_reserve_memory_headroom(
+        &self,
+        additional_bytes: usize,
+        snapshot: EvictionConfig,
+    ) -> Option<MemoryReservation<'_>> {
+        if additional_bytes == 0 || snapshot.max_memory == 0 {
+            return Some(MemoryReservation::new(self, 0));
+        }
+
+        self.try_reserve_memory(additional_bytes).ok()?;
+        if self.committed_memory_pressure() <= snapshot.max_memory {
+            return Some(MemoryReservation::new(self, additional_bytes));
+        }
+
+        self.memory_reserved
+            .fetch_sub(additional_bytes, Ordering::Release);
+        None
     }
 
     #[cfg(not(feature = "lock-profile"))]
@@ -1401,7 +1427,7 @@ mod tests {
         for slot in 0..table.total_slots() {
             if table
                 .slot_key_value(slot)
-                .is_some_and(|(slot_key, _)| slot_key == key)
+                .is_some_and(|(slot_key, _)| slot_key == key.as_bytes())
             {
                 return slot;
             }
@@ -1579,6 +1605,8 @@ mod tests {
     #[test]
     fn runtime_metrics_snapshot_aggregates_reactor_counters() {
         let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 4);
+        ks.set_runtime_telemetry_mode(RuntimeTelemetryMode::Standard);
+        ks.set_runtime_local_flush_policy(1, 100);
 
         ks.record_reactor_loop_iteration(0);
         ks.record_reactor_loop_iteration(1);
@@ -1643,9 +1671,11 @@ mod tests {
 
         let snapshot = ks.runtime_metrics();
 
-        assert_eq!(snapshot.telemetry_mode, RuntimeTelemetryMode::Minimal);
+        assert_eq!(snapshot.telemetry_mode, RuntimeTelemetryMode::Standard);
         assert!(!snapshot.profile_timers_available);
         assert!(snapshot.local_flush_metrics_available);
+        assert_eq!(snapshot.local_flush_sample_rate, 1);
+        assert_eq!(snapshot.metrics_flush_interval_millis, 100);
         assert_eq!(snapshot.reactor_slots, 4);
         assert_eq!(snapshot.backend.requested, RuntimeBackendMode::Auto);
         assert_eq!(snapshot.backend.effective, RuntimeBackendMode::Polling);
@@ -1767,14 +1797,25 @@ mod tests {
     #[test]
     fn runtime_metrics_flush_local_batches_once() {
         let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 2);
+        ks.set_runtime_telemetry_mode(RuntimeTelemetryMode::Standard);
+        ks.set_runtime_local_flush_policy(1, 100);
 
         ks.flush_reactor_local_metrics(
             1,
             RuntimeLocalFlushMetrics {
+                backend_submit_syscalls: 2,
                 loop_iterations: 4,
+                accept_eagain_rearms: 10,
                 accept_drain_runs: 2,
                 accept_drain_accepted: 5,
                 accept_drain_accepted_max: 3,
+                completion_budget_exhaustions: 6,
+                command_budget_exhaustions: 1,
+                accept_budget_exhaustions: 7,
+                writev_budget_exhaustions: 8,
+                maintenance_budget_exhaustions: 9,
+                yielded_connections: 1,
+                parser_resumes: 2,
                 completion_batch_count: 2,
                 completion_batch_total: 9,
                 completion_batch_max: 7,
@@ -1786,14 +1827,26 @@ mod tests {
                 writev_iovecs_max: 6,
                 queued_response_bytes_total: 1024,
                 queued_response_bytes_max: 512,
+                active_expiry_runs: 4,
+                active_expiry_sampled: 40,
+                active_expiry_expired: 3,
             },
         );
 
         let snapshot = ks.runtime_metrics();
+        assert_eq!(snapshot.backend_submit_syscalls, 2);
         assert_eq!(snapshot.loop_iterations, 4);
+        assert_eq!(snapshot.accept_eagain_rearms, 10);
         assert_eq!(snapshot.accept_drain_runs, 2);
         assert_eq!(snapshot.accept_drain_accepted, 5);
         assert_eq!(snapshot.accept_drain_accepted_max, 3);
+        assert_eq!(snapshot.completion_budget_exhaustions, 6);
+        assert_eq!(snapshot.command_budget_exhaustions, 1);
+        assert_eq!(snapshot.accept_budget_exhaustions, 7);
+        assert_eq!(snapshot.writev_budget_exhaustions, 8);
+        assert_eq!(snapshot.maintenance_budget_exhaustions, 9);
+        assert_eq!(snapshot.yielded_connections, 1);
+        assert_eq!(snapshot.parser_resumes, 2);
         assert_eq!(snapshot.completion_batch_count, 2);
         assert_eq!(snapshot.completion_batch_total, 9);
         assert_eq!(snapshot.completion_batch_max, 7);
@@ -1805,6 +1858,9 @@ mod tests {
         assert_eq!(snapshot.writev_iovecs_max, 6);
         assert_eq!(snapshot.queued_response_bytes_total, 1024);
         assert_eq!(snapshot.queued_response_bytes_max, 512);
+        assert_eq!(snapshot.active_expiry_runs, 4);
+        assert_eq!(snapshot.active_expiry_sampled, 40);
+        assert_eq!(snapshot.active_expiry_expired, 3);
     }
 
     #[cfg(feature = "profile-telemetry")]
@@ -1812,6 +1868,8 @@ mod tests {
     fn runtime_telemetry_mode_controls_profile_availability() {
         let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 1);
         assert!(!ks.runtime_profile_timers_enabled());
+        assert_eq!(ks.runtime_profile_metric_start(), None);
+        assert_eq!(ks.runtime_profile_metric_elapsed_nanos(None), 0);
         assert_eq!(
             ks.runtime_metrics().telemetry_mode,
             RuntimeTelemetryMode::Minimal
@@ -1823,6 +1881,18 @@ mod tests {
         assert_eq!(snapshot.telemetry_mode, RuntimeTelemetryMode::Profile);
         assert!(snapshot.profile_timers_available);
         assert!(ks.runtime_profile_timers_enabled());
+        let start = ks.runtime_profile_metric_start();
+        assert!(start.is_some());
+        assert_ne!(ks.runtime_profile_metric_elapsed_nanos(start), 0);
+    }
+
+    #[cfg(not(feature = "profile-telemetry"))]
+    #[test]
+    fn runtime_profile_metric_helpers_are_compile_time_disabled_without_profile_feature() {
+        let ks = ConcurrentKeyspace::new_with_runtime_slots(TEST_SHARDS, 1);
+        assert_eq!(ks.runtime_profile_metric_start(), None);
+        assert_eq!(ks.runtime_profile_metric_elapsed_nanos(None), 0);
+        assert_eq!(ks.runtime_profile_metric_elapsed_nanos(Some(1)), 0);
     }
 
     #[test]
@@ -2047,7 +2117,7 @@ mod tests {
             let lsn = writer_ks
                 .next_lsn()
                 .expect("writer should allocate an LSN after flush");
-            guard.insert_with_lsn(
+            guard.insert_with_entry_lsn(
                 VortexKey::from_bytes(&writer_key),
                 VortexValue::from("after-flush"),
                 Some(lsn),
@@ -2072,9 +2142,65 @@ mod tests {
 
         let flush_lsn = flush_lsn.expect("non-empty flush should allocate an LSN");
         assert!(
-            flush_lsn.get() < writer_lsn,
+            flush_lsn.get() < writer_lsn.get(),
             "post-FLUSH writer LSN must be greater than FLUSH LSN"
         );
+    }
+
+    #[test]
+    fn command_scoped_flush_releases_prior_shards_while_waiting() {
+        let ks = Arc::new(ConcurrentKeyspace::new(TEST_SHARDS));
+        ks.enable_aof_recording();
+
+        let keys = keys_for_shards(&ks, &[0, TEST_SHARDS - 1]);
+        let resident_key = keys[0].clone();
+        ks.write(&resident_key, |table| {
+            table.insert(
+                VortexKey::from_bytes(&resident_key),
+                VortexValue::from("resident"),
+            );
+        });
+
+        let blocker = ks.shards[TEST_SHARDS - 1].write();
+        let flush_ks = Arc::clone(&ks);
+        let (flush_tx, flush_rx) = mpsc::channel();
+        let flush_handle = thread::spawn(move || {
+            flush_tx
+                .send(
+                    flush_ks
+                        .flush_all_with_lsn_command_scoped()
+                        .expect("command-scoped flush should succeed"),
+                )
+                .expect("flush LSN receiver should stay alive");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut prior_shard_released = false;
+        while Instant::now() < deadline {
+            if let Some(guard) = ks.shards[0].try_write() {
+                prior_shard_released = guard.is_empty();
+                if prior_shard_released {
+                    break;
+                }
+            }
+            thread::yield_now();
+        }
+        assert!(
+            prior_shard_released,
+            "command-scoped flush should not retain shard 0 while blocked on a later shard"
+        );
+
+        drop(blocker);
+        let flush_lsn = flush_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("flush should complete after blocker is released");
+        flush_handle.join().expect("flush worker should not panic");
+
+        assert!(
+            flush_lsn.is_some(),
+            "non-empty command-scoped flush should allocate an AOF LSN"
+        );
+        assert_eq!(ks.dbsize(), 0);
     }
 
     #[test]

@@ -21,6 +21,7 @@ ORIGINAL_ARGS=("$@")
 source "${SCRIPTS_DIR}/profiler/common.sh"
 source "${SCRIPTS_DIR}/profiler/host.sh"
 source "${SCRIPTS_DIR}/profiler/bench.sh"
+source "${SCRIPTS_DIR}/profiler/remote.sh"
 source "${SCRIPTS_DIR}/profiler/summary.sh"
 source "${SCRIPTS_DIR}/profiler/build.sh"
 source "${SCRIPTS_DIR}/profiler/server.sh"
@@ -38,93 +39,141 @@ Vortex Profiler — profiling tool manager for vortex-server and engine targets
 
 Usage: just profiler [mode flags] [options]
 
+Description:
+  Captures profiler evidence for a managed server, an attached endpoint, or an
+  engine-only binary. Sessions write session.json, summary.json, summary.md,
+  notes.md, host telemetry, raw tool output, and optional benchmark-bridge
+  artifacts under --artifact-root.
+
+Progress and reports:
+  Interactive terminals get one live status line for long-running phases.
+  CI/log streams get stable line-oriented progress. Use --json for JSON lines.
+  Read summary.md first, then summary.json for automation and raw tool files
+  for detailed diagnosis.
+
 Modes (at least one required, combinable):
-  --cpu              Full CPU profiling (flamegraph + perf stat + perf record)
-    --scheduler        Scheduler-focused diagnostics with host context
-        --lock-offcpu      Lock wait and off-CPU diagnostics with blocking classification
-  --memory           Heap allocation profiling (heaptrack / massif / Instruments)
-  --cache            Cache locality analysis (cachegrind)
-    --c2c              Cache-line contention analysis (perf c2c on Linux)
-    --aof-disk         AOF and disk-focused diagnostics with host context
-    --network          Network-focused diagnostics with host context
-  --all              Run cpu + memory + cache sequentially
+  --cpu                       CPU suite: flamegraph, perf stat, perf record
+  --scheduler                 Scheduler/run-queue diagnostics with host context
+  --lock-offcpu               Lock wait and off-CPU diagnostics
+  --memory                    Heap/RSS allocation profiling
+  --cache                     Cache locality analysis
+  --c2c                       Cache-line contention analysis with perf c2c
+  --aof-disk                  AOF and disk-focused diagnostics
+  --network                   Network/socket-focused diagnostics
+  --all                       Run cpu + memory + cache sequentially
 
-Specific tools (only one, runs that tool alone):
-  --flamegraph         Flamegraph SVG only
-  --perf-stat          perf stat hardware counters only (Linux)
-  --samply             Samply interactive profiler
-  --instruments        Instruments Time Profiler (macOS)
-  --heaptrack          Heaptrack allocation profiler
-  --cachegrind         Cachegrind cache simulation
-  --callgrind          Callgrind instruction counting + call graph
-  --massif             Massif chronological heap snapshot
+Specific tools (run one tool directly):
+  --flamegraph                Flamegraph SVG only
+  --perf-stat                 perf stat hardware/software counters only
+  --samply                    Samply interactive profiler
+  --instruments               Instruments Time Profiler on macOS
+  --heaptrack                 Heaptrack allocation profiler
+  --cachegrind                Valgrind cache simulation
+  --callgrind                 Valgrind instruction counts and call graph
+  --massif                    Valgrind chronological heap snapshots
 
-Criterion (standalone, no server):
-  --criterion        Run Criterion micro-benchmarks
-  --filter PATTERN   Benchmark filter pattern
-  --package NAME     Cargo package (default: vortex-bench)
-  --bench-target T   Cargo bench target name
+Criterion:
+  --criterion                 Run Criterion micro-benchmarks, no server
+  --filter PATTERN            Criterion benchmark filter
+  --package NAME              Cargo package, default: vortex-bench
+  --bench-target NAME         Cargo bench target name
 
-Workload (how load is generated internally):
-  --command CMDS     Commands for redis-benchmark (e.g. SET,GET,INCR)
-  --duration SECS    Load duration in seconds (default: 15)
-  --clients N        Number of parallel clients (default: 50)
-  --manifest PATH    Profiling manifest YAML (see scripts/profiler/manifests/)
-    --bench-manifest   Use a vortex_bench manifest as the load source
-    --bench-request    Use a prior vortex_bench run-request JSON as the load source
-    --compare-to PATH  Write a machine-readable comparison against an earlier session
+Workload:
+  --command CMDS              redis-benchmark commands, e.g. SET,GET,INCR
+  --duration SECS             Load duration in seconds, default: 15
+  --clients N                 Parallel clients, default: 50
+  --manifest PATH             Profiler manifest YAML
+  --bench-manifest PATH       Use a vortex_bench manifest as profiler load
+  --bench-request PATH        Use a prior vortex_bench run-request JSON as load
+  --compare-to PATH           Compare summary output to an earlier session
 
 Server configuration:
-  --threads N        Server thread count (default: 4)
-  --aof              Enable AOF persistence
-  --maxmemory SIZE   Set max memory (e.g. 64mb, 1gb)
-  --eviction POLICY  Set eviction policy (e.g. allkeys-lru)
-    --io-backend KIND  Explicit Vortex I/O backend: auto, uring, or polling
-    --ring-size N      io_uring submission queue size override
-        --fixed-buffers N  Vortex fixed I/O buffer count override
-    --sqpoll-idle-ms N SQPOLL idle timeout in milliseconds
-  --host HOST        Bind address (default: 127.0.0.1)
-  --port PORT        Bind port (default: 16379)
-  --bin PATH         Use pre-built binary instead of building
+  --threads N                 Server thread count, default: 4
+  --aof                       Enable AOF persistence
+  --maxmemory SIZE            Set max memory, e.g. 64mb, 1gb
+  --eviction POLICY           Set eviction policy, e.g. allkeys-lru
+  --io-backend KIND           Vortex I/O backend: auto, uring, or polling
+  --ring-size N               io_uring submission queue size
+  --fixed-buffers N           Fixed I/O buffer count
+  --sqpoll-idle-ms N          SQPOLL idle timeout in milliseconds
+  --host HOST                 Bind or attached host, default: 127.0.0.1
+  --port PORT                 Bind or attached port, default: 16379
+  --bin PATH                  Use pre-built server binary
+
+Target and artifacts:
+  --target-mode MODE          local, host-port, ssh-managed, or ssh-attach
+  --artifact-root DIR         Override .artifacts/profiling
+  --ssh-target HOST           SSH service/control host
+  --ssh-workdir DIR           Remote checkout directory
+  --ssh-port PORT             SSH port
+  --ssh-identity-file PATH    SSH private key
+  --ssh-config PATH           SSH config file
+  --ssh-option OPT            Raw SSH -o option, repeatable
+  --ssh-connect-timeout SECS  SSH ConnectTimeout seconds
+  --ssh-start-command CMD     Remote command for ssh-managed service start
+  --ssh-stop-command CMD      Remote command for ssh-managed service stop
+  --ssh-artifact-path DIR     Remote artifact directory to copy back
 
 Engine target:
-    --engine-example NAME  Cargo example in vortex-engine to profile (for example: engine_probe)
-    --engine-bin PATH      Use a pre-built engine binary instead of building an example
-    --engine-args ARGS     Shell-quoted argument string forwarded to the engine binary
-    --                    Treat the remaining arguments as engine-target arguments
+  --engine-example NAME       Cargo example in vortex-engine, e.g. engine_probe
+  --engine-bin PATH           Pre-built engine binary
+  --engine-args ARGS          Shell-quoted args forwarded to the engine binary
+  --                         Remaining arguments are engine-target arguments
 
 Profiler tuning:
-  --frequency N      Sampling frequency for perf/flamegraph (default: 99)
+  --frequency N               Sampling frequency for perf/flamegraph, default: 99
 
 Diagnostics:
-  --check            Show OS, available tools, binary status
-    --dry-run          Write tool-check artifacts without starting a capture (currently for --c2c)
+  --check                     Show OS, available tools, and binary status
+  --dry-run                   Resolve preflight/session artifacts only
+  --json                      Emit JSON progress/status lines where supported
+  --no-color                  Disable ANSI color
+  -h, --help                  Show this man page
 
 Environment:
-    .env               If present at repo root (or scripts/profiler/.env), it is loaded automatically
-    HOST_PASSWORD      Optional sudo password used for macOS profilers that require elevation
-
-macOS note:
-    profiling binary   Auto-signed with get-task-allow so Instruments can attach to vortex-server
+  .env                        Loaded from repo root or scripts/profiler/.env
+  HOST_PASSWORD               Optional sudo password for tools requiring sudo
 
 Examples:
-  just profiler --command SET,GET
-    just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
-        just profiler --lock-offcpu --command SET --duration 10
-  just profiler --cpu --command SET,GET --duration 20
-  just profiler --flamegraph --command SET --threads 2
-  just profiler --memory --command SET --duration 15
-    just profiler --c2c --dry-run --command SET,GET --duration 10
-  just profiler --cache --command SET --threads 1
-    just profiler-engine --c2c --engine-example c2c_probe -- --variant unpadded --threads 4 --duration-seconds 3
-  just profiler --callgrind --command SET --threads 1
-  just profiler --all --command SET,GET
-  just profiler --manifest scripts/profiler/manifests/cpu-set-heavy.yaml
-    just profiler-engine --memory -- --workload set-inline-string --keys 1000000 --value-size 16 --shards 64
-  just profiler --criterion --filter cmd_get_inline
   just profiler --check
+  just profiler --dry-run --cpu --command PING --artifact-root .artifacts/profiling/dry-run
+  just profiler --cpu --command SET,GET --duration 20 --clients 100
+  just profiler --scheduler --bench-manifest vortex-benchmark/manifests/examples/local-native-redis-benchmark.yaml
+  just profiler --lock-offcpu --command SET --duration 10
+  just profiler --memory --command SET --maxmemory 512mb --eviction allkeys-lru
+  just profiler --network --command SET,GET,INCR --duration 20
+  just profiler --criterion --package vortex-engine --bench-target engine --filter cmd_get_inline
+  just profiler --cpu --target-mode host-port --host 127.0.0.1 --port 16379 --command PING
+  just profiler --cpu --target-mode ssh-attach --ssh-target perfbox --ssh-workdir /srv/vortex --host perfbox --port 16379 --command PING
+  just profiler --engine-example engine_probe --memory -- --workload set-inline-string --keys 1000000 --value-size 16 --shards 64
 EOF
     exit 0
+}
+
+normalize_size_literal_to_bytes() {
+    local value="$1"
+    local label="${2:-size}"
+    local compact="${value//[[:space:]]/}"
+
+    if [[ ! "$compact" =~ ^([0-9]+)([A-Za-z]*)$ ]]; then
+        fatal "${label} must be a size literal such as 4194304, 4mb, 2g, or 512k"
+    fi
+
+    local amount="${BASH_REMATCH[1]}"
+    local suffix="${BASH_REMATCH[2],,}"
+    local multiplier
+    case "$suffix" in
+        ""|b) multiplier=1 ;;
+        k|kb|kib) multiplier=1024 ;;
+        m|mb|mib) multiplier=$((1024 * 1024)) ;;
+        g|gb|gib) multiplier=$((1024 * 1024 * 1024)) ;;
+        t|tb|tib) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+        *)
+            fatal "unsupported size suffix for ${label}: ${suffix:-bytes} (bytes, b, k, kb, kib, m, mb, mib, g, gb, gib, t, tb, tib)"
+            ;;
+    esac
+
+    printf '%s\n' "$((amount * multiplier))"
 }
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -140,6 +189,7 @@ MODE_ALL=false
 MODE_CRITERION=false
 MODE_CHECK=false
 DRY_RUN=false
+JSON_OUTPUT=false
 
 # Specific tools
 TOOL_FLAMEGRAPH=false
@@ -156,6 +206,7 @@ COMMAND=""
 DURATION=15
 DURATION_SET_BY_CLI=false
 CLIENTS=50
+WORKLOAD_KEYSPACE=""
 MANIFEST=""
 COMPARE_TO=""
 
@@ -172,6 +223,18 @@ RING_SIZE=""
 FIXED_BUFFERS=""
 SQPOLL_IDLE_MS=""
 BIN_OVERRIDE=""
+TARGET_MODE="local"
+SSH_TARGET=""
+SSH_WORKDIR=""
+SSH_START_COMMAND=""
+SSH_STOP_COMMAND=""
+SSH_ARTIFACT_PATH=""
+SSH_PORT=""
+SSH_IDENTITY_FILE=""
+SSH_CONFIG=""
+SSH_OPTIONS=()
+SSH_CONNECT_TIMEOUT=""
+ARTIFACT_ROOT=""
 
 # Target selection
 PROFILER_TARGET_KIND="server"
@@ -206,6 +269,8 @@ while [[ $# -gt 0 ]]; do
         --criterion)    MODE_CRITERION=true;     shift ;;
         --check)        MODE_CHECK=true;         shift ;;
         --dry-run)      DRY_RUN=true;            shift ;;
+        --json)         JSON_OUTPUT=true;        shift ;;
+        --no-color)     export VORTEX_PROFILER_NO_COLOR=true; shift ;;
 
         # Specific tools
         --flamegraph)   TOOL_FLAMEGRAPH=true;    shift ;;
@@ -238,6 +303,18 @@ while [[ $# -gt 0 ]]; do
         --fixed-buffers) FIXED_BUFFERS="$2";     shift 2 ;;
         --sqpoll-idle-ms) SQPOLL_IDLE_MS="$2";   shift 2 ;;
         --bin)          BIN_OVERRIDE="$2";       shift 2 ;;
+        --target-mode)  TARGET_MODE="$2";        shift 2 ;;
+        --artifact-root) ARTIFACT_ROOT="$2";     shift 2 ;;
+        --ssh-target)   SSH_TARGET="$2";         shift 2 ;;
+        --ssh-workdir)  SSH_WORKDIR="$2";        shift 2 ;;
+        --ssh-port)     SSH_PORT="$2";           shift 2 ;;
+        --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+        --ssh-config)   SSH_CONFIG="$2";         shift 2 ;;
+        --ssh-option)   SSH_OPTIONS+=("$2");     shift 2 ;;
+        --ssh-connect-timeout) SSH_CONNECT_TIMEOUT="$2"; shift 2 ;;
+        --ssh-start-command) SSH_START_COMMAND="$2"; shift 2 ;;
+        --ssh-stop-command) SSH_STOP_COMMAND="$2"; shift 2 ;;
+        --ssh-artifact-path) SSH_ARTIFACT_PATH="$2"; shift 2 ;;
         --engine-example) PROFILER_TARGET_KIND="engine"; ENGINE_EXAMPLE="$2"; shift 2 ;;
         --engine-bin)   PROFILER_TARGET_KIND="engine"; ENGINE_BIN_OVERRIDE="$2"; shift 2 ;;
         --engine-args)  PROFILER_TARGET_KIND="engine"; ENGINE_ARGS_RAW="$2"; shift 2 ;;
@@ -280,6 +357,7 @@ if [[ -n "$MANIFEST" ]]; then
     [[ -z "$COMMAND"   && -n "${MANIFEST_WORKLOAD_COMMAND:-}" ]]   && COMMAND="$MANIFEST_WORKLOAD_COMMAND"
     [[ "$DURATION" == 15 && -n "${MANIFEST_WORKLOAD_DURATION:-}" ]] && DURATION="$MANIFEST_WORKLOAD_DURATION"
     [[ "$CLIENTS" == 50 && -n "${MANIFEST_WORKLOAD_CLIENTS:-}" ]]  && CLIENTS="$MANIFEST_WORKLOAD_CLIENTS"
+    [[ -z "$WORKLOAD_KEYSPACE" && -n "${MANIFEST_WORKLOAD_KEYSPACE:-}" ]] && WORKLOAD_KEYSPACE="$MANIFEST_WORKLOAD_KEYSPACE"
     [[ "$THREADS" == 4  && -n "${MANIFEST_SERVER_THREADS:-}" ]]    && THREADS="$MANIFEST_SERVER_THREADS"
     [[ -z "$MAXMEMORY" && -n "${MANIFEST_SERVER_MAXMEMORY:-}" ]]   && MAXMEMORY="$MANIFEST_SERVER_MAXMEMORY"
     [[ -z "$EVICTION"  && -n "${MANIFEST_SERVER_EVICTION:-}" ]]    && EVICTION="$MANIFEST_SERVER_EVICTION"
@@ -316,6 +394,10 @@ if [[ -n "$MANIFEST" ]]; then
     ok "Manifest loaded: ${MANIFEST_NAME:-unknown} — ${MANIFEST_DESCRIPTION:-}"
 fi
 
+if [[ -n "$MAXMEMORY" ]]; then
+    MAXMEMORY="$(normalize_size_literal_to_bytes "$MAXMEMORY" "--maxmemory")"
+fi
+
 # ── Resolve: --all expands to cpu + memory + cache ───────────────────────────
 if $MODE_ALL; then
     MODE_CPU=true
@@ -343,8 +425,48 @@ if ! has_any_mode; then
     fi
 fi
 
-if $DRY_RUN && ! $MODE_C2C && ! $MODE_CHECK; then
-    fatal "--dry-run is currently supported only with --c2c or --check"
+case "$TARGET_MODE" in
+    local|host-port|ssh-managed|ssh-attach) ;;
+    *) fatal "--target-mode must be one of: local, host-port, ssh-managed, ssh-attach" ;;
+esac
+
+if [[ "$TARGET_MODE" == ssh-* && -z "$SSH_TARGET" ]]; then
+    fatal "${TARGET_MODE} requires --ssh-target"
+fi
+
+if [[ "$TARGET_MODE" == ssh-* && -z "$SSH_WORKDIR" ]]; then
+    fatal "${TARGET_MODE} requires --ssh-workdir"
+fi
+
+if [[ "$TARGET_MODE" == "ssh-managed" && -z "$SSH_START_COMMAND" ]]; then
+    fatal "ssh-managed requires --ssh-start-command"
+fi
+
+if [[ -n "$SSH_PORT" && ! "$SSH_PORT" =~ ^[1-9][0-9]*$ ]]; then
+    fatal "--ssh-port must be a positive integer"
+fi
+
+if [[ -n "$SSH_CONNECT_TIMEOUT" && ! "$SSH_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    fatal "--ssh-connect-timeout must be a positive integer"
+fi
+
+if [[ -n "$ARTIFACT_ROOT" ]]; then
+    mkdir -p "$ARTIFACT_ROOT"
+    SESSION_ARTIFACT_ROOT="$(cd "$ARTIFACT_ROOT" && pwd)"
+fi
+
+SESSION_TARGET_MODE="$TARGET_MODE"
+SESSION_TARGET_HOST="$HOST"
+SESSION_TARGET_PORT="$PORT"
+SESSION_SSH_TARGET="$SSH_TARGET"
+SESSION_SSH_PORT="$SSH_PORT"
+SESSION_SSH_IDENTITY_FILE="$SSH_IDENTITY_FILE"
+SESSION_SSH_CONFIG="$SSH_CONFIG"
+SESSION_SSH_OPTIONS="$(printf '%s\n' "${SSH_OPTIONS[@]}")"
+SESSION_SSH_CONNECT_TIMEOUT="$SSH_CONNECT_TIMEOUT"
+
+if $DRY_RUN && ! $MODE_CHECK; then
+    MODE_CHECK=true
 fi
 
 if [[ "${HOST_SAMPLER_INTERVAL_SECONDS:-1}" =~ ^1(\.0+)?$ ]] && {
@@ -353,15 +475,6 @@ if [[ "${HOST_SAMPLER_INTERVAL_SECONDS:-1}" =~ ^1(\.0+)?$ ]] && {
     HOST_SAMPLER_INTERVAL_SECONDS="0.25"
     info "Using 0.25s host telemetry sampling for short-lived memory/cache profiling sessions"
 fi
-
-shell_join() {
-    local rendered=""
-    local arg
-    for arg in "$@"; do
-        printf -v rendered '%s%q ' "$rendered" "$arg"
-    done
-    printf '%s' "${rendered% }"
-}
 
 profiling_target_is_engine() {
     [[ "$PROFILER_TARGET_KIND" == "engine" ]]
@@ -549,6 +662,35 @@ prepare_session_contract_context() {
     done < <(resolve_requested_tools)
 }
 
+# ── Dry-run mode ─────────────────────────────────────────────────────────────
+if $DRY_RUN; then
+    SESSION_DIR="$(make_session_dir dry-run)"
+    mkdir -p "${SESSION_DIR}"
+    prepare_session_contract_context "dry-run" "none" "${BIN_OVERRIDE:-$PROFILING_BINARY}"
+    initialize_session_contract "$SESSION_DIR"
+    {
+        run_check_mode
+    } >"${SESSION_DIR}/tool-check.txt" 2>&1 || true
+    if has_cmd python3; then
+        python3 "${SCRIPTS_DIR}/profiler/platform_preflight.py" --format json \
+            >"${SESSION_DIR}/preflight.json" 2>"${SESSION_DIR}/preflight.err" || true
+    fi
+    finalize_session_contract "$SESSION_DIR" "dry-run" 0
+    if $JSON_OUTPUT; then
+        python3 - "$SESSION_DIR" <<'PY'
+from __future__ import annotations
+import json
+import sys
+from pathlib import Path
+session = Path(sys.argv[1])
+print(json.dumps({"session": str(session), "session_json": str(session / "session.json")}))
+PY
+    else
+        printf "dry-run session: %s\n" "$SESSION_DIR"
+    fi
+    exit 0
+fi
+
 # ── Check mode ───────────────────────────────────────────────────────────────
 if $MODE_CHECK; then
     run_check_mode
@@ -590,6 +732,32 @@ fi
 # ── Target-based profiling ───────────────────────────────────────────────────
 SESSION_DIR="$(make_session_dir profiling)"
 register_cleanup
+if [[ "$TARGET_MODE" == ssh-* ]]; then
+    prepare_session_contract_context "remote-profiling" "remote" "${SSH_WORKDIR}/target/profiling/vortex-server"
+    initialize_session_contract "$SESSION_DIR"
+    remote_session_rc=0
+    run_remote_profiler_session "$SESSION_DIR" || remote_session_rc=$?
+    if [[ "$remote_session_rc" -eq 0 ]]; then
+        finalize_session_contract "$SESSION_DIR" "completed" 0
+        trap - EXIT INT TERM
+        if $JSON_OUTPUT; then
+            python3 - "$SESSION_DIR" <<'PY'
+from __future__ import annotations
+import json
+import sys
+from pathlib import Path
+session = Path(sys.argv[1])
+print(json.dumps({"session": str(session), "session_json": str(session / "session.json")}))
+PY
+        else
+            printf "remote profiler session: %s\n" "$SESSION_DIR"
+        fi
+        exit 0
+    fi
+    finalize_session_contract "$SESSION_DIR" "failed" "$remote_session_rc"
+    trap - EXIT INT TERM
+    exit "$remote_session_rc"
+fi
 resolve_benchmark_bridge "$SESSION_DIR"
 if profiling_target_is_engine && benchmark_bridge_enabled; then
     fatal "--bench-manifest and --bench-request are only supported for server-based profiler sessions"
@@ -624,6 +792,7 @@ else
     printf "  Bind:      %s:%s\n" "$HOST" "$PORT"
     printf "  Threads:   %s\n" "$THREADS"
     printf "  Command:   %s\n" "${COMMAND:-<none — no load>}"
+    if [[ -n "$WORKLOAD_KEYSPACE" ]]; then printf "  Keyspace:  %s\n" "$WORKLOAD_KEYSPACE"; fi
 fi
 if profiling_target_is_engine; then
     banner_duration="$(engine_target_arg_value "--duration-seconds" || true)"

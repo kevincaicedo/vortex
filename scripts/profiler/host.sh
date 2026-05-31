@@ -84,8 +84,93 @@ _sample_process_probe() {
     fi
 }
 
+_sample_low_overhead_tool_pack() {
+    local host="$1" port="$2" explicit_pid="${3:-}"
+    local pid="$explicit_pid"
+
+    if [[ -z "$pid" && -n "$port" ]]; then
+        pid="$(discover_pid_by_port "$port")"
+    fi
+
+    printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [[ -n "$host" && -n "$port" ]]; then
+        printf 'target=%s:%s\n' "$host" "$port"
+    else
+        printf 'target=none\n'
+    fi
+    printf 'pid=%s\n' "${pid:-none}"
+
+    if [[ "$OS" == "linux" ]]; then
+        if has_cmd vmstat; then
+            printf '\n--- vmstat ---\n'
+            vmstat 1 2 || true
+        else
+            printf '\n--- vmstat unavailable ---\n'
+        fi
+        if has_cmd mpstat; then
+            printf '\n--- mpstat ---\n'
+            mpstat 1 1 || true
+        else
+            printf '\n--- mpstat unavailable ---\n'
+        fi
+        if has_cmd pidstat && [[ -n "$pid" ]]; then
+            printf '\n--- pidstat ---\n'
+            pidstat -p "$pid" -rudw 1 1 || true
+        else
+            printf '\n--- pidstat unavailable ---\n'
+        fi
+        if has_cmd iostat; then
+            printf '\n--- iostat ---\n'
+            iostat -xz 1 1 || true
+        else
+            printf '\n--- iostat unavailable ---\n'
+        fi
+        if has_cmd sar; then
+            printf '\n--- sar-net ---\n'
+            sar -n DEV 1 1 || true
+        else
+            printf '\n--- sar unavailable ---\n'
+        fi
+        if has_cmd nstat; then
+            printf '\n--- nstat ---\n'
+            nstat -az 2>/dev/null || nstat 2>/dev/null || true
+        else
+            printf '\n--- nstat unavailable ---\n'
+        fi
+        return 0
+    fi
+
+    if [[ "$OS" == "macos" ]]; then
+        if has_cmd vm_stat; then
+            printf '\n--- vm_stat ---\n'
+            vm_stat || true
+        else
+            printf '\n--- vm_stat unavailable ---\n'
+        fi
+        if has_cmd iostat; then
+            printf '\n--- iostat ---\n'
+            iostat -w 1 -c 2 || true
+        else
+            printf '\n--- iostat unavailable ---\n'
+        fi
+        if has_cmd netstat; then
+            printf '\n--- netstat ---\n'
+            netstat -ibn || true
+        else
+            printf '\n--- netstat unavailable ---\n'
+        fi
+        if has_cmd sysctl; then
+            printf '\n--- sysctl ---\n'
+            sysctl hw.ncpu hw.memsize kern.osrelease || true
+        else
+            printf '\n--- sysctl unavailable ---\n'
+        fi
+        return 0
+    fi
+}
+
 start_host_sampler_pack() {
-    local session_dir="$1" host="${2:-}" port="${3:-}" pid="${4:-0}"
+    local session_dir="$1" host="${2:-}" port="${3:-}" pid="${4:-}"
     local session_label
 
     if [[ ${#HOST_SAMPLER_PIDS[@]} -gt 0 ]]; then
@@ -104,9 +189,11 @@ start_host_sampler_pack() {
             python3 "${PROFILER_SCRIPT_DIR}/host_telemetry_runner.py"
             --output-dir "$HOST_SAMPLER_DIR"
             --label "$session_label"
-            --pid "$pid"
             --interval-seconds "$HOST_SAMPLER_INTERVAL_SECONDS"
         )
+        if [[ -n "$pid" ]]; then
+            args+=(--pid "$pid")
+        fi
         if [[ -n "$host" ]]; then
             args+=(--host "$host")
         fi
@@ -122,6 +209,7 @@ start_host_sampler_pack() {
 
     _start_host_sampler_process "${HOST_SAMPLER_DIR}/socket-summary.log" _sample_socket_summary "$host" "$port"
     _start_host_sampler_process "${HOST_SAMPLER_DIR}/process-probe.log" _sample_process_probe "$host" "$port" "$pid"
+    _start_host_sampler_process "${HOST_SAMPLER_DIR}/low-overhead-tool-pack.log" _sample_low_overhead_tool_pack "$host" "$port" "$pid"
 }
 
 stop_host_sampler_pack() {

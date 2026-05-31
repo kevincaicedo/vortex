@@ -5,6 +5,7 @@ use vortex_proto::{CommandFlags, CommandMeta, FrameRef, KeyRange};
 pub(super) struct KeyspaceGateScope<'a> {
     pub(super) keys: SmallVec<[&'a [u8]; 16]>,
     pub(super) full: bool,
+    pub(super) exclusive: bool,
 }
 
 impl<'a> KeyspaceGateScope<'a> {
@@ -13,6 +14,7 @@ impl<'a> KeyspaceGateScope<'a> {
         Self {
             keys: SmallVec::new(),
             full: false,
+            exclusive: false,
         }
     }
 
@@ -21,12 +23,26 @@ impl<'a> KeyspaceGateScope<'a> {
         Self {
             keys: SmallVec::new(),
             full: true,
+            exclusive: false,
+        }
+    }
+
+    #[inline]
+    pub(super) fn full_exclusive() -> Self {
+        Self {
+            keys: SmallVec::new(),
+            full: true,
+            exclusive: true,
         }
     }
 
     #[inline]
     pub(super) fn keys(keys: SmallVec<[&'a [u8]; 16]>) -> Self {
-        KeyspaceGateScope { keys, full: false }
+        KeyspaceGateScope {
+            keys,
+            full: false,
+            exclusive: false,
+        }
     }
 }
 
@@ -40,10 +56,13 @@ pub(super) fn command_keyspace_gate_scope<'a>(
     }
 
     if meta.key_range.is_empty() {
-        return if command_requires_full_keyspace_scope(meta.name) {
-            KeyspaceGateScope::full()
+        if !command_requires_full_keyspace_scope(meta.name) {
+            return KeyspaceGateScope::none();
+        }
+        return if meta.flags.contains(CommandFlags::WRITE) {
+            KeyspaceGateScope::full_exclusive()
         } else {
-            KeyspaceGateScope::none()
+            KeyspaceGateScope::full()
         };
     }
 
@@ -52,6 +71,61 @@ pub(super) fn command_keyspace_gate_scope<'a>(
         KeyspaceGateScope::none()
     } else {
         KeyspaceGateScope::keys(keys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_proto::{CommandFlags, CommandMeta, KeyRange, RespTape};
+
+    use super::*;
+
+    fn frame_for(parts: &[&[u8]]) -> (Vec<u8>, RespTape) {
+        let mut data = Vec::new();
+        data.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+        for part in parts {
+            data.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            data.extend_from_slice(part);
+            data.extend_from_slice(b"\r\n");
+        }
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
+        (data, tape)
+    }
+
+    #[test]
+    fn full_keyspace_writes_use_exclusive_scope() {
+        let (_data, tape) = frame_for(&[b"FLUSHALL"]);
+        let frame = tape.iter().next().expect("one frame");
+        let meta = CommandMeta {
+            name: "FLUSHALL",
+            arity: -1,
+            flags: CommandFlags::WRITE.union(CommandFlags::SLOW),
+            key_range: KeyRange::NONE,
+        };
+
+        let scope = command_keyspace_gate_scope(&meta, &frame);
+
+        assert!(scope.full);
+        assert!(scope.exclusive);
+        assert!(scope.keys.is_empty());
+    }
+
+    #[test]
+    fn full_keyspace_reads_use_shared_scope() {
+        let (_data, tape) = frame_for(&[b"SCAN", b"0"]);
+        let frame = tape.iter().next().expect("one frame");
+        let meta = CommandMeta {
+            name: "SCAN",
+            arity: -2,
+            flags: CommandFlags::READ.union(CommandFlags::SLOW),
+            key_range: KeyRange::NONE,
+        };
+
+        let scope = command_keyspace_gate_scope(&meta, &frame);
+
+        assert!(scope.full);
+        assert!(!scope.exclusive);
+        assert!(scope.keys.is_empty());
     }
 }
 

@@ -89,7 +89,7 @@ def render_markdown_report(
     _section_validity_warnings(lines, host, validity)
     _section_database_targets(lines, databases)
     _section_workloads(lines, workloads)
-    _section_alpha_interpretation(lines, analysis, diagnostics)
+    _section_measurement_interpretation(lines, analysis, diagnostics)
     _section_workload_contract_matrix(lines, analysis, diagnostics)
     _section_cross_db_comparison(lines, analysis, databases)
     _section_workload_rankings(lines, analysis, databases)
@@ -125,7 +125,7 @@ def _section_header(
     source_runs: list[dict[str, Any]],
     rows: list[dict[str, Any]],
 ) -> None:
-    lines.append(f"# {payload.get('title', 'Vortex Benchmark Report')}")
+    lines.append(f"# {payload.get('title', 'Benchmark Report')}")
     lines.append("")
     lines.append("## Overview")
     lines.append("")
@@ -312,14 +312,14 @@ def _md_cell(value: Any) -> str:
     return text.replace("|", "\\|")
 
 
-def _section_alpha_interpretation(
+def _section_measurement_interpretation(
     lines: list[str],
     analysis: dict[str, Any],
     diagnostics: dict[str, Any],
 ) -> None:
-    gate_summary = (
-        analysis.get("alpha_gate_summary")
-        or diagnostics.get("alpha_gate_summary")
+    measurement_summary = (
+        analysis.get("measurement_summary")
+        or diagnostics.get("measurement_summary")
         or {}
     )
     interpretation_rows = (
@@ -327,55 +327,51 @@ def _section_alpha_interpretation(
         or diagnostics.get("interpretation_rows")
         or []
     )
-    if not gate_summary and not interpretation_rows:
+    if not measurement_summary and not interpretation_rows:
         return
 
-    lines.append("## Alpha Gates And Interpretation")
+    lines.append("## Measurement Interpretation")
     lines.append("")
-    target_summary = gate_summary.get("target_summary")
-    if target_summary:
-        lines.append(f"- **Target summary:** {_md_cell(target_summary)}")
-        lines.append("")
 
-    gate_rows = gate_summary.get("gates") or []
-    if gate_rows:
-        lines.append("| Gate | Decision | Target | Reason |")
-        lines.append("|------|----------|--------|--------|")
-        for row in gate_rows:
+    check_rows = measurement_summary.get("checks") or []
+    if check_rows:
+        lines.append("| Check | Status | Requirement | Reason |")
+        lines.append("|-------|--------|-------------|--------|")
+        for row in check_rows:
             lines.append(
-                f"| {_md_cell(row.get('gate'))} "
-                f"| {_md_cell(row.get('decision'))} "
-                f"| {_md_cell(row.get('target'))} "
+                f"| {_md_cell(row.get('check'))} "
+                f"| {_md_cell(row.get('status'))} "
+                f"| {_md_cell(row.get('requirement'))} "
                 f"| {_md_cell(row.get('reason'))} |"
             )
         lines.append("")
 
     if interpretation_rows:
-        lines.append("### Row Claim Boundaries")
+        lines.append("### Row Diagnostics")
         lines.append("")
         lines.append(
-            "| Database | Backend | Series | Service T | Load T | Evidence | Client | Limiting Resource | Latency Gate | Redis Gate | Memory Gate | Reason |"
+            "| Database | Backend | Series | Service T | Load T | Measurement Tier | Client | Limiting Resource | Latency Coverage | Peer Comparison | Reference | Reason |"
         )
         lines.append(
-            "|----------|---------|--------|----------:|-------:|----------|--------|-------------------|--------------|------------|-------------|--------|"
+            "|----------|---------|--------|----------:|-------:|------------------|--------|-------------------|------------------|-----------------|-----------|--------|"
         )
         for row in interpretation_rows:
-            ratio = row.get("throughput_vs_redis_ratio")
-            redis_gate = _md_cell(row.get("redis_comparison_gate"))
+            ratio = row.get("throughput_vs_reference_ratio")
+            peer = _md_cell(row.get("peer_comparison"))
             if ratio is not None:
-                redis_gate = f"{redis_gate} ({float(ratio):.2f}x)"
+                peer = f"{peer} ({float(ratio):.2f}x)"
             lines.append(
                 f"| {_md_cell(row.get('database'))} "
                 f"| {_md_cell(row.get('backend'))} "
                 f"| {_md_cell(row.get('series_label'))} "
                 f"| {_md_cell(row.get('service_threads'))} "
                 f"| {_md_cell(row.get('thread_count'))} "
-                f"| {_md_cell(row.get('evidence_tier'))} "
+                f"| {_md_cell(row.get('measurement_tier'))} "
                 f"| {_md_cell(row.get('client_saturation'))} "
                 f"| {_md_cell(row.get('limiting_resource_hypothesis'))} "
-                f"| {_md_cell(row.get('alpha_latency_gate'))} "
-                f"| {redis_gate} "
-                f"| {_md_cell(row.get('alpha_memory_gate'))} "
+                f"| {_md_cell(row.get('latency_coverage'))} "
+                f"| {peer} "
+                f"| {_md_cell(row.get('reference_database'))} "
                 f"| {_md_cell(row.get('reason'))} |"
             )
         lines.append("")
@@ -458,6 +454,8 @@ def _section_cross_db_comparison(
         return
 
     db_names = [d.get("database", "unknown") for d in databases]
+    if len(set(db_names)) < 2:
+        return
 
     lines.append("---")
     lines.append("")
@@ -467,7 +465,7 @@ def _section_cross_db_comparison(
         lines.append(
             "> ⚠️ **Advisory comparison** — Runtime configurations differ between "
             "databases (see Invalid Comparisons below). Use these tables for "
-            "directional guidance only, not citation-grade claims."
+            "directional guidance only, not publication-grade decisions."
         )
         lines.append("")
 
@@ -1143,7 +1141,7 @@ def _section_reactor_fairness(
     lines.append("### Reactor Fairness And Backend Telemetry")
     lines.append("")
     lines.append(
-        "| Database | Backend | IO | Telemetry | Profile Timers | Series | Threads | Fixed Reg | SQPOLL | Multishot | Accept4 "
+        "| Database | Backend | IO | Telemetry | Profile Timers | Local Flush | Sample | Flush ms | Series | Threads | Fixed Reg | SQPOLL | Multishot | Accept4 "
         "| CloseOp | Cancel | Ring | SQ Occ Max | CQ Occ Max | CQ Overflows | CQ Cap | CQE/Submit x1000 | Submit Calls | SQ Pressure | CQ Pressure | CQE Max "
         "| SQ Retries | Submit Failures | Completion Budget | Command Budget | Accept Budget | Writev Budget | Maint Budget | Yields | Parser Resumes | Writev Chunks "
         "| Queued Bytes Max | Client Retained Max | Request Cap | Response Cap | Tx Cmd Cap | Tx Byte Cap | Watch Cap | Writev Cap "
@@ -1153,7 +1151,7 @@ def _section_reactor_fairness(
         "| AOF Fsync Done | AOF Fsync Fail | AOF Backpressure | Expiry ms Max | Eviction ms Max | Metrics Flush ms Max |"
     )
     lines.append(
-        "|----------|---------|----|-----------|---------------:|--------|--------:|----------:|-------:|----------:|--------:"
+        "|----------|---------|----|-----------|---------------:|------------:|-------:|---------:|--------|--------:|----------:|-------:|----------:|--------:"
         "|--------:|-------:|-----:|-----------:|-----------:|-------------:|-------:|-----------------:|-------------:|------------:|------------:|--------:"
         "|-----------:|----------------:|------------------:|---------------:|--------------:|-------------:|------------:|-------:|---------------:|--------------:"
         "|-----------------:|--------------------:|------------:|-------------:|-----------:|------------:|----------:|----------:"
@@ -1170,6 +1168,9 @@ def _section_reactor_fairness(
             f"| {_md_cell(effective_io)} "
             f"| {_md_cell(row.get('runtime_telemetry_mode_after') or row.get('configured_telemetry_mode'))} "
             f"| {_md_cell(row.get('runtime_profile_timers_available_after'))} "
+            f"| {_md_cell(row.get('runtime_local_flush_metrics_available_after'))} "
+            f"| {_md_cell(row.get('runtime_local_flush_sample_rate_after'))} "
+            f"| {_md_cell(row.get('runtime_metrics_flush_interval_ms_after'))} "
             f"| {row.get('series_label') or 'n/a'} "
             f"| {row.get('thread_count') or 'n/a'} "
             f"| {_md_cell(row.get('backend_fixed_buffers_registered_after'))} "
@@ -1400,19 +1401,7 @@ def _section_diagnostics(
             f"| Max engine bytes/live-key | {_fmt_float(diagnostic_summary.get('max_engine_bytes_per_live_key'), 2)} |"
         )
         lines.append(
-            f"| Max full-server RSS/Redis ratio | {_fmt_float(diagnostic_summary.get('max_full_server_rss_vs_redis_ratio'), 2)} |"
-        )
-        lines.append(
-            "| Engine memory claim decisions | "
-            f"Allowed {diagnostic_summary.get('engine_memory_claims_allowed') or 0}, "
-            f"Narrowed {diagnostic_summary.get('engine_memory_claims_narrowed') or 0}, "
-            f"Rejected {diagnostic_summary.get('engine_memory_claims_rejected') or 0} |"
-        )
-        lines.append(
-            "| Full-server RSS claim decisions | "
-            f"Allowed {diagnostic_summary.get('full_server_rss_claims_allowed') or 0}, "
-            f"Narrowed {diagnostic_summary.get('full_server_rss_claims_narrowed') or 0}, "
-            f"Rejected {diagnostic_summary.get('full_server_rss_claims_rejected') or 0} |"
+            f"| Max full-server RSS/reference ratio | {_fmt_float(diagnostic_summary.get('max_full_server_rss_vs_reference_ratio'), 2)} |"
         )
         lines.append(
             f"| Max dirty memory peak | {_fmt_bytes(diagnostic_summary.get('max_system_mem_dirty_peak_bytes'))} |"
@@ -1432,10 +1421,10 @@ def _section_diagnostics(
         lines.append("### Memory And Reclaim")
         lines.append("")
         lines.append(
-            "| Database | Backend | Series | Threads | Engine B/key | Engine Claim | RSS/Redis | RSS Claim | Table Alloc | Slots | Slack | Tombstones | Load | IO Reserved | IO Committed | Conn State | RSS Peak | Dataset After | Allocator Resident After | Frag Ratio | Dirty Peak | Writeback Peak | Direct Scan | Allocstall |"
+            "| Database | Backend | Series | Threads | Engine B/key | RSS/reference | Reference | Table Alloc | Slots | Slack | Tombstones | Load | IO Reserved | IO Committed | Conn State | RSS Peak | Dataset After | Allocator Resident After | Frag Ratio | Dirty Peak | Writeback Peak | Direct Scan | Allocstall |"
         )
         lines.append(
-            "|----------|---------|--------|--------:|-------------:|--------------|----------:|-----------|------------:|------:|------:|-----------:|-----:|------------:|-------------:|-----------:|---------:|--------------:|------------------------:|-----------:|-----------:|---------------:|------------:|-----------:|"
+            "|----------|---------|--------|--------:|-------------:|--------------:|-----------|------------:|------:|------:|-----------:|-----:|------------:|-------------:|-----------:|---------:|--------------:|------------------------:|-----------:|-----------:|---------------:|------------:|-----------:|"
         )
         for row in memory_rows:
             lines.append(
@@ -1444,9 +1433,8 @@ def _section_diagnostics(
                 f"| {row.get('series_label') or 'n/a'} "
                 f"| {row.get('thread_count') or 'n/a'} "
                 f"| {_fmt_float(row.get('engine_bytes_per_live_key_after'), 2)} "
-                f"| {row.get('engine_memory_claim_decision') or 'n/a'} "
-                f"| {_fmt_float(row.get('full_server_rss_vs_redis_ratio'), 2)} "
-                f"| {row.get('full_server_rss_claim_decision') or 'n/a'} "
+                f"| {_fmt_float(row.get('full_server_rss_vs_reference_ratio'), 2)} "
+                f"| {row.get('full_server_rss_reference_database') or 'n/a'} "
                 f"| {_fmt_bytes(row.get('engine_table_allocated_after_bytes'))} "
                 f"| {_fmt_float(row.get('engine_table_total_slots_after'), 0)} "
                 f"| {_fmt_float(row.get('engine_capacity_slack_slots_after'), 0)} "

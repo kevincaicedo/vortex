@@ -131,7 +131,37 @@ Configuration is loaded from multiple sources with the following precedence (hig
 | `everysec` | fsync once per second. Good balance of safety and performance. **Recommended.** |
 | `no` | Let the OS decide when to flush. Fastest, risk of data loss on crash. |
 
-> **Note:** AOF append, replay, fsync policy, and write-stop behavior are active alpha surfaces. Live `BGREWRITEAOF` remains disabled for alpha, multi-reactor runtime `appendonly` toggles fail closed, and VXF snapshots are still planned.
+#### AOF Alpha Runtime Contract
+
+`appendonly` is a startup persistence setting. A single-reactor alpha server may
+enable or disable it through `CONFIG SET appendonly yes|no` using the configured
+`--aof-path`, but multi-reactor runtime toggles fail closed because there is no
+pool-wide handoff protocol yet. `CONFIG GET appendonly` reports whether the
+current reactor owns an active writer.
+
+`appendfsync` is startup-only in alpha. `CONFIG GET appendfsync` reports the
+configured policy, defaulting to `everysec` when AOF is not active, but
+`CONFIG SET appendfsync ...` fails closed with an alpha error and leaves writer
+state unchanged.
+
+| Policy | Response release point | Crash loss window for acknowledged writes |
+|--------|------------------------|-------------------------------------------|
+| `no` | Userspace append into the reactor-owned AOF buffer. | Process crash can lose buffered bytes; OS crash can lose dirty page-cache bytes. |
+| `everysec` | Userspace append into the reactor-owned AOF buffer. | Process crash can lose buffered bytes plus up to one fsync cadence of dirty page-cache data; reactor backpressure bounds pending fsync bytes. |
+| `always` | File flush plus `sync_data()` for the record. | Successful replies have reached the filesystem durability point, subject to the device/filesystem honoring fsync. |
+
+Append or fsync failure marks AOF failed and write-stops subsequent mutating
+commands with `MISCONF`. A failure discovered after a normal write has mutated
+memory is not treated as durable: the failed command can be visible to current
+readers, but it is absent from replay unless the append succeeded. Transaction
+commit failures fail the transaction before exposing its queued mutations.
+Restart or explicit reconfiguration is required before accepting more writes.
+
+Replay uses the AOF record LSN prefixes and K-way merge ordering across
+per-reactor files. Complete records replay in LSN order, truncated trailing
+records are discarded, and invalid complete records fail closed. Live
+`BGREWRITEAOF` remains disabled for alpha; the existing rewrite primitive is
+offline infrastructure. VXF snapshots are still planned.
 
 ---
 
@@ -164,7 +194,7 @@ RUST_LOG=info vortex-server  # Standard filter
 | Option | CLI | Env Var | Default | Description |
 |--------|-----|---------|---------|-------------|
 | Metrics port | `--metrics-port` | `VORTEX_METRICS_PORT` | None | Reserved alpha configuration field for a future Prometheus endpoint. No metrics listener is started by the current server. |
-| Telemetry mode | `--telemetry-mode` | `VORTEX_TELEMETRY_MODE` | `minimal` | Runtime telemetry cost policy. Normal release builds support `minimal`; profiling builds add `profile`. |
+| Telemetry mode | `--telemetry-mode` | `VORTEX_TELEMETRY_MODE` | `minimal` | Runtime telemetry cost policy. Normal release builds support `minimal` and sampled `standard`; profiling builds add `profile`. |
 
 > **Note:** `INFO runtime` is the current runtime observability surface. Profile telemetry is feature-gated and is not accepted by the normal release binary.
 

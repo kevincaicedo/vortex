@@ -282,7 +282,7 @@ impl Reactor {
                     }
                 }
                 Err(ParseError::NeedMoreData) => {
-                    self.keyspace.record_reactor_parser_resume(self.id);
+                    self.local_metrics.record_parser_resume();
                     need_more_data = true;
                     break;
                 }
@@ -325,9 +325,8 @@ impl Reactor {
         }
 
         if yielded {
-            self.keyspace
-                .record_reactor_command_budget_exhaustion(self.id);
-            self.keyspace.record_reactor_yielded_connection(self.id);
+            self.local_metrics.record_command_budget_exhaustion();
+            self.local_metrics.record_yielded_connection();
         }
 
         self.writev_states[conn_id].finalize();
@@ -374,8 +373,7 @@ impl Reactor {
                 self.close_connection(conn_id);
             } else {
                 if self.writev_states[conn_id].remaining_iovecs().len() > iov_count {
-                    self.keyspace
-                        .record_reactor_writev_budget_exhaustion(self.id);
+                    self.local_metrics.record_writev_budget_exhaustion();
                 }
                 self.local_metrics.record_writev_chunk(iov_count);
                 self.mark_inflight_submitted(conn_id, OpType::Writev);

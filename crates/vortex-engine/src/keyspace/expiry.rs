@@ -1,5 +1,7 @@
 use std::sync::atomic::Ordering;
 
+use vortex_common::VortexKey;
+
 use super::ConcurrentKeyspace;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,7 +134,9 @@ impl ConcurrentKeyspace {
             sampled += 1;
             if deadline <= now_nanos {
                 let watched_key = if self.watch_tracking_active() {
-                    guard.slot_key_value(slot).map(|(key, _)| key.clone())
+                    guard
+                        .slot_key_value(slot)
+                        .map(|(key, _)| VortexKey::from_bytes(key))
                 } else {
                     None
                 };

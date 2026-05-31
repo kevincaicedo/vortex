@@ -17,12 +17,76 @@ use super::{
     ReadLease, SubmitError, WriteLease, preserve_reaped_completion_count,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CqOverflowCounter(u32);
+
+impl CqOverflowCounter {
+    #[inline]
+    const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    fn delta_since(self, previous: Self) -> u64 {
+        self.0.wrapping_sub(previous.0) as u64
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedQueueStatus {
+    sq_occupancy: u64,
+    sq_capacity: u64,
+    cq_occupancy: u64,
+    cq_capacity: u64,
+    cq_overflow: CqOverflowCounter,
+}
+
+impl ObservedQueueStatus {
+    #[inline]
+    const fn new(
+        sq_occupancy: u64,
+        sq_capacity: u64,
+        cq_occupancy: u64,
+        cq_capacity: u64,
+        cq_overflow: u32,
+    ) -> Self {
+        Self {
+            sq_occupancy,
+            sq_capacity,
+            cq_occupancy,
+            cq_capacity,
+            cq_overflow: CqOverflowCounter::new(cq_overflow),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CqOverflowTracker {
+    last: CqOverflowCounter,
+}
+
+impl CqOverflowTracker {
+    #[inline]
+    fn queue_status(&mut self, observed: ObservedQueueStatus) -> BackendQueueStatus {
+        let cq_overflow_delta = observed.cq_overflow.delta_since(self.last);
+        self.last = observed.cq_overflow;
+
+        BackendQueueStatus {
+            sq_occupancy: observed.sq_occupancy,
+            sq_capacity: observed.sq_capacity,
+            cq_occupancy: observed.cq_occupancy,
+            cq_capacity: observed.cq_capacity,
+            cq_overflow_delta,
+        }
+    }
+}
+
 /// io_uring-based I/O backend for Linux.
 pub struct IoUringBackend {
     ring: IoUring,
     fixed_buffers_registered: AtomicBool,
     sqpoll_enabled: bool,
-    last_cq_overflow: u32,
+    cq_overflow: CqOverflowTracker,
 }
 
 impl IoUringBackend {
@@ -54,13 +118,18 @@ impl IoUringBackend {
             ring,
             fixed_buffers_registered: AtomicBool::new(false),
             sqpoll_enabled,
-            last_cq_overflow: 0,
+            cq_overflow: CqOverflowTracker::default(),
         })
     }
 
     #[inline]
     pub(crate) const fn sqpoll_enabled(&self) -> bool {
         self.sqpoll_enabled
+    }
+
+    #[inline]
+    fn queue_status_from_observed(&mut self, observed: ObservedQueueStatus) -> BackendQueueStatus {
+        self.cq_overflow.queue_status(observed)
     }
 }
 
@@ -356,15 +425,307 @@ impl BackendDriver for IoUringBackend {
             let cq = self.ring.completion();
             (cq.len() as u64, cq.capacity() as u64, cq.overflow())
         };
-        let cq_overflow_delta = cq_overflow.wrapping_sub(self.last_cq_overflow) as u64;
-        self.last_cq_overflow = cq_overflow;
 
-        BackendQueueStatus {
+        self.queue_status_from_observed(ObservedQueueStatus::new(
             sq_occupancy,
             sq_capacity,
             cq_occupancy,
             cq_capacity,
-            cq_overflow_delta,
+            cq_overflow,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    use crate::backend::{
+        BackendDriver, Completion, CompletionToken, ConnFd, DecodedCompletionToken, IovecBatch,
+        OpType, ReadLease, SubmitError,
+    };
+
+    fn native_uring_required() -> bool {
+        std::env::var_os("VORTEX_REQUIRE_IO_URING_TESTS").is_some()
+    }
+
+    fn skippable_uring_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+        ) || error.to_string().contains("Operation not permitted")
+    }
+
+    fn new_test_backend(ring_size: u32) -> Option<IoUringBackend> {
+        match IoUringBackend::new(ring_size, 0) {
+            Ok(backend) => Some(backend),
+            Err(error) if skippable_uring_error(&error) && !native_uring_required() => {
+                eprintln!("skipping native io_uring backend test: {error}");
+                None
+            }
+            Err(error) => panic!("native io_uring backend startup failed: {error}"),
         }
+    }
+
+    fn drain_until_tokens(
+        backend: &mut IoUringBackend,
+        expected: &[CompletionToken],
+    ) -> Vec<Completion> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completions = Vec::new();
+
+        while Instant::now() < deadline {
+            backend
+                .completions(&mut completions)
+                .expect("native completion drain");
+            if expected
+                .iter()
+                .all(|token| completions.iter().any(|cqe| cqe.token == *token))
+            {
+                return completions;
+            }
+        }
+
+        panic!(
+            "timed out waiting for native completions; expected={:?}, got={:?}",
+            expected, completions
+        );
+    }
+
+    fn fill_socket_send_buffer(stream: &mut UnixStream) {
+        let chunk = [0x5Au8; 8192];
+        let mut wrote_any = false;
+        loop {
+            match stream.write(&chunk) {
+                Ok(0) => panic!("socket write returned zero while filling send buffer"),
+                Ok(_) => wrote_any = true,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(wrote_any, "send buffer should accept at least one write");
+                    return;
+                }
+                Err(error) => panic!("failed to fill socket send buffer: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_submit_close_reports_queue_full_when_sq_is_full() {
+        let Some(mut backend) = new_test_backend(2) else {
+            return;
+        };
+
+        let mut saw_queue_full = false;
+        for sequence in 0..128 {
+            let token = CompletionToken::from_raw(0x10_000 + sequence);
+            match backend.submit_close(ConnFd::new(-1), token) {
+                Ok(()) => {}
+                Err(SubmitError::QueueFull) => {
+                    saw_queue_full = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected native submit_close error: {error}"),
+            }
+        }
+
+        assert!(
+            saw_queue_full,
+            "native io_uring close submissions should report QueueFull before overwriting SQ state"
+        );
+    }
+
+    #[test]
+    fn native_queue_status_reports_submission_pressure() {
+        let Some(mut backend) = new_test_backend(2) else {
+            return;
+        };
+
+        backend
+            .submit_close(ConnFd::new(-1), CompletionToken::from_raw(0x20_000))
+            .expect("first close SQE should fit");
+        let status = backend.queue_status();
+
+        assert!(status.has_capacity(), "native queue status has capacity");
+        assert!(status.sq_capacity > 0, "SQ capacity should be published");
+        assert!(
+            status.sq_occupancy > 0,
+            "pending native SQE should be visible as submission pressure"
+        );
+    }
+
+    #[test]
+    fn native_queue_status_fault_injects_cq_overflow_delta() {
+        let Some(mut backend) = new_test_backend(2) else {
+            return;
+        };
+
+        let first = backend.queue_status_from_observed(ObservedQueueStatus::new(0, 2, 2, 4, 7));
+        assert_eq!(first.cq_occupancy, 2);
+        assert_eq!(first.cq_capacity, 4);
+        assert_eq!(first.cq_overflow_delta, 7);
+
+        let second = backend.queue_status_from_observed(ObservedQueueStatus::new(1, 2, 3, 4, 9));
+        assert_eq!(second.sq_occupancy, 1);
+        assert_eq!(second.cq_overflow_delta, 2);
+
+        let stable = backend.queue_status_from_observed(ObservedQueueStatus::new(0, 2, 0, 4, 9));
+        assert_eq!(stable.cq_overflow_delta, 0);
+
+        let _ =
+            backend.queue_status_from_observed(ObservedQueueStatus::new(0, 2, 0, 4, u32::MAX - 1));
+        let wrapped = backend.queue_status_from_observed(ObservedQueueStatus::new(0, 2, 0, 4, 3));
+        assert_eq!(
+            wrapped.cq_overflow_delta, 5,
+            "overflow delta should survive the kernel's u32 counter wrap"
+        );
+    }
+
+    #[test]
+    fn native_cancel_race_uses_distinct_cancel_and_target_completions() {
+        let Some(mut backend) = new_test_backend(8) else {
+            return;
+        };
+        let (read_socket, mut write_socket) = UnixStream::pair().expect("socketpair");
+        read_socket
+            .set_nonblocking(true)
+            .expect("set read socket nonblocking");
+        write_socket
+            .set_nonblocking(true)
+            .expect("set write socket nonblocking");
+
+        let mut read_buf = [0u8; 1];
+        let read_token = CompletionToken::conn(7, 3, OpType::Read).expect("read token");
+        let cancel_token = CompletionToken::cancel(read_token).expect("cancel token");
+        let read_lease = unsafe {
+            // SAFETY: `read_buf` stays live until both native completions are
+            // drained below, and the socket fd remains owned by `read_socket`.
+            ReadLease::new(
+                ConnFd::new(read_socket.as_raw_fd()),
+                read_buf.as_mut_ptr(),
+                read_buf.len(),
+                None,
+            )
+        }
+        .expect("read lease");
+
+        backend
+            .submit_read(read_lease, read_token)
+            .expect("submit native read");
+        backend
+            .submit_cancel(read_token, cancel_token)
+            .expect("submit native cancel");
+        write_socket.write_all(b"x").expect("write race byte");
+
+        let completions = drain_until_tokens(&mut backend, &[read_token, cancel_token]);
+        let read_completion = completions
+            .iter()
+            .find(|cqe| cqe.token == read_token)
+            .expect("read completion");
+        let cancel_completion = completions
+            .iter()
+            .find(|cqe| cqe.token == cancel_token)
+            .expect("cancel completion");
+
+        assert!(matches!(
+            read_token.decode(),
+            Ok(DecodedCompletionToken::Conn {
+                id: 7,
+                generation: 3,
+                op: OpType::Read,
+            })
+        ));
+        assert!(matches!(
+            cancel_token.decode(),
+            Ok(DecodedCompletionToken::Cancel { target }) if target == read_token
+        ));
+        assert_ne!(
+            cancel_completion.token, read_completion.token,
+            "native cancel CQE must not reuse the target operation token"
+        );
+        assert!(
+            read_completion.result >= 0 || read_completion.result == -libc::ECANCELED,
+            "read target should complete or be canceled, got {}",
+            read_completion.result
+        );
+        assert!(
+            cancel_completion.result >= 0
+                || cancel_completion.result == -libc::ENOENT
+                || cancel_completion.result == -libc::EALREADY,
+            "cancel result should represent a legal native race outcome, got {}",
+            cancel_completion.result
+        );
+    }
+
+    #[test]
+    fn native_writev_pressure_reports_short_or_eagain_completion() {
+        let Some(mut backend) = new_test_backend(8) else {
+            return;
+        };
+        let (mut write_socket, mut read_socket) = UnixStream::pair().expect("socketpair");
+        write_socket
+            .set_nonblocking(true)
+            .expect("set write socket nonblocking");
+        read_socket
+            .set_nonblocking(true)
+            .expect("set read socket nonblocking");
+
+        fill_socket_send_buffer(&mut write_socket);
+
+        let payload = vec![0xA5u8; 1024 * 1024];
+        let iov = libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        };
+        let writev_token = CompletionToken::conn(9, 4, OpType::Writev).expect("writev token");
+        let batch = unsafe {
+            // SAFETY: `iov` and `payload` stay live until the native writev
+            // completion is drained below, and the fd remains owned by
+            // `write_socket`.
+            IovecBatch::new(ConnFd::new(write_socket.as_raw_fd()), &iov, 1)
+        }
+        .expect("writev batch");
+
+        backend
+            .submit_writev(batch, writev_token)
+            .expect("submit native writev");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completions = Vec::new();
+        let mut drain = [0u8; 8192];
+        let mut drained_after_submit = 0usize;
+        let writev_result = loop {
+            backend
+                .completions(&mut completions)
+                .expect("native completion drain");
+            if let Some(cqe) = completions.iter().find(|cqe| cqe.token == writev_token) {
+                break cqe.result;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for native pressured writev completion");
+            }
+            if drained_after_submit < 256 * 1024 {
+                match read_socket.read(&mut drain) {
+                    Ok(0) => panic!("peer socket closed while draining pressure"),
+                    Ok(n) => drained_after_submit += n,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("peer drain failed: {error}"),
+                }
+            } else {
+                std::thread::yield_now();
+            }
+        };
+
+        assert!(
+            writev_result == -libc::EAGAIN
+                || (writev_result > 0 && (writev_result as usize) < payload.len()),
+            "native writev under send-buffer pressure should report EAGAIN or a short write, got {} for {} bytes",
+            writev_result,
+            payload.len()
+        );
     }
 }

@@ -29,7 +29,7 @@ use core::{
 };
 use std::sync::atomic::AtomicU8;
 
-use vortex_common::{VortexKey, VortexValue};
+use vortex_common::VortexValue;
 
 use crate::morph::AccessProfile;
 
@@ -61,11 +61,59 @@ pub const VTYPE_STREAM: u8 = 7;
 pub const EVICTION_COUNTER_MAX: u8 = 255;
 
 const PTR_BYTES: usize = size_of::<usize>();
-const HEAP_KEY_LEN_OFFSET: usize = PTR_BYTES;
 const HEAP_KEY_META_LEN: usize = PTR_BYTES + size_of::<u32>();
 const HEAP_VALUE_TAG: u8 = 0xFE;
 const INTEGER_VALUE_TAG: u8 = 0xFF;
 pub(crate) const MAX_STORED_LSN_VERSION: u64 = (1u64 << 48) - 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HeapKeyData {
+    ptr: *const u8,
+    len: u32,
+    _pad: [u8; vortex_common::MAX_INLINE_KEY_LEN - PTR_BYTES - size_of::<u32>()],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union EntryKeyData {
+    inline: [u8; vortex_common::MAX_INLINE_KEY_LEN],
+    heap: HeapKeyData,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union EntryValueData {
+    inline: [u8; vortex_common::MAX_INLINE_VALUE_LEN],
+    heap: *const VortexValue,
+    integer: i64,
+}
+
+/// LSN/version value that fits in the 48-bit entry metadata slot.
+///
+/// The global allocator may traffic in raw `u64` counters, but table and entry
+/// mutation paths use this bounded type so an out-of-range value cannot reach
+/// the 64-byte slot layout by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryLsn(u64);
+
+impl EntryLsn {
+    pub const MAX: u64 = MAX_STORED_LSN_VERSION;
+
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn from_raw(lsn: u64) -> Option<Self> {
+        if lsn <= Self::MAX {
+            Some(Self(lsn))
+        } else {
+            None
+        }
+    }
+}
 
 /// Physical value view returned by [`Entry::read_value`].
 ///
@@ -83,6 +131,22 @@ pub enum EntryValue<'a> {
 /// Raw representation fields are private so safe downstream code cannot forge
 /// heap-backed pointer metadata and then call safe readers.
 ///
+/// Metadata contract:
+///
+/// - `control` is the only occupancy authority. Table code may read the rest of
+///   the slot only after a live control-byte proof.
+/// - `flags` carries payload representation, logical value type, and TTL
+///   presence. It is private so setters can keep value tags and TTL state
+///   coherent.
+/// - `morris_cnt` and `access_profile` are relaxed atomics because read-side
+///   eviction/access recording must not take table write locks or shared
+///   counters.
+/// - `ttl_deadline_nanos` is an absolute monotonic deadline; zero means no TTL
+///   and must match the absence of `FLAG_HAS_TTL`.
+/// - `lsn_version` stores exactly the low 48 bits accepted by [`EntryLsn`].
+///   WATCH, AOF visibility, resize, and tombstone-reuse paths must stamp
+///   entries through the bounded type before the bytes reach this field.
+///
 /// ```compile_fail
 /// let mut entry = vortex_engine::Entry::empty();
 /// entry.control = 0x92;
@@ -93,24 +157,24 @@ pub struct Entry {
     control: u8,
     /// Inline key length. Heap keys encode their length in `key_data`.
     key_len: u8,
-    /// Entry flags (type tag, heap indicators, TTL).
+    /// Payload representation, logical value type, and TTL-present bit.
     flags: u8,
-    /// Morris counter for probabilistic eviction (0..=255, saturating).
+    /// Relaxed, saturating Morris counter for lock-free eviction access samples.
     morris_cnt: AtomicU8,
-    /// Access-profile payload. Lock-free tracking.
+    /// Relaxed access-profile payload used by eviction policy read paths.
     access_profile: AtomicU32,
-    /// Absolute monotonic TTL deadline in nanoseconds.
+    /// Absolute monotonic TTL deadline in nanoseconds; zero means no TTL.
     ttl_deadline_nanos: u64,
-    /// 48-bit monotonic version / LSN.
+    /// Little-endian 48-bit WATCH/AOF visibility version, bounded by `EntryLsn`.
     lsn_version: [u8; 6],
     /// Inline value length, or HEAP / INTEGER sentinel.
     value_tag: u8,
     /// Explicit pad so `key_data` starts on an 8-byte boundary.
     _reserved: u8,
-    /// Inline key bytes, or heap key metadata (ptr + len).
-    key_data: [u8; vortex_common::MAX_INLINE_KEY_LEN],
-    /// Inline value bytes, integer bytes, or heap value pointer.
-    value_data: [u8; vortex_common::MAX_INLINE_VALUE_LEN],
+    /// Inline key bytes, or typed heap key metadata (ptr + len).
+    key_data: EntryKeyData,
+    /// Inline value bytes, integer bytes, or typed heap value pointer.
+    value_data: EntryValueData,
 }
 
 const _: () = assert!(size_of::<Entry>() == 64);
@@ -130,8 +194,12 @@ impl Entry {
             lsn_version: [0; 6],
             value_tag: 0,
             _reserved: 0,
-            key_data: [0; vortex_common::MAX_INLINE_KEY_LEN],
-            value_data: [0; vortex_common::MAX_INLINE_VALUE_LEN],
+            key_data: EntryKeyData {
+                inline: [0; vortex_common::MAX_INLINE_KEY_LEN],
+            },
+            value_data: EntryValueData {
+                inline: [0; vortex_common::MAX_INLINE_VALUE_LEN],
+            },
         }
     }
 
@@ -218,14 +286,11 @@ impl Entry {
         u64::from_le_bytes(buf)
     }
 
-    /// Stores a new 48-bit LSN/version in the entry.
-    ///
-    /// # Panics
-    /// Panics if `lsn` exceeds the 48-bit storage budget of the slot layout.
+    /// Stores a bounded 48-bit LSN/version in the entry.
     #[inline]
-    pub fn set_lsn_version(&mut self, lsn: u64) {
-        assert!(lsn <= MAX_STORED_LSN_VERSION, "lsn exceeds 48-bit storage");
-        self.lsn_version.copy_from_slice(&lsn.to_le_bytes()[..6]);
+    pub fn set_lsn_version(&mut self, lsn: EntryLsn) {
+        self.lsn_version
+            .copy_from_slice(&lsn.get().to_le_bytes()[..6]);
     }
 
     /// Writes an inline key and inline string value into this entry.
@@ -252,23 +317,24 @@ impl Entry {
     /// Write an entry that borrows heap-backed key/value storage owned elsewhere.
     ///
     /// # Safety
-    /// The caller must ensure the referenced key bytes and value outlive this
-    /// entry, or that the entry is rewritten before those owners move or drop.
+    /// The caller must ensure the referenced heap key bytes and value outlive
+    /// this entry, or that the entry is rewritten before those owners move or
+    /// drop. Inline key/value bytes are copied into the slot.
     #[inline]
     pub(super) unsafe fn write_borrowed(
         &mut self,
         h2: u8,
-        key: &VortexKey,
+        key: &[u8],
         value: &VortexValue,
         ttl_deadline: u64,
     ) {
         self.reset(h2, ttl_deadline);
 
         if key.len() <= vortex_common::MAX_INLINE_KEY_LEN {
-            self.store_inline_key(key.as_bytes());
+            self.store_inline_key(key);
         } else {
             // SAFETY: caller guarantees the borrowed key bytes outlive this entry.
-            unsafe { self.store_heap_key(key.as_bytes()) };
+            unsafe { self.store_heap_key(key) };
         }
 
         match value {
@@ -316,7 +382,8 @@ impl Entry {
         self.assert_full("Entry::read_key");
 
         if self.has_flag(FLAG_INLINE_KEY) {
-            &self.key_data[..self.key_len as usize]
+            // SAFETY: `FLAG_INLINE_KEY` means the inline key union arm is active.
+            unsafe { &self.key_data.inline[..self.key_len as usize] }
         } else {
             let (ptr, len) = self.heap_key_parts();
             assert!(!ptr.is_null(), "heap key pointer missing");
@@ -346,7 +413,10 @@ impl Entry {
                 self.value_tag as usize <= vortex_common::MAX_INLINE_VALUE_LEN,
                 "inline value tag exceeds MAX_INLINE_VALUE_LEN"
             );
-            return EntryValue::Inline(&self.value_data[..self.value_tag as usize]);
+            // SAFETY: `FLAG_INLINE_VALUE` means the inline value union arm is active.
+            return EntryValue::Inline(unsafe {
+                &self.value_data.inline[..self.value_tag as usize]
+            });
         }
 
         assert_eq!(
@@ -417,8 +487,12 @@ impl Entry {
         self.lsn_version = [0; 6];
         self.value_tag = 0;
         self._reserved = 0;
-        self.key_data = [0; vortex_common::MAX_INLINE_KEY_LEN];
-        self.value_data = [0; vortex_common::MAX_INLINE_VALUE_LEN];
+        self.key_data = EntryKeyData {
+            inline: [0; vortex_common::MAX_INLINE_KEY_LEN],
+        };
+        self.value_data = EntryValueData {
+            inline: [0; vortex_common::MAX_INLINE_VALUE_LEN],
+        };
     }
 }
 
@@ -432,9 +506,8 @@ impl Entry {
             return None;
         }
 
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&self.value_data[..8]);
-        Some(i64::from_ne_bytes(buf))
+        // SAFETY: `FLAG_INTEGER_VALUE` means the integer union arm is active.
+        Some(unsafe { self.value_data.integer })
     }
 
     #[inline]
@@ -458,8 +531,12 @@ impl Entry {
         self.lsn_version = old_lsn;
         self.value_tag = 0;
         self._reserved = 0;
-        self.key_data = [0; vortex_common::MAX_INLINE_KEY_LEN];
-        self.value_data = [0; vortex_common::MAX_INLINE_VALUE_LEN];
+        self.key_data = EntryKeyData {
+            inline: [0; vortex_common::MAX_INLINE_KEY_LEN],
+        };
+        self.value_data = EntryValueData {
+            inline: [0; vortex_common::MAX_INLINE_VALUE_LEN],
+        };
 
         if ttl_deadline != 0 {
             self.set_ttl(ttl_deadline);
@@ -477,7 +554,9 @@ impl Entry {
         debug_assert!(key.len() <= vortex_common::MAX_INLINE_KEY_LEN);
         self.store_flags(self.flags() | FLAG_INLINE_KEY);
         self.key_len = key.len() as u8;
-        self.key_data[..key.len()].copy_from_slice(key);
+        let mut data = [0u8; vortex_common::MAX_INLINE_KEY_LEN];
+        data[..key.len()].copy_from_slice(key);
+        self.key_data = EntryKeyData { inline: data };
     }
 
     /// Stores heap-key metadata for a borrowed key.
@@ -490,10 +569,13 @@ impl Entry {
         debug_assert!(key.len() > vortex_common::MAX_INLINE_KEY_LEN);
         debug_assert!(key.len() <= u32::MAX as usize);
 
-        let ptr = key.as_ptr() as usize;
-        self.key_data[..PTR_BYTES].copy_from_slice(&ptr.to_ne_bytes());
-        self.key_data[HEAP_KEY_LEN_OFFSET..HEAP_KEY_META_LEN]
-            .copy_from_slice(&(key.len() as u32).to_ne_bytes());
+        self.key_data = EntryKeyData {
+            heap: HeapKeyData {
+                ptr: key.as_ptr(),
+                len: key.len() as u32,
+                _pad: [0; vortex_common::MAX_INLINE_KEY_LEN - HEAP_KEY_META_LEN],
+            },
+        };
     }
 
     #[inline]
@@ -501,7 +583,9 @@ impl Entry {
         debug_assert!(value.len() <= vortex_common::MAX_INLINE_VALUE_LEN);
         self.store_flags(self.flags() | FLAG_INLINE_VALUE);
         self.value_tag = value.len() as u8;
-        self.value_data[..value.len()].copy_from_slice(value);
+        let mut data = [0u8; vortex_common::MAX_INLINE_VALUE_LEN];
+        data[..value.len()].copy_from_slice(value);
+        self.value_data = EntryValueData { inline: data };
     }
 
     /// Stores a borrowed pointer to a heap-backed value.
@@ -511,16 +595,17 @@ impl Entry {
     /// rewritten or deleted.
     #[inline]
     unsafe fn store_heap_value(&mut self, value: &VortexValue) {
-        let ptr = value as *const VortexValue as usize;
         self.value_tag = HEAP_VALUE_TAG;
-        self.value_data[..PTR_BYTES].copy_from_slice(&ptr.to_ne_bytes());
+        self.value_data = EntryValueData {
+            heap: value as *const VortexValue,
+        };
     }
 
     #[inline]
     fn store_integer_value(&mut self, value: i64) {
         self.store_flags(self.flags() | FLAG_INTEGER_VALUE);
         self.value_tag = INTEGER_VALUE_TAG;
-        self.value_data[..8].copy_from_slice(&value.to_ne_bytes());
+        self.value_data = EntryValueData { integer: value };
     }
 
     #[inline(always)]
@@ -535,16 +620,10 @@ impl Entry {
 
     #[inline]
     fn heap_key_parts(&self) -> (*const u8, usize) {
-        let mut ptr_buf = [0u8; PTR_BYTES];
-        ptr_buf.copy_from_slice(&self.key_data[..PTR_BYTES]);
-
-        let mut len_buf = [0u8; 4];
-        len_buf.copy_from_slice(&self.key_data[HEAP_KEY_LEN_OFFSET..HEAP_KEY_META_LEN]);
-
-        (
-            usize::from_ne_bytes(ptr_buf) as *const u8,
-            u32::from_ne_bytes(len_buf) as usize,
-        )
+        // SAFETY: callers only use this when `FLAG_INLINE_KEY` is absent, so
+        // the heap key union arm is active.
+        let heap = unsafe { self.key_data.heap };
+        (heap.ptr, heap.len as usize)
     }
 
     /// Reconstructs the borrowed heap-backed value reference stored in the slot.
@@ -554,9 +633,9 @@ impl Entry {
     /// [`Self::store_heap_value`], and that pointee must still be alive.
     #[inline]
     unsafe fn heap_value_ref(&self) -> &VortexValue {
-        let mut ptr_buf = [0u8; PTR_BYTES];
-        ptr_buf.copy_from_slice(&self.value_data[..PTR_BYTES]);
-        let ptr = usize::from_ne_bytes(ptr_buf) as *const VortexValue;
+        // SAFETY: callers only use this when the heap-value tag is present, so
+        // the heap value union arm is active.
+        let ptr = unsafe { self.value_data.heap };
         assert!(!ptr.is_null(), "heap value pointer missing");
 
         // SAFETY: `write_borrowed` stored a valid borrowed pointer.
@@ -582,6 +661,7 @@ impl Entry {
 mod tests {
     use core::mem::offset_of;
 
+    use vortex_common::VortexKey;
     use vortex_common::value::{InlineBytes, VortexList};
 
     use super::*;
@@ -596,7 +676,7 @@ mod tests {
         // SAFETY: each test keeps `key` and `value` alive until all reads from
         // `entry` are complete.
         unsafe {
-            entry.write_borrowed(h2, key, value, ttl_deadline);
+            entry.write_borrowed(h2, key.as_bytes(), value, ttl_deadline);
         }
     }
 
@@ -772,7 +852,11 @@ mod tests {
         assert!(e.is_deleted());
         assert!(!e.is_full());
         assert_eq!(e.key_len, 0);
-        assert_eq!(e.key_data, [0; vortex_common::MAX_INLINE_KEY_LEN]);
+        // SAFETY: `mark_deleted` writes the inline union arm to zero.
+        assert_eq!(
+            unsafe { e.key_data.inline },
+            [0; vortex_common::MAX_INLINE_KEY_LEN]
+        );
     }
 
     #[test]
@@ -811,7 +895,13 @@ mod tests {
 
         entry.store_flags(entry.flags() & !FLAG_INLINE_KEY);
         entry.key_len = 0;
-        entry.key_data = [0; vortex_common::MAX_INLINE_KEY_LEN];
+        entry.key_data = EntryKeyData {
+            heap: HeapKeyData {
+                ptr: core::ptr::null(),
+                len: 0,
+                _pad: [0; vortex_common::MAX_INLINE_KEY_LEN - HEAP_KEY_META_LEN],
+            },
+        };
 
         let _ = entry.read_key();
     }
@@ -837,7 +927,9 @@ mod tests {
         let value = VortexValue::List(Box::default());
         write_borrowed_for_test(&mut entry, 0x82, &key, &value, 0);
 
-        entry.value_data = [0; vortex_common::MAX_INLINE_VALUE_LEN];
+        entry.value_data = EntryValueData {
+            heap: core::ptr::null(),
+        };
 
         let _ = entry.read_value();
     }
@@ -936,10 +1028,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "lsn exceeds 48-bit storage")]
-    fn set_lsn_version_panics_when_value_exceeds_48_bits() {
-        let mut entry = Entry::empty();
-        entry.set_lsn_version(MAX_STORED_LSN_VERSION + 1);
+    fn entry_lsn_rejects_values_above_storage_width() {
+        assert_eq!(
+            EntryLsn::from_raw(MAX_STORED_LSN_VERSION).map(EntryLsn::get),
+            Some(MAX_STORED_LSN_VERSION)
+        );
+        assert!(EntryLsn::from_raw(MAX_STORED_LSN_VERSION + 1).is_none());
     }
 
     #[test]
