@@ -1,6 +1,16 @@
 # VortexDB
 
-[![CI](https://github.com/kevincaicedo/vortex/actions/workflows/ci.yml/badge.svg)](https://github.com/kevincaicedo/vortex/actions/workflows/ci.yml)
+> [!WARNING]
+> **VortexDB is deprecated and no longer maintained.**
+>
+> Development has moved to **[InfinityDB](https://github.com/kevincaicedo/infinitydb)** —
+> a from-scratch successor that carries the same ideas (thread-per-core,
+> shared-nothing, `io_uring`-native, Redis-compatible) forward on a cleaner
+> architecture. **Please use InfinityDB instead.**
+>
+> This repository is kept for historical reference only. Its CI/CD pipelines
+> are disabled and no further releases are planned.
+
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 > Alpha-stage Redis-compatible in-memory database written in Rust. Built around thread-per-core reactors, Linux io_uring or cross-platform polling, SIMD parsing, and a Swiss Table engine.
