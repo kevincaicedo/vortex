@@ -8,9 +8,22 @@ description = "VortexDB persistence engine — AOF, VXF snapshots, shadow paging
 [features]
 default = []
 dax = []
+test-faults = []
+profile-telemetry = ["vortex-engine/profile-telemetry"]
 
 [dependencies]
 vortex-common = { workspace = true }
 vortex-memory = { workspace = true }
+vortex-engine = { workspace = true }
+vortex-proto = { workspace = true }
 lz4_flex = { workspace = true }
 crc32fast = { workspace = true }
+itoa = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "aof_writer"
+harness = false

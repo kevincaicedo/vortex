@@ -9,7 +9,7 @@
 //!
 //! ## Key Types
 //!
-//! - [`VortexKey`] — Small-string-optimized key (inline ≤23 bytes)
+//! - [`VortexKey`] — Small-string-optimized key
 //! - [`VortexValue`] — Tagged enum for all value types
 //! - [`VortexError`] / [`VortexResult`] — Unified error handling
 //! - [`ShardId`] — Shard routing identifier
@@ -30,6 +30,9 @@ pub use encoding::Encoding;
 pub use error::{VortexError, VortexResult};
 pub use key::VortexKey;
 pub use shard::ShardId;
-pub use timestamp::Timestamp;
+pub use timestamp::{
+    Timestamp, absolute_unix_nanos_to_deadline_nanos, current_unix_time_nanos,
+    deadline_nanos_to_absolute_unix_nanos,
+};
 pub use ttl::TTL;
 pub use value::VortexValue;

@@ -1,8 +1,10 @@
 name: Release
 
+# DEPRECATED: VortexDB is no longer maintained. Development moved to InfinityDB
+# (https://github.com/kevincaicedo/infinitydb). CI is disabled — this workflow
+# runs only on manual dispatch.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write

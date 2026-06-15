@@ -1,0 +1,21 @@
+schema_version: 1
+name: memory-write-pressure
+description: Heap allocation profiling under sustained write pressure
+
+modes:
+  - memory
+
+server:
+  threads: 4
+  aof: false
+  maxmemory: 64mb
+  eviction: allkeys-lru
+
+workload:
+  command: SET
+  duration: 30
+  clients: 100
+  keyspace: 1000000
+
+profiler:
+  frequency: 99

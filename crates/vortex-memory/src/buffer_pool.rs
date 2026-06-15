@@ -53,7 +53,12 @@ impl MmapRegion {
     /// On Linux, also calls `mlock` to pin pages in physical memory
     /// (required for io_uring fixed buffer registration).
     fn new(total_bytes: usize) -> std::io::Result<Self> {
-        assert!(total_bytes > 0, "mmap region size must be > 0");
+        if total_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mmap region size must be greater than zero",
+            ));
+        }
 
         // SAFETY: We request anonymous private memory with no backing file.
         // MAP_ANONYMOUS | MAP_PRIVATE gives us zero-initialized pages.
@@ -73,6 +78,19 @@ impl MmapRegion {
         }
 
         let ptr = ptr.cast::<u8>();
+
+        // Fault pages during pool creation so the first client read/write does
+        // not pay anonymous mmap first-touch latency in the benchmark window.
+        // One byte per page is enough to commit the page while keeping startup
+        // work linear in pages, not bytes.
+        #[cfg(not(miri))]
+        unsafe {
+            let mut offset = 0usize;
+            while offset < total_bytes {
+                ptr.add(offset).write_volatile(0);
+                offset += PAGE_SIZE;
+            }
+        }
 
         // On Linux, pin pages in physical memory for io_uring.
         #[cfg(all(target_os = "linux", not(miri)))]
@@ -95,9 +113,14 @@ impl MmapRegion {
     /// Returns a pointer to the `i`-th buffer of `buffer_size` bytes.
     #[inline]
     fn buffer_ptr(&self, index: usize, buffer_size: usize) -> *mut u8 {
-        let offset = index * buffer_size;
-        debug_assert!(offset + buffer_size <= self.total_bytes);
-        // SAFETY: `offset` is within the mmap region (checked by debug_assert).
+        let Some(offset) = index.checked_mul(buffer_size) else {
+            panic!("buffer index offset overflow");
+        };
+        let Some(end) = offset.checked_add(buffer_size) else {
+            panic!("buffer index end overflow");
+        };
+        assert!(end <= self.total_bytes, "buffer index out of mmap region");
+        // SAFETY: `offset..end` is within the mmap region, checked above.
         unsafe { self.ptr.add(offset) }
     }
 }
@@ -128,6 +151,8 @@ pub struct BufferPool {
     count: usize,
     /// Indices of available (not leased) buffers.
     available: VecDeque<usize>,
+    /// Lease state by buffer index.
+    leased: Vec<bool>,
     /// Number of currently leased buffers.
     outstanding: usize,
     /// The backing mmap region.
@@ -135,38 +160,96 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
+    /// Returns the page-aligned buffer size used by [`BufferPool::new`].
+    #[inline]
+    pub const fn aligned_buffer_size(buffer_size: usize) -> Option<usize> {
+        let Some(adjusted) = buffer_size.checked_add(PAGE_SIZE - 1) else {
+            return None;
+        };
+        Some(adjusted & !(PAGE_SIZE - 1))
+    }
+
+    /// Returns bytes reserved for a pool with `count` buffers.
+    #[inline]
+    pub const fn reserved_bytes_for(count: usize, buffer_size: usize) -> Option<usize> {
+        let Some(aligned) = Self::aligned_buffer_size(buffer_size) else {
+            return None;
+        };
+        count.checked_mul(aligned)
+    }
+
     /// Creates a new buffer pool with `count` buffers of `buffer_size` bytes each.
     ///
     /// `buffer_size` is rounded up to the nearest page boundary.
-    pub fn new(count: usize, buffer_size: usize) -> Self {
-        // Round up to page alignment.
-        let buffer_size = (buffer_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let total_bytes = count * buffer_size;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested size is zero, the rounded size
+    /// overflows, or the mmap allocation fails.
+    pub fn new(count: usize, buffer_size: usize) -> std::io::Result<Self> {
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer_count must be greater than zero",
+            ));
+        }
+        if buffer_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer_size must be greater than zero",
+            ));
+        }
+        let buffer_size = Self::aligned_buffer_size(buffer_size).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer_size alignment overflow",
+            )
+        })?;
+        let total_bytes = Self::reserved_bytes_for(count, buffer_size).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer pool size overflow",
+            )
+        })?;
 
-        let region = MmapRegion::new(total_bytes).expect("mmap allocation failed for buffer pool");
+        let region = MmapRegion::new(total_bytes)?;
 
         let available = (0..count).collect();
 
-        Self {
+        Ok(Self {
             buffer_size,
             count,
             available,
+            leased: vec![false; count],
             outstanding: 0,
             region,
-        }
+        })
     }
 
     /// Creates a new buffer pool with optional NUMA node binding.
     ///
     /// When `numa_node` is `Some(n)`, buffers will be allocated on NUMA node `n`.
     /// TODO(Phase 2): Implement actual NUMA-local allocation via mmap + mbind.
-    pub fn new_with_numa(count: usize, buffer_size: usize, _numa_node: Option<usize>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`BufferPool::new`].
+    pub fn new_with_numa(
+        count: usize,
+        buffer_size: usize,
+        _numa_node: Option<usize>,
+    ) -> std::io::Result<Self> {
         Self::new(count, buffer_size)
     }
 
     /// Leases a buffer from the pool. Returns `None` if all buffers are in use.
     pub fn lease(&mut self) -> Option<Buffer> {
         self.available.pop_front().map(|index| {
+            assert!(
+                !self.leased[index],
+                "buffer free-list contains leased index"
+            );
+            self.leased[index] = true;
             self.outstanding += 1;
             Buffer {
                 ptr: self.region.buffer_ptr(index, self.buffer_size),
@@ -178,9 +261,21 @@ impl BufferPool {
     /// Returns a buffer to the pool.
     pub fn release(&mut self, buf: Buffer) {
         // Compute the buffer index from the pointer offset.
-        let offset = (buf.ptr as usize) - (self.region.ptr as usize);
+        let offset = (buf.ptr as usize)
+            .checked_sub(self.region.ptr as usize)
+            .expect("releasing a buffer not from this pool");
+        assert_eq!(
+            offset % self.buffer_size,
+            0,
+            "releasing an unaligned buffer pointer"
+        );
         let index = offset / self.buffer_size;
-        debug_assert!(index < self.count, "releasing a buffer not from this pool");
+        assert!(index < self.count, "releasing a buffer not from this pool");
+        assert!(
+            self.outstanding > 0,
+            "releasing a buffer when none are leased"
+        );
+        assert!(self.leased[index], "releasing a buffer that is not leased");
 
         // Zero the buffer before reuse to prevent data leakage.
         // SAFETY: `buf.ptr` is a valid pointer to `buf.len` bytes within our mmap region.
@@ -189,6 +284,7 @@ impl BufferPool {
         }
 
         self.available.push_back(index);
+        self.leased[index] = false;
         self.outstanding -= 1;
     }
 
@@ -228,19 +324,29 @@ impl BufferPool {
     /// Returns `None` if all buffers are in use. The caller accesses the
     /// buffer memory via [`ptr()`](Self::ptr).
     pub fn lease_index(&mut self) -> Option<usize> {
-        self.available.pop_front().inspect(|_| {
-            self.outstanding += 1;
-        })
+        let index = self.available.pop_front()?;
+        assert!(
+            !self.leased[index],
+            "buffer free-list contains leased index"
+        );
+        self.leased[index] = true;
+        self.outstanding += 1;
+        Some(index)
     }
 
     /// Release a buffer index back to the pool (zeroes the buffer first).
     ///
     /// # Panics
     ///
-    /// Debug-panics if `index >= count`.
+    /// Panics if `index >= count`.
     pub fn release_index(&mut self, index: usize) {
-        debug_assert!(index < self.count, "releasing invalid buffer index");
-        // SAFETY: `index` is within the mmap region (checked by debug_assert).
+        assert!(index < self.count, "releasing invalid buffer index");
+        assert!(
+            self.outstanding > 0,
+            "releasing a buffer when none are leased"
+        );
+        assert!(self.leased[index], "releasing a buffer that is not leased");
+        // SAFETY: `index` is within the mmap region (checked above).
         // The caller guarantees no outstanding I/O references this buffer.
         unsafe {
             ptr::write_bytes(
@@ -250,6 +356,7 @@ impl BufferPool {
             );
         }
         self.available.push_back(index);
+        self.leased[index] = false;
         self.outstanding -= 1;
     }
 
@@ -260,10 +367,10 @@ impl BufferPool {
     ///
     /// # Panics
     ///
-    /// Debug-panics if `index >= count`.
+    /// Panics if `index >= count`.
     #[inline]
     pub fn ptr(&self, index: usize) -> *mut u8 {
-        debug_assert!(index < self.count, "buffer index out of range");
+        assert!(index < self.count, "buffer index out of range");
         self.region.buffer_ptr(index, self.buffer_size)
     }
 }
@@ -272,9 +379,16 @@ impl BufferPool {
 mod tests {
     use super::*;
 
+    fn expect_pool_error(result: std::io::Result<BufferPool>) -> std::io::Error {
+        match result {
+            Ok(_) => panic!("buffer pool allocation should fail"),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn lease_and_release() {
-        let mut pool = BufferPool::new(4, 4096);
+        let mut pool = BufferPool::new(4, 4096).expect("buffer pool should allocate");
         assert_eq!(pool.available(), 4);
         assert_eq!(pool.outstanding(), 0);
 
@@ -290,14 +404,14 @@ mod tests {
 
     #[test]
     fn exhaustion() {
-        let mut pool = BufferPool::new(1, 512);
+        let mut pool = BufferPool::new(1, 512).expect("buffer pool should allocate");
         let _buf = pool.lease().unwrap();
         assert!(pool.lease().is_none());
     }
 
     #[test]
     fn buffers_are_page_aligned() {
-        let mut pool = BufferPool::new(4, 8192);
+        let mut pool = BufferPool::new(4, 8192).expect("buffer pool should allocate");
         for _ in 0..4 {
             let buf = pool.lease().unwrap();
             assert_eq!(
@@ -312,14 +426,16 @@ mod tests {
     #[test]
     fn buffer_size_rounded_to_page() {
         // 5000 bytes should be rounded to 8192 (2 pages).
-        let pool = BufferPool::new(2, 5000);
+        let pool = BufferPool::new(2, 5000).expect("buffer pool should allocate");
         assert_eq!(pool.buffer_size(), 8192);
         assert_eq!(pool.total_bytes(), 2 * 8192);
+        assert_eq!(BufferPool::aligned_buffer_size(5000), Some(8192));
+        assert_eq!(BufferPool::reserved_bytes_for(2, 5000), Some(2 * 8192));
     }
 
     #[test]
     fn as_iovecs_returns_correct_count() {
-        let pool = BufferPool::new(8, 4096);
+        let pool = BufferPool::new(8, 4096).expect("buffer pool should allocate");
         let iovecs = pool.as_iovecs();
         assert_eq!(iovecs.len(), 8);
         for iov in &iovecs {
@@ -330,7 +446,57 @@ mod tests {
 
     #[test]
     fn total_bytes_correct() {
-        let pool = BufferPool::new(16, 4096);
+        let pool = BufferPool::new(16, 4096).expect("buffer pool should allocate");
         assert_eq!(pool.total_bytes(), 16 * 4096);
+    }
+
+    #[test]
+    fn rejects_zero_sized_pool() {
+        let err = expect_pool_error(BufferPool::new(0, 4096));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = expect_pool_error(BufferPool::new(1, 0));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_aligned_size_overflow() {
+        let err = expect_pool_error(BufferPool::new(1, usize::MAX));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_total_size_overflow() {
+        let err = expect_pool_error(BufferPool::new(usize::MAX, PAGE_SIZE));
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer index out of range")]
+    fn ptr_rejects_invalid_index_in_release_builds() {
+        let pool = BufferPool::new(1, 4096).expect("buffer pool should allocate");
+        let _ = pool.ptr(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "releasing invalid buffer index")]
+    fn release_index_rejects_invalid_index_in_release_builds() {
+        let mut pool = BufferPool::new(1, 4096).expect("buffer pool should allocate");
+        pool.release_index(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "releasing a buffer when none are leased")]
+    fn release_index_rejects_unleased_index_in_release_builds() {
+        let mut pool = BufferPool::new(1, 4096).expect("buffer pool should allocate");
+        pool.release_index(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "releasing a buffer that is not leased")]
+    fn release_index_rejects_wrong_live_index() {
+        let mut pool = BufferPool::new(2, 4096).expect("buffer pool should allocate");
+        let _leased = pool.lease_index().expect("first index should lease");
+        pool.release_index(1);
     }
 }

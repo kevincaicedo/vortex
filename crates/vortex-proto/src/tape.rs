@@ -135,49 +135,105 @@ pub struct RespTape {
     consumed: usize,
 }
 
+/// Flat tape output borrowing the caller's backing slice.
+///
+/// This keeps the tape entry layout identical to [`RespTape`] but avoids the
+/// extra `Bytes` copy when the caller already owns a stable input buffer.
+pub struct BorrowedRespTape<'a> {
+    entries: Vec<TapeEntry>,
+    backing: &'a [u8],
+    frame_count: usize,
+    consumed: usize,
+}
+
+/// Flat tape view borrowing both the caller's input and caller-owned scratch
+/// entries. This is the allocation-free hot-path parser shape for reactors.
+pub struct BorrowedRespTapeRef<'a> {
+    entries: &'a [TapeEntry],
+    backing: &'a [u8],
+    frame_count: usize,
+    consumed: usize,
+}
+
+fn parse_pipeline_entries_into(
+    bytes: &[u8],
+    entries: &mut Vec<TapeEntry>,
+) -> Result<(usize, usize), ParseError> {
+    parse_pipeline_entries_into_limit(bytes, entries, usize::MAX)
+}
+
+fn parse_pipeline_entries_into_limit(
+    bytes: &[u8],
+    entries: &mut Vec<TapeEntry>,
+    max_frames: usize,
+) -> Result<(usize, usize), ParseError> {
+    entries.clear();
+    if bytes.is_empty() || max_frames == 0 {
+        return Err(ParseError::NeedMoreData);
+    }
+
+    let mut offset: usize = 0;
+    // Pre-size without letting one large bulk string reserve entries
+    // proportional to payload bytes. Deep pipelines still grow the scratch
+    // vector as needed, but a single large SET should not allocate megabytes
+    // of tape entries before parsing its first frame.
+    let frame_hint = max_frames.min(2048).saturating_mul(8).max(64);
+    let target_entries = (bytes.len() / 8).min(frame_hint).min(16_384);
+    if entries.capacity() < target_entries {
+        entries.reserve(target_entries - entries.capacity());
+    }
+    let mut frame_count: usize = 0;
+
+    while offset < bytes.len() && frame_count < max_frames {
+        let snap_entries = entries.len();
+        let snap_offset = offset;
+        match tape_parse_frame(bytes, &mut offset, entries, 0) {
+            Ok(()) => frame_count += 1,
+            Err(error) if frame_count == 0 => {
+                entries.clear();
+                return Err(error);
+            }
+            Err(_) => {
+                entries.truncate(snap_entries);
+                offset = snap_offset;
+                break;
+            }
+        }
+    }
+
+    if frame_count == 0 {
+        return Err(ParseError::NeedMoreData);
+    }
+
+    Ok((frame_count, offset))
+}
+
+fn parse_pipeline_entries(bytes: &[u8]) -> Result<(Vec<TapeEntry>, usize, usize), ParseError> {
+    let mut entries = Vec::new();
+    let (frame_count, consumed) = parse_pipeline_entries_into(bytes, &mut entries)?;
+    Ok((entries, frame_count, consumed))
+}
+
+#[inline(always)]
+fn tape_u32(value: usize) -> TapeResult<u32> {
+    u32::try_from(value).map_err(|_| ParseError::FrameTooLarge)
+}
+
 impl RespTape {
     /// Parse a pipeline from a byte slice (copies input into `Bytes`).
     pub fn parse_pipeline(buf: &[u8]) -> Result<Self, ParseError> {
-        if buf.is_empty() {
-            return Err(ParseError::NeedMoreData);
-        }
         Self::parse_pipeline_bytes(Bytes::copy_from_slice(buf))
     }
 
     /// Parse a pipeline from caller-owned `Bytes` — zero copy.
     pub fn parse_pipeline_bytes(backing: Bytes) -> Result<Self, ParseError> {
-        if backing.is_empty() {
-            return Err(ParseError::NeedMoreData);
-        }
-        let bytes = backing.as_ref();
-        let mut offset: usize = 0;
-        // Pre-size: typical SET command ≈ 37 bytes → 4 entries → ~0.11 entries/byte.
-        let mut entries = Vec::with_capacity(bytes.len() / 8);
-        let mut frame_count: usize = 0;
-
-        while offset < bytes.len() {
-            let snap_entries = entries.len();
-            let snap_offset = offset;
-            match tape_parse_frame(bytes, &mut offset, &mut entries, 0) {
-                Ok(()) => frame_count += 1,
-                Err(error) if frame_count == 0 => return Err(error),
-                Err(_) => {
-                    entries.truncate(snap_entries);
-                    offset = snap_offset;
-                    break;
-                }
-            }
-        }
-
-        if frame_count == 0 {
-            return Err(ParseError::NeedMoreData);
-        }
+        let (entries, frame_count, consumed) = parse_pipeline_entries(backing.as_ref())?;
 
         Ok(Self {
             entries,
             backing,
             frame_count,
-            consumed: offset,
+            consumed,
         })
     }
 
@@ -211,6 +267,125 @@ impl RespTape {
         TapeIter {
             entries: &self.entries,
             backing: self.backing.as_ref(),
+            index: 0,
+        }
+    }
+}
+
+impl<'a> BorrowedRespTape<'a> {
+    /// Parse a pipeline directly from the caller's stable backing slice.
+    pub fn parse_pipeline(backing: &'a [u8]) -> Result<Self, ParseError> {
+        let (entries, frame_count, consumed) = parse_pipeline_entries(backing)?;
+        Ok(Self {
+            entries,
+            backing,
+            frame_count,
+            consumed,
+        })
+    }
+
+    /// Parse a pipeline into caller-owned scratch tape entries.
+    ///
+    /// The returned view borrows `entries`, so callers must finish iterating it
+    /// before mutating or reusing the scratch vector.
+    pub fn parse_pipeline_into(
+        backing: &'a [u8],
+        entries: &'a mut Vec<TapeEntry>,
+    ) -> Result<BorrowedRespTapeRef<'a>, ParseError> {
+        let (frame_count, consumed) = parse_pipeline_entries_into(backing, entries)?;
+        Ok(BorrowedRespTapeRef {
+            entries: entries.as_slice(),
+            backing,
+            frame_count,
+            consumed,
+        })
+    }
+
+    /// Parse at most `max_frames` top-level frames into caller-owned scratch entries.
+    ///
+    /// This is used by cooperative reactor loops that need to stop parsing at
+    /// a command budget boundary without scanning the rest of a deep pipeline.
+    pub fn parse_pipeline_limited_into(
+        backing: &'a [u8],
+        entries: &'a mut Vec<TapeEntry>,
+        max_frames: usize,
+    ) -> Result<BorrowedRespTapeRef<'a>, ParseError> {
+        let (frame_count, consumed) =
+            parse_pipeline_entries_into_limit(backing, entries, max_frames)?;
+        Ok(BorrowedRespTapeRef {
+            entries: entries.as_slice(),
+            backing,
+            frame_count,
+            consumed,
+        })
+    }
+
+    /// Number of top-level frames parsed.
+    #[inline]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    /// Total bytes consumed from the input.
+    #[inline]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    /// Raw tape entries.
+    #[inline]
+    pub fn entries(&self) -> &[TapeEntry] {
+        &self.entries
+    }
+
+    /// Borrowed backing buffer.
+    #[inline]
+    pub fn backing(&self) -> &'a [u8] {
+        self.backing
+    }
+
+    /// Iterate over top-level frames.
+    #[inline]
+    pub fn iter(&self) -> TapeIter<'_> {
+        TapeIter {
+            entries: &self.entries,
+            backing: self.backing,
+            index: 0,
+        }
+    }
+}
+
+impl<'a> BorrowedRespTapeRef<'a> {
+    /// Number of top-level frames parsed.
+    #[inline]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    /// Total bytes consumed from the input.
+    #[inline]
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    /// Raw tape entries.
+    #[inline]
+    pub fn entries(&self) -> &[TapeEntry] {
+        self.entries
+    }
+
+    /// Borrowed backing buffer.
+    #[inline]
+    pub fn backing(&self) -> &'a [u8] {
+        self.backing
+    }
+
+    /// Iterate over top-level frames.
+    #[inline]
+    pub fn iter(&self) -> TapeIter<'_> {
+        TapeIter {
+            entries: self.entries,
+            backing: self.backing,
             index: 0,
         }
     }
@@ -342,6 +517,125 @@ impl<'a> FrameRef<'a> {
             _ => None,
         }
     }
+
+    /// Write this frame's RESP encoding to a byte buffer.
+    ///
+    /// Reconstructs the RESP wire bytes from the parsed tape entries.
+    /// Used by the AOF writer to log mutation commands without storing
+    /// raw byte offsets in the tape (which would bloat every entry).
+    ///
+    /// Returns the number of bytes written, or `None` if the buffer is too small.
+    pub fn write_resp_to(&self, buf: &mut [u8]) -> Option<usize> {
+        let mut pos = 0;
+        self.write_entry_resp(self.start, buf, &mut pos)?;
+        Some(pos)
+    }
+
+    /// Recursive helper: write the RESP encoding of entry at `idx`.
+    fn write_entry_resp(&self, idx: usize, buf: &mut [u8], pos: &mut usize) -> Option<()> {
+        let e = &self.entries[idx];
+        match e.tag {
+            TAG_BULK_STRING => {
+                let data = &self.backing[e.a as usize..e.b as usize];
+                let mut len_buf = itoa::Buffer::new();
+                let len_str = len_buf.format(data.len());
+                let needed = 1 + len_str.len() + 2 + data.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'$';
+                *pos += 1;
+                buf[*pos..*pos + len_str.len()].copy_from_slice(len_str.as_bytes());
+                *pos += len_str.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                buf[*pos..*pos + data.len()].copy_from_slice(data);
+                *pos += data.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            TAG_SIMPLE_STRING => {
+                let data = &self.backing[e.a as usize..e.b as usize];
+                let needed = 1 + data.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'+';
+                *pos += 1;
+                buf[*pos..*pos + data.len()].copy_from_slice(data);
+                *pos += data.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            TAG_INTEGER => {
+                let val = e.as_i64();
+                let mut int_buf = itoa::Buffer::new();
+                let int_str = int_buf.format(val);
+                let needed = 1 + int_str.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b':';
+                *pos += 1;
+                buf[*pos..*pos + int_str.len()].copy_from_slice(int_str.as_bytes());
+                *pos += int_str.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            TAG_ARRAY => {
+                let count = e.a;
+                let end = e.b as usize;
+                let mut count_buf = itoa::Buffer::new();
+                let count_str = count_buf.format(count);
+                let needed = 1 + count_str.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'*';
+                *pos += 1;
+                buf[*pos..*pos + count_str.len()].copy_from_slice(count_str.as_bytes());
+                *pos += count_str.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                // Write children.
+                let mut child_idx = idx + 1;
+                while child_idx < end {
+                    self.write_entry_resp(child_idx, buf, pos)?;
+                    child_idx = entry_span_end(self.entries, child_idx);
+                }
+                Some(())
+            }
+            TAG_NULL_BULK_STRING => {
+                if *pos + 5 > buf.len() {
+                    return None;
+                }
+                buf[*pos..*pos + 5].copy_from_slice(b"$-1\r\n");
+                *pos += 5;
+                Some(())
+            }
+            TAG_ERROR => {
+                let data = &self.backing[e.a as usize..e.b as usize];
+                let needed = 1 + data.len() + 2;
+                if *pos + needed > buf.len() {
+                    return None;
+                }
+                buf[*pos] = b'-';
+                *pos += 1;
+                buf[*pos..*pos + data.len()].copy_from_slice(data);
+                *pos += data.len();
+                buf[*pos..*pos + 2].copy_from_slice(b"\r\n");
+                *pos += 2;
+                Some(())
+            }
+            _ => {
+                // Unsupported tag — skip (shouldn't happen for command arrays).
+                Some(())
+            }
+        }
+    }
 }
 
 /// Iterator over children of an aggregate tape entry.
@@ -406,6 +700,7 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     let end = buf.len().wrapping_sub(1);
     let mut i = from;
     while i < end {
+        // SAFETY: `i < buf.len() - 1`, so both `i` and `i + 1` are in bounds.
         if unsafe { *buf.get_unchecked(i) == b'\r' && *buf.get_unchecked(i + 1) == b'\n' } {
             return Some(i);
         }
@@ -503,11 +798,9 @@ fn tape_parse_simple_string(
     let start = *offset;
     let line_end = find_crlf(buf, start + 1).ok_or(ParseError::NeedMoreData)?;
     *offset = line_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_SIMPLE_STRING,
-        (start + 1) as u32,
-        line_end as u32,
-    ));
+    let data_start = tape_u32(start + 1)?;
+    let data_end = tape_u32(line_end)?;
+    entries.push(TapeEntry::new(TAG_SIMPLE_STRING, data_start, data_end));
     Ok(())
 }
 
@@ -521,11 +814,9 @@ fn tape_parse_error(
     let start = *offset;
     let line_end = find_crlf(buf, start + 1).ok_or(ParseError::NeedMoreData)?;
     *offset = line_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_ERROR,
-        (start + 1) as u32,
-        line_end as u32,
-    ));
+    let data_start = tape_u32(start + 1)?;
+    let data_end = tape_u32(line_end)?;
+    entries.push(TapeEntry::new(TAG_ERROR, data_start, data_end));
     Ok(())
 }
 
@@ -573,11 +864,9 @@ fn tape_parse_bulk_string(
         .ok_or(ParseError::FrameTooLarge)?;
     tape_validate_crlf(buf, data_end)?;
     *offset = data_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_BULK_STRING,
-        data_start as u32,
-        data_end as u32,
-    ));
+    let data_start = tape_u32(data_start)?;
+    let data_end = tape_u32(data_end)?;
+    entries.push(TapeEntry::new(TAG_BULK_STRING, data_start, data_end));
     Ok(())
 }
 
@@ -612,7 +901,8 @@ fn tape_parse_array(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -691,11 +981,9 @@ fn tape_parse_big_number(
         return Err(ParseError::InvalidFrame);
     }
     *offset = line_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_BIG_NUMBER,
-        (start + 1) as u32,
-        line_end as u32,
-    ));
+    let data_start = tape_u32(start + 1)?;
+    let data_end = tape_u32(line_end)?;
+    entries.push(TapeEntry::new(TAG_BIG_NUMBER, data_start, data_end));
     Ok(())
 }
 
@@ -724,11 +1012,9 @@ fn tape_parse_bulk_error(
         .ok_or(ParseError::FrameTooLarge)?;
     tape_validate_crlf(buf, data_end)?;
     *offset = data_end + 2;
-    entries.push(TapeEntry::new(
-        TAG_BULK_ERROR,
-        data_start as u32,
-        data_end as u32,
-    ));
+    let data_start = tape_u32(data_start)?;
+    let data_end = tape_u32(data_end)?;
+    entries.push(TapeEntry::new(TAG_BULK_ERROR, data_start, data_end));
     Ok(())
 }
 
@@ -764,11 +1050,9 @@ fn tape_parse_verbatim_string(
     let mut encoding = [0u8; 3];
     encoding.copy_from_slice(&buf[data_start..data_start + 3]);
     *offset = data_end + 2;
-    let mut entry = TapeEntry::new(
-        TAG_VERBATIM_STRING,
-        (data_start + 4) as u32,
-        data_end as u32,
-    );
+    let payload_start = tape_u32(data_start + 4)?;
+    let data_end = tape_u32(data_end)?;
+    let mut entry = TapeEntry::new(TAG_VERBATIM_STRING, payload_start, data_end);
     entry.extra = encoding;
     entries.push(entry);
     Ok(())
@@ -802,7 +1086,8 @@ fn tape_parse_map(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -833,7 +1118,8 @@ fn tape_parse_set(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -864,7 +1150,8 @@ fn tape_parse_push(
         tape_parse_frame(buf, offset, entries, depth + 1)?;
     }
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -899,7 +1186,8 @@ fn tape_parse_attribute(
     // Data frame follows the pairs.
     tape_parse_frame(buf, offset, entries, depth + 1)?;
 
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -930,12 +1218,13 @@ fn tape_parse_inline(
         while cursor < line_end && buf[cursor] != b' ' {
             cursor += 1;
         }
-        entries.push(TapeEntry::new(
-            TAG_BULK_STRING,
-            part_start as u32,
-            cursor as u32,
-        ));
-        count += 1;
+        let part_start = tape_u32(part_start)?;
+        let part_end = tape_u32(cursor)?;
+        entries.push(TapeEntry::new(TAG_BULK_STRING, part_start, part_end));
+        count = count.checked_add(1).ok_or(ParseError::FrameTooLarge)?;
+        if count as usize > MAX_ARRAY_ELEMENTS {
+            return Err(ParseError::FrameTooLarge);
+        }
     }
 
     if count == 0 {
@@ -945,7 +1234,8 @@ fn tape_parse_inline(
 
     *offset = line_end + 2;
     entries[header_idx].a = count;
-    entries[header_idx].b = entries.len() as u32;
+    let end_idx = tape_u32(entries.len())?;
+    entries[header_idx].b = end_idx;
     Ok(())
 }
 
@@ -956,6 +1246,16 @@ mod tests {
     use super::*;
     use crate::RespParser;
     use crate::frame::RespFrame;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn tape_offsets_reject_unrepresentable_values() {
+        assert_eq!(tape_u32(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(
+            tape_u32(u32::MAX as usize + 1),
+            Err(ParseError::FrameTooLarge)
+        );
+    }
 
     #[test]
     fn simple_string() {
@@ -1075,6 +1375,56 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_pipeline_limited_stops_at_frame_budget() {
+        let mut buf = Vec::new();
+        for _ in 0..4 {
+            buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        }
+        let mut scratch = Vec::new();
+        let tape = BorrowedRespTape::parse_pipeline_limited_into(&buf, &mut scratch, 2).unwrap();
+
+        assert_eq!(tape.frame_count(), 2);
+        assert_eq!(tape.consumed(), b"*1\r\n$4\r\nPING\r\n".len() * 2);
+        assert_eq!(tape.iter().count(), 2);
+    }
+
+    #[test]
+    fn borrowed_tape_large_bulk_presizes_by_frame_hint_not_payload_bytes() {
+        let payload_len = 1024 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("${payload_len}\r\n").as_bytes());
+        let data_start = buf.len();
+        buf.resize(data_start + payload_len, b'x');
+        buf.extend_from_slice(b"\r\n");
+
+        let mut scratch = Vec::new();
+        let (frame_count, consumed, entries_len, data_len, data_ptr_matches) = {
+            let tape =
+                BorrowedRespTape::parse_pipeline_limited_into(&buf, &mut scratch, 1).unwrap();
+            let frame = tape.iter().next().unwrap();
+            let data = frame.as_bytes().unwrap();
+            (
+                tape.frame_count(),
+                tape.consumed(),
+                tape.entries().len(),
+                data.len(),
+                std::ptr::eq(data.as_ptr(), buf[data_start..].as_ptr()),
+            )
+        };
+
+        assert_eq!(frame_count, 1);
+        assert_eq!(consumed, buf.len());
+        assert_eq!(entries_len, 1);
+        assert!(
+            scratch.capacity() <= 128,
+            "scratch capacity should stay bounded by frame hint, got {}",
+            scratch.capacity()
+        );
+        assert_eq!(data_len, payload_len);
+        assert!(data_ptr_matches);
+    }
+
+    #[test]
     fn frame_ref_children() {
         let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         let tape = RespTape::parse_pipeline(input).unwrap();
@@ -1087,6 +1437,40 @@ mod tests {
         assert_eq!(children[0].as_bytes(), Some(b"SET".as_slice()));
         assert_eq!(children[1].as_bytes(), Some(b"foo".as_slice()));
         assert_eq!(children[2].as_bytes(), Some(b"bar".as_slice()));
+    }
+
+    #[test]
+    fn borrowed_tape_reuses_input_buffer() {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let tape = BorrowedRespTape::parse_pipeline(input).unwrap();
+        let cmd = tape.iter().next().unwrap();
+        let name = cmd.command_name().unwrap();
+
+        assert_eq!(tape.frame_count(), 1);
+        assert_eq!(tape.consumed(), input.len());
+        assert!(std::ptr::eq(name.as_ptr(), input[8..].as_ptr()));
+        assert_eq!(tape.backing().as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn borrowed_tape_into_reuses_scratch_entries() {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let mut scratch = Vec::with_capacity(16);
+        let original_capacity = scratch.capacity();
+
+        {
+            let tape = BorrowedRespTape::parse_pipeline_into(input, &mut scratch).unwrap();
+            let cmd = tape.iter().next().unwrap();
+            let name = cmd.command_name().unwrap();
+
+            assert_eq!(tape.frame_count(), 1);
+            assert_eq!(tape.consumed(), input.len());
+            assert!(std::ptr::eq(name.as_ptr(), input[8..].as_ptr()));
+            assert_eq!(tape.backing().as_ptr(), input.as_ptr());
+            assert_eq!(tape.entries().len(), 4);
+        }
+
+        assert_eq!(scratch.capacity(), original_capacity);
     }
 
     #[test]

@@ -1,0 +1,438 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+from vortex_benchmark.catalog import (
+    expand_command_groups,
+    get_workload_definition,
+    normalize_command_name,
+    resolve_backend_name,
+    resolve_command_group_name,
+    resolve_workload_name,
+)
+from vortex_benchmark.manifests.loader import (
+    BenchmarkManifest,
+    SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION,
+    SUPPORTED_VORTEX_IO_BACKENDS,
+    SUPPORTED_VORTEX_TELEMETRY_MODES,
+    load_manifest,
+)
+from vortex_benchmark.models import (
+    DEFAULT_CPUS,
+    DEFAULT_MEMORY,
+    DEFAULT_PORT_BASE,
+    SUPPORTED_DATABASES,
+    SUPPORTED_AOF_FSYNC_POLICIES,
+    SUPPORTED_EVICTION_POLICIES,
+    split_csv_values,
+)
+
+
+@dataclass
+class ResolvedBenchmarkSpec:
+    manifest: Optional[BenchmarkManifest]
+    databases: list[str]
+    workloads: list[str]
+    workload_definitions: list[dict[str, object]]
+    workload_default_commands: list[str]
+    commands: list[str]
+    command_groups: list[str]
+    expanded_group_commands: list[str]
+    resolved_commands: list[str]
+    effective_commands: list[str]
+    backends: list[str]
+    evidence_tier: str
+    repeat_count: int
+    duration: Optional[str]
+    mode: Optional[str]
+    output_dir: Optional[str]
+    state_file: Optional[str]
+    port_base: int
+    cpus: int
+    memory: str
+    threads: Optional[int]
+    build_vortex: bool
+    settings: dict[str, Any]
+    environment: dict[str, Any]
+    resource_config: dict[str, Any]
+    runtime_config: dict[str, Any]
+
+    @property
+    def manifest_path(self) -> Optional[str]:
+        if self.manifest is None:
+            return None
+        return self.manifest.source_path
+
+    @property
+    def manifest_format(self) -> Optional[str]:
+        if self.manifest is None:
+            return None
+        return self.manifest.source_format
+
+    @property
+    def manifest_name(self) -> Optional[str]:
+        if self.manifest is None:
+            return None
+        return self.manifest.name
+
+
+def _dedupe_ordered(values: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _coalesce_list(cli_values: list[str], manifest_values: list[str]) -> list[str]:
+    return cli_values if cli_values else list(manifest_values)
+
+
+def _coalesce_scalar(cli_value, manifest_value, default_value):
+    if cli_value is not None:
+        return cli_value
+    if manifest_value is not None:
+        return manifest_value
+    return default_value
+
+
+def _resolve_manifest(args) -> Optional[BenchmarkManifest]:
+    if not getattr(args, "workload_manifest", None):
+        return None
+    return load_manifest(Path(getattr(args, "workload_manifest")))
+
+
+def _resolve_databases(raw_databases: list[str]) -> list[str]:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for database in raw_databases:
+        normalized = database.strip().lower()
+        if normalized not in SUPPORTED_DATABASES:
+            supported = ", ".join(SUPPORTED_DATABASES)
+            raise ValueError(
+                f"unsupported database '{database}'. Supported databases: {supported}"
+            )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(normalized)
+    return resolved
+
+
+def _validate_duration(duration: Optional[str]) -> Optional[str]:
+    if duration is None:
+        return None
+    if not re.fullmatch(r"\d+(ms|s|m|h)", duration):
+        raise ValueError("duration must use a simple time literal such as 500ms, 60s, 5m, or 1h")
+    return duration
+
+
+def _validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
+    aof_enabled = runtime_config.get("aof_enabled")
+    if aof_enabled is not None and not isinstance(aof_enabled, bool):
+        raise ValueError("aof_enabled must be a boolean when provided")
+
+    aof_fsync = runtime_config.get("aof_fsync")
+    if aof_fsync is not None and aof_fsync not in SUPPORTED_AOF_FSYNC_POLICIES:
+        supported = ", ".join(SUPPORTED_AOF_FSYNC_POLICIES)
+        raise ValueError(f"aof_fsync must be one of: {supported}")
+
+    aof_max_pending_fsync_bytes = runtime_config.get("aof_max_pending_fsync_bytes")
+    if aof_max_pending_fsync_bytes is not None and (
+        not isinstance(aof_max_pending_fsync_bytes, int)
+        or aof_max_pending_fsync_bytes <= 0
+    ):
+        raise ValueError("aof_max_pending_fsync_bytes must be a positive integer when provided")
+
+    shard_count = runtime_config.get("shard_count")
+    if shard_count is not None:
+        if not isinstance(shard_count, int) or shard_count <= 0:
+            raise ValueError("shard_count must be a positive integer when provided")
+        if shard_count & (shard_count - 1) != 0:
+            raise ValueError("shard_count must be a power of two")
+
+    maxmemory = runtime_config.get("maxmemory")
+    if maxmemory is not None and (not isinstance(maxmemory, str) or not maxmemory.strip()):
+        raise ValueError("maxmemory must be a non-empty size literal when provided")
+
+    eviction_policy = runtime_config.get("eviction_policy")
+    if eviction_policy is not None and eviction_policy not in SUPPORTED_EVICTION_POLICIES:
+        supported = ", ".join(SUPPORTED_EVICTION_POLICIES)
+        raise ValueError(f"eviction_policy must be one of: {supported}")
+
+    io_backend = runtime_config.get("io_backend")
+    if io_backend is not None and io_backend not in SUPPORTED_VORTEX_IO_BACKENDS:
+        supported = ", ".join(SUPPORTED_VORTEX_IO_BACKENDS)
+        raise ValueError(f"io_backend must be one of: {supported}")
+
+    telemetry_mode = runtime_config.get("telemetry_mode")
+    if (
+        telemetry_mode is not None
+        and telemetry_mode not in SUPPORTED_VORTEX_TELEMETRY_MODES
+    ):
+        supported = ", ".join(SUPPORTED_VORTEX_TELEMETRY_MODES)
+        raise ValueError(f"telemetry_mode must be one of: {supported}")
+
+    ring_size = runtime_config.get("ring_size")
+    if ring_size is not None:
+        if not isinstance(ring_size, int) or ring_size <= 0:
+            raise ValueError("ring_size must be a positive integer when provided")
+        if ring_size & (ring_size - 1) != 0:
+            raise ValueError("ring_size must be a power of two")
+
+    fixed_buffers = runtime_config.get("fixed_buffers")
+    if fixed_buffers is not None and (not isinstance(fixed_buffers, int) or fixed_buffers <= 0):
+        raise ValueError("fixed_buffers must be a positive integer when provided")
+
+    fixed_buffer_registration = runtime_config.get("fixed_buffer_registration")
+    if (
+        fixed_buffer_registration is not None
+        and fixed_buffer_registration not in SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION
+    ):
+        supported = ", ".join(SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION)
+        raise ValueError(f"fixed_buffer_registration must be one of: {supported}")
+
+    sqpoll_idle_ms = runtime_config.get("sqpoll_idle_ms")
+    if sqpoll_idle_ms is not None and (not isinstance(sqpoll_idle_ms, int) or sqpoll_idle_ms < 0):
+        raise ValueError("sqpoll_idle_ms must be a non-negative integer when provided")
+    telemetry_local_sample_rate = runtime_config.get("telemetry_local_sample_rate")
+    if telemetry_local_sample_rate is not None and (
+        not isinstance(telemetry_local_sample_rate, int)
+        or telemetry_local_sample_rate <= 0
+    ):
+        raise ValueError("telemetry_local_sample_rate must be a positive integer when provided")
+    telemetry_flush_interval_ms = runtime_config.get("telemetry_flush_interval_ms")
+    if telemetry_flush_interval_ms is not None and (
+        not isinstance(telemetry_flush_interval_ms, int)
+        or telemetry_flush_interval_ms <= 0
+    ):
+        raise ValueError("telemetry_flush_interval_ms must be a positive integer when provided")
+
+    return runtime_config
+
+
+def resolve_benchmark_spec(args) -> ResolvedBenchmarkSpec:
+    manifest = _resolve_manifest(args)
+    manifest_databases = manifest.databases if manifest else []
+    manifest_workloads = manifest.workloads if manifest else []
+    manifest_commands = manifest.commands if manifest else []
+    manifest_groups = manifest.command_groups if manifest else []
+    manifest_backends = manifest.backends if manifest else []
+    manifest_repeat = manifest.repeat if manifest else None
+    manifest_environment = manifest.environment if manifest else {}
+    manifest_resource_config = manifest.resource_config if manifest else {}
+    manifest_runtime_config = manifest.runtime_config if manifest else {}
+    manifest_settings = dict(manifest.settings) if manifest else {}
+
+    cli_databases = split_csv_values(getattr(args, "databases", []))
+    cli_workloads = split_csv_values(getattr(args, "workloads", []))
+    cli_commands = split_csv_values(getattr(args, "commands", []))
+    cli_groups = split_csv_values(getattr(args, "command_groups", []))
+    cli_backends = split_csv_values(getattr(args, "backends", []))
+
+    raw_databases = _coalesce_list(cli_databases, manifest_databases)
+    raw_workloads = _coalesce_list(cli_workloads, manifest_workloads)
+    raw_commands = _coalesce_list(cli_commands, manifest_commands)
+    raw_groups = _coalesce_list(cli_groups, manifest_groups)
+    raw_backends = _coalesce_list(cli_backends, manifest_backends)
+
+    workloads = _dedupe_ordered([resolve_workload_name(value) for value in raw_workloads])
+    workload_definitions = [get_workload_definition(name).to_dict() for name in workloads]
+    workload_default_commands = _dedupe_ordered(
+        [
+            command
+            for name in workloads
+            for command in get_workload_definition(name).default_commands
+        ]
+    )
+    commands = _dedupe_ordered([normalize_command_name(value) for value in raw_commands])
+    command_groups = _dedupe_ordered([resolve_command_group_name(value) for value in raw_groups])
+    expanded_group_commands = expand_command_groups(command_groups)
+    resolved_commands = _dedupe_ordered(commands + expanded_group_commands)
+    effective_commands = _dedupe_ordered(resolved_commands + workload_default_commands)
+    backends = _dedupe_ordered([resolve_backend_name(value) for value in raw_backends])
+
+    mode = None
+    if getattr(args, "native", False):
+        mode = "native"
+    elif getattr(args, "container", False):
+        mode = "container"
+    elif manifest_environment.get("mode") is not None:
+        mode = manifest_environment["mode"]
+
+    output_dir = _coalesce_scalar(
+        getattr(args, "output_dir", None), manifest_environment.get("output_dir"), None
+    )
+    state_file = _coalesce_scalar(
+        getattr(args, "state_file", None), manifest_environment.get("state_file"), None
+    )
+    port_base = _coalesce_scalar(
+        getattr(args, "port_base", None), manifest_environment.get("port_base"), DEFAULT_PORT_BASE
+    )
+    cpus = _coalesce_scalar(getattr(args, "cpus", None), manifest_resource_config.get("cpus"), DEFAULT_CPUS)
+    memory = _coalesce_scalar(
+        getattr(args, "memory", None), manifest_resource_config.get("memory"), DEFAULT_MEMORY
+    )
+    service_cpus = manifest_resource_config.get("service_cpus")
+    load_cpus = manifest_resource_config.get("load_cpus")
+    threads = _coalesce_scalar(
+        getattr(args, "threads", None), manifest_resource_config.get("threads"), None
+    )
+    build_vortex = _coalesce_scalar(
+        getattr(args, "build_vortex", None), manifest_environment.get("build_vortex"), True
+    )
+    aof_enabled = _coalesce_scalar(
+        getattr(args, "aof_enabled", None), manifest_runtime_config.get("aof_enabled"), None
+    )
+    aof_fsync = _coalesce_scalar(
+        getattr(args, "aof_fsync", None), manifest_runtime_config.get("aof_fsync"), None
+    )
+    aof_max_pending_fsync_bytes = _coalesce_scalar(
+        getattr(args, "aof_max_pending_fsync_bytes", None),
+        manifest_runtime_config.get("aof_max_pending_fsync_bytes"),
+        None,
+    )
+    shard_count = _coalesce_scalar(
+        getattr(args, "shard_count", None), manifest_runtime_config.get("shard_count"), None
+    )
+    maxmemory = _coalesce_scalar(
+        getattr(args, "maxmemory", None), manifest_runtime_config.get("maxmemory"), None
+    )
+    eviction_policy = _coalesce_scalar(
+        getattr(args, "eviction_policy", None),
+        manifest_runtime_config.get("eviction_policy"),
+        None,
+    )
+    io_backend = _coalesce_scalar(
+        getattr(args, "io_backend", None), manifest_runtime_config.get("io_backend"), None
+    )
+    telemetry_mode = _coalesce_scalar(
+        getattr(args, "telemetry_mode", None),
+        manifest_runtime_config.get("telemetry_mode"),
+        None,
+    )
+    telemetry_local_sample_rate = _coalesce_scalar(
+        getattr(args, "telemetry_local_sample_rate", None),
+        manifest_runtime_config.get("telemetry_local_sample_rate"),
+        None,
+    )
+    telemetry_flush_interval_ms = _coalesce_scalar(
+        getattr(args, "telemetry_flush_interval_ms", None),
+        manifest_runtime_config.get("telemetry_flush_interval_ms"),
+        None,
+    )
+    ring_size = _coalesce_scalar(
+        getattr(args, "ring_size", None), manifest_runtime_config.get("ring_size"), None
+    )
+    fixed_buffers = _coalesce_scalar(
+        getattr(args, "fixed_buffers", None),
+        manifest_runtime_config.get("fixed_buffers"),
+        None,
+    )
+    fixed_buffer_registration = _coalesce_scalar(
+        getattr(args, "fixed_buffer_registration", None),
+        manifest_runtime_config.get("fixed_buffer_registration"),
+        None,
+    )
+    sqpoll_idle_ms = _coalesce_scalar(
+        getattr(args, "sqpoll_idle_ms", None),
+        manifest_runtime_config.get("sqpoll_idle_ms"),
+        None,
+    )
+
+    if port_base <= 0:
+        raise ValueError("port base must be a positive integer")
+    if cpus <= 0:
+        raise ValueError("cpus must be a positive integer")
+    repeat_count = int(_coalesce_scalar(getattr(args, "repeat", None), manifest_repeat, 1) or 1)
+    if repeat_count <= 0:
+        raise ValueError("repeat must be a positive integer")
+    if threads is not None and threads <= 0:
+        raise ValueError("threads must be a positive integer when provided")
+    if not isinstance(memory, str) or not memory.strip():
+        raise ValueError("memory must be a non-empty string")
+
+    environment = {
+        "mode": mode,
+        "output_dir": output_dir,
+        "state_file": state_file,
+        "port_base": port_base,
+        "build_vortex": build_vortex,
+    }
+    resource_config = {
+        "cpus": cpus,
+        "memory": memory,
+        "threads": threads,
+        "service_cpus": service_cpus,
+        "load_cpus": load_cpus,
+    }
+    runtime_config = _validate_runtime_config(
+        {
+            key: value
+            for key, value in {
+                "aof_enabled": aof_enabled,
+                "aof_fsync": aof_fsync,
+                "aof_max_pending_fsync_bytes": aof_max_pending_fsync_bytes,
+                "shard_count": shard_count,
+                "maxmemory": maxmemory.strip() if isinstance(maxmemory, str) else maxmemory,
+                "eviction_policy": eviction_policy,
+                "io_backend": io_backend,
+                "telemetry_mode": telemetry_mode,
+                "telemetry_local_sample_rate": telemetry_local_sample_rate,
+                "telemetry_flush_interval_ms": telemetry_flush_interval_ms,
+                "ring_size": ring_size,
+                "fixed_buffers": fixed_buffers,
+                "fixed_buffer_registration": fixed_buffer_registration,
+                "sqpoll_idle_ms": sqpoll_idle_ms,
+            }.items()
+            if value is not None
+        }
+    )
+
+    return ResolvedBenchmarkSpec(
+        manifest=manifest,
+        databases=_resolve_databases(raw_databases),
+        workloads=workloads,
+        workload_definitions=workload_definitions,
+        workload_default_commands=workload_default_commands,
+        commands=commands,
+        command_groups=command_groups,
+        expanded_group_commands=expanded_group_commands,
+        resolved_commands=resolved_commands,
+        effective_commands=effective_commands,
+        backends=backends,
+        evidence_tier=str(getattr(args, "evidence_tier", None) or "engineering"),
+        repeat_count=repeat_count,
+        duration=_validate_duration(_coalesce_scalar(getattr(args, "duration", None), manifest.duration if manifest else None, None)),
+        mode=mode,
+        output_dir=output_dir,
+        state_file=state_file,
+        port_base=port_base,
+        cpus=cpus,
+        memory=memory.strip(),
+        threads=threads,
+        build_vortex=bool(build_vortex),
+        settings=manifest_settings,
+        environment=environment,
+        resource_config=resource_config,
+        runtime_config=runtime_config,
+    )
+
+
+def validate_run_inputs(spec: ResolvedBenchmarkSpec, selected_databases: list[str]) -> None:
+    if not selected_databases:
+        raise ValueError("run requires at least one database selection via --db, manifest, or state file")
+
+    if spec.repeat_count <= 0:
+        raise ValueError("run repeat count must be a positive integer")
+
+    if not (spec.workloads or spec.commands or spec.command_groups):
+        raise ValueError(
+            "run requires at least one workload, command, or command group from CLI flags or the workload manifest"
+        )

@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "VortexDB core data engine — Swiss Table, shard, commands, data structures"
+autoexamples = false
 
 [features]
 default = ["simd"]
 simd = []
+lock-profile = []
+profile-telemetry = []
+profiling-tools = ["dep:clap", "dep:tikv-jemallocator", "lock-profile", "profile-telemetry"]
 
 [lints.rust]
 unsafe_code = "allow"
@@ -16,10 +20,62 @@ unsafe_code = "allow"
 vortex-common = { workspace = true }
 vortex-proto = { workspace = true }
 vortex-memory = { workspace = true }
+vortex-sync = { workspace = true }
 ahash = { workspace = true }
+crossbeam-utils = { workspace = true }
+parking_lot = { workspace = true }
 itoa = { workspace = true }
 ryu = { workspace = true }
 bytes = { workspace = true }
+smallvec = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
+libc = { workspace = true }
+clap = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+hdrhistogram = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "table"
+harness = false
+
+[[example]]
+name = "engine_probe"
+path = "examples/engine_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "c2c_probe"
+path = "examples/c2c_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "lock_offcpu_probe"
+path = "examples/lock_offcpu_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "allocation_probe"
+path = "examples/allocation_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "atomic_contention_probe"
+path = "examples/atomic_contention_probe.rs"
+required-features = ["profiling-tools"]
+
+[[example]]
+name = "table_growth_limit_probe"
+path = "examples/table_growth_limit_probe.rs"
+
+[[example]]
+name = "table_live_slot_probe"
+path = "examples/table_live_slot_probe.rs"

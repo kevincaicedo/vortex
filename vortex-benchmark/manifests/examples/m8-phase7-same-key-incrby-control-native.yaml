@@ -1,0 +1,41 @@
+schema_version: 1
+name: m8-phase7-same-key-incrby-control-native
+description: Native same-key INCRBY redis-benchmark control for M8 Phase 7 engine/keyspace isolation.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+commands:
+  - INCRBY
+duration: 10s
+repeat: 1
+environment:
+  mode: native
+  port_base: 19079
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  io_backend: polling
+  telemetry_mode: minimal
+settings:
+  redis-benchmark:
+    requests: 200000
+    clients: 8
+    pipeline: 1
+    clients_sweep:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+    pipeline_sweep:
+      - 1
+      - 16
+    keyspace_size: 1000

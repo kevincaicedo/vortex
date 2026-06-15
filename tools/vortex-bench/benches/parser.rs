@@ -1,7 +1,9 @@
 use bytes::{Bytes, BytesMut};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use vortex_proto::frame::RespFrame;
-use vortex_proto::{IovecWriter, RespParser, RespSerializer, RespTape, scan_crlf, swar_parse_int};
+use vortex_proto::{
+    BorrowedRespTape, IovecWriter, RespParser, RespSerializer, RespTape, scan_crlf, swar_parse_int,
+};
 
 fn next_sample<'a, T>(samples: &'a [T], index: &mut usize) -> &'a T {
     let sample = &samples[*index];
@@ -368,6 +370,14 @@ fn bench_tape_parse(c: &mut Criterion) {
         b.iter(|| {
             let tape =
                 RespTape::parse_pipeline_bytes(black_box(pipeline_1000_bytes.clone())).unwrap();
+            black_box((tape.frame_count(), tape.consumed()));
+        });
+    });
+
+    group.bench_function("tape_pipeline_1000_borrowed", |b| {
+        b.iter(|| {
+            let tape =
+                BorrowedRespTape::parse_pipeline(black_box(pipeline_1000_bytes.as_ref())).unwrap();
             black_box((tape.frame_count(), tape.consumed()));
         });
     });

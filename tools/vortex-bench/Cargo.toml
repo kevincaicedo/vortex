@@ -32,10 +32,6 @@ path = "src/bin/loadgen.rs"
 bench = false
 
 [[bench]]
-name = "engine"
-harness = false
-
-[[bench]]
 name = "parser"
 harness = false
 
@@ -45,4 +41,12 @@ harness = false
 
 [[bench]]
 name = "reactor_scaling"
+harness = false
+
+[[bench]]
+name = "reactor_clock"
+harness = false
+
+[[bench]]
+name = "transaction_roundtrip"
 harness = false

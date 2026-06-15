@@ -1,9 +1,9 @@
 /// Maximum length for inline key storage (bytes).
 /// Keys ≤ this length are stored directly in the key struct without heap allocation.
-pub const MAX_INLINE_KEY_LEN: usize = 23;
+pub const MAX_INLINE_KEY_LEN: usize = 24;
 
 /// Maximum length for inline value storage (bytes).
-pub const MAX_INLINE_VALUE_LEN: usize = 21;
+pub const MAX_INLINE_VALUE_LEN: usize = 16;
 
 /// CPU cache line size in bytes (x86_64 / aarch64).
 pub const CACHE_LINE_SIZE: usize = 64;

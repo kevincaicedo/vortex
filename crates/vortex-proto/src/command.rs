@@ -112,12 +112,14 @@ pub fn uppercase_inplace(buf: &mut [u8]) {
         // SAFETY: i + 8 <= len, so ptr.add(i) points to 8 valid bytes.
         let word = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
         let uppercased = swar_upper_u64(word);
+        // SAFETY: i + 8 <= len, so ptr.add(i) points to 8 writable bytes.
         unsafe { (ptr.add(i) as *mut u64).write_unaligned(uppercased) };
         i += 8;
     }
 
     // Scalar tail for remaining bytes.
     while i < len {
+        // SAFETY: i < len, so ptr.add(i) points to one valid writable byte.
         unsafe {
             let b = *ptr.add(i);
             // Branchless: if b is in a-z range, clear bit 5.
@@ -224,8 +226,22 @@ impl CommandRouter {
         self.scratch[..len].copy_from_slice(cmd_bytes);
         uppercase_inplace(&mut self.scratch[..len]);
 
-        // PHF lookup. SAFETY: scratch contains valid UTF-8 (uppercase ASCII).
-        let name_str = unsafe { std::str::from_utf8_unchecked(&self.scratch[..len]) };
+        Self::dispatch_normalized(frame, &self.scratch[..len])
+    }
+
+    /// Dispatch a frame using a command name that was already normalized to
+    /// uppercase ASCII by the caller.
+    #[inline]
+    pub fn dispatch_normalized<'a>(
+        frame: &crate::FrameRef<'_>,
+        name: &'a [u8],
+    ) -> DispatchResult<'a> {
+        if name.is_empty() || !name.is_ascii() {
+            return DispatchResult::UnknownCommand;
+        }
+
+        // PHF lookup. SAFETY: `is_ascii()` guarantees valid UTF-8.
+        let name_str = unsafe { std::str::from_utf8_unchecked(name) };
         let meta = match COMMAND_TABLE.get(name_str).copied() {
             Some(m) => m,
             None => return DispatchResult::UnknownCommand,
@@ -246,11 +262,7 @@ impl CommandRouter {
             return DispatchResult::WrongArity { meta };
         }
 
-        DispatchResult::Dispatch {
-            meta,
-            name: &self.scratch[..len],
-            argc,
-        }
+        DispatchResult::Dispatch { meta, name, argc }
     }
 }
 
@@ -398,6 +410,30 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_non_ascii_command_name() {
+        let mut router = CommandRouter::new();
+        assert!(matches!(
+            dispatch_wire(&mut router, b"*1\r\n$3\r\nG\xffT\r\n"),
+            DispatchResult::UnknownCommand
+        ));
+    }
+
+    #[test]
+    fn dispatch_normalized_reuses_caller_command_name() {
+        let tape =
+            RespTape::parse_pipeline(b"*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n").expect("valid RESP");
+        let frame = tape.iter().next().expect("at least one frame");
+        match CommandRouter::dispatch_normalized(&frame, b"GET") {
+            DispatchResult::Dispatch { meta, name, argc } => {
+                assert_eq!(meta.name, "GET");
+                assert_eq!(name, b"GET");
+                assert_eq!(argc, 2);
+            }
+            _ => panic!("expected Dispatch"),
+        }
+    }
+
+    #[test]
     fn dispatch_set_correct_arity() {
         let mut router = CommandRouter::new();
         // SET key value → 3 args, arity -3 → OK
@@ -449,6 +485,30 @@ mod tests {
         assert!(matches!(
             dispatch_wire(&mut router, b"*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"),
             DispatchResult::Dispatch { .. }
+        ));
+    }
+
+    #[test]
+    fn dispatch_expire_accepts_optional_condition_arity() {
+        let mut router = CommandRouter::new();
+
+        for wire in [
+            b"*3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n".as_slice(),
+            b"*4\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n$2\r\nNX\r\n".as_slice(),
+            b"*4\r\n$7\r\nPEXPIRE\r\n$3\r\nkey\r\n$3\r\n100\r\n$2\r\nGT\r\n".as_slice(),
+            b"*4\r\n$8\r\nEXPIREAT\r\n$3\r\nkey\r\n$10\r\n1760000000\r\n$2\r\nLT\r\n".as_slice(),
+            b"*4\r\n$9\r\nPEXPIREAT\r\n$3\r\nkey\r\n$13\r\n1760000000000\r\n$2\r\nXX\r\n"
+                .as_slice(),
+        ] {
+            assert!(matches!(
+                dispatch_wire(&mut router, wire),
+                DispatchResult::Dispatch { .. }
+            ));
+        }
+
+        assert!(matches!(
+            dispatch_wire(&mut router, b"*2\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n"),
+            DispatchResult::WrongArity { .. }
         ));
     }
 

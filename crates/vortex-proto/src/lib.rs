@@ -49,4 +49,4 @@ pub use serializer::{
     RESP_ERR_WRONGTYPE,
 };
 pub use swar::swar_parse_int;
-pub use tape::{FrameRef, RespTape, TapeEntry};
+pub use tape::{BorrowedRespTape, FrameRef, RespTape, TapeEntry};

@@ -1,0 +1,40 @@
+schema_version: 1
+name: aof-pressure-always-native
+description: Native write-heavy AOF benchmark with appendfsync always; short storage-bound durability sample.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+  - memtier_benchmark
+commands:
+  - SET
+  - INCR
+workloads:
+  - uniform-write_only
+duration: 5s
+repeat: 3
+environment:
+  mode: native
+  port_base: 18779
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: true
+  aof_fsync: always
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 100
+    clients: 1
+    pipeline: 1
+    keyspace_size: 64
+  memtier_benchmark:
+    clients: 1
+    pipeline: 1
+    keyspace_size: 64
+    data_size: 64
+    thread_sweep:
+      - 1

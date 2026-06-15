@@ -5,15 +5,15 @@
 //! This crate implements the **thread-per-core** reactor architecture:
 //!
 //! - Each CPU core runs a dedicated [`Reactor`] with its own event loop,
-//!   memory arena, io_uring instance (Linux), and keyspace shard.
+//!   memory arena, and io_uring instance (Linux).
 //! - Connections are pinned to cores via `SO_REUSEPORT`.
-//! - The [`IoBackend`] trait abstracts over io_uring (Linux) and polling
+//! - A crate-private backend layer selects io_uring (Linux) or polling
 //!   (cross-platform fallback via epoll/kqueue/IOCP).
 //!
 //! ## Key Types
 //!
 //! - [`Reactor`] — Single-threaded event loop
-//! - [`IoBackend`] — Trait abstracting I/O backend
+//! - [`IoBackendMode`] — Runtime backend selection mode
 //! - [`ConnectionSlab`] — Slab-allocated connection tracking
 //! - [`Connection`] — Per-client state machine
 //!
@@ -24,7 +24,8 @@
 //! - `polling-fallback` — Cross-platform polling backend (default)
 
 pub mod accept;
-pub mod backend;
+pub(crate) mod aof;
+pub(crate) mod backend;
 pub mod connection;
 pub mod pool;
 pub mod reactor;
@@ -32,7 +33,13 @@ pub mod shutdown;
 pub mod timer;
 
 pub use connection::{ConnectionMeta, ConnectionSlab, ConnectionState};
-pub use pool::{CrossMessage, ReactorPool, ReactorPoolConfig};
-pub use reactor::{Reactor, ReactorConfig};
+pub use pool::{FixedBufferRegistrationMode, IoBackendMode};
+pub use pool::{ReactorPool, ReactorPoolConfig};
+pub use reactor::{
+    AcceptBudget, AofConfig, CommandBudget, CompletionBudget, ConnectionMemoryCaps,
+    MaintenanceBudget, Reactor, ReactorBudgets, ReactorConfig, ReactorOverloadPolicy, TimeBudget,
+    WritevBudget,
+};
 pub use shutdown::ShutdownCoordinator;
 pub use timer::TimerWheel;
+pub use vortex_engine::keyspace::RuntimeTelemetryMode;

@@ -1,0 +1,35 @@
+schema_version: 1
+name: m8-phase7-hot-counter-aof-correctness-native
+description: Native Phase 7 M8 semantic-counter AOF correctness smoke with small operation counts.
+databases:
+  - vortex
+backends:
+  - custom-rust
+workloads:
+  - hot_counter
+  - hot_counter_ttl
+duration: 2s
+repeat: 1
+environment:
+  mode: native
+  port_base: 18479
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: true
+  aof_fsync: always
+  eviction_policy: noeviction
+  telemetry_mode: minimal
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 1
+      - 4
+      - 8
+    keyspace_size: 2
+    ops_per_thread: 1000
+    warmup_ops: 100
+    value_size: 16

@@ -1,0 +1,603 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from typing import Optional
+
+from vortex_benchmark.commands import (
+    CounterReplayCheckError,
+    execute_attach,
+    execute_counter_replay_check,
+    execute_report,
+    execute_run,
+    execute_setup,
+    execute_teardown,
+    has_run_selection,
+)
+from vortex_benchmark.db.base import SetupError
+from vortex_benchmark.models import (
+    DEFAULT_CPUS,
+    DEFAULT_MEMORY,
+    DEFAULT_PORT_BASE,
+    SUPPORTED_AOF_FSYNC_POLICIES,
+    SUPPORTED_EVICTION_POLICIES,
+)
+from vortex_benchmark.session import TARGET_MODES
+
+SUPPORTED_VORTEX_IO_BACKENDS = ("auto", "uring", "polling")
+SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION = ("auto", "on", "off")
+SUPPORTED_VORTEX_TELEMETRY_MODES = ("minimal", "standard", "profile")
+SUPPORTED_EVIDENCE_TIERS = ("exploratory", "engineering", "citation-grade")
+SUPPORTED_RUN_PROFILES = ("quick", "engineering", "citation", "diagnostic")
+
+
+class BenchmarkHelpFormatter(
+    argparse.RawDescriptionHelpFormatter,
+):
+    """Preserve examples in operator-facing help output."""
+
+
+BENCHMARK_HELP_EPILOG = """
+Primary examples:
+  just benchmark --db vortex --native --backend redis-benchmark --command PING,GET,SET --duration 10s --artifact-root .artifacts/benchmarks/local
+  just benchmark --db redis --target-mode host-port --target-url 127.0.0.1:6379 --backend redis-benchmark --command PING --artifact-root .artifacts/benchmarks/attach
+  just benchmark --workload-manifest vortex-benchmark/manifests/examples/local-native-full-cycle.yaml --profile engineering
+  just benchmark report --summary-file .artifacts/benchmarks/results/<run>-summary.json --output-dir .artifacts/benchmarks/report
+
+Target modes:
+  local        Start and stop managed native or Docker services.
+  host-port    Attach to an existing RESP endpoint and never stop it.
+  ssh-managed  Run explicit SSH start/stop commands and benchmark the declared endpoint.
+  ssh-attach   Attach to an existing remote endpoint and never mutate the service.
+
+Report output:
+  Runs write session.json, preflight.json, request JSON, raw backend outputs,
+  normalized summaries, report.json, report.csv, and report.md under --artifact-root.
+  Product policy is intentionally outside this tool.
+
+Expert/debug subcommands:
+  setup, attach, run, teardown, report, counter-replay-check
+"""
+
+
+REPORT_HELP_EPILOG = """
+Report examples:
+  just benchmark report --summary-file .artifacts/benchmarks/results/<run>-summary.json --output-dir .artifacts/benchmarks/report
+  just benchmark report --results-dir .artifacts/benchmarks/results --output-dir .artifacts/benchmarks/report
+  just benchmark report --baseline-summary-file .artifacts/benchmarks/baseline/results/<run>-summary.json --candidate-summary-file .artifacts/benchmarks/candidate/results/<run>-summary.json --output-dir .artifacts/benchmarks/diff
+
+Outputs:
+  report.json, report.csv, report.md, chart assets, reports/latest/ copies, and
+  a compact console table with throughput, latency, client saturation, and the
+  limiting-resource hypothesis.
+"""
+
+
+def add_environment_arguments(parser: argparse.ArgumentParser, *, include_state_file: bool) -> None:
+    parser.add_argument(
+        "--db",
+        dest="databases",
+        action="append",
+        default=[],
+        help="Comma-separated database list. Supported: vortex, redis, dragonfly, valkey.",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--native", action="store_true", help="Use native processes where supported.")
+    mode_group.add_argument("--container", action="store_true", help="Use Docker containers.")
+    if include_state_file:
+        parser.add_argument("--state-file", help="Path to an environment state file.")
+    parser.add_argument(
+        "--output-dir",
+        help="Artifact root directory. Defaults to .artifacts/benchmarks under the repo root.",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        dest="output_dir",
+        help="Alias for --output-dir. Creates a complete timestamped session under this root.",
+    )
+    parser.add_argument(
+        "--port-base",
+        type=int,
+        default=None,
+        help=f"Base port used for setup. Default: {DEFAULT_PORT_BASE}.",
+    )
+    parser.add_argument(
+        "--cpus",
+        type=int,
+        default=None,
+        help=f"CPU budget used for container limits and service thread defaults. Default: {DEFAULT_CPUS}.",
+    )
+    parser.add_argument(
+        "--memory",
+        default=None,
+        help=f"Container memory limit to record in state files. Default: {DEFAULT_MEMORY}.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        help="Override the service thread count used for Vortex, Redis, Dragonfly, or Valkey setup.",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        help="Vortex engine shard count for setup scenarios. Must be a power of two.",
+    )
+    aof_group = parser.add_mutually_exclusive_group()
+    aof_group.add_argument(
+        "--aof-enabled",
+        dest="aof_enabled",
+        action="store_true",
+        help="Enable AOF or appendonly persistence for supported databases during setup.",
+    )
+    aof_group.add_argument(
+        "--aof-disabled",
+        dest="aof_enabled",
+        action="store_false",
+        help="Explicitly disable AOF or appendonly persistence in the requested runtime config.",
+    )
+    parser.add_argument(
+        "--aof-fsync",
+        choices=SUPPORTED_AOF_FSYNC_POLICIES,
+        help="AOF fsync policy for supported databases. Choices: always, everysec, no.",
+    )
+    parser.add_argument(
+        "--aof-max-pending-fsync-bytes",
+        type=int,
+        help="Vortex everysec AOF pending-byte limit before backpressure.",
+    )
+    parser.add_argument(
+        "--maxmemory",
+        help="Database maxmemory setting for setup scenarios, for example 4mb, 2g, or 1073741824.",
+    )
+    parser.add_argument(
+        "--eviction-policy",
+        choices=SUPPORTED_EVICTION_POLICIES,
+        help="Database eviction policy for supported databases.",
+    )
+    parser.add_argument(
+        "--io-backend",
+        choices=SUPPORTED_VORTEX_IO_BACKENDS,
+        help="Vortex I/O backend override for setup scenarios. Choices: auto, uring, polling.",
+    )
+    parser.add_argument(
+        "--telemetry-mode",
+        choices=SUPPORTED_VORTEX_TELEMETRY_MODES,
+        help="Vortex telemetry mode. minimal is cheapest, standard samples batch diagnostics, and profile requires native target/profiling with profile-telemetry.",
+    )
+    parser.add_argument(
+        "--telemetry-local-sample-rate",
+        type=int,
+        help="Vortex standard-mode sample rate for reactor-local batch diagnostics.",
+    )
+    parser.add_argument(
+        "--telemetry-flush-interval-ms",
+        type=int,
+        help="Vortex cold metrics flush interval in milliseconds.",
+    )
+    parser.add_argument(
+        "--ring-size",
+        type=int,
+        help="Vortex io_uring submission queue size override for setup scenarios.",
+    )
+    parser.add_argument(
+        "--fixed-buffers",
+        type=int,
+        help="Vortex fixed I/O buffer count override for setup scenarios.",
+    )
+    parser.add_argument(
+        "--fixed-buffer-registration",
+        choices=SUPPORTED_VORTEX_FIXED_BUFFER_REGISTRATION,
+        help="Vortex io_uring fixed-buffer registration policy. Choices: auto, on, off.",
+    )
+    parser.add_argument(
+        "--sqpoll-idle-ms",
+        type=int,
+        help="Vortex SQPOLL idle timeout override for setup scenarios.",
+    )
+    parser.add_argument(
+        "--no-build-vortex",
+        dest="build_vortex",
+        action="store_false",
+        help="Do not auto-build the Vortex binary or Docker image when missing.",
+    )
+    parser.set_defaults(build_vortex=None)
+    parser.set_defaults(aof_enabled=None)
+
+
+def add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        choices=SUPPORTED_RUN_PROFILES,
+        help="Run profile: quick, engineering, citation, or diagnostic.",
+    )
+    parser.add_argument(
+        "--evidence-tier",
+        choices=SUPPORTED_EVIDENCE_TIERS,
+        default="engineering",
+        help="Measurement validity tier recorded in metadata. Default: engineering.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=None,
+        help="Execute each selected scenario multiple times. Overrides manifest repeat; defaults to 1 when neither is set.",
+    )
+    parser.add_argument(
+        "--backend",
+        dest="backends",
+        action="append",
+        default=[],
+        help="Comma-separated backend list to execute. Defaults are chosen from the selected commands and workloads.",
+    )
+    parser.add_argument(
+        "--workload",
+        dest="workloads",
+        action="append",
+        default=[],
+        help="Comma-separated workload names.",
+    )
+    parser.add_argument(
+        "--workload-manifest",
+        help="Path to a JSON or YAML benchmark manifest.",
+    )
+    parser.add_argument(
+        "--manifest",
+        dest="workload_manifest",
+        help="Alias for --workload-manifest.",
+    )
+    parser.add_argument(
+        "--command",
+        dest="commands",
+        action="append",
+        default=[],
+        help="Comma-separated command names.",
+    )
+    parser.add_argument(
+        "--command-group",
+        dest="command_groups",
+        action="append",
+        default=[],
+        help="Comma-separated higher-level command groups.",
+    )
+    parser.add_argument("--duration", help="Requested benchmark duration, for example 60s.")
+    parser.add_argument(
+        "--target-mode",
+        choices=TARGET_MODES,
+        help="Target mode for one-command runs: local, host-port, ssh-managed, or ssh-attach.",
+    )
+    parser.add_argument(
+        "--target-url",
+        help="RESP endpoint for attach modes, for example redis://127.0.0.1:6379 or 127.0.0.1:6379.",
+    )
+    parser.add_argument("--target-host", help="RESP host for host-port or SSH attach modes.")
+    parser.add_argument("--target-port", type=int, help="RESP port for host-port or SSH attach modes.")
+    parser.add_argument(
+        "--target-pid",
+        type=int,
+        help="Optional externally managed service PID to record for attach modes.",
+    )
+    parser.add_argument("--ssh-target", help="SSH target for remote managed or remote attach modes.")
+    parser.add_argument("--ssh-service-host", help="Remote service host label recorded in session metadata.")
+    parser.add_argument("--ssh-load-host", help="Optional SSH target that runs benchmark load generation from --ssh-workdir.")
+    parser.add_argument("--ssh-workdir", help="Remote working directory for SSH source copy, build, profiler, or load execution.")
+    parser.add_argument("--ssh-port", type=int, help="SSH port for remote benchmark transport.")
+    parser.add_argument("--ssh-identity-file", help="SSH private key path for remote benchmark transport.")
+    parser.add_argument("--ssh-config", help="SSH config file for remote benchmark transport.")
+    parser.add_argument(
+        "--ssh-option",
+        action="append",
+        default=[],
+        help="Raw SSH -o option, for example StrictHostKeyChecking=no. May be repeated.",
+    )
+    parser.add_argument(
+        "--ssh-connect-timeout",
+        type=int,
+        help="SSH ConnectTimeout seconds for remote benchmark transport.",
+    )
+    parser.add_argument(
+        "--ssh-copy-source",
+        action="store_true",
+        help="Copy the local checkout to --ssh-workdir before an SSH benchmark run.",
+    )
+    parser.add_argument(
+        "--ssh-build-command",
+        help="Remote build or preparation command to run inside --ssh-workdir before SSH benchmark execution.",
+    )
+    parser.add_argument("--ssh-start-command", help="Remote command that starts the service for ssh-managed mode.")
+    parser.add_argument("--ssh-stop-command", help="Remote command that stops the service for ssh-managed mode.")
+    parser.add_argument("--ssh-artifact-path", help="Remote artifact path to copy back when available.")
+    parser.add_argument(
+        "--ssh-redact",
+        action="append",
+        default=[],
+        help="Sensitive value to redact from SSH command output. May be repeated.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve setup, target, workload, preflight, and artifact paths without running benchmarks.",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Print the resolved execution plan before running.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Stream progress events as JSON lines.",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color in progress output.",
+    )
+    parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Skip automatic report generation in one-command run mode.",
+    )
+
+
+def add_report_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--summary-file",
+        dest="summary_files",
+        action="append",
+        default=[],
+        help="Path to a benchmark summary JSON file. Repeat to aggregate multiple runs.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        help="Directory containing *-summary.json files. Defaults to .artifacts/benchmarks/results when no summary file is passed.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Artifact root directory for generated report outputs. Defaults to the source artifact root.",
+    )
+    parser.add_argument(
+        "--title",
+        help="Optional report title override.",
+    )
+    parser.add_argument(
+        "--baseline-summary-file",
+        dest="baseline_summary_files",
+        action="append",
+        default=[],
+        help="Baseline summary JSON for an offline before/after diff report. Repeat to aggregate multiple runs.",
+    )
+    parser.add_argument(
+        "--baseline-results-dir",
+        help="Directory containing baseline *-summary.json files for a diff report.",
+    )
+    parser.add_argument(
+        "--candidate-summary-file",
+        dest="candidate_summary_files",
+        action="append",
+        default=[],
+        help="Candidate summary JSON for an offline before/after diff report. Repeat to aggregate multiple runs.",
+    )
+    parser.add_argument(
+        "--candidate-results-dir",
+        help="Directory containing candidate *-summary.json files for a diff report.",
+    )
+
+
+def add_attach_arguments(parser: argparse.ArgumentParser) -> None:
+    add_environment_arguments(parser, include_state_file=True)
+    parser.add_argument("--host", required=True, help="Host of the already running endpoint.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        required=True,
+        help="RESP port of the already running endpoint.",
+    )
+    parser.add_argument(
+        "--pid",
+        type=int,
+        help="Optional PID of the already running server process.",
+    )
+    parser.add_argument(
+        "--label",
+        help="Optional short label added to the attached environment identifier.",
+    )
+    parser.add_argument(
+        "--binary-path",
+        help="Optional binary path recorded in the environment metadata.",
+    )
+    parser.add_argument(
+        "--log-path",
+        help="Optional existing log file path to record in the attached state.",
+    )
+
+
+def add_counter_replay_check_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--artifact-root",
+        required=True,
+        help="Completed benchmark artifact root that contains environments/, backend-runs/, and runtime/.",
+    )
+    parser.add_argument(
+        "--workload",
+        default="hot_counter",
+        help="Counter workload to verify. Defaults to hot_counter.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        help="Specific load-thread row to verify. Defaults to the highest available thread row.",
+    )
+    parser.add_argument(
+        "--key",
+        default="bench:counter:0",
+        help="Counter key to read after replay. Defaults to bench:counter:0.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=19680,
+        help="Temporary localhost port for the replay server. Defaults to 19680.",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Time to wait for replay startup before failing. Defaults to 30 seconds.",
+    )
+    parser.add_argument(
+        "--threads-for-replay",
+        type=int,
+        default=4,
+        help="Vortex service threads used for replay. Defaults to 4.",
+    )
+    parser.add_argument(
+        "--vortex-binary",
+        help="Optional vortex-server binary override. Defaults to the binary recorded in the environment state.",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="just benchmark",
+        description="Artifact-first benchmark runner for local, attach, Docker, and SSH targets.",
+        formatter_class=BenchmarkHelpFormatter,
+        epilog=BENCHMARK_HELP_EPILOG,
+    )
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Run setup in unified mode before optional run-request resolution.",
+    )
+    parser.add_argument(
+        "--teardown",
+        action="store_true",
+        help="Stop services tracked by --state-file in unified mode.",
+    )
+    add_environment_arguments(parser, include_state_file=True)
+    add_run_arguments(parser)
+
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Start database services and write a state file.",
+        formatter_class=BenchmarkHelpFormatter,
+    )
+    add_environment_arguments(setup_parser, include_state_file=True)
+    setup_parser.add_argument(
+        "--workload-manifest",
+        help="Path to a JSON or YAML benchmark manifest.",
+    )
+
+    attach_parser = subparsers.add_parser(
+        "attach",
+        help="Record an already running endpoint as an environment state file.",
+        formatter_class=BenchmarkHelpFormatter,
+    )
+    add_attach_arguments(attach_parser)
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Execute benchmark backends from an existing state file.",
+        formatter_class=BenchmarkHelpFormatter,
+        epilog=BENCHMARK_HELP_EPILOG,
+    )
+    add_environment_arguments(run_parser, include_state_file=True)
+    add_run_arguments(run_parser)
+
+    teardown_parser = subparsers.add_parser(
+        "teardown",
+        help="Stop services tracked by an environment state file.",
+        formatter_class=BenchmarkHelpFormatter,
+    )
+    teardown_parser.add_argument("--state-file", required=True, help="Path to an environment state file.")
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Aggregate benchmark summaries into JSON, CSV, Markdown, and chart artifacts.",
+        formatter_class=BenchmarkHelpFormatter,
+        epilog=REPORT_HELP_EPILOG,
+    )
+    add_report_arguments(report_parser)
+
+    counter_replay_parser = subparsers.add_parser(
+        "counter-replay-check",
+        help="Replay a completed Vortex AOF artifact and verify the final counter value.",
+        formatter_class=BenchmarkHelpFormatter,
+    )
+    add_counter_replay_check_arguments(counter_replay_parser)
+
+    return parser
+
+
+def dispatch(args: argparse.Namespace) -> int:
+    if args.subcommand == "setup":
+        execute_setup(args)
+        return 0
+
+    if args.subcommand == "attach":
+        execute_attach(args)
+        return 0
+
+    if args.subcommand == "run":
+        execute_run(args)
+        return 0
+
+    if args.subcommand == "teardown":
+        execute_teardown(args)
+        return 0
+
+    if args.subcommand == "report":
+        execute_report(args)
+        return 0
+
+    if args.subcommand == "counter-replay-check":
+        execute_counter_replay_check(args)
+        return 0
+
+    if args.setup and args.teardown:
+        raise ValueError("--setup and --teardown cannot be combined")
+
+    if args.teardown:
+        if not args.state_file:
+            raise ValueError("--teardown requires --state-file")
+        execute_teardown(args)
+        return 0
+
+    if args.setup:
+        state = execute_setup(args)
+        if has_run_selection(args):
+            execute_run(args, preloaded_state=state)
+        return 0
+
+    if args.state_file and has_run_selection(args):
+        execute_run(args)
+        return 0
+
+    if has_run_selection(args):
+        args.subcommand = "run"
+        execute_run(args)
+        return 0
+
+    raise ValueError(
+        "no action requested; pass benchmark selectors, use --setup, or choose a subcommand"
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if not raw_argv:
+        parser.print_help()
+        return 0
+    args = parser.parse_args(raw_argv)
+
+    try:
+        return dispatch(args)
+    except (SetupError, CounterReplayCheckError, ValueError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

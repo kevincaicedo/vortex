@@ -1,10 +1,10 @@
 //! # vortex-metrics
 //!
-//! Observability layer for VortexDB.
+//! Reserved crate for future standalone observability infrastructure.
 //!
-//! Provides per-reactor thread-local metric counters, metric aggregation,
-//! a built-in HTTP server for Prometheus `/metrics` endpoint, `SLOWLOG`
-//! ring buffer, `LATENCY HISTOGRAM` per command type, and `INFO` command
-//! response building.
+//! This crate intentionally exposes no release-supported metrics API in
+//! `v0.1-alpha`. The current alpha runtime telemetry surface is implemented in
+//! the engine/server `INFO` path. A standalone metrics crate, Prometheus
+//! endpoint, `SLOWLOG`, and `LATENCY HISTOGRAM` support remain future work.
 //!
-//! **Status:** Stub — implementation in Phase 4.
+//! **Status:** Stub — implementation planned for Phase 4.

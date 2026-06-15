@@ -12,3 +12,11 @@ Cargo.lock
 # Benchmark results (generated, keep only .gitkeep)
 benchmarks/*.json
 benchmarks/*.md
+**/.artifacts/
+**/.env
+**/.env-*
+
+**/__pycache__/
+**/.pytest_cache/
+**/perf.data
+**/perf.data.*

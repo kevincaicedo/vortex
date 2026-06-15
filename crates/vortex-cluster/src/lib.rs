@@ -1,8 +1,9 @@
 //! # vortex-cluster
 //!
-//! Cluster protocol, gossip, and slot routing for VortexDB.
+//! Reserved crate for future cluster protocol, gossip, and slot-routing work.
 //!
-//! Implements Redis Cluster-compatible slot routing (16384 slots),
-//! gossip protocol for node discovery, and MOVED/ASK redirections.
+//! This crate intentionally exposes no release-supported cluster API in
+//! `v0.1-alpha`. Redis Cluster-compatible slot routing, gossip-based node
+//! discovery, and `MOVED`/`ASK` redirections remain future work.
 //!
-//! **Status:** Stub — implementation in Phase 7.
+//! **Status:** Stub — implementation planned for Phase 7.

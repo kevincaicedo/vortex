@@ -1,0 +1,36 @@
+schema_version: 1
+name: workstream-e-memtier-read-heavy-polling-svc4-load-e-t8-compare
+description: Focused Workstream E memtier read-heavy t8 comparison with four P-core service threads and E-core load threads.
+databases:
+  - vortex
+  - redis
+backends:
+  - memtier_benchmark
+workloads:
+  - uniform-read_heavy
+duration: 10s
+repeat: 5
+environment:
+  mode: native
+  port_base: 40379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+  service_cpus: "0,2,4,6"
+  load_cpus: "16,17,18,19,20,21,22,23"
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  telemetry_mode: minimal
+  io_backend: polling
+  fixed_buffers: 1024
+settings:
+  memtier_benchmark:
+    clients: 100
+    pipeline: 1
+    keyspace_size: 100000
+    data_size: 256
+    thread_sweep:
+      - 8

@@ -5,8 +5,8 @@
 //! 10 PINGs each.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use vortex_io::{ReactorPool, ReactorPoolConfig};
@@ -17,6 +17,38 @@ fn free_port() -> u16 {
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
     port
+}
+
+fn connect_stream(addr: SocketAddr) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("timeout");
+                stream.set_nodelay(true).expect("nodelay");
+                return stream;
+            }
+            Err(err)
+                if Instant::now() < deadline
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::AddrNotAvailable
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("connect {addr} failed: {err}"),
+        }
+    }
+}
+
+fn connect_streams(addr: SocketAddr, num_clients: usize) -> Vec<TcpStream> {
+    (0..num_clients).map(|_| connect_stream(addr)).collect()
 }
 
 fn reactor_scaling(c: &mut Criterion) {
@@ -44,26 +76,24 @@ fn reactor_scaling(c: &mut Criterion) {
                     buffer_size: 16_384,
                     buffer_count: 1024,
                     connection_timeout: 0,
+                    aof_config: None,
+                    shard_count: 64,
+                    io_backend: vortex_io::IoBackendMode::Auto,
+                    ring_size: 1024,
+                    sqpoll_idle_ms: 4096,
+                    max_memory: 0,
+                    eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
                 };
 
                 let mut pool = ReactorPool::spawn(config).expect("pool creation");
-                std::thread::sleep(Duration::from_millis(200));
+                let num_clients = 20;
+                let pings_per_client = 10;
+                let ping_cmd = b"*1\r\n$4\r\nPING\r\n";
+                let expected_len = "+PONG\r\n".len() * pings_per_client;
+                let mut streams = connect_streams(addr, num_clients);
+                let mut buf = vec![0u8; expected_len + 64];
 
                 b.iter(|| {
-                    let num_clients = 20;
-                    let pings_per_client = 10;
-                    let ping_cmd = b"*1\r\n$4\r\nPING\r\n";
-
-                    let mut streams: Vec<TcpStream> = (0..num_clients)
-                        .map(|_| {
-                            let s = TcpStream::connect(addr).expect("connect");
-                            s.set_read_timeout(Some(Duration::from_secs(5)))
-                                .expect("timeout");
-                            s.set_nodelay(true).expect("nodelay");
-                            s
-                        })
-                        .collect();
-
                     // Pipeline PINGs.
                     for stream in &mut streams {
                         for _ in 0..pings_per_client {
@@ -72,8 +102,6 @@ fn reactor_scaling(c: &mut Criterion) {
                     }
 
                     // Read all responses.
-                    let expected_len = "+PONG\r\n".len() * pings_per_client;
-                    let mut buf = vec![0u8; expected_len + 64];
                     for stream in &mut streams {
                         let mut total = 0;
                         while total < expected_len {
@@ -84,9 +112,9 @@ fn reactor_scaling(c: &mut Criterion) {
                             total += n;
                         }
                     }
-
-                    drop(streams);
                 });
+
+                drop(streams);
 
                 pool.shutdown();
                 pool.join();

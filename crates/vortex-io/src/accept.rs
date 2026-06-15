@@ -5,6 +5,7 @@
 //! `SO_INCOMING_CPU` to hint the kernel to route incoming connections to the
 //! specified CPU core's receive queue, reducing cross-core cache migration.
 
+use std::net::SocketAddr;
 use std::os::fd::RawFd;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -13,11 +14,12 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 ///
 /// Sets `SO_REUSEADDR`, `SO_REUSEPORT`, `TCP_NODELAY`, and non-blocking mode.
 /// On Linux, additionally sets `SO_INCOMING_CPU` when `core_hint` is provided.
-pub fn create_listener(
-    bind_addr: std::net::SocketAddr,
-    core_hint: Option<usize>,
-) -> std::io::Result<RawFd> {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+pub fn create_listener(bind_addr: SocketAddr, core_hint: Option<usize>) -> std::io::Result<RawFd> {
+    let domain = match bind_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
@@ -56,4 +58,37 @@ pub fn create_listener(
 
     tracing::debug!(fd, addr = %bind_addr, "listener created");
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    use super::create_listener;
+
+    #[test]
+    fn listener_binds_ipv6_loopback_when_host_supports_ipv6() -> io::Result<()> {
+        let bind_addr = "[::1]:0".parse().expect("valid IPv6 loopback address");
+
+        match create_listener(bind_addr, None) {
+            Ok(fd) => {
+                // SAFETY: `create_listener` returned a fresh owned file descriptor
+                // that is not managed elsewhere after it transfers the raw fd.
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                drop(owned);
+                Ok(())
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL | libc::EACCES | libc::EPERM)
+                ) =>
+            {
+                eprintln!("skipping IPv6 bind check on host without usable loopback IPv6: {error}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
 }

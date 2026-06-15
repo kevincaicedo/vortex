@@ -1,0 +1,33 @@
+schema_version: 1
+name: aof-backpressure-everysec-native
+description: Native Vortex-only everysec AOF backpressure proof with a low pending-byte limit.
+databases:
+  - vortex
+backends:
+  - memtier_benchmark
+commands:
+  - SET
+workloads:
+  - uniform-write_only
+duration: 10s
+repeat: 3
+environment:
+  mode: native
+  port_base: 18879
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: true
+  aof_fsync: everysec
+  aof_max_pending_fsync_bytes: 4096
+  eviction_policy: noeviction
+settings:
+  memtier_benchmark:
+    clients: 8
+    pipeline: 4
+    keyspace_size: 100000
+    data_size: 128
+    thread_sweep:
+      - 1

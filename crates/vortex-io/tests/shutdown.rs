@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vortex_io::{Reactor, ReactorConfig};
+use vortex_io::{IoBackendMode, Reactor, ReactorConfig};
 use vortex_io::{ReactorPool, ReactorPoolConfig, ShutdownCoordinator};
 
 /// Find a free port by binding to :0, extracting the port, and closing.
@@ -37,8 +37,19 @@ fn graceful_shutdown_single_reactor() {
             bind_addr: addr,
             max_connections: 64,
             buffer_size: 4096,
-            buffer_count: 64,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: Default::default(),
+            overload_policy: Default::default(),
+            buffer_count: 128,
+            fixed_buffer_registration: Default::default(),
             connection_timeout: 0,
+            aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
+            budgets: Default::default(),
+            telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();
@@ -91,8 +102,22 @@ fn graceful_shutdown_pool() {
         threads: 2,
         max_connections: 128,
         buffer_size: 4096,
-        buffer_count: 128,
+        max_request_bytes: 64 * 1024 * 1024,
+        connection_caps: Default::default(),
+        overload_policy: Default::default(),
+        buffer_count: 256,
+        fixed_buffer_registration: Default::default(),
         connection_timeout: 0,
+        aof_config: None,
+        shard_count: 64,
+        io_backend: IoBackendMode::Polling,
+        ring_size: 4096,
+        sqpoll_idle_ms: 1000,
+        budgets: Default::default(),
+        telemetry_mode: Default::default(),
+        max_memory: 0,
+        eviction_policy: vortex_engine::EvictionPolicy::NoEviction,
+        ..Default::default()
     };
 
     let mut pool = ReactorPool::spawn(config).expect("pool creation");
@@ -148,8 +173,19 @@ fn new_connections_refused_during_drain() {
             bind_addr: addr,
             max_connections: 64,
             buffer_size: 4096,
-            buffer_count: 64,
+            max_request_bytes: 64 * 1024 * 1024,
+            connection_caps: Default::default(),
+            overload_policy: Default::default(),
+            buffer_count: 128,
+            fixed_buffer_registration: Default::default(),
             connection_timeout: 0,
+            aof_config: None,
+            io_backend: IoBackendMode::Polling,
+            ring_size: 4096,
+            sqpoll_idle_ms: 1000,
+            budgets: Default::default(),
+            telemetry_mode: Default::default(),
+            ..Default::default()
         };
         let mut reactor = Reactor::new(0, config, coord_clone).expect("reactor creation");
         reactor.run();

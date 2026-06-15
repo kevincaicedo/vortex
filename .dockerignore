@@ -2,3 +2,7 @@ target/
 fuzz/target/
 .git/
 benchmarks/
+vortex-benchmark/
+smoketests/
+scripts/
+.artifacts/

@@ -1,7 +1,9 @@
 //! # vortex-replication
 //!
-//! Leader-follower replication engine for VortexDB.
+//! Reserved crate for future leader-follower replication work.
 //!
-//! Implements PSYNC-compatible replication with a replication backlog.
+//! This crate intentionally exposes no release-supported replication API in
+//! `v0.1-alpha`. PSYNC-compatible replication and the replication backlog
+//! remain future work.
 //!
-//! **Status:** Stub — implementation in Phase 6.
+//! **Status:** Stub — implementation planned for Phase 6.

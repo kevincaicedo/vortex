@@ -1,33 +1,387 @@
 //! Command handler dispatch for VortexDB engine.
 //!
-//! Each command is a free function `cmd_xxx(shard, args, now_nanos) -> CmdResult`
+//! Each command is a free function `cmd_xxx(keyspace, args, now_nanos) -> CmdResult`
 //! dispatched via a static match on the command name. No trait objects, no
 //! dynamic dispatch — the compiler inlines the entire chain.
 
-pub mod key;
-pub mod server;
-pub mod string;
+pub(crate) mod connection;
+pub(crate) mod generic;
+pub(crate) mod pattern;
+pub(crate) mod server;
+pub(crate) mod string;
+pub(crate) mod transaction;
 
-use vortex_common::{VortexKey, VortexValue};
+use smallvec::SmallVec;
+use vortex_common::{
+    VortexKey, VortexValue,
+    absolute_unix_nanos_to_deadline_nanos as common_absolute_unix_nanos_to_deadline_nanos,
+    current_unix_time_nanos,
+    deadline_nanos_to_absolute_unix_nanos as common_deadline_nanos_to_absolute_unix_nanos,
+};
 use vortex_proto::{FrameRef, RespFrame};
 
-use crate::Shard;
+use crate::ConcurrentKeyspace;
+pub use crate::effects::{AofCommitEffect, AofRecord, AofRecords, MutationErrorKind};
+use crate::keyspace::AofLsn;
 
 /// Nanoseconds per second.
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 /// Nanoseconds per millisecond.
 pub const NS_PER_MS: u64 = 1_000_000;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommandClock {
+    pub monotonic_nanos: u64,
+    pub unix_nanos: u64,
+}
+
+impl CommandClock {
+    #[inline]
+    pub const fn new(monotonic_nanos: u64, unix_nanos: u64) -> Self {
+        Self {
+            monotonic_nanos,
+            unix_nanos,
+        }
+    }
+}
+
+impl From<u64> for CommandClock {
+    #[inline]
+    fn from(now_nanos: u64) -> Self {
+        Self::new(now_nanos, now_nanos)
+    }
+}
+
+#[inline]
+pub(crate) fn resolve_unix_time_now_nanos(unix_now_nanos: u64) -> u64 {
+    if unix_now_nanos == 0 {
+        current_unix_time_nanos()
+    } else {
+        unix_now_nanos
+    }
+}
+
+#[inline]
+fn resolve_deadline_clock_now_nanos(now_nanos: u64, unix_now_nanos: u64) -> u64 {
+    if unix_now_nanos == 0 {
+        now_nanos
+    } else {
+        unix_now_nanos
+    }
+}
+
+#[inline]
+pub(crate) fn absolute_unix_nanos_to_deadline_nanos(
+    absolute_unix_nanos: u64,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> u64 {
+    common_absolute_unix_nanos_to_deadline_nanos(
+        absolute_unix_nanos,
+        now_nanos,
+        resolve_deadline_clock_now_nanos(now_nanos, unix_now_nanos),
+    )
+}
+
+#[inline]
+pub(crate) fn deadline_nanos_to_absolute_unix_nanos(
+    deadline_nanos: u64,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> u64 {
+    common_deadline_nanos_to_absolute_unix_nanos(
+        deadline_nanos,
+        now_nanos,
+        resolve_deadline_clock_now_nanos(now_nanos, unix_now_nanos),
+    )
+}
+
+#[inline]
+pub(crate) fn relative_deadline_nanos(amount: u64, unit_nanos: u64, now_nanos: u64) -> Option<u64> {
+    amount
+        .checked_mul(unit_nanos)
+        .and_then(|delta| now_nanos.checked_add(delta))
+}
+
+#[inline]
+pub(crate) fn absolute_deadline_nanos(
+    amount: u64,
+    unit_nanos: u64,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> Option<u64> {
+    let absolute_unix_nanos = amount.checked_mul(unit_nanos)?;
+    Some(absolute_unix_nanos_to_deadline_nanos(
+        absolute_unix_nanos,
+        now_nanos,
+        unix_now_nanos,
+    ))
+}
+
+#[inline]
+pub(crate) fn seconds_to_millis(seconds: u64) -> Option<u64> {
+    seconds.checked_mul(1_000)
+}
+
 /// The result of executing a command.
 ///
 /// `Static` avoids allocation entirely for pre-computed wire bytes.
+/// `Owned` carries already-serialized dynamic wire bytes.
 /// `Resp` wraps a `RespFrame` for dynamic responses.
 #[derive(Debug)]
 pub enum CmdResult {
     /// Pre-computed static RESP bytes — written directly to the wire.
     Static(&'static [u8]),
+    /// Pre-serialized inline RESP bytes for tiny dynamic replies.
+    Inline(InlineResp),
+    /// Owned serialized RESP bytes for dynamic replies that can bypass frame
+    /// construction and serializer traversal.
+    Owned(Box<[u8]>),
     /// Dynamic RESP frame requiring serialization.
     Resp(RespFrame),
+}
+
+impl CmdResult {
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        match self {
+            Self::Static(buf) => buf.first() == Some(&b'-'),
+            Self::Inline(inline) => inline.as_bytes().first() == Some(&b'-'),
+            Self::Owned(buf) => buf.first() == Some(&b'-'),
+            Self::Resp(frame) => matches!(frame, RespFrame::Error(_)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InlineResp {
+    len: u8,
+    buf: [u8; 32],
+}
+
+impl InlineResp {
+    #[inline]
+    pub fn bulk_from_payload(payload: &[u8]) -> Self {
+        debug_assert!(
+            payload.len() <= 23,
+            "InlineResp only supports tiny bulk strings"
+        );
+
+        let mut buf = [0u8; 32];
+        let mut cursor = 0usize;
+        buf[cursor] = b'$';
+        cursor += 1;
+
+        let len = payload.len();
+        if len >= 10 {
+            buf[cursor] = b'0' + (len / 10) as u8;
+            cursor += 1;
+        }
+        buf[cursor] = b'0' + (len % 10) as u8;
+        cursor += 1;
+        buf[cursor] = b'\r';
+        cursor += 1;
+        buf[cursor] = b'\n';
+        cursor += 1;
+        buf[cursor..cursor + payload.len()].copy_from_slice(payload);
+        cursor += payload.len();
+        buf[cursor] = b'\r';
+        cursor += 1;
+        buf[cursor] = b'\n';
+        cursor += 1;
+
+        Self {
+            len: cursor as u8,
+            buf,
+        }
+    }
+
+    #[inline]
+    pub fn bulk_from_i64(n: i64) -> Self {
+        let mut itoa_buf = itoa::Buffer::new();
+        let text = itoa_buf.format(n);
+        Self::bulk_from_payload(text.as_bytes())
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        let total = self.len as usize;
+        let payload_start = if self.buf[2] == b'\r' { 4 } else { 5 };
+        &self.buf[payload_start..total - 2]
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecutedCommand {
+    pub response: CmdResult,
+    pub aof_records: AofRecords,
+    pub aof_commit: Option<AofCommitEffect>,
+    pub aof_payload: Option<Box<[u8]>>,
+}
+
+impl ExecutedCommand {
+    #[inline]
+    pub fn with_aof_lsn(response: CmdResult, aof_lsn: Option<AofLsn>) -> Self {
+        Self {
+            response,
+            aof_records: None,
+            aof_commit: aof_lsn.map(AofCommitEffect::new),
+            aof_payload: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_optional_aof_payload(
+        response: CmdResult,
+        aof_lsn: Option<AofLsn>,
+        aof_payload: Option<Box<[u8]>>,
+    ) -> Self {
+        Self::with_optional_aof_payload_and_records(response, None, aof_lsn, aof_payload)
+    }
+
+    #[inline]
+    pub fn with_aof_records(
+        response: CmdResult,
+        aof_records: AofRecords,
+        aof_lsn: Option<AofLsn>,
+    ) -> Self {
+        Self::with_optional_aof_payload_and_records(response, aof_records, aof_lsn, None)
+    }
+
+    #[inline]
+    pub fn with_optional_aof_payload_and_records(
+        response: CmdResult,
+        aof_records: AofRecords,
+        aof_lsn: Option<AofLsn>,
+        aof_payload: Option<Box<[u8]>>,
+    ) -> Self {
+        Self {
+            response,
+            aof_records,
+            aof_commit: aof_lsn.map(AofCommitEffect::new),
+            aof_payload,
+        }
+    }
+
+    #[inline]
+    pub fn aof_lsn(&self) -> Option<AofLsn> {
+        self.aof_commit.map(AofCommitEffect::lsn)
+    }
+}
+
+pub(crate) trait MutationErrorExt {
+    fn into_executed(self) -> ExecutedCommand;
+}
+
+impl MutationErrorExt for crate::engine::domain::MutationError {
+    #[inline]
+    fn into_executed(self) -> ExecutedCommand {
+        ExecutedCommand::with_aof_records(
+            CmdResult::Static(mutation_error_response(self.kind)),
+            self.aof_records,
+            None,
+        )
+    }
+}
+
+#[inline]
+pub(crate) const fn mutation_error_response(kind: MutationErrorKind) -> &'static [u8] {
+    match kind {
+        MutationErrorKind::WrongType => ERR_WRONG_TYPE,
+        MutationErrorKind::NotInteger => ERR_NOT_INTEGER,
+        MutationErrorKind::NotFloat => ERR_NOT_FLOAT,
+        MutationErrorKind::Overflow => ERR_OVERFLOW,
+        MutationErrorKind::LsnOverflow => ERR_LSN_OVERFLOW,
+        MutationErrorKind::OutOfMemory => ERR_OOM,
+        MutationErrorKind::NoSuchKey => ERR_NO_SUCH_KEY,
+    }
+}
+
+impl From<CmdResult> for ExecutedCommand {
+    #[inline]
+    fn from(response: CmdResult) -> Self {
+        Self {
+            response,
+            aof_records: None,
+            aof_commit: None,
+            aof_payload: None,
+        }
+    }
+}
+
+#[inline]
+fn encode_resp_bulk_command(parts: &[&[u8]]) -> Box<[u8]> {
+    let mut buf = Vec::with_capacity(16 + parts.iter().map(|part| part.len() + 16).sum::<usize>());
+
+    push_resp_array_len(&mut buf, parts.len());
+    for part in parts {
+        push_resp_bulk_string(&mut buf, part);
+    }
+
+    buf.into_boxed_slice()
+}
+
+#[inline]
+fn push_resp_array_len(buf: &mut Vec<u8>, len: usize) {
+    buf.push(b'*');
+    push_decimal(buf, len);
+    buf.extend_from_slice(b"\r\n");
+}
+
+#[inline]
+fn push_resp_bulk_string(buf: &mut Vec<u8>, value: &[u8]) {
+    buf.push(b'$');
+    push_decimal(buf, value.len());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(value);
+    buf.extend_from_slice(b"\r\n");
+}
+
+#[inline]
+fn push_decimal<T: itoa::Integer>(buf: &mut Vec<u8>, value: T) {
+    let mut digits = itoa::Buffer::new();
+    buf.extend_from_slice(digits.format(value).as_bytes());
+}
+
+#[inline]
+pub(crate) fn encode_aof_set(key_bytes: &[u8], value_bytes: &[u8]) -> Box<[u8]> {
+    encode_resp_bulk_command(&[b"SET", key_bytes, value_bytes])
+}
+
+#[inline]
+pub(crate) fn encode_aof_set_pxat(
+    key_bytes: &[u8],
+    value_bytes: &[u8],
+    absolute_deadline_ms: u64,
+) -> Box<[u8]> {
+    let mut deadline = itoa::Buffer::new();
+    encode_resp_bulk_command(&[
+        b"SET",
+        key_bytes,
+        value_bytes,
+        b"PXAT",
+        deadline.format(absolute_deadline_ms).as_bytes(),
+    ])
+}
+
+#[inline]
+pub(crate) fn encode_aof_pexpireat(key_bytes: &[u8], absolute_deadline_ms: u64) -> Box<[u8]> {
+    let mut deadline = itoa::Buffer::new();
+    encode_resp_bulk_command(&[
+        b"PEXPIREAT",
+        key_bytes,
+        deadline.format(absolute_deadline_ms).as_bytes(),
+    ])
+}
+
+#[inline]
+pub(crate) fn encode_aof_persist(key_bytes: &[u8]) -> Box<[u8]> {
+    encode_resp_bulk_command(&[b"PERSIST", key_bytes])
 }
 
 // Pre-computed RESP constants for zero-allocation hot paths.
@@ -47,85 +401,182 @@ pub static ERR_SYNTAX: &[u8] = b"-ERR syntax error\r\n";
 pub static ERR_NOT_INTEGER: &[u8] = b"-ERR value is not an integer or out of range\r\n";
 pub static ERR_NOT_FLOAT: &[u8] = b"-ERR value is not a valid float\r\n";
 pub static ERR_OVERFLOW: &[u8] = b"-ERR increment or decrement would overflow\r\n";
+pub static ERR_LSN_OVERFLOW: &[u8] = b"-ERR mutation sequence number exhausted\r\n";
 pub static ERR_BIT_OFFSET: &[u8] = b"-ERR bit offset is not an integer or out of range\r\n";
+pub static ERR_OOM: &[u8] = b"-OOM command not allowed when used memory > 'maxmemory'.\r\n";
+pub static ERR_NO_SUCH_KEY: &[u8] = b"-ERR no such key\r\n";
 
-/// Execute a command by name.
+/// Execute a command against the shared concurrent keyspace.
 ///
 /// `name` must be an uppercase ASCII command name (already normalized by
 /// the CommandRouter). Returns `None` if the command is unknown to the
-/// engine (connection-level commands like PING/QUIT are handled by the
-/// reactor directly).
+/// engine. Connection-state commands such as MULTI and WATCH are handled by
+/// the reactor directly because their correctness depends on per-client state.
 #[inline]
 pub fn execute_command(
-    shard: &mut Shard,
+    keyspace: &ConcurrentKeyspace,
     name: &[u8],
     frame: &FrameRef<'_>,
-    now_nanos: u64,
-) -> Option<CmdResult> {
-    // String commands — ordered by frequency in typical workloads.
+    clock: impl Into<CommandClock>,
+) -> Option<ExecutedCommand> {
+    let clock = clock.into();
+    let now_nanos = clock.monotonic_nanos;
+    let unix_now_nanos = clock.unix_nanos;
+
     match name {
-        b"GET" => Some(string::cmd_get(shard, frame, now_nanos)),
-        b"SET" => Some(string::cmd_set(shard, frame, now_nanos)),
-        b"INCR" => Some(string::cmd_incr(shard, frame, now_nanos)),
-        b"DECR" => Some(string::cmd_decr(shard, frame, now_nanos)),
-        b"INCRBY" => Some(string::cmd_incrby(shard, frame, now_nanos)),
-        b"DECRBY" => Some(string::cmd_decrby(shard, frame, now_nanos)),
-        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat(shard, frame, now_nanos)),
-        b"MGET" => Some(string::cmd_mget(shard, frame, now_nanos)),
-        b"MSET" => Some(string::cmd_mset(shard, frame, now_nanos)),
-        b"MSETNX" => Some(string::cmd_msetnx(shard, frame, now_nanos)),
-        b"SETNX" => Some(string::cmd_setnx(shard, frame, now_nanos)),
-        b"SETEX" => Some(string::cmd_setex(shard, frame, now_nanos)),
-        b"PSETEX" => Some(string::cmd_psetex(shard, frame, now_nanos)),
-        b"GETSET" => Some(string::cmd_getset(shard, frame, now_nanos)),
-        b"GETDEL" => Some(string::cmd_getdel(shard, frame, now_nanos)),
-        b"GETEX" => Some(string::cmd_getex(shard, frame, now_nanos)),
-        b"APPEND" => Some(string::cmd_append(shard, frame, now_nanos)),
-        b"STRLEN" => Some(string::cmd_strlen(shard, frame, now_nanos)),
-        b"GETRANGE" => Some(string::cmd_getrange(shard, frame, now_nanos)),
-        b"SETRANGE" => Some(string::cmd_setrange(shard, frame, now_nanos)),
-        // Key management commands.
-        b"DEL" => Some(key::cmd_del(shard, frame, now_nanos)),
-        b"UNLINK" => Some(key::cmd_unlink(shard, frame, now_nanos)),
-        b"EXISTS" => Some(key::cmd_exists(shard, frame, now_nanos)),
-        b"EXPIRE" => Some(key::cmd_expire(shard, frame, now_nanos)),
-        b"PEXPIRE" => Some(key::cmd_pexpire(shard, frame, now_nanos)),
-        b"EXPIREAT" => Some(key::cmd_expireat(shard, frame, now_nanos)),
-        b"PEXPIREAT" => Some(key::cmd_pexpireat(shard, frame, now_nanos)),
-        b"PERSIST" => Some(key::cmd_persist(shard, frame, now_nanos)),
-        b"TTL" => Some(key::cmd_ttl(shard, frame, now_nanos)),
-        b"PTTL" => Some(key::cmd_pttl(shard, frame, now_nanos)),
-        b"EXPIRETIME" => Some(key::cmd_expiretime(shard, frame, now_nanos)),
-        b"PEXPIRETIME" => Some(key::cmd_pexpiretime(shard, frame, now_nanos)),
-        b"TYPE" => Some(key::cmd_type(shard, frame, now_nanos)),
-        b"RENAME" => Some(key::cmd_rename(shard, frame, now_nanos)),
-        b"RENAMENX" => Some(key::cmd_renamenx(shard, frame, now_nanos)),
-        b"KEYS" => Some(key::cmd_keys(shard, frame, now_nanos)),
-        b"SCAN" => Some(key::cmd_scan(shard, frame, now_nanos)),
-        b"RANDOMKEY" => Some(key::cmd_randomkey(shard, frame, now_nanos)),
-        b"TOUCH" => Some(key::cmd_touch(shard, frame, now_nanos)),
-        b"COPY" => Some(key::cmd_copy(shard, frame, now_nanos)),
-        // Server & connection commands.
-        b"PING" => Some(server::cmd_ping(shard, frame, now_nanos)),
-        b"ECHO" => Some(server::cmd_echo(shard, frame, now_nanos)),
-        b"QUIT" => Some(server::cmd_quit(shard, frame, now_nanos)),
-        b"DBSIZE" => Some(server::cmd_dbsize(shard, frame, now_nanos)),
-        b"FLUSHDB" => Some(server::cmd_flushdb(shard, frame, now_nanos)),
-        b"FLUSHALL" => Some(server::cmd_flushall(shard, frame, now_nanos)),
-        b"INFO" => Some(server::cmd_info(shard, frame, now_nanos)),
-        b"COMMAND" => Some(server::cmd_command(shard, frame, now_nanos)),
-        b"SELECT" => Some(server::cmd_select(shard, frame, now_nanos)),
-        b"TIME" => Some(server::cmd_time(shard, frame, now_nanos)),
-        b"MULTI" => Some(server::cmd_multi(shard, frame, now_nanos)),
-        b"EXEC" => Some(server::cmd_exec(shard, frame, now_nanos)),
-        b"DISCARD" => Some(server::cmd_discard(shard, frame, now_nanos)),
-        b"WATCH" => Some(server::cmd_watch(shard, frame, now_nanos)),
-        b"UNWATCH" => Some(server::cmd_unwatch(shard, frame, now_nanos)),
+        b"GET" => Some(string::cmd_get(keyspace, frame, now_nanos).into()),
+        b"SET" => Some(string::cmd_set_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"INCR" => Some(string::cmd_incr(keyspace, frame, now_nanos)),
+        b"DECR" => Some(string::cmd_decr(keyspace, frame, now_nanos)),
+        b"INCRBY" => Some(string::cmd_incrby(keyspace, frame, now_nanos)),
+        b"DECRBY" => Some(string::cmd_decrby(keyspace, frame, now_nanos)),
+        b"INCRBYFLOAT" => Some(string::cmd_incrbyfloat_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"MGET" => Some(string::cmd_mget(keyspace, frame, now_nanos).into()),
+        b"MSET" => Some(string::cmd_mset(keyspace, frame, now_nanos)),
+        b"MSETNX" => Some(string::cmd_msetnx(keyspace, frame, now_nanos)),
+        b"SETNX" => Some(string::cmd_setnx(keyspace, frame, now_nanos)),
+        b"SETEX" => Some(string::cmd_setex_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PSETEX" => Some(string::cmd_psetex_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"GETSET" => Some(string::cmd_getset(keyspace, frame, now_nanos)),
+        b"GETDEL" => Some(string::cmd_getdel(keyspace, frame, now_nanos)),
+        b"GETEX" => Some(string::cmd_getex_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"APPEND" => Some(string::cmd_append(keyspace, frame, now_nanos)),
+        b"STRLEN" => Some(string::cmd_strlen(keyspace, frame, now_nanos).into()),
+        b"GETRANGE" => Some(string::cmd_getrange(keyspace, frame, now_nanos).into()),
+        b"SETRANGE" => Some(string::cmd_setrange(keyspace, frame, now_nanos)),
+        b"DEL" => Some(generic::cmd_del(keyspace, frame, now_nanos)),
+        b"UNLINK" => Some(generic::cmd_unlink(keyspace, frame, now_nanos)),
+        b"EXISTS" => Some(generic::cmd_exists(keyspace, frame, now_nanos).into()),
+        b"EXPIRE" => Some(generic::cmd_expire_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PEXPIRE" => Some(generic::cmd_pexpire_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"EXPIREAT" => Some(generic::cmd_expireat_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PEXPIREAT" => Some(generic::cmd_pexpireat_with_clock(
+            keyspace,
+            frame,
+            now_nanos,
+            unix_now_nanos,
+        )),
+        b"PERSIST" => Some(generic::cmd_persist(keyspace, frame, now_nanos)),
+        b"TTL" => Some(generic::cmd_ttl(keyspace, frame, now_nanos).into()),
+        b"PTTL" => Some(generic::cmd_pttl(keyspace, frame, now_nanos).into()),
+        b"EXPIRETIME" => Some(
+            generic::cmd_expiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into(),
+        ),
+        b"PEXPIRETIME" => Some(
+            generic::cmd_pexpiretime_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into(),
+        ),
+        b"TYPE" => Some(generic::cmd_type(keyspace, frame, now_nanos).into()),
+        b"RENAME" => Some(generic::cmd_rename(keyspace, frame, now_nanos)),
+        b"RENAMENX" => Some(generic::cmd_renamenx(keyspace, frame, now_nanos)),
+        b"KEYS" => Some(generic::cmd_keys(keyspace, frame, now_nanos).into()),
+        b"SCAN" => Some(generic::cmd_scan(keyspace, frame, now_nanos).into()),
+        b"RANDOMKEY" => Some(generic::cmd_randomkey(keyspace, frame, now_nanos).into()),
+        b"TOUCH" => Some(generic::cmd_touch(keyspace, frame, now_nanos).into()),
+        b"COPY" => Some(generic::cmd_copy(keyspace, frame, now_nanos)),
+        b"PING" => Some(connection::cmd_ping(keyspace, frame, now_nanos).into()),
+        b"ECHO" => Some(connection::cmd_echo(keyspace, frame, now_nanos).into()),
+        b"QUIT" => Some(connection::cmd_quit(keyspace, frame, now_nanos).into()),
+        b"DBSIZE" => Some(server::cmd_dbsize(keyspace, frame, now_nanos).into()),
+        b"FLUSHDB" => Some(server::cmd_flushdb(keyspace, frame, now_nanos)),
+        b"FLUSHALL" => Some(server::cmd_flushall(keyspace, frame, now_nanos)),
+        b"INFO" => Some(server::cmd_info(keyspace, frame, now_nanos).into()),
+        b"COMMAND" => Some(server::cmd_command(keyspace, frame, now_nanos).into()),
+        b"SELECT" => Some(connection::cmd_select(keyspace, frame, now_nanos).into()),
+        b"HELLO" => Some(server::cmd_hello(keyspace, frame, now_nanos).into()),
+        b"CLIENT" => Some(server::cmd_client(keyspace, frame, now_nanos).into()),
+        b"TIME" => {
+            Some(server::cmd_time_with_clock(keyspace, frame, now_nanos, unix_now_nanos).into())
+        }
+        b"EXEC" => Some(transaction::cmd_exec(keyspace, frame, now_nanos).into()),
+        b"DISCARD" => Some(transaction::cmd_discard(keyspace, frame, now_nanos).into()),
+        b"UNWATCH" => Some(transaction::cmd_unwatch(keyspace, frame, now_nanos).into()),
         _ => None,
     }
 }
 
 // ── Argument extraction helpers ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct CommandArgs<'a> {
+    args: SmallVec<[&'a [u8]; 8]>,
+}
+
+impl<'a> CommandArgs<'a> {
+    #[inline]
+    pub fn collect(frame: &FrameRef<'a>) -> Option<Self> {
+        let mut children = frame.children()?;
+        let mut args = SmallVec::with_capacity(frame.element_count()? as usize);
+        for child in &mut children {
+            args.push(child.as_bytes()?);
+        }
+        Some(Self { args })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.args.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty()
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&'a [u8]> {
+        self.args.get(index).copied()
+    }
+
+    #[inline]
+    pub fn i64(&self, index: usize) -> Option<i64> {
+        parse_i64(self.get(index)?)
+    }
+
+    #[inline]
+    pub fn iter_from(&self, start: usize) -> impl Iterator<Item = &'a [u8]> + '_ {
+        self.args.iter().skip(start).copied()
+    }
+}
 
 /// Extract the Nth child's bytes from a FrameRef (0-indexed).
 /// Child 0 is the command name.
@@ -212,18 +663,11 @@ pub fn value_from_bytes(bytes: &[u8]) -> VortexValue {
 #[inline]
 pub fn value_to_resp(val: &VortexValue) -> CmdResult {
     match val {
-        VortexValue::InlineString(ib) => CmdResult::Resp(RespFrame::bulk_string(
-            bytes::Bytes::copy_from_slice(ib.as_bytes()),
-        )),
-        VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b.clone())),
-        VortexValue::Integer(n) => {
-            // Serialize integer as its string representation (Redis behavior).
-            let mut buf = itoa::Buffer::new();
-            let s = buf.format(*n);
-            CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
-                s.as_bytes(),
-            )))
+        VortexValue::InlineString(ib) => {
+            CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes()))
         }
+        VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b.clone())),
+        VortexValue::Integer(n) => CmdResult::Inline(InlineResp::bulk_from_i64(*n)),
         _ => CmdResult::Static(ERR_WRONG_TYPE),
     }
 }
@@ -232,30 +676,92 @@ pub fn value_to_resp(val: &VortexValue) -> CmdResult {
 #[inline]
 pub fn owned_value_to_resp(val: VortexValue) -> CmdResult {
     match val {
-        VortexValue::InlineString(ib) => CmdResult::Resp(RespFrame::bulk_string(
-            bytes::Bytes::copy_from_slice(ib.as_bytes()),
-        )),
-        VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b)),
-        VortexValue::Integer(n) => {
-            let mut buf = itoa::Buffer::new();
-            let s = buf.format(n);
-            CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
-                s.as_bytes(),
-            )))
+        VortexValue::InlineString(ib) => {
+            CmdResult::Inline(InlineResp::bulk_from_payload(ib.as_bytes()))
         }
+        VortexValue::String(b) => CmdResult::Resp(RespFrame::bulk_string(b)),
+        VortexValue::Integer(n) => CmdResult::Inline(InlineResp::bulk_from_i64(n)),
         _ => CmdResult::Static(ERR_WRONG_TYPE),
     }
 }
 
-/// Integer response.
+/// Integer response — uses pre-computed static bytes for common values.
 #[inline]
 pub fn int_resp(n: i64) -> CmdResult {
-    CmdResult::Resp(RespFrame::integer(n))
+    match n {
+        0 => CmdResult::Static(RESP_ZERO),
+        1 => CmdResult::Static(RESP_ONE),
+        -1 => CmdResult::Static(RESP_NEG_ONE),
+        -2 => CmdResult::Static(RESP_NEG_TWO),
+        _ => CmdResult::Resp(RespFrame::integer(n)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_harness {
+    use crate::engine::domain::SetOptions;
+    use crate::keyspace::ConcurrentKeyspace;
+    use vortex_common::{VortexKey, VortexValue};
+
+    pub struct TestHarness {
+        pub keyspace: ConcurrentKeyspace,
+    }
+
+    impl TestHarness {
+        pub fn new() -> Self {
+            Self {
+                keyspace: ConcurrentKeyspace::new(64),
+            }
+        }
+
+        pub fn set(&self, key: VortexKey, value: VortexValue) {
+            let _ = self
+                .keyspace
+                .set_value_with_options(key, value, SetOptions::default(), 0);
+        }
+
+        pub fn set_with_ttl(&self, key: VortexKey, value: VortexValue, ttl_deadline: u64) {
+            let _ = self.keyspace.set_value_with_options(
+                key,
+                value,
+                SetOptions {
+                    ttl_deadline,
+                    ..SetOptions::default()
+                },
+                0,
+            );
+        }
+
+        pub fn get(&self, key: &VortexKey, now: u64) -> Option<VortexValue> {
+            self.keyspace.get_value(key, now)
+        }
+
+        pub fn exists(&self, key: &VortexKey, now: u64) -> bool {
+            self.get(key, now).is_some()
+        }
+
+        pub fn len(&self) -> usize {
+            self.keyspace.dbsize()
+        }
+    }
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+
+    fn production_region(source: &'static str) -> &'static str {
+        source.split("\n#[cfg(all(test").next().unwrap_or(source)
+    }
+
+    fn assert_forbidden_tokens_absent(name: &str, source: &str, forbidden: &[&str]) {
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "{name} must not contain `{token}` across the command/domain boundary"
+            );
+        }
+    }
 
     #[test]
     fn parse_i64_valid() {
@@ -288,5 +794,115 @@ mod tests {
     fn value_from_bytes_string() {
         let val = value_from_bytes(b"hello");
         assert!(matches!(val, VortexValue::InlineString(_)));
+    }
+
+    #[test]
+    fn absolute_deadline_round_trips_between_unix_and_monotonic_domains() {
+        let unix_now = 1_750_000_000 * NS_PER_SEC;
+        let mono_now = 9_000 * NS_PER_SEC;
+        let absolute = unix_now + 60 * NS_PER_SEC;
+
+        let deadline = common_absolute_unix_nanos_to_deadline_nanos(absolute, mono_now, unix_now);
+        assert_eq!(deadline, mono_now + 60 * NS_PER_SEC);
+
+        let round_trip = common_deadline_nanos_to_absolute_unix_nanos(deadline, mono_now, unix_now);
+        assert_eq!(round_trip, absolute);
+    }
+
+    #[test]
+    fn command_modules_stay_parse_reply_or_domain_only() {
+        let forbidden = [
+            "crate::table",
+            "crate::entry",
+            "SwissTable",
+            "EntryValue",
+            "read_shard",
+            "read_shard_by_index",
+            "try_read_shard_by_index",
+            "write_shard",
+            "write_shard_by_index",
+            "try_write_shard_by_index",
+            "multi_read",
+            "multi_write",
+            "MutationEffects",
+            "MemoryReservation",
+            "commit_effects",
+            "apply_expiry_transition",
+            "bump_watch",
+            "record_frequency",
+            "next_lsn",
+            "next_aof_lsn",
+            "set_entry_ttl",
+            "clear_entry_ttl",
+            "set_lsn_version",
+            "ensure_memory_for_snapshot",
+        ];
+
+        let files = [
+            (
+                "commands/connection.rs",
+                production_region(include_str!("connection.rs")),
+            ),
+            (
+                "commands/generic.rs",
+                production_region(include_str!("generic.rs")),
+            ),
+            (
+                "commands/server.rs",
+                production_region(include_str!("server.rs")),
+            ),
+            (
+                "commands/string.rs",
+                production_region(include_str!("string.rs")),
+            ),
+            (
+                "commands/transaction.rs",
+                production_region(include_str!("transaction.rs")),
+            ),
+        ];
+
+        for (name, source) in files {
+            assert_forbidden_tokens_absent(name, source, &forbidden);
+        }
+    }
+
+    #[test]
+    fn command_hot_path_has_no_dynamic_dispatch_surface() {
+        let forbidden = ["Box<dyn", "Arc<dyn", "&dyn", "dyn Command"];
+        let files = [
+            ("commands/mod.rs", production_region(include_str!("mod.rs"))),
+            (
+                "commands/string.rs",
+                production_region(include_str!("string.rs")),
+            ),
+            (
+                "commands/generic.rs",
+                production_region(include_str!("generic.rs")),
+            ),
+            (
+                "engine/domain.rs",
+                production_region(include_str!("../engine/domain.rs")),
+            ),
+            (
+                "engine/domain/mutation.rs",
+                production_region(include_str!("../engine/domain/mutation.rs")),
+            ),
+            (
+                "engine/domain/string_ops.rs",
+                production_region(include_str!("../engine/domain/string_ops.rs")),
+            ),
+            (
+                "engine/domain/key_ops.rs",
+                production_region(include_str!("../engine/domain/key_ops.rs")),
+            ),
+            (
+                "executor.rs",
+                production_region(include_str!("../executor.rs")),
+            ),
+        ];
+
+        for (name, source) in files {
+            assert_forbidden_tokens_absent(name, source, &forbidden);
+        }
     }
 }

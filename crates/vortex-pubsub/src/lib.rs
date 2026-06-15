@@ -1,8 +1,9 @@
 //! # vortex-pubsub
 //!
-//! Pub/Sub routing engine for VortexDB.
+//! Reserved crate for future Pub/Sub routing work.
 //!
-//! Handles SUBSCRIBE, UNSUBSCRIBE, PUBLISH, and pattern subscriptions
-//! with cross-reactor message delivery.
+//! This crate intentionally exposes no release-supported Pub/Sub API in
+//! `v0.1-alpha`. `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, pattern
+//! subscriptions, and cross-reactor message delivery remain future work.
 //!
-//! **Status:** Stub — implementation in Phase 4.
+//! **Status:** Stub — implementation planned for Phase 4.

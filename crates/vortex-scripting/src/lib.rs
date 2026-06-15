@@ -1,8 +1,9 @@
 //! # vortex-scripting
 //!
-//! Lua and Function API scripting engine for VortexDB.
+//! Reserved crate for future Lua and Function API scripting work.
 //!
-//! Embeds a Lua runtime for EVAL/EVALSHA commands and supports
-//! the Redis Functions API.
+//! This crate intentionally exposes no release-supported scripting API in
+//! `v0.1-alpha`. `EVAL`, `EVALSHA`, embedded Lua execution, and Redis
+//! Functions remain future work.
 //!
-//! **Status:** Stub — implementation in Phase 8.
+//! **Status:** Stub — implementation planned for Phase 8.

@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -5,25 +6,26 @@ use crate::MAX_INLINE_KEY_LEN;
 
 /// Small-string-optimized key type for VortexDB.
 ///
-/// Keys ≤ 23 bytes are stored inline without heap allocation, covering >90%
-/// of real-world keys. Larger keys fall back to heap allocation.
+/// Keys up to `MAX_INLINE_KEY_LEN` bytes are stored inline without heap
+/// allocation, covering >90% of real-world keys. Larger keys fall back to heap
+/// allocation.
 ///
 /// Total size: 32 bytes (inline variant uses 24, but we pad to 32 for alignment).
 #[derive(Clone)]
 pub enum VortexKey {
-    /// Keys that fit within 23 bytes — stored inline, zero allocation.
+    /// Keys that fit within `MAX_INLINE_KEY_LEN` bytes — stored inline, zero allocation.
     Inline {
         len: u8,
         data: [u8; MAX_INLINE_KEY_LEN],
     },
-    /// Keys exceeding 23 bytes — heap allocated.
+    /// Keys exceeding `MAX_INLINE_KEY_LEN` bytes — heap allocated.
     Heap(Vec<u8>),
 }
 
 impl VortexKey {
     /// Creates a new key from a byte slice.
     ///
-    /// If the slice fits in 23 bytes, it's stored inline.
+    /// If the slice fits in `MAX_INLINE_KEY_LEN` bytes, it's stored inline.
     /// Otherwise it's heap-allocated.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.len() <= MAX_INLINE_KEY_LEN {
@@ -67,11 +69,28 @@ impl VortexKey {
     pub fn is_inline(&self) -> bool {
         matches!(self, Self::Inline { .. })
     }
+
+    /// Returns a rough estimate of the key's memory usage in bytes.
+    #[inline]
+    pub fn memory_usage(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Inline { .. } => 0,
+                Self::Heap(bytes) => bytes.len(),
+            }
+    }
 }
 
 impl AsRef<[u8]> for VortexKey {
     #[inline]
     fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl Borrow<[u8]> for VortexKey {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
         self.as_bytes()
     }
 }

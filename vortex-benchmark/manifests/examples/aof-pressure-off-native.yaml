@@ -1,0 +1,39 @@
+schema_version: 1
+name: aof-pressure-off-native
+description: Native write-heavy baseline with AOF disabled for AOF pressure comparisons.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+  - memtier_benchmark
+commands:
+  - SET
+  - INCR
+workloads:
+  - uniform-write_only
+duration: 15s
+repeat: 3
+environment:
+  mode: native
+  port_base: 18479
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 150000
+    clients: 50
+    pipeline: 16
+    keyspace_size: 250000
+  memtier_benchmark:
+    clients: 16
+    pipeline: 4
+    keyspace_size: 250000
+    data_size: 64
+    thread_sweep:
+      - 1

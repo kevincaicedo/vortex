@@ -1,0 +1,32 @@
+schema_version: 1
+name: wave3-aof-backpressure-pressure-native
+description: "Native Wave 3 Vortex-only low-threshold AOF backpressure stress: one durable writer plus 100 latency-sensitive pipeline-1 GET clients with p99.9-capable custom-rust reporting."
+databases:
+  - vortex
+backends:
+  - custom-rust
+workloads:
+  - pressure-aof_backlog
+repeat: 3
+duration: 10s
+environment:
+  mode: native
+  port_base: 19079
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: true
+  aof_fsync: everysec
+  aof_max_pending_fsync_bytes: 4096
+  eviction_policy: noeviction
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 100
+    keyspace_size: 5000
+    ops_per_thread: 1000
+    warmup_ops: 50
+    value_size: 64

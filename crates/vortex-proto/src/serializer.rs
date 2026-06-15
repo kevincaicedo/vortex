@@ -94,8 +94,8 @@ pub static RESP_ERR_BUSY: &[u8] = b"-BUSY\r\n";
 /// - [`serialize`](Self::serialize) — writes into `BytesMut` (existing API)
 /// - [`serialize_to_slice`](Self::serialize_to_slice) — writes into a raw
 ///   `&mut [u8]` buffer (zero-alloc, used by the reactor's mmap write path)
-/// - [`estimated_size`](Self::estimated_size) — pre-compute output size for
-///   `reserve()` calls
+/// - [`serialized_len`](Self::serialized_len) — pre-compute exact output size
+///   for cap checks and `reserve()` calls
 pub struct RespSerializer;
 
 impl RespSerializer {
@@ -437,6 +437,129 @@ impl RespSerializer {
         Some(cursor)
     }
 
+    /// Returns the exact number of RESP wire bytes this frame serializes to.
+    ///
+    /// This is allocation-free and is used by the reactor to enforce
+    /// per-connection pending-response caps before a response frame is retained
+    /// in deferred writev state.
+    pub fn serialized_len(frame: &RespFrame) -> usize {
+        match frame {
+            RespFrame::SimpleString(s) => {
+                if s.as_ref() == b"OK" {
+                    RESP_OK.len()
+                } else if s.as_ref() == b"QUEUED" {
+                    RESP_QUEUED.len()
+                } else if s.as_ref() == b"PONG" {
+                    RESP_PONG.len()
+                } else {
+                    1usize.saturating_add(s.len()).saturating_add(2)
+                }
+            }
+            RespFrame::Error(e) => 1usize.saturating_add(e.len()).saturating_add(2),
+            RespFrame::Integer(n) => {
+                if (0..=9).contains(n) {
+                    RESP_INT[*n as usize].len()
+                } else {
+                    1usize.saturating_add(decimal_len_i64(*n)).saturating_add(2)
+                }
+            }
+            RespFrame::BulkString(None) => RESP_NIL.len(),
+            RespFrame::BulkString(Some(data)) => 1usize
+                .saturating_add(decimal_len_usize(data.len()))
+                .saturating_add(2)
+                .saturating_add(data.len())
+                .saturating_add(2),
+            RespFrame::Array(None) => RESP_NULL_ARRAY.len(),
+            RespFrame::Array(Some(frames)) => {
+                if frames.is_empty() {
+                    RESP_EMPTY_ARRAY.len()
+                } else {
+                    let mut len = 1usize
+                        .saturating_add(decimal_len_usize(frames.len()))
+                        .saturating_add(2);
+                    for frame in frames {
+                        len = len.saturating_add(Self::serialized_len(frame));
+                    }
+                    len
+                }
+            }
+            #[cfg(feature = "resp3")]
+            RespFrame::Null => 3,
+            #[cfg(feature = "resp3")]
+            RespFrame::Boolean(_) => 4,
+            #[cfg(feature = "resp3")]
+            RespFrame::Double(d) => {
+                let mut ryu_buf = ryu::Buffer::new();
+                let s = ryu_buf.format(*d);
+                1usize.saturating_add(s.len()).saturating_add(2)
+            }
+            #[cfg(feature = "resp3")]
+            RespFrame::BigNumber(n) => 1usize.saturating_add(n.len()).saturating_add(2),
+            #[cfg(feature = "resp3")]
+            RespFrame::BulkError(e) => 1usize
+                .saturating_add(decimal_len_usize(e.len()))
+                .saturating_add(2)
+                .saturating_add(e.len())
+                .saturating_add(2),
+            #[cfg(feature = "resp3")]
+            RespFrame::VerbatimString { encoding: _, data } => {
+                let body_len = 3usize.saturating_add(1).saturating_add(data.len());
+                1usize
+                    .saturating_add(decimal_len_usize(body_len))
+                    .saturating_add(2)
+                    .saturating_add(body_len)
+                    .saturating_add(2)
+            }
+            #[cfg(feature = "resp3")]
+            RespFrame::Map(entries) => {
+                let mut len = 1usize
+                    .saturating_add(decimal_len_usize(entries.len()))
+                    .saturating_add(2);
+                for (key, value) in entries {
+                    len = len.saturating_add(Self::serialized_len(key));
+                    len = len.saturating_add(Self::serialized_len(value));
+                }
+                len
+            }
+            #[cfg(feature = "resp3")]
+            RespFrame::Set(frames) => {
+                let mut len = 1usize
+                    .saturating_add(decimal_len_usize(frames.len()))
+                    .saturating_add(2);
+                for frame in frames {
+                    len = len.saturating_add(Self::serialized_len(frame));
+                }
+                len
+            }
+            #[cfg(feature = "resp3")]
+            RespFrame::Attribute { entries, data } => {
+                let mut len = 1usize
+                    .saturating_add(decimal_len_usize(entries.len()))
+                    .saturating_add(2);
+                for (key, value) in entries {
+                    len = len.saturating_add(Self::serialized_len(key));
+                    len = len.saturating_add(Self::serialized_len(value));
+                }
+                len.saturating_add(Self::serialized_len(data))
+            }
+            #[cfg(feature = "resp3")]
+            RespFrame::Push { kind, data } => {
+                let mut len = 1usize
+                    .saturating_add(decimal_len_usize(1usize.saturating_add(data.len())))
+                    .saturating_add(2)
+                    .saturating_add(1)
+                    .saturating_add(decimal_len_usize(kind.len()))
+                    .saturating_add(2)
+                    .saturating_add(kind.len())
+                    .saturating_add(2);
+                for frame in data {
+                    len = len.saturating_add(Self::serialized_len(frame));
+                }
+                len
+            }
+        }
+    }
+
     // ── Scatter-gather serialization ───────────────────────────────────────
 
     /// Serialize a `RespFrame` into an [`IovecWriter`] for scatter-gather I/O.
@@ -474,9 +597,7 @@ impl RespSerializer {
             }
             RespFrame::BulkString(Some(data)) => {
                 // $<len>\r\n<data>\r\n — length prefix is scratch, data is zero-copy.
-                w.push_static(b"$");
-                Self::write_integer_digits_iovec(data.len() as i64, w);
-                w.push_static(b"\r\n");
+                Self::write_len_prefix_iovec(b'$', data.len(), w);
                 w.push_bytes(data);
                 w.push_static(b"\r\n");
             }
@@ -487,9 +608,7 @@ impl RespSerializer {
                 if frames.is_empty() {
                     w.push_static(RESP_EMPTY_ARRAY);
                 } else {
-                    w.push_static(b"*");
-                    Self::write_integer_digits_iovec(frames.len() as i64, w);
-                    w.push_static(b"\r\n");
+                    Self::write_len_prefix_iovec(b'*', frames.len(), w);
                     for f in frames {
                         Self::serialize_to_iovecs(f, w);
                     }
@@ -644,6 +763,27 @@ impl RespSerializer {
         }
     }
 
+    #[inline]
+    fn write_len_prefix_iovec(prefix: u8, len: usize, w: &mut IovecWriter) {
+        let mut tmp = [0u8; 32];
+        tmp[0] = prefix;
+        let digits_len = if len < 10_000 {
+            let entry = &INT_LUT[len];
+            let digits_len = entry.len as usize;
+            tmp[1..1 + digits_len].copy_from_slice(&entry.digits[..digits_len]);
+            digits_len
+        } else {
+            let mut itoa_buf = itoa::Buffer::new();
+            let digits = itoa_buf.format(len);
+            let digits_len = digits.len();
+            tmp[1..1 + digits_len].copy_from_slice(digits.as_bytes());
+            digits_len
+        };
+        tmp[1 + digits_len] = b'\r';
+        tmp[2 + digits_len] = b'\n';
+        w.push_scratch(&tmp[..3 + digits_len]);
+    }
+
     /// Write a full integer frame (`:N\r\n`) into `BytesMut`, using the LUT
     /// for 0-9 (pre-computed full frame) and 10-9999 (LUT digits).
     #[inline]
@@ -758,9 +898,28 @@ fn write_integer_digits_to_slice(n: i64, buf: &mut [u8]) -> Option<usize> {
     }
 }
 
+#[inline]
+fn decimal_len_usize(n: usize) -> usize {
+    if n < INT_LUT.len() {
+        return INT_LUT[n].len as usize;
+    }
+    let mut itoa_buf = itoa::Buffer::new();
+    itoa_buf.format(n).len()
+}
+
+#[inline]
+fn decimal_len_i64(n: i64) -> usize {
+    if (0..10_000_i64).contains(&n) {
+        return INT_LUT[n as usize].len as usize;
+    }
+    let mut itoa_buf = itoa::Buffer::new();
+    itoa_buf.format(n).len()
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -771,10 +930,28 @@ mod tests {
     }
 
     fn serialize_slice(frame: &RespFrame) -> Vec<u8> {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; RespSerializer::serialized_len(frame)];
         let n = RespSerializer::serialize_to_slice(frame, &mut buf).unwrap();
         buf.truncate(n);
         buf
+    }
+
+    fn resp2_frame_strategy() -> impl Strategy<Value = RespFrame> {
+        let bytes = proptest::collection::vec(any::<u8>(), 0..64).prop_map(Bytes::from);
+        let leaf = prop_oneof![
+            bytes.clone().prop_map(RespFrame::SimpleString),
+            bytes.clone().prop_map(RespFrame::Error),
+            any::<i64>().prop_map(RespFrame::Integer),
+            Just(RespFrame::BulkString(None)),
+            bytes
+                .clone()
+                .prop_map(|value| RespFrame::BulkString(Some(value))),
+            Just(RespFrame::Array(None)),
+        ];
+
+        leaf.prop_recursive(3, 64, 6, |inner| {
+            proptest::collection::vec(inner, 0..8).prop_map(|frames| RespFrame::Array(Some(frames)))
+        })
     }
 
     #[test]
@@ -869,6 +1046,54 @@ mod tests {
     }
 
     #[test]
+    fn serialized_len_matches_serializers() {
+        let frames = [
+            RespFrame::SimpleString(Bytes::from_static(b"OK")),
+            RespFrame::SimpleString(Bytes::from_static(b"custom")),
+            RespFrame::Error(Bytes::from_static(b"ERR bad")),
+            RespFrame::Integer(i64::MIN),
+            RespFrame::BulkString(None),
+            RespFrame::BulkString(Some(Bytes::from_static(b"hello"))),
+            RespFrame::Array(Some(vec![
+                RespFrame::Integer(1),
+                RespFrame::BulkString(Some(Bytes::from_static(b"nested"))),
+            ])),
+        ];
+
+        for frame in &frames {
+            assert_eq!(
+                RespSerializer::serialized_len(frame),
+                serialize(frame).len()
+            );
+            assert_eq!(
+                RespSerializer::serialized_len(frame),
+                serialize_iovec(frame).len()
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn serialized_len_matches_all_resp2_serializers(frame in resp2_frame_strategy()) {
+            let expected = serialize(&frame);
+            let len = RespSerializer::serialized_len(&frame);
+
+            prop_assert_eq!(len, expected.len());
+            let slice = serialize_slice(&frame);
+            let iovec = serialize_iovec(&frame);
+            prop_assert_eq!(&slice, &expected);
+            prop_assert_eq!(&iovec, &expected);
+
+            if len > 0 {
+                let mut short = vec![0u8; len - 1];
+                prop_assert!(RespSerializer::serialize_to_slice(&frame, &mut short).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn serialize_to_slice_returns_none_if_too_small() {
         let frame = RespFrame::SimpleString(Bytes::from_static(b"OK"));
         let mut tiny = [0u8; 2];
@@ -950,6 +1175,12 @@ mod tests {
         w.flatten()
     }
 
+    fn serialize_iovec_segments(frame: &RespFrame) -> usize {
+        let mut w = crate::iovec::IovecWriter::new();
+        RespSerializer::serialize_to_iovecs(frame, &mut w);
+        w.segment_count()
+    }
+
     #[test]
     fn iovec_ok() {
         let frame = RespFrame::SimpleString(Bytes::from_static(b"OK"));
@@ -998,6 +1229,7 @@ mod tests {
     fn iovec_bulk_string() {
         let frame = RespFrame::BulkString(Some(Bytes::from_static(b"hello")));
         assert_eq!(serialize_iovec(&frame), b"$5\r\nhello\r\n");
+        assert_eq!(serialize_iovec_segments(&frame), 3);
     }
 
     #[test]
@@ -1014,6 +1246,7 @@ mod tests {
     fn iovec_array() {
         let frame = RespFrame::Array(Some(vec![RespFrame::Integer(1), RespFrame::Integer(2)]));
         assert_eq!(serialize_iovec(&frame), b"*2\r\n:1\r\n:2\r\n");
+        assert_eq!(serialize_iovec_segments(&frame), 3);
     }
 
     #[test]

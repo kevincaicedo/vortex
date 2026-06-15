@@ -10,6 +10,20 @@ This document lists every Redis command and its implementation status in VortexD
 
 ---
 
+## Alpha Fairness Scope For O(N) Commands
+
+The v0.1-alpha latency and fairness claims exclude large synchronous O(N) command
+turns until command-level execution yielding is implemented and measured.
+`SCAN` bounds one command turn by capping response key material and sparse slot
+walks, so user-provided `COUNT` is a work hint rather than an unbounded promise.
+`KEYS` bounds response material by failing closed when the matched result set
+exceeds the alpha cap; use `SCAN` for large keyspaces. `FLUSHDB` and `FLUSHALL`
+enter an exclusive all-shard gate and clear shards sequentially, but they remain
+synchronous compatibility or admin surfaces in alpha, not release latency-proof
+surfaces. Treat flushes as explicit maintenance work.
+
+---
+
 ## String Commands (20 of 22)
 
 | Command | Status | Phase | Notes |
@@ -58,16 +72,16 @@ This document lists every Redis command and its implementation status in VortexD
 | `TYPE` | ✅ | 3 | Returns Redis-compatible type strings |
 | `RENAME` | ✅ | 3 | O(1) via remove + insert, preserves TTL |
 | `RENAMENX` | ✅ | 3 | |
-| `KEYS` | ✅ | 3 | Glob pattern matching: `*`, `?`, `[abc]`, `[a-z]`, `[^abc]`, `\x` |
-| `SCAN` | ✅ | 3 | Reverse-bit cursor (Redis-compatible resize safety) |
+| `KEYS` | ✅ | 3 | Synchronous O(N) with alpha response cap; use SCAN for large keyspaces |
+| `SCAN` | ✅ | 3 | Shard/slot cursor with capped COUNT and sparse-slot budget per command turn |
 | `RANDOMKEY` | ✅ | 3 | xorshift64 random slot selection |
 | `TOUCH` | ✅ | 3 | Multi-key, returns count of existing keys |
-| `COPY` | ✅ | 3 | Via get + clone + insert, preserves TTL |
+| `COPY` | ⚠️ Partial | 3 | DB 0 only in alpha; cross-database `DB` targets are rejected |
 | `SORT` | 🔄 | 4+ | Requires List/Set/Sorted Set data structures |
 
 ---
 
-## Server & Connection Commands (15 of 30)
+## Server & Connection Commands (17 of 30 with alpha partials)
 
 | Command | Status | Phase | Notes |
 |---------|--------|-------|-------|
@@ -75,8 +89,8 @@ This document lists every Redis command and its implementation status in VortexD
 | `ECHO` | ✅ | 1 | |
 | `QUIT` | ✅ | 1 | Closes connection after `+OK` flush |
 | `DBSIZE` | ✅ | 3 | O(1) — reads table length field |
-| `FLUSHDB` | ✅ | 3 | Accepts ASYNC/SYNC option (synchronous in v0.1) |
-| `FLUSHALL` | ✅ | 3 | Same as FLUSHDB in single-DB mode |
+| `FLUSHDB` | ✅ | 3 | Accepts ASYNC/SYNC option; synchronous exclusive-gate alpha admin path, excluded from latency claims |
+| `FLUSHALL` | ✅ | 3 | Same as FLUSHDB in single-DB mode; synchronous exclusive-gate alpha admin path |
 | `INFO` | ✅ | 3 | 4 sections: server, clients, memory, keyspace |
 | `COMMAND` | ✅ | 3 | COUNT, INFO, DOCS, LIST, GETKEYS subcommands |
 | `SELECT` | ✅ | 3 | Accepts DB 0, rejects DB >0 (single-database design) |
@@ -87,20 +101,38 @@ This document lists every Redis command and its implementation status in VortexD
 | `WATCH` | 🔌 | 5+ | Returns `-ERR not yet implemented` |
 | `UNWATCH` | ✅ | 3 | No-op `+OK` (safe to call unconditionally) |
 | `AUTH` | 🔄 | 6 | ACL phase |
-| `HELLO` | 🔄 | 4+ | RESP3 negotiation |
+| `HELLO` | 🔄 | 3 | Alpha subset: RESP2 handshake metadata for `HELLO`/`HELLO 2`; RESP3 is explicitly rejected |
 | `RESET` | 🔄 | 4+ | |
-| `CLIENT` | 🔄 | 4+ | CLIENT ID, LIST, GETNAME, SETNAME, etc. |
-| `CONFIG` | 🔄 | 4+ | CONFIG GET/SET/REWRITE/RESETSTAT |
+| `CLIENT` | 🔄 | 3 | Alpha subset: `CLIENT SETINFO LIB-NAME|LIB-VER` accepted as setup no-op; other subcommands remain unsupported |
+| `CONFIG` | 🔄 | 4+ | Alpha subset: AOF, maxmemory, telemetry/backend visibility; live telemetry/backend/appendfsync toggles fail closed |
 | `DEBUG` | ❌ | — | Security risk, not implementing |
 | `SAVE` | 🔄 | 5 | Persistence phase |
 | `BGSAVE` | 🔄 | 5 | |
-| `BGREWRITEAOF` | 🔄 | 5 | |
+| `BGREWRITEAOF` | 🔌 | 5 | Explicitly disabled for alpha live serving |
 | `LASTSAVE` | 🔄 | 5 | |
 | `SLOWLOG` | 🔄 | 4 | Metrics phase |
 | `WAIT` | 🔄 | 6 | Replication phase |
 | `SHUTDOWN` | 🔄 | 4+ | Graceful shutdown via command |
 | `SWAPDB` | ❌ | — | Single-database design |
 | `OBJECT` | 🔄 | 4+ | OBJECT ENCODING, REFCOUNT, IDLETIME, HELP |
+
+---
+
+## Client Library Notes
+
+VortexDB v0.1-alpha is a RESP2 server. Modern client-library metadata setup is
+accepted for RESP2 clients:
+
+- `redis-py` 8.0.0: passes with `protocol=2`; default RESP3 setup receives
+  `NOPROTO` because RESP3 is outside alpha scope.
+- `redis` / node-redis 5.12.1: passes with default setup and with explicit
+  `RESP: 2`.
+- `ioredis` 5.11.0: passes with default setup.
+
+`CLIENT SETINFO` is accepted as a no-op and `HELLO 2` returns RESP2 handshake
+metadata. Broader `CLIENT` subcommands and RESP3 negotiation remain unsupported,
+so broad "no code changes" compatibility is only valid for clients that stay on
+RESP2.
 
 ---
 

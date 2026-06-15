@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "smoketests",
     "crates/vortex-common",
     "crates/vortex-memory",
     "crates/vortex-sync",
@@ -46,11 +47,12 @@ crc32fast = "1"
 # ── Memory & allocation ──
 tikv-jemallocator = "0.6"
 tikv-jemalloc-sys = "0.6"
-tikv-jemalloc-ctl = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 # ── Concurrency ──
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
+parking_lot = { version = "0.12.5", features = ["hardware-lock-elision"] }
 
 # ── I/O ──
 polling = "3"
@@ -64,6 +66,7 @@ phf = "0.11"
 phf_codegen = "0.11"
 itoa = "1"
 ryu = "1"
+smallvec = "1"
 
 # ── Configuration ──
 clap = { version = "4", features = ["derive", "env"] }
@@ -111,3 +114,10 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+lto = "thin"
+split-debuginfo = "unpacked"

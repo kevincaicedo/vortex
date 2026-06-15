@@ -1,0 +1,36 @@
+schema_version: 1
+name: workstream-e-rb-multikey-polling-svc4-pinned
+description: Focused Workstream E redis-benchmark multi-key slice with four service threads pinned away from four P-core load CPUs.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+commands:
+  - MGET
+  - MSET
+  - MSETNX
+duration: 10s
+repeat: 10
+environment:
+  mode: native
+  port_base: 16379
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+  service_cpus: "0,2,4,6"
+  load_cpus: "8,10,12,14"
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+  maxmemory: 1800mb
+  telemetry_mode: minimal
+  io_backend: polling
+  fixed_buffers: 1024
+settings:
+  redis-benchmark:
+    requests: 100000
+    clients: 100
+    pipeline: 1
+    keyspace_size: 100000

@@ -24,7 +24,7 @@ const SCRATCH_CAP: usize = 512;
 /// data in `scratch`. All `IoSlice` entries returned by [`as_io_slices`]
 /// borrow `&self`, ensuring the backing memory outlives the slices.
 pub struct IovecWriter {
-    /// (ptr, len) pairs — offsets into either static slices or `scratch`.
+    /// Borrowed pointers or offsets into `scratch`, with segment lengths.
     segments: IovecSegments,
     /// Inline scratch buffer for dynamically formatted bytes.
     scratch: ScratchBuf,
@@ -47,18 +47,52 @@ enum ScratchBuf {
 /// A single iovec segment descriptor.
 #[derive(Clone, Copy)]
 struct Segment {
-    /// Pointer to the start of the segment data.
-    ptr: *const u8,
-    /// Length of the segment.
-    len: u32,
+    /// Borrowed pointer bits or scratch offset.
+    data: usize,
+    /// Length plus kind bit. Keeping this as one word keeps `Segment` compact.
+    len_and_kind: usize,
 }
 
 // SAFETY: IovecWriter is used single-threaded on the reactor thread.
-// The raw pointers in Segment point to either:
-// 1. Static data (&'static [u8]) which is valid for 'static.
-// 2. Data within our owned scratch buffer.
-// Both are valid for the lifetime of the IovecWriter.
+// `Segment::data` stores either a borrowed pointer that the caller guarantees
+// outlives the writer or an offset into our owned scratch buffer. Scratch
+// offsets are resolved and bounds-checked before building slices.
 unsafe impl Send for IovecWriter {}
+
+impl Segment {
+    #[inline]
+    fn borrowed(buf: &[u8]) -> Self {
+        Self::new(buf.as_ptr() as usize, buf.len(), false)
+    }
+
+    #[inline]
+    fn scratch(offset: usize, len: usize) -> Self {
+        Self::new(offset, len, true)
+    }
+
+    #[inline]
+    fn new(data: usize, len: usize, scratch: bool) -> Self {
+        assert!(
+            len <= SEGMENT_LEN_MASK,
+            "iovec segment length exceeds representable range"
+        );
+        let kind = if scratch { SEGMENT_SCRATCH_BIT } else { 0 };
+        Self {
+            data,
+            len_and_kind: kind | len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len_and_kind & SEGMENT_LEN_MASK
+    }
+
+    #[inline]
+    fn is_scratch(&self) -> bool {
+        (self.len_and_kind & SEGMENT_SCRATCH_BIT) != 0
+    }
+}
 
 impl IovecWriter {
     /// Create an empty writer.
@@ -67,8 +101,8 @@ impl IovecWriter {
         Self {
             segments: IovecSegments::Inline {
                 buf: [Segment {
-                    ptr: std::ptr::null(),
-                    len: 0,
+                    data: 0,
+                    len_and_kind: 0,
                 }; INLINE_CAP],
                 len: 0,
             },
@@ -92,7 +126,11 @@ impl IovecWriter {
     #[inline]
     pub fn total_len(&self) -> usize {
         let mut total = 0usize;
-        self.for_each_segment(|seg| total += seg.len as usize);
+        self.for_each_segment(|seg| {
+            total = total
+                .checked_add(seg.len())
+                .expect("iovec total length overflow");
+        });
         total
     }
 
@@ -106,10 +144,7 @@ impl IovecWriter {
     /// Zero-copy: the iovec points directly into `.rodata`.
     #[inline]
     pub fn push_static(&mut self, buf: &'static [u8]) {
-        self.push_segment(Segment {
-            ptr: buf.as_ptr(),
-            len: buf.len() as u32,
-        });
+        self.push_segment(Segment::borrowed(buf));
     }
 
     /// Push a `Bytes` reference slice. The caller must ensure the `Bytes`
@@ -119,10 +154,7 @@ impl IovecWriter {
         if buf.is_empty() {
             return;
         }
-        self.push_segment(Segment {
-            ptr: buf.as_ptr(),
-            len: buf.len() as u32,
-        });
+        self.push_segment(Segment::borrowed(buf));
     }
 
     /// Write dynamically formatted bytes into the scratch buffer and push a
@@ -134,12 +166,8 @@ impl IovecWriter {
         self.scratch_extend(data);
         // The segment points into our scratch buffer. The pointer is stable
         // because we re-derive it from scratch_ptr() + start at as_iovecs time.
-        // Store the start offset in ptr and the length — we'll fix up ptrs later.
-        self.push_segment(Segment {
-            // Use a sentinel: store offset as a tagged pointer (top bit set).
-            ptr: SCRATCH_TAG.wrapping_add(start) as *const u8,
-            len: data.len() as u32,
-        });
+        // Store the start offset and length; resolved views validate bounds.
+        self.push_segment(Segment::scratch(start, data.len()));
     }
 
     /// Flatten all segments into a contiguous byte vector.
@@ -172,13 +200,24 @@ impl IovecWriter {
     pub fn as_raw_iovecs(&self) -> Vec<libc::iovec> {
         let count = self.segment_count();
         let mut iovs = Vec::with_capacity(count);
+        self.write_raw_iovecs(&mut iovs);
+        iovs
+    }
+
+    /// Write raw `libc::iovec` entries into an existing vector.
+    ///
+    /// This lets reactor-owned write state reuse the raw-iovec allocation
+    /// across steady-state responses instead of allocating a fresh vector for
+    /// each `writev` submission.
+    pub fn write_raw_iovecs(&self, out: &mut Vec<libc::iovec>) {
+        out.clear();
+        out.reserve(self.segment_count());
         self.for_each_resolved(|ptr, len| {
-            iovs.push(libc::iovec {
+            out.push(libc::iovec {
                 iov_base: ptr as *mut libc::c_void,
                 iov_len: len,
             });
         });
-        iovs
     }
 
     /// Reset the writer for reuse, clearing all segments and scratch data.
@@ -229,13 +268,15 @@ impl IovecWriter {
         match &mut self.scratch {
             ScratchBuf::Inline { buf, len } => {
                 let start = *len as usize;
-                let end = start + data.len();
+                let end = start
+                    .checked_add(data.len())
+                    .expect("iovec scratch length overflow");
                 if end <= SCRATCH_CAP {
                     buf[start..end].copy_from_slice(data);
                     *len = end as u16;
                 } else {
                     // Spill to heap.
-                    let mut v = Vec::with_capacity(SCRATCH_CAP * 2);
+                    let mut v = Vec::with_capacity(end.max(SCRATCH_CAP * 2));
                     v.extend_from_slice(&buf[..start]);
                     v.extend_from_slice(data);
                     self.scratch = ScratchBuf::Heap(v);
@@ -258,14 +299,22 @@ impl IovecWriter {
     fn for_each_resolved(&self, mut f: impl FnMut(*const u8, usize)) {
         let scratch_base = self.scratch_ptr();
         self.for_each_segment(|seg| {
-            let ptr = if is_scratch_ptr(seg.ptr) {
-                let offset = (seg.ptr as usize).wrapping_sub(SCRATCH_TAG);
-                // SAFETY: offset < scratch_len(), scratch_base is valid.
+            let len = seg.len();
+            let ptr = if seg.is_scratch() {
+                let offset = seg.data;
+                let end = offset
+                    .checked_add(len)
+                    .expect("iovec scratch segment length overflow");
+                assert!(
+                    end <= self.scratch_len(),
+                    "iovec scratch segment exceeds scratch buffer"
+                );
+                // SAFETY: offset..end is within the scratch buffer.
                 unsafe { scratch_base.add(offset) }
             } else {
-                seg.ptr
+                seg.data as *const u8
             };
-            f(ptr, seg.len as usize);
+            f(ptr, len);
         });
     }
 
@@ -292,15 +341,9 @@ impl Default for IovecWriter {
     }
 }
 
-/// Tag value used to mark scratch-buffer pointers. We use a high address that
-/// is guaranteed not to be a real pointer on any supported platform.
-const SCRATCH_TAG: usize = 0xDEAD_0000_0000_0000_usize;
-
-/// Check if a pointer is a tagged scratch offset.
-#[inline]
-fn is_scratch_ptr(ptr: *const u8) -> bool {
-    (ptr as usize) >= SCRATCH_TAG && (ptr as usize) < SCRATCH_TAG + (u16::MAX as usize)
-}
+/// High bit used in `Segment::len_and_kind` to mark scratch-backed segments.
+const SEGMENT_SCRATCH_BIT: usize = 1usize << (usize::BITS - 1);
+const SEGMENT_LEN_MASK: usize = SEGMENT_SCRATCH_BIT - 1;
 
 #[cfg(test)]
 mod tests {
@@ -386,6 +429,14 @@ mod tests {
     }
 
     #[test]
+    fn segment_size_remains_two_words() {
+        assert_eq!(
+            std::mem::size_of::<Segment>(),
+            std::mem::size_of::<usize>() * 2
+        );
+    }
+
+    #[test]
     fn clear_resets() {
         let mut w = IovecWriter::new();
         w.push_static(b"+OK\r\n");
@@ -422,6 +473,30 @@ mod tests {
         assert_eq!(w.total_len(), 600);
         let flat = w.flatten();
         assert!(flat.iter().all(|&b| b == b'X'));
+    }
+
+    #[test]
+    fn scratch_offsets_above_u16_max_resolve() {
+        let mut w = IovecWriter::new();
+        let chunk = [b'X'; 100];
+        for _ in 0..700 {
+            w.push_scratch(&chunk);
+        }
+
+        assert_eq!(w.total_len(), 70_000);
+        let flat = w.flatten();
+        assert_eq!(flat.len(), 70_000);
+        assert!(flat.iter().all(|&b| b == b'X'));
+
+        let iovs = w.as_raw_iovecs();
+        let mut reconstructed = Vec::with_capacity(70_000);
+        for iov in &iovs {
+            // SAFETY: raw iovecs were resolved from the writer's own valid segments.
+            let slice =
+                unsafe { std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len) };
+            reconstructed.extend_from_slice(slice);
+        }
+        assert_eq!(reconstructed, flat);
     }
 
     #[test]

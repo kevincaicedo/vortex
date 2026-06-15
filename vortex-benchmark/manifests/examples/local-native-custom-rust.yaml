@@ -1,0 +1,31 @@
+schema_version: 1
+name: local-native-custom-rust
+description: Quick native local multi-key sweep for Vortex and Redis using the custom Rust backend.
+databases:
+  - vortex
+  - redis
+backends:
+  - custom-rust
+workloads:
+  - multi_key_only
+duration: 8s
+environment:
+  mode: native
+  port_base: 17579
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  custom-rust:
+    profile: release
+    thread_sweep:
+      - 1
+      - 4
+    keyspace_size: 50000
+    ops_per_thread: 6000
+    warmup_ops: 500
+    value_size: 64

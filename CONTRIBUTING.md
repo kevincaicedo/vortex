@@ -221,7 +221,7 @@ For the full architecture guide: [docs/architecture.md](docs/architecture.md)
 2. Add the match arm in `crates/vortex-engine/src/commands/mod.rs` → `execute_command()`
 3. Add the command metadata in `crates/vortex-proto/build.rs` → PHF table
 4. Add unit tests in the command module
-5. Add a Criterion benchmark in `tools/vortex-bench/benches/engine.rs`
+5. Add a Criterion benchmark in `crates/vortex-engine/benches/engine.rs`
 6. Update [docs/compatibility.md](docs/compatibility.md)
 
 ### CI Pipeline

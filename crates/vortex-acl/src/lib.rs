@@ -1,8 +1,9 @@
 //! # vortex-acl
 //!
-//! ACL (Access Control List) engine and authentication for VortexDB.
+//! Reserved crate for future ACL and authentication work.
 //!
-//! Implements Redis ACL-compatible user management, command permissions,
-//! key patterns, and channel permissions.
+//! This crate intentionally exposes no release-supported ACL API in
+//! `v0.1-alpha`. Redis ACL-compatible user management, command permissions,
+//! key patterns, and channel permissions remain future work.
 //!
-//! **Status:** Stub — implementation in Phase 6.
+//! **Status:** Stub — implementation planned for Phase 6.

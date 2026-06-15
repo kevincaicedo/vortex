@@ -1,0 +1,18 @@
+schema_version: 1
+name: network-mixed
+description: Network-focused diagnostics under a mixed read/write workload.
+
+modes:
+  - network
+
+server:
+  threads: 4
+  aof: false
+
+workload:
+  command: SET,GET,INCR
+  duration: 20
+  clients: 50
+
+profiler:
+  frequency: 99

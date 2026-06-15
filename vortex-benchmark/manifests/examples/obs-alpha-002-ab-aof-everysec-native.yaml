@@ -1,0 +1,27 @@
+schema_version: 1
+name: obs-alpha-002-ab-aof-everysec-native
+description: OBS-ALPHA-002 telemetry mode A/B rows with AOF everysec, pipeline 1.
+databases:
+  - vortex
+backends:
+  - redis-benchmark
+commands:
+  - SET
+duration: 5s
+environment:
+  mode: native
+  port_base: 18579
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: true
+  aof_fsync: everysec
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 20000
+    clients: 64
+    pipeline: 1
+    keyspace_size: 100000

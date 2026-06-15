@@ -1,0 +1,30 @@
+schema_version: 1
+name: local-native-memtier
+description: Quick native local mixed-workload sweep for Vortex and Redis using memtier_benchmark.
+databases:
+  - vortex
+  - redis
+backends:
+  - memtier_benchmark
+workloads:
+  - uniform-read_heavy
+duration: 8s
+environment:
+  mode: native
+  port_base: 17479
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  memtier_benchmark:
+    clients: 16
+    pipeline: 4
+    keyspace_size: 100000
+    data_size: 256
+    thread_sweep:
+      - 1
+      - 4

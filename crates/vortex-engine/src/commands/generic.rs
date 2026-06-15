@@ -1,0 +1,1891 @@
+//! Generic key command handlers.
+//!
+//! Implements DEL, UNLINK, EXISTS, EXPIRE, EXPIREAT, PEXPIRE, PEXPIREAT,
+//! PERSIST, TTL, PTTL, EXPIRETIME, PEXPIRETIME, TYPE, RENAME, RENAMENX,
+//! KEYS, SCAN, RANDOMKEY, TOUCH, COPY.
+//!
+//! All handlers are free functions: `cmd_xxx(shard, frame, now_nanos) -> CmdResult`.
+//! Zero dynamic dispatch, designed for inlining by the compiler.
+
+use vortex_common::VortexKey;
+use vortex_proto::{FrameRef, RespFrame};
+
+#[cfg(test)]
+use super::ERR_NO_SUCH_KEY;
+use super::{
+    CmdResult, CommandArgs, ExecutedCommand, MutationErrorExt, NS_PER_MS, NS_PER_SEC, RESP_NEG_ONE,
+    RESP_NEG_TWO, RESP_NIL, RESP_OK, RESP_ONE, RESP_ZERO, absolute_deadline_nanos, arg_bytes,
+    deadline_nanos_to_absolute_unix_nanos, encode_aof_pexpireat, int_resp, key_from_bytes,
+    relative_deadline_nanos,
+};
+use crate::ConcurrentKeyspace;
+use crate::engine::domain::{ExpireOptions, KEYS_MAX_RESULTS_PER_CALL, MutationOutcome, TtlState};
+
+// ── Error constants ─────────────────────────────────────────────────
+
+static ERR_WRONG_ARGS: &[u8] = b"-ERR wrong number of arguments\r\n";
+static ERR_DB_INDEX: &[u8] = b"-ERR DB index is out of range\r\n";
+static ERR_KEYS_ALPHA_LIMIT: &[u8] = b"-ERR KEYS result exceeds alpha response limit; use SCAN\r\n";
+
+// ── DEL / UNLINK / EXISTS ───────────────────────────────────────────
+
+/// DEL key [key ...]
+/// Removes the specified keys. Returns the number of keys removed.
+#[inline]
+pub fn cmd_del(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS)),
+    };
+    if argc < 2 {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    }
+    // Single-key fast path: skip CommandArgs::collect SmallVec allocation.
+    if argc == 2 {
+        if let Some(kb) = arg_bytes(frame, 1) {
+            let outcome = match keyspace.delete_key_bytes(kb, now_nanos) {
+                Ok(outcome) => outcome,
+                Err(err) => return err.into_executed(),
+            };
+            return ExecutedCommand::with_aof_lsn(
+                int_resp(i64::from(outcome.value)),
+                outcome.aof_lsn,
+            );
+        }
+        return ExecutedCommand::from(CmdResult::Static(RESP_ZERO));
+    }
+    let Some(mut children) = frame.children() else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let _ = children.next();
+    let mut keys: smallvec::SmallVec<[&[u8]; 16]> = smallvec::SmallVec::with_capacity(argc - 1);
+    for child in children {
+        let Some(kb) = child.as_bytes() else {
+            return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+        };
+        keys.push(kb);
+    }
+    let outcome = match keyspace.delete_key_bytes_batch(&keys, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    ExecutedCommand::with_aof_lsn(int_resp(outcome.value), outcome.aof_lsn)
+}
+
+/// UNLINK key [key ...]
+/// Same as DEL for now (heap deallocation is deferred in Phase 3 via
+/// inline entry tombstoning — no heap to free for inline entries).
+#[inline]
+pub fn cmd_unlink(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_del(keyspace, frame, now_nanos)
+}
+
+/// EXISTS key [key ...]
+/// Returns the count of specified keys that exist.
+#[inline]
+pub fn cmd_exists(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    let argc = match frame.element_count() {
+        Some(n) => n as usize,
+        None => return CmdResult::Static(ERR_WRONG_ARGS),
+    };
+    if argc < 2 {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    }
+    // Single-key fast path: skip CommandArgs::collect.
+    if argc == 2 {
+        if let Some(kb) = arg_bytes(frame, 1) {
+            return int_resp(keyspace.count_existing_key_bytes(&[kb], now_nanos));
+        }
+        return CmdResult::Static(RESP_ZERO);
+    }
+    let Some(mut children) = frame.children() else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let _ = children.next();
+    let mut keys: smallvec::SmallVec<[&[u8]; 16]> = smallvec::SmallVec::with_capacity(argc - 1);
+    for child in children {
+        let Some(kb) = child.as_bytes() else {
+            return CmdResult::Static(ERR_WRONG_ARGS);
+        };
+        keys.push(kb);
+    }
+    int_resp(keyspace.count_existing_key_bytes(&keys, now_nanos))
+}
+
+// ── EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT / PERSIST ───────────────
+
+/// EXPIRE key seconds [NX|XX|GT|LT]
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn cmd_expire(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_expire_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_expire_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::RelativeSeconds,
+    )
+}
+
+/// PEXPIRE key milliseconds [NX|XX|GT|LT]
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn cmd_pexpire(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_pexpire_with_clock(keyspace, frame, now_nanos, 0)
+}
+
+#[inline]
+pub(crate) fn cmd_pexpire_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::RelativeMillis,
+    )
+}
+
+/// EXPIREAT key timestamp [NX|XX|GT|LT]
+#[inline]
+#[allow(dead_code)]
+pub fn cmd_expireat(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_expireat_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_expireat_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::AbsoluteSeconds,
+    )
+}
+
+/// PEXPIREAT key ms-timestamp [NX|XX|GT|LT]
+#[inline]
+#[allow(dead_code)]
+pub fn cmd_pexpireat(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    cmd_pexpireat_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_pexpireat_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> ExecutedCommand {
+    expire_generic(
+        keyspace,
+        frame,
+        now_nanos,
+        unix_now_nanos,
+        ExpireMode::AbsoluteMillis,
+    )
+}
+
+/// PERSIST key
+#[inline]
+pub fn cmd_persist(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let Some(kb) = args.get(1) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let key = key_from_bytes(kb);
+    let outcome = match keyspace.persist_key(&key, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    let response = if outcome.value {
+        CmdResult::Static(RESP_ONE)
+    } else {
+        CmdResult::Static(RESP_ZERO)
+    };
+    ExecutedCommand::with_aof_lsn(response, outcome.aof_lsn)
+}
+
+#[derive(Clone, Copy)]
+enum ExpireMode {
+    RelativeSeconds,
+    RelativeMillis,
+    AbsoluteSeconds,
+    AbsoluteMillis,
+}
+
+/// Generic implementation for all EXPIRE variants with NX/XX/GT/LT flags.
+fn expire_generic(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+    mode: ExpireMode,
+) -> ExecutedCommand {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
+    if argc < 3 {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    }
+    let Some(kb) = args.get(1) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let Some(time_val) = args.i64(2) else {
+        return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+    };
+
+    // Parse optional flags (NX, XX, GT, LT).
+    let mut options = ExpireOptions::default();
+    let mut condition_seen = false;
+    for i in 3..argc {
+        if let Some(flag) = args.get(i) {
+            match flag.len() {
+                2 => {
+                    let upper = [flag[0] | 0x20, flag[1] | 0x20];
+                    if matches!(&upper, b"nx" | b"xx" | b"gt" | b"lt") {
+                        if condition_seen {
+                            return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX));
+                        }
+                        condition_seen = true;
+                    }
+                    match &upper {
+                        b"nx" => options.nx = true,
+                        b"xx" => options.xx = true,
+                        b"gt" => options.gt = true,
+                        b"lt" => options.lt = true,
+                        _ => return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX)),
+                    }
+                }
+                _ => return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX)),
+            }
+        }
+    }
+
+    // Compute absolute deadline in nanos.
+    let deadline_nanos = match mode {
+        ExpireMode::RelativeSeconds => {
+            if time_val <= 0 {
+                0
+            } else {
+                let Some(deadline) =
+                    relative_deadline_nanos(time_val as u64, NS_PER_SEC, now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
+            }
+        }
+        ExpireMode::RelativeMillis => {
+            if time_val <= 0 {
+                0
+            } else {
+                let Some(deadline) = relative_deadline_nanos(time_val as u64, NS_PER_MS, now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
+            }
+        }
+        ExpireMode::AbsoluteSeconds => {
+            if time_val <= 0 {
+                0
+            } else {
+                let Some(deadline) =
+                    absolute_deadline_nanos(time_val as u64, NS_PER_SEC, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
+            }
+        }
+        ExpireMode::AbsoluteMillis => {
+            if time_val <= 0 {
+                0
+            } else {
+                let Some(deadline) =
+                    absolute_deadline_nanos(time_val as u64, NS_PER_MS, now_nanos, unix_now_nanos)
+                else {
+                    return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+                };
+                deadline
+            }
+        }
+    };
+
+    let key = key_from_bytes(kb);
+
+    let outcome = match keyspace.expire_key_with_options(&key, deadline_nanos, now_nanos, options) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    let response = if outcome.value {
+        CmdResult::Static(RESP_ONE)
+    } else {
+        CmdResult::Static(RESP_ZERO)
+    };
+    let aof_payload = if outcome.aof_lsn.is_some() && unix_now_nanos != 0 {
+        let absolute_deadline_ms =
+            deadline_nanos_to_absolute_unix_nanos(deadline_nanos, now_nanos, unix_now_nanos)
+                / NS_PER_MS;
+        Some(encode_aof_pexpireat(kb, absolute_deadline_ms))
+    } else {
+        None
+    };
+    ExecutedCommand::with_optional_aof_payload(response, outcome.aof_lsn, aof_payload)
+}
+
+// ── TTL / PTTL / EXPIRETIME / PEXPIRETIME ───────────────────────────
+
+/// TTL key
+#[inline]
+pub fn cmd_ttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(((deadline - now_nanos) / NS_PER_SEC) as i64),
+    }
+}
+
+/// PTTL key
+#[inline]
+pub fn cmd_pttl(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(((deadline - now_nanos) / NS_PER_MS) as i64),
+    }
+}
+
+/// EXPIRETIME key
+#[inline]
+#[allow(dead_code)]
+pub fn cmd_expiretime(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    cmd_expiretime_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_expiretime_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> CmdResult {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(
+            (deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos)
+                / NS_PER_SEC) as i64,
+        ),
+    }
+}
+
+/// PEXPIRETIME key
+#[inline]
+#[allow(dead_code)]
+pub fn cmd_pexpiretime(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    cmd_pexpiretime_with_clock(keyspace, frame, now_nanos, now_nanos)
+}
+
+#[inline]
+pub(crate) fn cmd_pexpiretime_with_clock(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+    unix_now_nanos: u64,
+) -> CmdResult {
+    let Some(key_bytes) = arg_bytes(frame, 1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    match keyspace.ttl_state_bytes(key_bytes, now_nanos) {
+        TtlState::Missing => CmdResult::Static(RESP_NEG_TWO),
+        TtlState::Persistent => CmdResult::Static(RESP_NEG_ONE),
+        TtlState::Deadline(deadline) => int_resp(
+            (deadline_nanos_to_absolute_unix_nanos(deadline, now_nanos, unix_now_nanos) / NS_PER_MS)
+                as i64,
+        ),
+    }
+}
+
+// ── TYPE ────────────────────────────────────────────────────────────
+
+/// TYPE key
+#[inline]
+pub fn cmd_type(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let Some(kb) = args.get(1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let key = key_from_bytes(kb);
+    match keyspace.type_of_key(&key, now_nanos) {
+        Some(type_name) => CmdResult::Resp(RespFrame::simple_string(type_name)),
+        None => CmdResult::Resp(RespFrame::simple_string("none")),
+    }
+}
+
+// ── RENAME / RENAMENX ───────────────────────────────────────────────
+
+/// RENAME key newkey
+#[inline]
+pub fn cmd_rename(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
+    if argc < 3 {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    }
+    let Some(old_kb) = args.get(1) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let Some(new_kb) = args.get(2) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let old_key = key_from_bytes(old_kb);
+    let new_key = key_from_bytes(new_kb);
+    match keyspace.rename_key(&old_key, new_key, now_nanos, false) {
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => {
+            let response = if value {
+                CmdResult::Static(RESP_OK)
+            } else {
+                CmdResult::Static(RESP_ZERO)
+            };
+            ExecutedCommand::with_aof_records(response, aof_records, aof_lsn)
+        }
+        Err(err) => err.into_executed(),
+    }
+}
+
+/// RENAMENX key newkey
+#[inline]
+pub fn cmd_renamenx(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
+    if argc < 3 {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    }
+    let Some(old_kb) = args.get(1) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let Some(new_kb) = args.get(2) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let old_key = key_from_bytes(old_kb);
+    let new_key = key_from_bytes(new_kb);
+
+    match keyspace.rename_key(&old_key, new_key, now_nanos, true) {
+        Ok(MutationOutcome {
+            value,
+            aof_records,
+            aof_lsn,
+        }) => {
+            let response = if value {
+                CmdResult::Static(RESP_ONE)
+            } else {
+                CmdResult::Static(RESP_ZERO)
+            };
+            ExecutedCommand::with_aof_records(response, aof_records, aof_lsn)
+        }
+        Err(err) => err.into_executed(),
+    }
+}
+
+// ── SCAN ────────────────────────────────────────────────────────────
+
+/// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
+pub fn cmd_scan(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let argc = args.len();
+    if argc < 2 {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    }
+    let Some(cursor_val) = args.i64(1) else {
+        return CmdResult::Static(super::ERR_NOT_INTEGER);
+    };
+    if cursor_val < 0 {
+        return CmdResult::Static(super::ERR_NOT_INTEGER);
+    }
+    let cursor = cursor_val as u64;
+
+    // Parse optional arguments.
+    let mut pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut type_filter: Option<&[u8]> = None;
+
+    let mut i = 2;
+    while i < argc {
+        let Some(opt) = args.get(i) else {
+            return CmdResult::Static(super::ERR_SYNTAX);
+        };
+        if eq_ci(opt, b"MATCH") {
+            i += 1;
+            let Some(value) = args.get(i) else {
+                return CmdResult::Static(super::ERR_SYNTAX);
+            };
+            pattern = Some(value);
+        } else if eq_ci(opt, b"COUNT") {
+            i += 1;
+            let Some(n) = args.i64(i) else {
+                return CmdResult::Static(super::ERR_NOT_INTEGER);
+            };
+            let Ok(parsed_count) = usize::try_from(n) else {
+                return CmdResult::Static(super::ERR_NOT_INTEGER);
+            };
+            if parsed_count == 0 {
+                return CmdResult::Static(super::ERR_NOT_INTEGER);
+            }
+            count = parsed_count;
+        } else if eq_ci(opt, b"TYPE") {
+            i += 1;
+            let Some(value) = args.get(i) else {
+                return CmdResult::Static(super::ERR_SYNTAX);
+            };
+            type_filter = Some(value);
+        } else {
+            return CmdResult::Static(super::ERR_SYNTAX);
+        }
+        i += 1;
+    }
+
+    let (next_cursor, results) = keyspace.scan_keys(cursor, pattern, count, type_filter, now_nanos);
+    scan_response(next_cursor, &results)
+}
+
+/// Build a SCAN response: `*2\r\n $cursor_len\r\n cursor\r\n *N\r\n ...keys...`
+fn scan_response(cursor: u64, keys: &[VortexKey]) -> CmdResult {
+    let cursor_str = itoa::Buffer::new().format(cursor).to_owned();
+    let mut elements = Vec::with_capacity(keys.len());
+    for k in keys {
+        elements.push(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
+            k.as_bytes(),
+        )));
+    }
+    CmdResult::Resp(RespFrame::Array(Some(vec![
+        RespFrame::bulk_string(bytes::Bytes::copy_from_slice(cursor_str.as_bytes())),
+        RespFrame::Array(Some(elements)),
+    ])))
+}
+
+// ── KEYS ────────────────────────────────────────────────────────────
+
+/// KEYS pattern
+pub fn cmd_keys(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    if args.len() != 2 {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    }
+    let Some(pat) = args.get(1) else {
+        return CmdResult::Static(ERR_WRONG_ARGS);
+    };
+    let (keys, limit_exceeded) =
+        keyspace.keys_matching_limited(pat, KEYS_MAX_RESULTS_PER_CALL, now_nanos);
+    if limit_exceeded {
+        return CmdResult::Static(ERR_KEYS_ALPHA_LIMIT);
+    }
+
+    let mut results = Vec::new();
+    for key in keys {
+        results.push(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
+            key.as_bytes(),
+        )));
+    }
+
+    CmdResult::Resp(RespFrame::Array(Some(results)))
+}
+
+// ── RANDOMKEY ───────────────────────────────────────────────────────
+
+/// RANDOMKEY
+#[inline]
+pub fn cmd_randomkey(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> CmdResult {
+    let _ = frame;
+    match keyspace.random_key(now_nanos, now_nanos) {
+        Some(key) => CmdResult::Resp(RespFrame::bulk_string(bytes::Bytes::copy_from_slice(
+            key.as_bytes(),
+        ))),
+        None => CmdResult::Static(RESP_NIL),
+    }
+}
+
+// ── TOUCH ───────────────────────────────────────────────────────────
+
+/// TOUCH key [key ...]
+/// Like EXISTS but conceptually "touches" the key (updates access time).
+/// In Phase 3, behaves identically to EXISTS.
+#[inline]
+pub fn cmd_touch(keyspace: &ConcurrentKeyspace, frame: &FrameRef<'_>, now_nanos: u64) -> CmdResult {
+    cmd_exists(keyspace, frame, now_nanos)
+}
+
+// ── COPY ────────────────────────────────────────────────────────────
+
+/// COPY source destination [DB destination-db] [REPLACE]
+pub fn cmd_copy(
+    keyspace: &ConcurrentKeyspace,
+    frame: &FrameRef<'_>,
+    now_nanos: u64,
+) -> ExecutedCommand {
+    let Some(args) = CommandArgs::collect(frame) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let argc = args.len();
+    if argc < 3 {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    }
+    let Some(src_kb) = args.get(1) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+    let Some(dst_kb) = args.get(2) else {
+        return ExecutedCommand::from(CmdResult::Static(ERR_WRONG_ARGS));
+    };
+
+    // Parse optional flags.
+    let mut replace = false;
+    let mut i = 3;
+    while i < argc {
+        let Some(opt) = args.get(i) else {
+            return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX));
+        };
+        if eq_ci(opt, b"REPLACE") {
+            replace = true;
+        } else if eq_ci(opt, b"DB") {
+            i += 1;
+            let Some(db) = args.i64(i) else {
+                return ExecutedCommand::from(CmdResult::Static(super::ERR_NOT_INTEGER));
+            };
+            if db != 0 {
+                return ExecutedCommand::from(CmdResult::Static(ERR_DB_INDEX));
+            }
+        } else {
+            return ExecutedCommand::from(CmdResult::Static(super::ERR_SYNTAX));
+        }
+        i += 1;
+    }
+
+    let src_key = key_from_bytes(src_kb);
+    let dst_key = key_from_bytes(dst_kb);
+
+    let outcome = match keyspace.copy_key(&src_key, dst_key, replace, now_nanos) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into_executed(),
+    };
+    let response = if outcome.value {
+        CmdResult::Static(RESP_ONE)
+    } else {
+        CmdResult::Static(RESP_ZERO)
+    };
+    ExecutedCommand::with_aof_records(response, outcome.aof_records, outcome.aof_lsn)
+}
+
+// ── Glob pattern matcher ────────────────────────────────────────────
+
+/// Match a Redis-style glob pattern against a string.
+#[inline]
+#[cfg(test)]
+pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
+    super::pattern::glob_match(pattern, string)
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// ASCII case-insensitive comparison.
+#[inline]
+fn eq_ci(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if (a[i] | 0x20) != (b[i] | 0x20) {
+            return false;
+        }
+    }
+    true
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use crate::commands::test_harness::TestHarness;
+    use crate::engine::domain::{KEYS_MAX_RESULTS_PER_CALL, SCAN_MAX_RESULTS_PER_CALL};
+    use vortex_common::VortexValue;
+    use vortex_proto::RespTape;
+
+    const NOW: u64 = 1_000_000_000_000; // 1000 seconds in nanos.
+
+    /// Build raw RESP array bytes from parts.
+    fn make_resp(parts: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+        for p in parts {
+            buf.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            buf.extend_from_slice(p);
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf
+    }
+
+    /// Parse RESP bytes and execute command via handler function.
+    fn exec<R>(
+        keyspace: &ConcurrentKeyspace,
+        handler: fn(&ConcurrentKeyspace, &FrameRef<'_>, u64) -> R,
+        parts: &[&[u8]],
+        now: u64,
+    ) -> CmdResult
+    where
+        R: Into<ExecutedCommand>,
+    {
+        let data = make_resp(parts);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
+        let frame = tape.iter().next().unwrap();
+        handler(keyspace, &frame, now).into().response
+    }
+
+    fn assert_static(result: CmdResult, expected: &[u8]) {
+        match result {
+            CmdResult::Static(s) => assert_eq!(s, expected, "Static mismatch"),
+            CmdResult::Inline(_) => panic!("Expected Static, got Inline"),
+            CmdResult::Owned(_) => panic!("Expected Static, got Owned"),
+            CmdResult::Resp(_) => panic!("Expected Static, got Resp"),
+        }
+    }
+
+    fn assert_integer(result: CmdResult, expected: i64) {
+        match result {
+            CmdResult::Resp(RespFrame::Integer(n)) => assert_eq!(n, expected),
+            CmdResult::Owned(_) => panic!("expected Integer, got Owned"),
+            CmdResult::Static(s) => {
+                // int_resp may return static bytes for common values (0, 1, -1, -2).
+                let expected_bytes = match expected {
+                    0 => super::RESP_ZERO,
+                    1 => super::RESP_ONE,
+                    -1 => super::RESP_NEG_ONE,
+                    -2 => super::RESP_NEG_TWO,
+                    _ => panic!(
+                        "Expected Integer({}), got Static({:?})",
+                        expected,
+                        std::str::from_utf8(s)
+                    ),
+                };
+                assert_eq!(
+                    s, expected_bytes,
+                    "Static integer mismatch for {}",
+                    expected
+                );
+            }
+            other => panic!("Expected Integer({}), got {:?}", expected, other),
+        }
+    }
+
+    fn scan_result(result: CmdResult) -> (u64, Vec<Vec<u8>>) {
+        let CmdResult::Resp(RespFrame::Array(Some(arr))) = result else {
+            panic!("expected SCAN array response");
+        };
+        assert_eq!(arr.len(), 2);
+
+        let RespFrame::BulkString(Some(cursor)) = &arr[0] else {
+            panic!("expected bulk-string SCAN cursor");
+        };
+        let cursor = std::str::from_utf8(cursor)
+            .expect("SCAN cursor is UTF-8")
+            .parse::<u64>()
+            .expect("SCAN cursor is an integer");
+
+        let RespFrame::Array(Some(keys)) = &arr[1] else {
+            panic!("expected SCAN key array");
+        };
+        let keys = keys
+            .iter()
+            .map(|key| match key {
+                RespFrame::BulkString(Some(bytes)) => bytes.to_vec(),
+                other => panic!("expected bulk-string SCAN key, got {other:?}"),
+            })
+            .collect();
+        (cursor, keys)
+    }
+
+    fn new_harness() -> TestHarness {
+        TestHarness::new()
+    }
+
+    // ── DEL tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn del_single() {
+        let h = new_harness();
+        h.set(VortexKey::from("foo"), VortexValue::from("bar"));
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"foo"], NOW);
+        assert_integer(r, 1);
+        assert!(!h.exists(&VortexKey::from("foo"), NOW));
+    }
+
+    #[test]
+    fn del_multi() {
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        h.set(VortexKey::from("b"), VortexValue::from("2"));
+        h.set(VortexKey::from("c"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"a", b"b", b"d"], NOW);
+        assert_integer(r, 2); // "d" doesn't exist.
+    }
+
+    #[test]
+    fn del_duplicate_key_counts_removed_key_once() {
+        let h = new_harness();
+        h.set(VortexKey::from("dup"), VortexValue::from("1"));
+
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"dup", b"dup"], NOW);
+
+        assert_integer(r, 1);
+        assert!(!h.exists(&VortexKey::from("dup"), NOW));
+    }
+
+    #[test]
+    fn del_nonexistent() {
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_del, &[b"DEL", b"x"], NOW);
+        assert_integer(r, 0);
+    }
+
+    // ── EXISTS tests ────────────────────────────────────────────────
+
+    #[test]
+    fn exists_single() {
+        let h = new_harness();
+        h.set(VortexKey::from("foo"), VortexValue::from("bar"));
+        let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"foo"], NOW);
+        assert_integer(r, 1);
+    }
+
+    #[test]
+    fn exists_multi_with_duplicates() {
+        let h = new_harness();
+        h.set(VortexKey::from("k"), VortexValue::from("v"));
+        // EXISTS k k (same key twice) — Redis counts each occurrence.
+        let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"k", b"k"], NOW);
+        assert_integer(r, 2);
+    }
+
+    #[test]
+    fn touch_duplicate_key_matches_exists_counting() {
+        let h = new_harness();
+        h.set(VortexKey::from("k"), VortexValue::from("v"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_touch,
+            &[b"TOUCH", b"k", b"k", b"missing"],
+            NOW,
+        );
+
+        assert_integer(r, 2);
+    }
+
+    #[test]
+    fn exists_miss() {
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_exists, &[b"EXISTS", b"nope"], NOW);
+        assert_integer(r, 0);
+    }
+
+    // ── EXPIRE + TTL round-trip ─────────────────────────────────────
+
+    #[test]
+    fn expire_and_ttl() {
+        let h = new_harness();
+        h.set(VortexKey::from("mykey"), VortexValue::from("val"));
+
+        // EXPIRE mykey 100
+        let r = exec(&h.keyspace, cmd_expire, &[b"EXPIRE", b"mykey", b"100"], NOW);
+        assert_static(r, RESP_ONE);
+
+        // TTL mykey => ~100 seconds.
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"mykey"], NOW);
+        // Deadline = NOW + 100*NS_PER_SEC. Remaining = 100.
+        assert_integer(r, 100);
+    }
+
+    #[test]
+    fn pexpire_and_pttl() {
+        let h = new_harness();
+        h.set(VortexKey::from("pk"), VortexValue::from("pv"));
+
+        let r = exec(&h.keyspace, cmd_pexpire, &[b"PEXPIRE", b"pk", b"5000"], NOW);
+        assert_static(r, RESP_ONE);
+
+        let r = exec(&h.keyspace, cmd_pttl, &[b"PTTL", b"pk"], NOW);
+        assert_integer(r, 5000);
+    }
+
+    #[test]
+    fn persist_removes_ttl() {
+        let h = new_harness();
+        h.set(VortexKey::from("tk"), VortexValue::from("tv"));
+        exec(&h.keyspace, cmd_expire, &[b"EXPIRE", b"tk", b"10"], NOW);
+
+        let r = exec(&h.keyspace, cmd_persist, &[b"PERSIST", b"tk"], NOW);
+        assert_static(r, RESP_ONE);
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], NOW);
+        assert_static(r, RESP_NEG_ONE); // No TTL.
+    }
+
+    #[test]
+    fn persist_expired_key_does_not_resurrect() {
+        let h = new_harness();
+        h.set_with_ttl(
+            VortexKey::from("expired-persist"),
+            VortexValue::from("tv"),
+            NOW - 1,
+        );
+
+        let r = exec(
+            &h.keyspace,
+            cmd_persist,
+            &[b"PERSIST", b"expired-persist"],
+            NOW,
+        );
+        assert_static(r, RESP_ZERO);
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"expired-persist"], NOW);
+        assert_static(r, RESP_NEG_TWO);
+    }
+
+    #[test]
+    fn expire_zero_honors_xx_condition_under_domain_lock() {
+        let h = new_harness();
+        h.set(VortexKey::from("persistent"), VortexValue::from("tv"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_expire,
+            &[b"EXPIRE", b"persistent", b"0", b"XX"],
+            NOW,
+        );
+        assert_static(r, RESP_ZERO);
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"persistent"], NOW);
+        assert_static(r, RESP_NEG_ONE);
+    }
+
+    #[test]
+    fn ttl_no_key() {
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"nokey"], NOW);
+        assert_static(r, RESP_NEG_TWO);
+    }
+
+    #[test]
+    fn ttl_no_expiry() {
+        let h = new_harness();
+        h.set(VortexKey::from("p"), VortexValue::from("v"));
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"p"], NOW);
+        assert_static(r, RESP_NEG_ONE);
+    }
+
+    // ── EXPIREAT / PEXPIREAT ────────────────────────────────────────
+
+    #[test]
+    fn expireat_and_expiretime() {
+        let h = new_harness();
+        h.set(VortexKey::from("ea"), VortexValue::from("v"));
+
+        let monotonic_now = NOW;
+        let unix_now_nanos = vortex_common::current_unix_time_nanos();
+        let deadline = unix_now_nanos / NS_PER_SEC + 60;
+
+        // EXPIREAT ea unix_now + 60 seconds
+        let data = make_resp(&[b"EXPIREAT", b"ea", deadline.to_string().as_bytes()]);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
+        let frame = tape.iter().next().unwrap();
+        let r =
+            cmd_expireat_with_clock(&h.keyspace, &frame, monotonic_now, unix_now_nanos).response;
+        assert_static(r, RESP_ONE);
+
+        // EXPIRETIME ea should report the original absolute deadline.
+        let data = make_resp(&[b"EXPIRETIME", b"ea"]);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP input");
+        let frame = tape.iter().next().unwrap();
+        let r = cmd_expiretime_with_clock(&h.keyspace, &frame, monotonic_now, unix_now_nanos);
+        match r {
+            CmdResult::Resp(RespFrame::Integer(actual)) => {
+                assert!((deadline as i64 - 1..=deadline as i64 + 1).contains(&actual));
+            }
+            CmdResult::Static(bytes) => panic!("expected integer response, got {bytes:?}"),
+            other => panic!("expected integer response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expireat_nonpositive_timestamp_deletes_key() {
+        let h = new_harness();
+        let key = VortexKey::from("ea-negative");
+        h.set(key.clone(), VortexValue::from("v"));
+
+        let data = make_resp(&[b"EXPIREAT", b"ea-negative", b"-1"]);
+        let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
+        let frame = tape.iter().next().unwrap();
+        let r =
+            cmd_expireat_with_clock(&h.keyspace, &frame, NOW, 1_750_000_000 * NS_PER_SEC).response;
+
+        assert_static(r, RESP_ONE);
+        assert!(!h.exists(&key, NOW));
+    }
+
+    #[test]
+    fn expire_deadline_overflow_is_rejected_without_mutating_ttl() {
+        let h = new_harness();
+        h.set(VortexKey::from("expire-overflow"), VortexValue::from("v"));
+        let huge = i64::MAX.to_string();
+
+        let r = exec(
+            &h.keyspace,
+            cmd_expire,
+            &[b"EXPIRE", b"expire-overflow", huge.as_bytes()],
+            NOW,
+        );
+
+        assert_static(r, crate::commands::ERR_NOT_INTEGER);
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"expire-overflow"], NOW);
+        assert_static(r, RESP_NEG_ONE);
+    }
+
+    #[test]
+    fn expire_rejects_conflicting_condition_options_without_mutating() {
+        let h = new_harness();
+        h.set(VortexKey::from("expire-conflict"), VortexValue::from("v"));
+
+        for parts in [
+            &[
+                b"EXPIRE".as_slice(),
+                b"expire-conflict".as_slice(),
+                b"60".as_slice(),
+                b"NX".as_slice(),
+                b"XX".as_slice(),
+            ][..],
+            &[
+                b"EXPIRE".as_slice(),
+                b"expire-conflict".as_slice(),
+                b"60".as_slice(),
+                b"GT".as_slice(),
+                b"LT".as_slice(),
+            ][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_expire, parts, NOW);
+            assert_static(r, crate::commands::ERR_SYNTAX);
+        }
+
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"expire-conflict"], NOW);
+        assert_static(r, RESP_NEG_ONE);
+    }
+
+    // ── TYPE ────────────────────────────────────────────────────────
+
+    #[test]
+    fn type_string() {
+        let h = new_harness();
+        h.set(VortexKey::from("s"), VortexValue::from("hello"));
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"s"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::SimpleString(s)) => {
+                assert_eq!(s.as_ref(), b"string")
+            }
+            other => panic!("Expected SimpleString, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn type_none() {
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"missing"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::SimpleString(s)) => {
+                assert_eq!(s.as_ref(), b"none")
+            }
+            other => panic!("Expected SimpleString('none'), got {:?}", other),
+        }
+    }
+
+    // ── RENAME / RENAMENX ───────────────────────────────────────────
+
+    #[test]
+    fn rename_basic() {
+        let h = new_harness();
+        h.set(VortexKey::from("old"), VortexValue::from("val"));
+        let r = exec(&h.keyspace, cmd_rename, &[b"RENAME", b"old", b"new"], NOW);
+        assert_static(r, RESP_OK);
+        assert!(!h.exists(&VortexKey::from("old"), NOW));
+        assert!(h.exists(&VortexKey::from("new"), NOW));
+    }
+
+    #[test]
+    fn rename_preserves_ttl() {
+        let h = new_harness();
+        h.set(VortexKey::from("rk"), VortexValue::from("rv"));
+        exec(&h.keyspace, cmd_expire, &[b"EXPIRE", b"rk", b"60"], NOW);
+
+        exec(&h.keyspace, cmd_rename, &[b"RENAME", b"rk", b"rk2"], NOW);
+
+        // TTL should still be ~60 on the new key.
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"rk2"], NOW);
+        assert_integer(r, 60);
+    }
+
+    #[test]
+    fn rename_same_key() {
+        let h = new_harness();
+        h.set(VortexKey::from("same"), VortexValue::from("v"));
+        let r = exec(&h.keyspace, cmd_rename, &[b"RENAME", b"same", b"same"], NOW);
+        assert_static(r, RESP_OK);
+        assert!(h.exists(&VortexKey::from("same"), NOW));
+    }
+
+    #[test]
+    fn rename_no_key() {
+        let h = new_harness();
+        let r = exec(
+            &h.keyspace,
+            cmd_rename,
+            &[b"RENAME", b"missing", b"new"],
+            NOW,
+        );
+        assert_static(r, ERR_NO_SUCH_KEY);
+    }
+
+    #[test]
+    fn renamenx_success() {
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        let r = exec(&h.keyspace, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
+        assert_static(r, RESP_ONE);
+    }
+
+    #[test]
+    fn renamenx_dest_exists() {
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        h.set(VortexKey::from("b"), VortexValue::from("2"));
+        let r = exec(&h.keyspace, cmd_renamenx, &[b"RENAMENX", b"a", b"b"], NOW);
+        assert_static(r, RESP_ZERO);
+    }
+
+    #[test]
+    fn rename_noeviction_returns_oom_without_mutating() {
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("value"));
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), crate::EvictionPolicy::NoEviction);
+
+        let r = exec(
+            &h.keyspace,
+            cmd_rename,
+            &[b"RENAME", b"a", b"destination-key-that-grows-memory"],
+            NOW,
+        );
+
+        assert_static(r, crate::commands::ERR_OOM);
+        assert!(h.exists(&VortexKey::from("a"), NOW));
+        assert!(!h.exists(&VortexKey::from("destination-key-that-grows-memory"), NOW));
+    }
+
+    // ── SCAN ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_full_iteration() {
+        let h = new_harness();
+        let n = 50;
+        for i in 0..n {
+            let key = format!("key:{i}");
+            h.set(VortexKey::from(key.as_str()), VortexValue::from("v"));
+        }
+
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut cursor: u64 = 0;
+        let mut iterations = 0;
+
+        loop {
+            let data = make_resp(&[b"SCAN", cursor.to_string().as_bytes(), b"COUNT", b"10"]);
+            let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
+            let frame = tape.iter().next().unwrap();
+            let result = cmd_scan(&h.keyspace, &frame, NOW);
+
+            match result {
+                CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                    // arr[0] = cursor bulk string, arr[1] = keys array.
+                    if let RespFrame::BulkString(Some(c)) = &arr[0] {
+                        cursor = std::str::from_utf8(c).unwrap().parse().unwrap();
+                    }
+                    if let RespFrame::Array(Some(keys)) = &arr[1] {
+                        for k in keys {
+                            if let RespFrame::BulkString(Some(kb)) = k {
+                                all_keys.push(String::from_utf8(kb.to_vec()).unwrap());
+                            }
+                        }
+                    }
+                }
+                _ => panic!("Expected Array response from SCAN"),
+            }
+
+            iterations += 1;
+            if cursor == 0 {
+                break;
+            }
+            // Safety: prevent infinite loop.
+            assert!(
+                iterations < 1000,
+                "SCAN did not terminate after 1000 iterations"
+            );
+        }
+
+        // All 50 keys must have been returned at least once.
+        all_keys.sort();
+        all_keys.dedup();
+        assert_eq!(
+            all_keys.len(),
+            n,
+            "SCAN must return all keys. Got {} of {}",
+            all_keys.len(),
+            n
+        );
+    }
+
+    #[test]
+    fn scan_with_match() {
+        let h = new_harness();
+        h.set(VortexKey::from("user:1"), VortexValue::from("a"));
+        h.set(VortexKey::from("user:2"), VortexValue::from("b"));
+        h.set(VortexKey::from("post:1"), VortexValue::from("c"));
+
+        let mut matched: Vec<String> = Vec::new();
+        let mut cursor: u64 = 0;
+        loop {
+            let cur_str = cursor.to_string();
+            let data = make_resp(&[b"SCAN", cur_str.as_bytes(), b"MATCH", b"user:*"]);
+            let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
+            let frame = tape.iter().next().unwrap();
+            let result = cmd_scan(&h.keyspace, &frame, NOW);
+
+            match result {
+                CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                    if let RespFrame::BulkString(Some(c)) = &arr[0] {
+                        cursor = std::str::from_utf8(c).unwrap().parse().unwrap();
+                    }
+                    if let RespFrame::Array(Some(keys)) = &arr[1] {
+                        for k in keys {
+                            if let RespFrame::BulkString(Some(kb)) = k {
+                                matched.push(String::from_utf8(kb.to_vec()).unwrap());
+                            }
+                        }
+                    }
+                }
+                _ => panic!("Expected Array"),
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        matched.sort();
+        matched.dedup();
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&"user:1".to_string()));
+        assert!(matched.contains(&"user:2".to_string()));
+    }
+
+    #[test]
+    fn scan_omits_expired_keys() {
+        let h = new_harness();
+        h.set(VortexKey::from("scan:live"), VortexValue::from("v"));
+        h.set_with_ttl(
+            VortexKey::from("scan:expired"),
+            VortexValue::from("v"),
+            NOW - 1,
+        );
+
+        let mut returned: Vec<String> = Vec::new();
+        let mut cursor: u64 = 0;
+        loop {
+            let cur_str = cursor.to_string();
+            let data = make_resp(&[b"SCAN", cur_str.as_bytes(), b"COUNT", b"10"]);
+            let tape = RespTape::parse_pipeline(&data).expect("valid RESP");
+            let frame = tape.iter().next().unwrap();
+            let result = cmd_scan(&h.keyspace, &frame, NOW);
+
+            match result {
+                CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                    if let RespFrame::BulkString(Some(c)) = &arr[0] {
+                        cursor = std::str::from_utf8(c).unwrap().parse().unwrap();
+                    }
+                    if let RespFrame::Array(Some(keys)) = &arr[1] {
+                        for k in keys {
+                            if let RespFrame::BulkString(Some(kb)) = k {
+                                returned.push(String::from_utf8(kb.to_vec()).unwrap());
+                            }
+                        }
+                    }
+                }
+                _ => panic!("Expected Array"),
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        returned.sort();
+        returned.dedup();
+        assert!(returned.contains(&"scan:live".to_string()));
+        assert!(!returned.contains(&"scan:expired".to_string()));
+    }
+
+    #[test]
+    fn scan_rejects_malformed_cursor_and_options() {
+        let h = new_harness();
+
+        for parts in [
+            &[b"SCAN".as_slice(), b"-1".as_slice()][..],
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"COUNT".as_slice()][..],
+            &[
+                b"SCAN".as_slice(),
+                b"0".as_slice(),
+                b"COUNT".as_slice(),
+                b"0".as_slice(),
+            ][..],
+            &[
+                b"SCAN".as_slice(),
+                b"0".as_slice(),
+                b"COUNT".as_slice(),
+                b"-5".as_slice(),
+            ][..],
+            &[
+                b"SCAN".as_slice(),
+                b"0".as_slice(),
+                b"COUNT".as_slice(),
+                b"nope".as_slice(),
+            ][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_scan, parts, NOW);
+            assert_static(r, crate::commands::ERR_NOT_INTEGER);
+        }
+
+        for parts in [
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"MATCH".as_slice()][..],
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"TYPE".as_slice()][..],
+            &[b"SCAN".as_slice(), b"0".as_slice(), b"UNKNOWN".as_slice()][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_scan, parts, NOW);
+            assert_static(r, crate::commands::ERR_SYNTAX);
+        }
+    }
+
+    #[test]
+    fn scan_large_count_is_capped_for_alpha_response_budget() {
+        let h = new_harness();
+        let keys = SCAN_MAX_RESULTS_PER_CALL + 128;
+        for i in 0..keys {
+            let key = format!("scan-cap:{i:04}");
+            h.set(VortexKey::from(key.as_str()), VortexValue::from("v"));
+        }
+
+        let count = (SCAN_MAX_RESULTS_PER_CALL * 8).to_string();
+        let result = exec(
+            &h.keyspace,
+            cmd_scan,
+            &[b"SCAN", b"0", b"COUNT", count.as_bytes()],
+            NOW,
+        );
+        let (cursor, returned) = scan_result(result);
+
+        assert!(
+            returned.len() <= SCAN_MAX_RESULTS_PER_CALL,
+            "SCAN must cap one-response key material; returned {}",
+            returned.len()
+        );
+        assert_ne!(
+            cursor, 0,
+            "SCAN must return a progress cursor when the capped response leaves keys behind"
+        );
+    }
+
+    #[test]
+    fn scan_sparse_match_advances_by_slot_budget() {
+        use crate::engine::domain::SCAN_MAX_SLOTS_PER_CALL;
+
+        let keyspace = ConcurrentKeyspace::with_capacity(
+            crate::keyspace::MIN_SHARD_COUNT,
+            SCAN_MAX_SLOTS_PER_CALL * crate::keyspace::MIN_SHARD_COUNT * 2,
+        );
+        let mut chosen_key = None;
+        for i in 0..10_000 {
+            let candidate = format!("scan-budget:{i}");
+            if keyspace.shard_index(candidate.as_bytes()) == 0 {
+                chosen_key = Some(candidate);
+                break;
+            }
+        }
+        let key = chosen_key.expect("test should find a key routed to shard zero");
+        keyspace.write(key.as_bytes(), |table| {
+            table.insert(VortexKey::from(key.as_str()), VortexValue::from("v"));
+        });
+
+        let result = exec(
+            &keyspace,
+            cmd_scan,
+            &[b"SCAN", b"0", b"MATCH", b"does-not-match:*", b"COUNT", b"1"],
+            NOW,
+        );
+        let (cursor, returned) = scan_result(result);
+
+        assert!(returned.is_empty());
+        assert_ne!(
+            cursor, 0,
+            "SCAN should return a progress cursor after exhausting its slot budget"
+        );
+    }
+
+    // ── KEYS ────────────────────────────────────────────────────────
+
+    #[test]
+    fn keys_star() {
+        let h = new_harness();
+        h.set(VortexKey::from("a"), VortexValue::from("1"));
+        h.set(VortexKey::from("b"), VortexValue::from("2"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"*"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert_eq!(arr.len(), 2);
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn keys_pattern() {
+        let h = new_harness();
+        h.set(VortexKey::from("hello"), VortexValue::from("1"));
+        h.set(VortexKey::from("hallo"), VortexValue::from("2"));
+        h.set(VortexKey::from("world"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"h?llo"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert_eq!(arr.len(), 2);
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn keys_char_class() {
+        let h = new_harness();
+        h.set(VortexKey::from("hello"), VortexValue::from("1"));
+        h.set(VortexKey::from("hallo"), VortexValue::from("2"));
+        h.set(VortexKey::from("hxllo"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"h[ae]llo"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert_eq!(arr.len(), 2); // hello, hallo — not hxllo.
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn keys_negated_class() {
+        let h = new_harness();
+        h.set(VortexKey::from("hello"), VortexValue::from("1"));
+        h.set(VortexKey::from("hallo"), VortexValue::from("2"));
+        h.set(VortexKey::from("hxllo"), VortexValue::from("3"));
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"h[^ae]llo"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::Array(Some(arr))) => {
+                assert_eq!(arr.len(), 1); // hxllo only.
+            }
+            _ => panic!("Expected array"),
+        }
+    }
+
+    #[test]
+    fn keys_rejects_wrong_arity() {
+        let h = new_harness();
+
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS"], NOW);
+        assert_static(r, ERR_WRONG_ARGS);
+
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"*", b"extra"], NOW);
+        assert_static(r, ERR_WRONG_ARGS);
+    }
+
+    #[test]
+    fn keys_large_match_fails_closed_at_alpha_response_cap() {
+        let h = new_harness();
+        for i in 0..=KEYS_MAX_RESULTS_PER_CALL {
+            let key = format!("keys-cap:{i:04}");
+            h.set(VortexKey::from(key), VortexValue::from("1"));
+        }
+
+        let r = exec(&h.keyspace, cmd_keys, &[b"KEYS", b"keys-cap:*"], NOW);
+
+        assert_static(r, ERR_KEYS_ALPHA_LIMIT);
+    }
+
+    // ── COPY ────────────────────────────────────────────────────────
+
+    #[test]
+    fn copy_basic() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("val"));
+        let r = exec(&h.keyspace, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
+        assert_static(r, RESP_ONE);
+        assert!(h.exists(&VortexKey::from("dst"), NOW));
+        // Source still exists.
+        assert!(h.exists(&VortexKey::from("src"), NOW));
+    }
+
+    #[test]
+    fn copy_no_replace() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("v1"));
+        h.set(VortexKey::from("dst"), VortexValue::from("v2"));
+        let r = exec(&h.keyspace, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
+        assert_static(r, RESP_ZERO); // Destination exists, no REPLACE.
+    }
+
+    #[test]
+    fn copy_with_replace() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("new_val"));
+        h.set(VortexKey::from("dst"), VortexValue::from("old_val"));
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst", b"REPLACE"],
+            NOW,
+        );
+        assert_static(r, RESP_ONE);
+    }
+
+    #[test]
+    fn copy_accepts_db_zero_and_rejects_malformed_options() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("value"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst", b"DB", b"0"],
+            NOW,
+        );
+        assert_static(r, RESP_ONE);
+        assert!(h.exists(&VortexKey::from("dst"), NOW));
+
+        for parts in [
+            &[
+                b"COPY".as_slice(),
+                b"src".as_slice(),
+                b"dst2".as_slice(),
+                b"DB".as_slice(),
+            ][..],
+            &[
+                b"COPY".as_slice(),
+                b"src".as_slice(),
+                b"dst2".as_slice(),
+                b"DB".as_slice(),
+                b"nope".as_slice(),
+            ][..],
+        ] {
+            let r = exec(&h.keyspace, cmd_copy, parts, NOW);
+            assert_static(r, crate::commands::ERR_NOT_INTEGER);
+        }
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst2", b"DB", b"1"],
+            NOW,
+        );
+        assert_static(r, ERR_DB_INDEX);
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"src", b"dst2", b"UNKNOWN"],
+            NOW,
+        );
+        assert_static(r, crate::commands::ERR_SYNTAX);
+    }
+
+    #[test]
+    fn copy_same_source_and_destination_with_replace_is_stable() {
+        let h = new_harness();
+        h.set(VortexKey::from("same"), VortexValue::from("value"));
+
+        let r = exec(
+            &h.keyspace,
+            cmd_copy,
+            &[b"COPY", b"same", b"same", b"REPLACE"],
+            NOW,
+        );
+
+        assert_static(r, RESP_ONE);
+        assert!(h.exists(&VortexKey::from("same"), NOW));
+    }
+
+    #[test]
+    fn copy_noeviction_returns_oom_without_mutating() {
+        let h = new_harness();
+        h.set(VortexKey::from("src"), VortexValue::from("value"));
+        h.keyspace
+            .configure_eviction(h.keyspace.memory_used(), crate::EvictionPolicy::NoEviction);
+
+        let r = exec(&h.keyspace, cmd_copy, &[b"COPY", b"src", b"dst"], NOW);
+
+        assert_static(r, crate::commands::ERR_OOM);
+        assert!(h.exists(&VortexKey::from("src"), NOW));
+        assert!(!h.exists(&VortexKey::from("dst"), NOW));
+    }
+
+    // ── RANDOMKEY ───────────────────────────────────────────────────
+
+    #[test]
+    fn randomkey_empty() {
+        let h = new_harness();
+        let r = exec(&h.keyspace, cmd_randomkey, &[b"RANDOMKEY"], NOW);
+        assert_static(r, RESP_NIL);
+    }
+
+    #[test]
+    fn randomkey_nonempty() {
+        let h = new_harness();
+        h.set(VortexKey::from("only"), VortexValue::from("one"));
+        let r = exec(&h.keyspace, cmd_randomkey, &[b"RANDOMKEY"], NOW);
+        match r {
+            CmdResult::Resp(RespFrame::BulkString(Some(b))) => {
+                assert_eq!(b.as_ref(), b"only");
+            }
+            _ => panic!("Expected BulkString"),
+        }
+    }
+
+    // ── Lazy expiry double-checked locking tests ────────────────────
+
+    /// When GET encounters an expired key, the double-checked locking
+    /// mechanism must clean it up (not just return nil).
+    #[test]
+    fn lazy_expiry_get_cleans_up_expired_key() {
+        let h = new_harness();
+        // Insert key with TTL deadline = 1 ms.
+        h.set_with_ttl(VortexKey::from("ek"), VortexValue::from("val"), 1_000_000);
+
+        // Before expiry: key exists.
+        assert_eq!(h.keyspace.dbsize(), 1);
+
+        // GET at now=2 ms → nil AND key removed from table.
+        let r = exec(
+            &h.keyspace,
+            super::super::string::cmd_get,
+            &[b"GET", b"ek"],
+            2_000_000,
+        );
+        assert_static(r, RESP_NIL);
+
+        // Key must be cleaned up — dbsize should be 0.
+        assert_eq!(h.keyspace.dbsize(), 0);
+    }
+
+    /// When TTL encounters an expired key, it returns -2 AND cleans up.
+    #[test]
+    fn lazy_expiry_ttl_cleans_up_expired_key() {
+        let h = new_harness();
+        h.set_with_ttl(VortexKey::from("tk"), VortexValue::from("val"), 1_000_000);
+        assert_eq!(h.keyspace.dbsize(), 1);
+
+        // TTL at now=2 ms → -2 (missing).
+        let r = exec(&h.keyspace, cmd_ttl, &[b"TTL", b"tk"], 2_000_000);
+        assert_static(r, RESP_NEG_TWO);
+
+        // Key cleaned up.
+        assert_eq!(h.keyspace.dbsize(), 0);
+    }
+
+    /// When TYPE encounters an expired key, it returns "none" AND cleans up.
+    #[test]
+    fn lazy_expiry_type_cleans_up_expired_key() {
+        let h = new_harness();
+        h.set_with_ttl(
+            VortexKey::from("typekey"),
+            VortexValue::from("val"),
+            1_000_000,
+        );
+        assert_eq!(h.keyspace.dbsize(), 1);
+
+        let r = exec(&h.keyspace, cmd_type, &[b"TYPE", b"typekey"], 2_000_000);
+        match r {
+            CmdResult::Resp(vortex_proto::RespFrame::SimpleString(s)) => assert_eq!(s, "none"),
+            other => panic!("expected SimpleString(none), got {:?}", other),
+        }
+
+        assert_eq!(h.keyspace.dbsize(), 0);
+    }
+
+    /// EXISTS with expired keys should return 0 AND clean up.
+    #[test]
+    fn lazy_expiry_exists_cleans_up_expired_key() {
+        let h = new_harness();
+        h.set_with_ttl(VortexKey::from("ex1"), VortexValue::from("v1"), 1_000_000);
+        h.set_with_ttl(VortexKey::from("ex2"), VortexValue::from("v2"), 1_000_000);
+        h.set(VortexKey::from("live"), VortexValue::from("v3"));
+        assert_eq!(h.keyspace.dbsize(), 3);
+
+        // EXISTS ex1 ex2 live at now=2 ms → only "live" counted.
+        let r = exec(
+            &h.keyspace,
+            cmd_exists,
+            &[b"EXISTS", b"ex1", b"ex2", b"live"],
+            2_000_000,
+        );
+        assert_integer(r, 1);
+
+        // Expired keys cleaned up.
+        assert_eq!(h.keyspace.dbsize(), 1);
+    }
+
+    // ── glob_match tests ────────────────────────────────────────────
+
+    #[test]
+    fn glob_star() {
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"*", b""));
+        assert!(glob_match(b"h*o", b"hello"));
+        assert!(glob_match(b"h*o", b"ho"));
+        assert!(!glob_match(b"h*o", b"hex"));
+    }
+
+    #[test]
+    fn glob_question() {
+        assert!(glob_match(b"h?llo", b"hello"));
+        assert!(glob_match(b"h?llo", b"hallo"));
+        assert!(!glob_match(b"h?llo", b"hllo"));
+    }
+
+    #[test]
+    fn glob_char_class() {
+        assert!(glob_match(b"h[ae]llo", b"hello"));
+        assert!(glob_match(b"h[ae]llo", b"hallo"));
+        assert!(!glob_match(b"h[ae]llo", b"hxllo"));
+    }
+
+    #[test]
+    fn glob_negated_class() {
+        assert!(!glob_match(b"h[^ae]llo", b"hello"));
+        assert!(glob_match(b"h[^ae]llo", b"hxllo"));
+    }
+
+    #[test]
+    fn glob_range() {
+        assert!(glob_match(b"[a-z]", b"m"));
+        assert!(!glob_match(b"[a-z]", b"M"));
+    }
+
+    #[test]
+    fn glob_escape() {
+        assert!(glob_match(b"h\\*llo", b"h*llo"));
+        assert!(!glob_match(b"h\\*llo", b"hello"));
+    }
+}

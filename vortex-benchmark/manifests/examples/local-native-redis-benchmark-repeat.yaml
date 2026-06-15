@@ -1,0 +1,29 @@
+schema_version: 1
+name: local-native-redis-benchmark-repeat
+description: Short native two-database redis-benchmark sweep with manifest-level repeat for report and comparison validation.
+databases:
+  - vortex
+  - redis
+backends:
+  - redis-benchmark
+commands:
+  - GET
+  - SET
+repeat: 2
+duration: 2s
+environment:
+  mode: native
+  port_base: 17479
+resource_config:
+  cpus: 4
+  memory: 2g
+  threads: 4
+runtime_config:
+  aof_enabled: false
+  eviction_policy: noeviction
+settings:
+  redis-benchmark:
+    requests: 12000
+    clients: 20
+    pipeline: 4
+    keyspace_size: 50000

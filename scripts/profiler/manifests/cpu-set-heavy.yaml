@@ -1,0 +1,19 @@
+schema_version: 1
+name: cpu-set-heavy
+description: Full CPU profiling under SET-heavy workload for hotspot analysis
+
+modes:
+  - cpu
+  - flamegraph
+
+server:
+  threads: 4
+  aof: false
+
+workload:
+  command: SET
+  duration: 30
+  clients: 50
+
+profiler:
+  frequency: 99

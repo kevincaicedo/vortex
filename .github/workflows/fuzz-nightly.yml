@@ -1,9 +1,9 @@
 name: Nightly Fuzz
 
+# DEPRECATED: VortexDB is no longer maintained. Development moved to InfinityDB
+# (https://github.com/kevincaicedo/infinitydb). Scheduled CI is disabled — this
+# workflow runs only on manual dispatch.
 on:
-  schedule:
-    # Run every day at 03:00 UTC
-    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:

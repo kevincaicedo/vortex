@@ -235,13 +235,13 @@ fn main() {
         ),
         (
             "EXPIRE",
-            3,
+            -3,
             "CommandFlags::WRITE.union(CommandFlags::FAST)",
             kr_single(1),
         ),
         (
             "EXPIREAT",
-            3,
+            -3,
             "CommandFlags::WRITE.union(CommandFlags::FAST)",
             kr_single(1),
         ),
@@ -253,13 +253,13 @@ fn main() {
         ),
         (
             "PEXPIRE",
-            3,
+            -3,
             "CommandFlags::WRITE.union(CommandFlags::FAST)",
             kr_single(1),
         ),
         (
             "PEXPIREAT",
-            3,
+            -3,
             "CommandFlags::WRITE.union(CommandFlags::FAST)",
             kr_single(1),
         ),

@@ -1,0 +1,19 @@
+schema_version: 1
+name: aof-disk-write-pressure
+description: AOF and disk diagnostics under sustained write pressure.
+
+modes:
+  - aof-disk
+
+server:
+  threads: 4
+  aof: true
+  aof_fsync: everysec
+
+workload:
+  command: SET,INCR
+  duration: 20
+  clients: 50
+
+profiler:
+  frequency: 99
